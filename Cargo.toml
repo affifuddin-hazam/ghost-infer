@@ -1,0 +1,16 @@
+[package]
+name = "betterllama"
+version = "0.1.0"
+edition = "2024"
+description = "A small, dependency-light LLM inference engine for GGUF models"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"

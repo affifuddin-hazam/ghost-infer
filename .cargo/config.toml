@@ -1,0 +1,3 @@
+# Built for this machine only: lets LLVM use AVX2/FMA in the matmul loops.
+[build]
+rustflags = ["-C", "target-cpu=native"]
