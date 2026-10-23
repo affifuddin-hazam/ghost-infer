@@ -458,7 +458,8 @@ fn chat(o: &Opts) -> Result<(), String> {
         if stdin.lock().read_line(&mut line).map_err(|e| e.to_string())? == 0 {
             break;
         }
-        let msg = line.trim();
+        // text piped from PowerShell starts with a byte-order mark
+        let msg = line.trim_start_matches('\u{feff}').trim();
         if msg.is_empty() || msg == "/bye" {
             break;
         }
