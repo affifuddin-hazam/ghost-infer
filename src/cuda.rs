@@ -16,7 +16,7 @@ const MATMUL_TB: usize = 8; // tokens per matmul block row (must match TB in the
 /// BETTERLLAMA_RPW overrides it for tuning.
 fn kq_rpw() -> usize {
     static RPW: OnceLock<usize> = OnceLock::new();
-    *RPW.get_or_init(|| std::env::var("BETTERLLAMA_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=16).contains(&v)).unwrap_or(2))
+    *RPW.get_or_init(|| std::env::var("BETTERLLAMA_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=16).contains(&v)).unwrap_or(1))
 }
 /// Activation values per int8 scale in the K-quant prompt matmuls (passed as -DQCH): 128 or 256.
 /// 128 is ~1% slower than 256 and about halves the log-probability drift; BETTERLLAMA_QCH=256 overrides.
@@ -30,7 +30,7 @@ const TILED_MIN_BATCH: usize = 16; // from this many tokens, the int8 tiled matm
 const ATT_MAX_CHUNK: usize = 256; // must match ATT_MAX_CHUNK
 const ATT_MAX_HD: usize = 128; // must match ATT_MAX_HD
 const ATT_MAX_G: usize = 8; // query heads per kv head the GQA attention kernel handles (must match ATT_MAX_G)
-const SPLIT_MIN_SPAN: usize = 128; // contexts up to this many positions are not split across blocks
+const SPLIT_MIN_SPAN: usize = 32; // contexts up to this many positions are not split across blocks
 const ATT_TARGET_BLOCKS: usize = 96; // aim for a few blocks per SM when splitting attention for one token
 const PREFILL_QT: usize = 32; // query tokens per prompt-attention block (must match PQT)
 const PREFILL_KT: usize = 32; // key positions per shared-memory tile (must match PKT)
@@ -103,11 +103,8 @@ __device__ __forceinline__ void q4k_scale_min(int j, const unsigned char* s, int
     else { *sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); *m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
 }
 
-// Same, for sub-blocks j and j+1 (j even) of a block whose 12 scale bytes start 4-byte aligned:
-// three word loads instead of a byte load per field.
-__device__ __forceinline__ void q4k_scale_min2(int j, const unsigned char* s, int* sc1, int* m1, int* sc2, int* m2) {
-    const unsigned int* w = reinterpret_cast<const unsigned int*>(s);
-    unsigned int w0 = w[0], w1 = w[1], w2 = w[2];
+// Same, for sub-blocks j and j+1 (j even), from the 12 scale bytes as three words.
+__device__ __forceinline__ void q4k_scale_min2w(int j, unsigned int w0, unsigned int w1, unsigned int w2, int* sc1, int* m1, int* sc2, int* m2) {
     #define SB(i) ((int)(((i) < 4 ? w0 : (i) < 8 ? w1 : w2) >> (8 * ((i) & 3)) & 0xFF))
     if (j < 4) {
         *sc1 = SB(j) & 63;            *m1 = SB(j + 4) & 63;
@@ -157,19 +154,62 @@ __global__ void embed(int fmt, const unsigned char* __restrict__ w, const float*
     }
 }
 
-// RMSNorm over each head of q and k in the packed qkv rows (Qwen3). grid (tokens, n_heads + n_kv), block = 128
-__global__ void head_rmsnorm(float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
-                             int n_heads, int n_kv, int hd, float eps) {
+// Per head of the packed [q | k | v] rows: RMSNorm of q and k (Qwen3; skipped when qn is null), RoPE on
+// q and k, and k, v copied into the cache. grid (tokens, n_heads + 2 * n_kv), block = 64.
+// neox: pairs (x[i], x[i + rope_dim/2]) (Qwen); otherwise adjacent pairs (x[2i], x[2i+1]) (GGUF llama).
+__global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
+                             float* __restrict__ kc, float* __restrict__ vc, int pos0, int n_heads, int n_kv, int hd,
+                             int rope_dim, float base, int neox, float eps) {
     __shared__ float sh[32];
-    int b = blockIdx.x, h = blockIdx.y;
-    int row_stride = (n_heads + 2 * n_kv) * hd;
-    float* v = qkv + (size_t)b * row_stride + h * hd; // k heads directly follow the q heads
-    const float* w = h < n_heads ? qn : kn;
-    float ss = 0.f;
-    for (int d = threadIdx.x; d < hd; d += blockDim.x) ss += v[d] * v[d];
-    ss = block_sum(ss, sh);
-    float scale = rsqrtf(ss / hd + eps);
-    for (int d = threadIdx.x; d < hd; d += blockDim.x) v[d] = v[d] * scale * w[d];
+    int b = blockIdx.x, h = blockIdx.y, pos = pos0 + b;
+    int q_dim = n_heads * hd, kv_dim = n_kv * hd;
+    float* row = qkv + (size_t)b * (q_dim + 2 * kv_dim);
+    if (h >= n_heads + n_kv) { // a v head: straight into the cache (same for the whole block)
+        int vh = h - n_heads - n_kv;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) vc[(size_t)pos * kv_dim + vh * hd + d] = row[q_dim + kv_dim + vh * hd + d];
+        return;
+    }
+    float* vec = row + h * hd; // k heads directly follow the q heads
+    if (qn) {
+        const float* w = h < n_heads ? qn : kn;
+        float ss = 0.f;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) ss += vec[d] * vec[d];
+        ss = block_sum(ss, sh);
+        float scale = rsqrtf(ss / hd + eps);
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) vec[d] = vec[d] * scale * w[d];
+        __syncthreads();
+    }
+    int half = rope_dim / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float freq = powf(base, -2.0f * (float)i / (float)rope_dim);
+        float s, c;
+        sincosf((float)pos * freq, &s, &c);
+        int ia = neox ? i : 2 * i, ib = neox ? i + half : 2 * i + 1;
+        float a = vec[ia], bb = vec[ib];
+        vec[ia] = a * c - bb * s;
+        vec[ib] = a * s + bb * c;
+    }
+    if (h >= n_heads) {
+        __syncthreads();
+        int kh = h - n_heads;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) kc[(size_t)pos * kv_dim + kh * hd + d] = vec[d];
+    }
+}
+
+// int8 quantisation (as quantize_q8) of 32-value blocks held 4 per lane by 8 adjacent lanes; the whole
+// warp must call it. Lane i of the row's float4s writes its 4 bytes; the block's first lane its scale and sum.
+__device__ __forceinline__ void quant8x4(float4 v, bool ok, int i, signed char* __restrict__ q, float* __restrict__ d, int* __restrict__ sums) {
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    for (int o = 1; o < 8; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    float dd = amax / 127.f;
+    float inv = dd != 0.f ? 1.f / dd : 0.f;
+    int q0 = (int)roundf(v.x * inv), q1 = (int)roundf(v.y * inv), q2 = (int)roundf(v.z * inv), q3 = (int)roundf(v.w * inv);
+    int s = q0 + q1 + q2 + q3;
+    for (int o = 1; o < 8; o <<= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+    if (ok) {
+        *reinterpret_cast<int*>(q + 4 * (size_t)i) = (q0 & 255) | ((q1 & 255) << 8) | ((q2 & 255) << 16) | ((unsigned)q3 << 24);
+        if ((i & 7) == 0) { d[i >> 3] = dd; sums[i >> 3] = s; }
+    }
 }
 
 // one block per row
@@ -183,6 +223,31 @@ __global__ void rmsnorm(const float* __restrict__ x, const float* __restrict__ w
     ss = block_sum(ss, sh);
     float scale = rsqrtf(ss / cols + eps);
     for (int i = threadIdx.x; i < cols; i += blockDim.x) o[i] = xr[i] * scale * w[i];
+}
+
+// RMSNorm straight to int8 activations (one token per block, up to 1024 threads, cols a multiple of 32):
+// the one-token K-quant matmuls take xq / xd directly, so there is no f32 copy and no quantize launch.
+__global__ void rmsnorm_q8(const float* __restrict__ x, const float* __restrict__ w, signed char* __restrict__ xq,
+                           float* __restrict__ xd, int* __restrict__ xsum, int cols, float eps) {
+    __shared__ float sh[32];
+    const float4* xr = reinterpret_cast<const float4*>(x + (size_t)blockIdx.x * cols);
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    int nv = cols >> 2;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < nv; i += blockDim.x) { float4 v = xr[i]; ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w; }
+    ss = block_sum(ss, sh);
+    float scale = rsqrtf(ss / cols + eps);
+    size_t r = blockIdx.x;
+    for (int base = 0; base < nv; base += blockDim.x) { // every lane takes part in the shuffles
+        int i = base + threadIdx.x;
+        bool ok = i < nv;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (ok) {
+            float4 a = xr[i], g = w4[i];
+            v = make_float4(a.x * scale * g.x, a.y * scale * g.y, a.z * scale * g.z, a.w * scale * g.w);
+        }
+        quant8x4(v, ok, i, xq + r * cols, xd + r * (cols >> 5), xsum + r * (cols >> 5));
+    }
 }
 
 // Generation matmuls: out[b*out_stride + out_off + r] (+)= dot(W[r], x[b]), f32 activations.
@@ -371,33 +436,35 @@ __global__ void matmul_q4k_dp4a(const unsigned char* __restrict__ w, const float
     int lane = threadIdx.x & 31;
     if (row0 >= rows) return;
     int nsb = cols >> 8;
-    // each lane: 2 words = 8 bytes of a 32-byte chunk = 8 values of each of two sub-blocks (16 values);
-    // a half-warp covers a super-block, so the warp walks two super-blocks per step
-    int hl = lane >> 4, l16 = lane & 15, j2 = l16 >> 2, q4 = l16 & 3;
+    // each lane: 16 bytes of a 32-byte nibble chunk = 16 values of each of two sub-blocks (32 values),
+    // plus the block's 16-byte header (d, dmin and all 12 scale bytes) in one load; 8 lanes cover a
+    // super-block, so the warp walks four super-blocks per step
+    int qsel = lane >> 3, l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
     size_t row_bytes = (size_t)nsb * Q4K_BYTES;
     float acc[RPW];
     #pragma unroll
     for (int r = 0; r < RPW; r++) acc[r] = 0.f;
     #pragma unroll 2 // more super-blocks' loads in flight before any is used
-    for (int sb = hl; sb < nsb; sb += 2) {
-        int pos = sb * 256 + 64 * j2 + 8 * q4;
-        int xl0 = *reinterpret_cast<const int*>(xq + pos), xl1 = *reinterpret_cast<const int*>(xq + pos + 4);
-        int xh0 = *reinterpret_cast<const int*>(xq + pos + 32), xh1 = *reinterpret_cast<const int*>(xq + pos + 36);
+    for (int sb = qsel; sb < nsb; sb += 4) {
+        int pos = sb * 256 + 64 * j2 + 16 * hf;
+        int4 xl = *reinterpret_cast<const int4*>(xq + pos), xh = *reinterpret_cast<const int4*>(xq + pos + 32);
         float dl = xd[pos >> 5], dh = xd[(pos >> 5) + 1];
-        float sl = dl * (float)__dp4a(0x01010101, xl0, __dp4a(0x01010101, xl1, 0));
-        float sh = dh * (float)__dp4a(0x01010101, xh0, __dp4a(0x01010101, xh1, 0));
+        const int one = 0x01010101;
+        float sl = dl * (float)__dp4a(one, xl.x, __dp4a(one, xl.y, __dp4a(one, xl.z, __dp4a(one, xl.w, 0))));
+        float sh = dh * (float)__dp4a(one, xh.x, __dp4a(one, xh.y, __dp4a(one, xh.z, __dp4a(one, xh.w, 0))));
         #pragma unroll
         for (int r = 0; r < RPW; r++) {
             if (row0 + r < rows) {
                 const unsigned char* b = w + (size_t)(row0 + r) * row_bytes + (size_t)sb * Q4K_BYTES;
-                float d, dmin;
-                q4k_dm(b, &d, &dmin);
+                int4 hdr = *reinterpret_cast<const int4*>(b);
+                int4 p = *reinterpret_cast<const int4*>(b + 16 + 32 * j2 + 16 * hf);
+                float d = h2f((unsigned)hdr.x & 0xFFFF), dmin = h2f((unsigned)hdr.x >> 16);
                 int sc1, m1, sc2, m2;
-                q4k_scale_min2(2 * j2, b + 4, &sc1, &m1, &sc2, &m2);
-                int2 pp = *reinterpret_cast<const int2*>(b + 16 + 32 * j2 + 8 * q4);
-                int p0 = pp.x, p1 = pp.y;
-                int lo = __dp4a(p0 & 0x0F0F0F0F, xl0, __dp4a(p1 & 0x0F0F0F0F, xl1, 0));
-                int hi = __dp4a((p0 >> 4) & 0x0F0F0F0F, xh0, __dp4a((p1 >> 4) & 0x0F0F0F0F, xh1, 0));
+                q4k_scale_min2w(2 * j2, hdr.y, hdr.z, hdr.w, &sc1, &m1, &sc2, &m2);
+                int lo = __dp4a(p.x & 0x0F0F0F0F, xl.x, __dp4a(p.y & 0x0F0F0F0F, xl.y,
+                         __dp4a(p.z & 0x0F0F0F0F, xl.z, __dp4a(p.w & 0x0F0F0F0F, xl.w, 0))));
+                int hi = __dp4a((p.x >> 4) & 0x0F0F0F0F, xh.x, __dp4a((p.y >> 4) & 0x0F0F0F0F, xh.y,
+                         __dp4a((p.z >> 4) & 0x0F0F0F0F, xh.z, __dp4a((p.w >> 4) & 0x0F0F0F0F, xh.w, 0))));
                 acc[r] += d * (sc1 * dl * (float)lo + sc2 * dh * (float)hi) - dmin * (m1 * sl + m2 * sh);
             }
         }
@@ -470,32 +537,6 @@ __global__ void matmul_q4k_1(KQ_ARGS) { q4k_matvec<1>(w, x, out, rows, cols, n, 
 __global__ void matmul_q4k_4(KQ_ARGS) { q4k_matvec<4>(w, x, out, rows, cols, n, accumulate, out_stride, out_off); }
 __global__ void matmul_q6k_1(KQ_ARGS) { q6k_matvec<1>(w, wd, x, out, rows, cols, n, accumulate, out_stride, out_off); }
 __global__ void matmul_q6k_4(KQ_ARGS) { q6k_matvec<4>(w, wd, x, out, rows, cols, n, accumulate, out_stride, out_off); }
-
-// qkv rows are [q | k | v]; rotates q and k and stores k, v at their positions.
-// neox: pairs (x[i], x[i + rope_dim/2]) (Qwen); otherwise adjacent pairs (x[2i], x[2i+1]) (GGUF llama).
-__global__ void rope_cache(float* __restrict__ qkv, float* __restrict__ kc, float* __restrict__ vc,
-                           int pos0, int n_heads, int n_kv, int hd, int rope_dim, float base, int neox) {
-    int b = blockIdx.x, pos = pos0 + b;
-    int q_dim = n_heads * hd, kv_dim = n_kv * hd;
-    float* row = qkv + (size_t)b * (q_dim + 2 * kv_dim);
-    int half = rope_dim / 2;
-    for (int idx = threadIdx.x; idx < (n_heads + n_kv) * half; idx += blockDim.x) {
-        int h = idx / half, i = idx % half;
-        float* vec = row + h * hd; // k heads directly follow the q heads
-        float freq = powf(base, -2.0f * (float)i / (float)rope_dim);
-        float s, c;
-        sincosf((float)pos * freq, &s, &c);
-        int ia = neox ? i : 2 * i, ib = neox ? i + half : 2 * i + 1;
-        float a = vec[ia], bb = vec[ib];
-        vec[ia] = a * c - bb * s;
-        vec[ib] = a * s + bb * c;
-    }
-    __syncthreads();
-    for (int j = threadIdx.x; j < kv_dim; j += blockDim.x) {
-        kc[(size_t)pos * kv_dim + j] = row[q_dim + j];
-        vc[(size_t)pos * kv_dim + j] = row[q_dim + kv_dim + j];
-    }
-}
 
 #define ATT_MAX_CHUNK 256
 #define ATT_MAX_HD 128
@@ -1605,6 +1646,20 @@ extern "C" {
 __global__ void __launch_bounds__(128) matmul_mma_q4k(MMA_K_ARGS) { mma_kquant<1>(wq, wd, xq, xd, xb, out, rows, cols, n, accumulate, out_stride, out_off); }
 __global__ void __launch_bounds__(128) matmul_mma_q6k(MMA_K_ARGS) { mma_kquant<2>(wq, wd, xq, xd, xb, out, rows, cols, n, accumulate, out_stride, out_off); }
 
+// One token: h = silu(gate) * up straight to int8 activations for the down projection (ffn a multiple of 32).
+__global__ void silu_q8(const float* __restrict__ gu, signed char* __restrict__ xq, float* __restrict__ xd,
+                        int* __restrict__ xsum, int ffn) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, nv = ffn >> 2;
+    bool ok = i < nv;
+    float4 h = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (ok) {
+        float4 g = reinterpret_cast<const float4*>(gu)[i], u = reinterpret_cast<const float4*>(gu + ffn)[i];
+        h = make_float4(g.x / (1.f + expf(-g.x)) * u.x, g.y / (1.f + expf(-g.y)) * u.y,
+                        g.z / (1.f + expf(-g.z)) * u.z, g.w / (1.f + expf(-g.w)) * u.w);
+    }
+    quant8x4(h, ok, i, xq, xd, xsum);
+}
+
 // gu rows are [gate | up]; h = silu(gate) * up
 __global__ void silu_mul(const float* __restrict__ gu, float* __restrict__ h, int ffn, int n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1833,7 +1888,8 @@ enum Arg {
 struct Kernels {
     embed: Ptr,
     rmsnorm: Ptr,
-    head_rmsnorm: Ptr,
+    rmsnorm_q8: Ptr, // one token: RMSNorm straight to int8 activations
+    qk_norm_rope: Ptr,
     matmul_q8: Ptr,
     matmul_q4k: [Ptr; 2], // f32 activations: one-token and four-token variants
     matmul_q6k: [Ptr; 2],
@@ -1844,13 +1900,13 @@ struct Kernels {
     matmul_mma_k: Option<[Ptr; 2]>, // the same for Q4_K / Q6_K with per-256 activation scales
     quantize_q8: Ptr,
     quantize_q8k: Ptr,
-    rope_cache: Ptr,
     attention_partial: Ptr,
     attention_partial_gqa: Ptr,
     attention_combine: Ptr,
     attention_prefill: Ptr,
     attention_prefill_tc: Option<[Ptr; 2]>, // f16 tensor cores (sm_75+), head size 64 / 128
     silu_mul: Ptr,
+    silu_q8: Ptr,
 }
 
 unsafe impl Send for Kernels {}
@@ -1898,7 +1954,8 @@ impl Kernels {
             Ok(Kernels {
                 embed: get("embed")?,
                 rmsnorm: get("rmsnorm")?,
-                head_rmsnorm: get("head_rmsnorm")?,
+                rmsnorm_q8: get("rmsnorm_q8")?,
+                qk_norm_rope: get("qk_norm_rope")?,
                 matmul_q8: get("matmul_q8")?,
                 matmul_q4k: [get("matmul_q4k_1")?, get("matmul_q4k_4")?],
                 matmul_q6k: [get("matmul_q6k_1")?, get("matmul_q6k_4")?],
@@ -1914,7 +1971,6 @@ impl Kernels {
                 },
                 quantize_q8: get("quantize_q8")?,
                 quantize_q8k: get("quantize_q8k")?,
-                rope_cache: get("rope_cache")?,
                 attention_partial: get("attention_partial")?,
                 attention_partial_gqa: get("attention_partial_gqa")?,
                 attention_combine: get("attention_combine")?,
@@ -1926,6 +1982,7 @@ impl Kernels {
                     None
                 },
                 silu_mul: get("silu_mul")?,
+                silu_q8: get("silu_q8")?,
             })
         }
     }
@@ -2164,20 +2221,10 @@ impl GpuModel {
             return Ok(());
         }
         // one token with K-quant weights: int8 activations + dp4a (BETTERLLAMA_EXACT=1 keeps f32)
-        if n == 1 && !crate::quant::exact_mode() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8) {
+        if Self::dp4a_path(parts, n) {
             let blocks = cols / 32;
             k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(blocks as i32)])?;
-            for &(m, off) in parts {
-                let f = if m.fmt == Fmt::Q4K { k.matmul_q4k_dp4a } else { k.matmul_q6k_dp4a };
-                k.launch(
-                    f,
-                    (m.rows.div_ceil(8 * kq_rpw()) as u32, 1),
-                    256,
-                    0,
-                    &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
-                )?;
-            }
-            return Ok(());
+            return self.matmul_dp4a(parts, out, out_stride, accumulate, s);
         }
         // otherwise f32 activations; 256 threads = 8 warps, one row each for Q8_0, RPW rows each for K-quants
         for &(m, off) in parts {
@@ -2191,6 +2238,39 @@ impl GpuModel {
             }
         }
         Ok(())
+    }
+
+    /// One token with K-quant weights goes through int8 activations and dp4a.
+    fn dp4a_path(parts: &[(&GpuMatrix, usize)], n: usize) -> bool {
+        n == 1 && !crate::quant::exact_mode() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8)
+    }
+
+    /// The dp4a matmuls on activations already quantised into `s.xq` / `s.xd`.
+    fn matmul_dp4a(&self, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
+        let k = &self.k;
+        for &(m, off) in parts {
+            let f = if m.fmt == Fmt::Q4K { k.matmul_q4k_dp4a } else { k.matmul_q6k_dp4a };
+            k.launch(
+                f,
+                (m.rows.div_ceil(8 * kq_rpw()) as u32, 1),
+                256,
+                0,
+                &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// RMSNorm of `x` into `s.xb`, then the matmul; for one token on the dp4a path the norm writes the
+    /// int8 activations directly.
+    fn norm_matmul(&self, norm: &DeviceBuf, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, s: &GpuSession) -> Result<(), String> {
+        let (k, c) = (&self.k, &self.cfg);
+        if Self::dp4a_path(parts, n) {
+            k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
+            return self.matmul_dp4a(parts, out, out_stride, false, s);
+        }
+        k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xb.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
+        self.matmul(parts, s.xb.ptr, out, out_stride, n, false, s)
     }
 
     fn matmul_one(&self, m: &GpuMatrix, x: u64, out: u64, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
@@ -2307,34 +2387,34 @@ impl GpuModel {
         let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
         for (l, layer) in self.layers.iter().enumerate() {
             let (kc, vc) = (s.k_cache.at(l * layer_kv), s.v_cache.at(l * layer_kv));
-            self.timed(1, || k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.attn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)]))?;
             let qkv: Vec<(&GpuMatrix, usize)> = layer.qkv.iter().map(|(m, off)| (m, *off)).collect();
-            self.timed(2, || self.matmul(&qkv, s.xb.ptr, s.qkv.ptr, qkv_rows, n, false, s))?;
+            self.timed(2, || self.norm_matmul(&layer.attn_norm, &qkv, s.qkv.ptr, qkv_rows, n, s))?;
             self.timed(3, || {
-                if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
-                    k.launch(
-                        k.head_rmsnorm,
-                        (n as u32, (c.n_heads + c.n_kv_heads) as u32),
-                        128,
-                        0,
-                        &[Arg::P(s.qkv.ptr), Arg::P(qn.ptr), Arg::P(kn.ptr), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::F(c.norm_eps)],
-                    )?;
-                }
+                let (qn, kn) = match (&layer.q_norm, &layer.k_norm) {
+                    (Some(qn), Some(kn)) => (qn.ptr, kn.ptr),
+                    _ => (0, 0),
+                };
                 k.launch(
-                    k.rope_cache,
-                    (n as u32, 1),
-                    256,
+                    k.qk_norm_rope,
+                    (n as u32, (c.n_heads + 2 * c.n_kv_heads) as u32),
+                    64,
                     0,
-                    &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32)],
+                    &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
                 )
             })?;
             self.timed(4, || self.attention(s, n, kc, vc))?;
             self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
 
-            self.timed(1, || k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)]))?;
             self.timed(6, || {
                 let gate_up: Vec<(&GpuMatrix, usize)> = layer.gate_up.iter().map(|(m, off)| (m, *off)).collect();
-                self.matmul(&gate_up, s.xb.ptr, s.gu.ptr, 2 * c.ffn_dim, n, false, s)?;
+                self.norm_matmul(&layer.ffn_norm, &gate_up, s.gu.ptr, 2 * c.ffn_dim, n, s)?;
+                let down = [(&layer.down, 0)];
+                if Self::dp4a_path(&down, n) {
+                    // one token: silu(gate) * up straight to int8 for the down projection
+                    let nv = (c.ffn_dim / 4) as u32;
+                    k.launch(k.silu_q8, (nv.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.ffn_dim as i32)])?;
+                    return self.matmul_dp4a(&down, s.x.ptr, dim, true, s);
+                }
                 let total = (n * c.ffn_dim) as u32;
                 k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(c.ffn_dim as i32), Arg::I(n as i32)])?;
                 self.matmul_one(&layer.down, s.h.ptr, s.x.ptr, n, true, s)

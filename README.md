@@ -28,8 +28,9 @@ and cultural attractions. Paris is a major global city, and its population is ap
   an f32 kernel on older GPUs or other head sizes). For K-quant weights the prompt matmul keeps its
   epilogue in integers: activations get one scale per 128 values, the sub-block scales are applied with
   integer multiply-adds and the Q4_K mins go through the tensor cores too. Generation uses `dp4a`
-  matrix-vector kernels for K-quants and split-context ("flash-decoding") attention that reads each
-  key/value row once per head group.
+  matrix-vector kernels for K-quants (16-byte loads, 84–97% of DRAM bandwidth on an 8B model), RMSNorm and
+  SiLU kernels that write the int8 activations directly, and split-context ("flash-decoding") attention
+  that reads each key/value row once per head group.
 - **Sampling**: greedy, or temperature + top-k + top-p.
 - **Chat**: ChatML template (SmolLM2, Qwen), multi-turn with the KV cache kept between turns.
 
@@ -102,11 +103,11 @@ compare rows only within one table)
 
 | | betterllama | Ollama |
 |---|---|---|
-| Prompt, ~33 tokens | 772 | **807** |
-| Prompt, ~260 tokens | **1,538** | 1,360 |
-| Prompt, ~1,040 tokens | **1,539** | 1,459 |
-| Generate, short context | 48.5 | **55.6** |
-| Generate at ~1,040 context | 47.0 | **54.5** |
+| Prompt, ~33 tokens | 745 | **800** |
+| Prompt, ~260 tokens | **1,475** | 1,313 |
+| Prompt, ~1,040 tokens | **1,477** | 1,390 |
+| Generate, short context | **69.7** | 52.7 |
+| Generate at ~1,040 context | **65.2** | 52.2 |
 
 **Qwen3 8B Q4_K_M, CPU**
 
