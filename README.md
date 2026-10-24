@@ -37,6 +37,10 @@ and cultural attractions. Paris is a major global city, and its population is ap
   inside a check batch, which is tested on whole replies and multi-turn chats.
 - **Sampling**: greedy, or temperature + top-k + top-p.
 - **Chat**: ChatML template (SmolLM2, Qwen), multi-turn with the KV cache kept between turns.
+- **OpenAI-compatible server** (`serve`): `/v1/chat/completions` and `/v1/completions` with streaming,
+  `/v1/models`, so chat apps and editor plugins that talk to OpenAI or Ollama can use it. It keeps the
+  last conversation in the cache: when a client resends the history with a new message, only the new
+  part is read.
 
 ## Build
 
@@ -54,19 +58,21 @@ betterllama run   model.gguf -p "Write a haiku about the ocean."
 betterllama chat  model.gguf --gpu
 betterllama bench model.gguf --prompt-len 256 -n 128 --gpu
 betterllama run   Qwen3-8B-Q4_K_M.gguf -p "Explain DNS." -t 0 --gpu --draft Qwen3-0.6B-Q8_0.gguf
+betterllama serve Qwen3-8B-Q4_K_M.gguf --gpu --port 8080
 ```
 
 | Command | What it does |
 |---|---|
 | `run <model> -p <prompt>` | one reply, streamed, with timing |
 | `chat <model>` | interactive chat (`/reset` clears the conversation, empty line or `/bye` quits) |
+| `serve <model>` | OpenAI-compatible HTTP server (see below) |
 | `bench <model>` | fixed workload: `--prompt-len` prompt tokens, then `-n` greedy tokens, best of 3 |
 | `top <model> <text> [--gpu]` | the 10 most likely next tokens after raw text, with log-probabilities |
 | `tokenize <model> <text>` | token ids and pieces, plus a round-trip check |
 | `inspect <model>` | metadata, tensor list and parameter counts |
 | `meta <model> <key>` | one metadata value in full (e.g. `tokenizer.chat_template`) |
 
-Options for `run`, `chat` and `bench`:
+Options for `run`, `chat`, `serve` and `bench`:
 
 | Option | Default | |
 |---|---|---|
@@ -83,6 +89,30 @@ Options for `run`, `chat` and `bench`:
 | `--special` | | print special tokens |
 | `--draft <gguf>` | | speculative decoding with this small model (`--gpu`, used for greedy replies; same tokenizer needed) |
 | `--draft-k <n>` | 3 | tokens the draft proposes per step (1-7) |
+| `--host <addr>` | 127.0.0.1 | `serve`: address to listen on (`0.0.0.0` for other machines on your network) |
+| `--port <n>` | 8080 | `serve`: port |
+
+### Server
+
+`betterllama serve model.gguf --gpu` listens on `http://127.0.0.1:8080/v1`. Point any OpenAI client at that
+base URL (the API key and model name can be anything):
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+```
+
+| Endpoint | |
+|---|---|
+| `POST /v1/chat/completions` | `messages` (system / user / assistant, text content), `stream`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `stream_options.include_usage` |
+| `POST /v1/completions` | the same with a raw `prompt` instead of messages (no chat template) |
+| `GET /v1/models` | the loaded model (its file name) |
+| `GET /health` | `{"status":"ok"}` |
+
+Requests run one at a time. Unset sampling fields use the command-line defaults (`-t`, `--top-k`,
+`--top-p`, `-n`). Greedy requests (`"temperature": 0`) use the `--draft` model when one is loaded, with
+the same output. Replies include special tokens such as Qwen3's `<think>` blocks as text, which chat apps
+that understand them can fold away. Images, tools/function calls, log-probabilities and several choices
+per request (`n`) are not supported.
 
 ### GPU requirements
 

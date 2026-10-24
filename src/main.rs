@@ -1,13 +1,16 @@
 mod cuda;
 mod gguf;
+mod json;
 mod model;
 mod profile;
 mod quant;
 mod sampler;
+mod server;
 mod tokenizer;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -26,6 +29,7 @@ USAGE:
     betterllama bench    <model.gguf> [-n <gen tokens>] [--prompt-len <n>] [--threads <n>] [--gpu] [--draft <gguf>]
     betterllama run      <model.gguf> -p <prompt> [options]
     betterllama chat     <model.gguf> [options]
+    betterllama serve    <model.gguf> [--host <addr>] [--port <n>] [options]   (OpenAI-compatible HTTP API)
 
 OPTIONS:
     -p, --prompt <text>   prompt (run)
@@ -42,6 +46,8 @@ OPTIONS:
         --draft-k <n>     tokens the draft proposes per step  [3]
         --threads <n>     CPU worker threads                 [physical cores]
         --special         print special tokens
+        --host <addr>     serve: address to listen on        [127.0.0.1]
+        --port <n>        serve: port                        [8080]
 ";
 
 struct Opts {
@@ -60,6 +66,8 @@ struct Opts {
     gpu: bool,
     draft: Option<PathBuf>,
     draft_k: usize,
+    host: String,
+    port: u16,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -87,6 +95,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         gpu: false,
         draft: None,
         draft_k: 3,
+        host: "127.0.0.1".into(),
+        port: 8080,
     };
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
@@ -110,6 +120,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--gpu" => o.gpu = true,
             "--draft" => o.draft = Some(PathBuf::from(val(a)?)),
             "--draft-k" => o.draft_k = num(val(a)?, a)? as usize,
+            "--host" => o.host = val(a)?,
+            "--port" => o.port = num(val(a)?, a)? as u16,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -127,6 +139,7 @@ fn main() -> ExitCode {
         Some("bench") if !rest.is_empty() => parse_opts(rest).and_then(|o| bench(&o)),
         Some("run") if !rest.is_empty() => parse_opts(rest).and_then(|o| run(&o)),
         Some("chat") if !rest.is_empty() => parse_opts(rest).and_then(|o| chat(&o)),
+        Some("serve") if !rest.is_empty() => parse_opts(rest).and_then(|o| server::serve(&o, &o.host, o.port)),
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
@@ -276,9 +289,11 @@ struct Draft {
 
 struct Engine<'a> {
     backend: Backend<'a>,
-    tok: Tokenizer,
+    tok: Arc<Tokenizer>,
     stop: Vec<u32>,
     draft: Option<Draft>,
+    /// the tokens in the main model's cache, in order (generate_with keeps it; the draft catches up from it)
+    hist: Vec<u32>,
 }
 
 struct Stats {
@@ -288,6 +303,9 @@ struct Stats {
     gen_secs: f64,
     stopped_on: Option<u32>,
 }
+
+/// Called with each generated token; Ok(false) stops after it (the token is still read into the cache).
+type Emit<'e> = &'e mut dyn FnMut(u32) -> Result<bool, String>;
 
 fn load<'a>(g: &'a Gguf, gpu: bool, ctx: usize) -> Result<Engine<'a>, String> {
     load_with_draft(g, gpu, ctx, None, 0)
@@ -326,12 +344,29 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
             }
         }
     }
-    Ok(Engine { backend, tok, stop, draft })
+    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new() })
 }
 
 impl Engine<'_> {
     /// Feeds `prompt` then samples up to `max_new` tokens, streaming text to stdout.
     fn generate(&mut self, prompt: &[u32], max_new: usize, sampler: &mut Sampler, show_special: bool) -> Result<Stats, String> {
+        let tok = self.tok.clone(); // a shared handle: generate_with borrows the engine
+        let mut out = std::io::stdout().lock();
+        let mut utf8 = Utf8Stream::default();
+        let st = self.generate_with(prompt, max_new, sampler, &mut |id| {
+            let text = utf8.push(&tok.token_bytes(id, show_special));
+            if !text.is_empty() {
+                write!(out, "{text}").and_then(|_| out.flush()).map_err(|e| e.to_string())?;
+            }
+            Ok(true)
+        })?;
+        writeln!(out).map_err(|e| e.to_string())?;
+        Ok(st)
+    }
+
+    /// Feeds `prompt` after what the cache holds, then samples up to `max_new` tokens, handing each to
+    /// `emit`. Greedy sampling with a draft model goes through speculative decoding (same tokens).
+    fn generate_with(&mut self, prompt: &[u32], max_new: usize, sampler: &mut Sampler, emit: Emit) -> Result<Stats, String> {
         if prompt.is_empty() {
             return Err("empty prompt".into());
         }
@@ -339,31 +374,30 @@ impl Engine<'_> {
             return Err(format!("prompt does not fit: {} + {} tokens > context {}", self.backend.pos(), prompt.len(), self.backend.ctx()));
         }
         let t0 = Instant::now();
+        let base = self.backend.pos();
+        self.hist.truncate(base);
         self.backend.prefill(prompt)?;
         if let Some(d) = self.draft.as_mut().filter(|_| sampler.is_greedy()) {
+            // the draft skips sampled replies; it catches up on whatever it missed, then reads the prompt
+            d.sess.pos = d.sess.pos.min(base);
+            let missed = self.hist[d.sess.pos..].to_vec();
+            d.model.prefill(&missed, &mut d.sess)?;
             d.model.prefill(prompt, &mut d.sess)?;
         }
+        self.hist.extend_from_slice(prompt);
         let prompt_secs = t0.elapsed().as_secs_f64();
 
+        let mut ids = Vec::new();
+        let t1 = Instant::now();
         if let (Some(d), true) = (self.draft.as_mut(), sampler.is_greedy()) {
-            let tok = &self.tok;
-            let mut out = std::io::stdout().lock();
-            let mut utf8 = Utf8Stream::default();
-            let t1 = Instant::now();
             let (generated, stopped_on) = speculate(&mut self.backend, d, &self.stop, max_new, true, &mut |id| {
-                let text = utf8.push(&tok.token_bytes(id, show_special));
-                if !text.is_empty() {
-                    write!(out, "{text}").and_then(|_| out.flush()).map_err(|e| e.to_string())?;
-                }
-                Ok(())
+                ids.push(id);
+                emit(id)
             })?;
-            writeln!(out).map_err(|e| e.to_string())?;
+            self.hist.extend_from_slice(&ids);
             return Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on });
         }
 
-        let mut out = std::io::stdout().lock();
-        let mut utf8 = Utf8Stream::default();
-        let t1 = Instant::now();
         let mut generated = 0;
         let mut stopped_on = None;
         while generated < max_new && self.backend.pos() < self.backend.ctx() {
@@ -373,17 +407,30 @@ impl Engine<'_> {
                 stopped_on = Some(next);
                 break;
             }
-            let text = utf8.push(&self.tok.token_bytes(next, show_special));
-            if !text.is_empty() {
-                write!(out, "{text}").and_then(|_| out.flush()).map_err(|e| e.to_string())?;
-            }
+            ids.push(next);
+            let more = emit(next)?;
             self.backend.step(next)?;
+            if !more {
+                break;
+            }
         }
-        writeln!(out).map_err(|e| e.to_string())?;
+        self.hist.extend_from_slice(&ids);
         Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on })
     }
 
-    fn speculate(&mut self, max_new: usize, honour_stop: bool, emit: &mut dyn FnMut(u32) -> Result<(), String>) -> Result<(usize, Option<u32>), String> {
+    /// Makes the cache hold only its first `pos` tokens (in the draft model too).
+    fn truncate(&mut self, pos: usize) {
+        self.hist.truncate(pos);
+        match &mut self.backend {
+            Backend::Cpu(_, s) => s.pos = s.pos.min(pos),
+            Backend::Gpu(_, s) => s.pos = s.pos.min(pos),
+        }
+        if let Some(d) = self.draft.as_mut() {
+            d.sess.pos = d.sess.pos.min(pos);
+        }
+    }
+
+    fn speculate(&mut self, max_new: usize, honour_stop: bool, emit: Emit) -> Result<(usize, Option<u32>), String> {
         let d = self.draft.as_mut().ok_or("no draft model")?;
         speculate(&mut self.backend, d, &self.stop, max_new, honour_stop, emit)
     }
@@ -392,7 +439,7 @@ impl Engine<'_> {
 /// Greedy decoding with a draft model, after both models have read the prompt. Produces exactly the
 /// tokens of the plain greedy loop, and leaves both caches as that loop leaves the main model's: every
 /// emitted token read except a final stop token. Returns (tokens generated, stop token if any).
-fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize, honour_stop: bool, emit: &mut dyn FnMut(u32) -> Result<(), String>) -> Result<(usize, Option<u32>), String> {
+fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize, honour_stop: bool, emit: Emit) -> Result<(usize, Option<u32>), String> {
     let Backend::Gpu(tm, ts) = backend else { return Err("speculative decoding needs the GPU".into()) };
     let base = ts.pos;
     let mut seq: Vec<u32> = Vec::new(); // tokens the main model has read since `base`
@@ -406,8 +453,8 @@ fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize,
             stopped_on = Some(last);
             break;
         }
-        emit(last)?;
-        if generated >= max_new || ts.pos + 1 >= ts.ctx {
+        let more = emit(last)?;
+        if !more || generated >= max_new || ts.pos + 1 >= ts.ctx {
             tm.forward_batch(&[last], ts, false)?; // the plain loop reads its last token too
             seq.push(last);
             break;
@@ -450,9 +497,9 @@ fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize,
                 stopped_on = Some(g);
                 break 'decode;
             }
-            emit(g)?;
+            let more = emit(g)?;
             seq.push(g);
-            if generated >= max_new {
+            if !more || generated >= max_new {
                 ts.pos = tpos0 + 2 + i;
                 break 'decode;
             }
@@ -473,6 +520,7 @@ impl Engine<'_> {
     /// Forgets the conversation, in the draft model too.
     fn reset(&mut self) {
         self.backend.reset();
+        self.hist.clear();
         if let Some(d) = self.draft.as_mut() {
             d.sess.pos = 0;
         }
@@ -550,7 +598,7 @@ fn bench(o: &Opts) -> Result<(), String> {
         profile::reset();
         let t1 = Instant::now();
         if engine.draft.is_some() {
-            engine.speculate(o.max_new, false, &mut |_| Ok(()))?;
+            engine.speculate(o.max_new, false, &mut |_| Ok(true))?;
         } else {
             for _ in 0..o.max_new {
                 let next = sampler.sample(engine.backend.logits());
