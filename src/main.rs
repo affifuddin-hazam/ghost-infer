@@ -23,7 +23,7 @@ USAGE:
     betterllama meta     <model.gguf> <key>
     betterllama tokenize <model.gguf> <text>
     betterllama top      <model.gguf> <text> [--gpu]   (next-token probabilities after raw text)
-    betterllama bench    <model.gguf> [-n <gen tokens>] [--prompt-len <n>] [--threads <n>] [--gpu]
+    betterllama bench    <model.gguf> [-n <gen tokens>] [--prompt-len <n>] [--threads <n>] [--gpu] [--draft <gguf>]
     betterllama run      <model.gguf> -p <prompt> [options]
     betterllama chat     <model.gguf> [options]
 
@@ -38,6 +38,8 @@ OPTIONS:
         --system <text>   system prompt (chat models)
         --raw             send the prompt as-is, no chat template
         --gpu             run on the NVIDIA GPU (CUDA driver + NVRTC, loaded at runtime)
+        --draft <gguf>    speculative decoding with this small model (GPU, greedy; same output, faster)
+        --draft-k <n>     tokens the draft proposes per step  [3]
         --threads <n>     CPU worker threads                 [physical cores]
         --special         print special tokens
 ";
@@ -56,6 +58,8 @@ struct Opts {
     show_special: bool,
     prompt_len: usize,
     gpu: bool,
+    draft: Option<PathBuf>,
+    draft_k: usize,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -81,6 +85,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         show_special: false,
         prompt_len: 256,
         gpu: false,
+        draft: None,
+        draft_k: 3,
     };
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
@@ -102,6 +108,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--raw" => o.raw = true,
             "--special" => o.show_special = true,
             "--gpu" => o.gpu = true,
+            "--draft" => o.draft = Some(PathBuf::from(val(a)?)),
+            "--draft-k" => o.draft_k = num(val(a)?, a)? as usize,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -253,10 +261,24 @@ impl<'a> Backend<'a> {
     }
 }
 
+/// A small model proposing tokens for the GPU model to check (speculative decoding). It sees the same
+/// token sequence as the main model; between generations its cache holds exactly the main model's.
+struct Draft {
+    model: cuda::GpuModel,
+    sess: cuda::GpuSession,
+    k: usize,
+    proposed: usize,
+    accepted: usize,
+    draft_secs: f64,
+    verify_secs: f64,
+    rounds: usize,
+}
+
 struct Engine<'a> {
     backend: Backend<'a>,
     tok: Tokenizer,
     stop: Vec<u32>,
+    draft: Option<Draft>,
 }
 
 struct Stats {
@@ -268,8 +290,34 @@ struct Stats {
 }
 
 fn load<'a>(g: &'a Gguf, gpu: bool, ctx: usize) -> Result<Engine<'a>, String> {
+    load_with_draft(g, gpu, ctx, None, 0)
+}
+
+fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBuf>, draft_k: usize) -> Result<Engine<'a>, String> {
     let backend = Backend::new(g, gpu, ctx)?;
     let tok = Tokenizer::from_gguf(g)?;
+    let draft = match draft {
+        None => None,
+        Some(path) => {
+            if !gpu {
+                return Err("--draft needs --gpu".into());
+            }
+            if !(1..cuda::DECODE_MAX_BATCH).contains(&draft_k) {
+                return Err(format!("--draft-k must be 1..{}", cuda::DECODE_MAX_BATCH - 1));
+            }
+            let dg = Gguf::open(path)?;
+            let dtok = Tokenizer::from_gguf(&dg)?;
+            let probe = "Hello, world! <|im_start|>user\nThe 3 quick brown foxes<|im_end|>";
+            if dtok.vocab_size() != tok.vocab_size() || dtok.encode(probe) != tok.encode(probe) {
+                return Err("the draft model's tokenizer differs from the main model's".into());
+            }
+            let cfg = Config::from_gguf(&dg)?;
+            let mut model = cuda::GpuModel::load(&dg, cfg)?;
+            model.int8_q8 = true; // a draft only has to guess well, not match f32 maths
+            let sess = cuda::GpuSession::new(&model.cfg, ctx)?;
+            Some(Draft { model, sess, k: draft_k, proposed: 0, accepted: 0, draft_secs: 0.0, verify_secs: 0.0, rounds: 0 })
+        }
+    };
     let mut stop: Vec<u32> = tok.eos_id.into_iter().collect();
     for t in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
         if let Some(id) = tok.token_id(t) {
@@ -278,7 +326,7 @@ fn load<'a>(g: &'a Gguf, gpu: bool, ctx: usize) -> Result<Engine<'a>, String> {
             }
         }
     }
-    Ok(Engine { backend, tok, stop })
+    Ok(Engine { backend, tok, stop, draft })
 }
 
 impl Engine<'_> {
@@ -292,7 +340,26 @@ impl Engine<'_> {
         }
         let t0 = Instant::now();
         self.backend.prefill(prompt)?;
+        if let Some(d) = self.draft.as_mut().filter(|_| sampler.is_greedy()) {
+            d.model.prefill(prompt, &mut d.sess)?;
+        }
         let prompt_secs = t0.elapsed().as_secs_f64();
+
+        if let (Some(d), true) = (self.draft.as_mut(), sampler.is_greedy()) {
+            let tok = &self.tok;
+            let mut out = std::io::stdout().lock();
+            let mut utf8 = Utf8Stream::default();
+            let t1 = Instant::now();
+            let (generated, stopped_on) = speculate(&mut self.backend, d, &self.stop, max_new, true, &mut |id| {
+                let text = utf8.push(&tok.token_bytes(id, show_special));
+                if !text.is_empty() {
+                    write!(out, "{text}").and_then(|_| out.flush()).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })?;
+            writeln!(out).map_err(|e| e.to_string())?;
+            return Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on });
+        }
 
         let mut out = std::io::stdout().lock();
         let mut utf8 = Utf8Stream::default();
@@ -315,6 +382,126 @@ impl Engine<'_> {
         writeln!(out).map_err(|e| e.to_string())?;
         Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on })
     }
+
+    fn speculate(&mut self, max_new: usize, honour_stop: bool, emit: &mut dyn FnMut(u32) -> Result<(), String>) -> Result<(usize, Option<u32>), String> {
+        let d = self.draft.as_mut().ok_or("no draft model")?;
+        speculate(&mut self.backend, d, &self.stop, max_new, honour_stop, emit)
+    }
+}
+
+/// Greedy decoding with a draft model, after both models have read the prompt. Produces exactly the
+/// tokens of the plain greedy loop, and leaves both caches as that loop leaves the main model's: every
+/// emitted token read except a final stop token. Returns (tokens generated, stop token if any).
+fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize, honour_stop: bool, emit: &mut dyn FnMut(u32) -> Result<(), String>) -> Result<(usize, Option<u32>), String> {
+    let Backend::Gpu(tm, ts) = backend else { return Err("speculative decoding needs the GPU".into()) };
+    let base = ts.pos;
+    let mut seq: Vec<u32> = Vec::new(); // tokens the main model has read since `base`
+    let mut last = argmax(&ts.logits); // decided but not yet read by either model
+    let mut pending: Vec<u32> = Vec::new(); // read by the main model, not yet by the draft
+    let mut generated = 0;
+    let mut stopped_on = None;
+    'decode: loop {
+        generated += 1;
+        if honour_stop && stop.contains(&last) {
+            stopped_on = Some(last);
+            break;
+        }
+        emit(last)?;
+        if generated >= max_new || ts.pos + 1 >= ts.ctx {
+            tm.forward_batch(&[last], ts, false)?; // the plain loop reads its last token too
+            seq.push(last);
+            break;
+        }
+        let k = d.k.min(max_new - generated).min(ts.ctx - ts.pos - 1); // >= 1 here
+
+        // the draft catches up and guesses k tokens
+        let td = Instant::now();
+        let dpos0 = d.sess.pos;
+        let mut feed = std::mem::take(&mut pending);
+        feed.push(last);
+        let mut guesses = vec![*d.model.forward_argmax(&feed, &mut d.sess)?.last().unwrap()];
+        while guesses.len() < k {
+            let g = d.model.forward_argmax(&[*guesses.last().unwrap()], &mut d.sess)?[0];
+            guesses.push(g);
+        }
+        // the main model reads `last` and the guesses in one batch: its pick after each of them
+        let tv = Instant::now();
+        d.draft_secs += (tv - td).as_secs_f64();
+        let tpos0 = ts.pos;
+        let mut batch = vec![last];
+        batch.extend_from_slice(&guesses);
+        let picks = tm.forward_argmax(&batch, ts)?;
+        d.verify_secs += tv.elapsed().as_secs_f64();
+        d.rounds += 1;
+        let a = guesses.iter().zip(&picks).take_while(|(g, p)| g == p).count();
+        d.proposed += k;
+        d.accepted += a;
+        // keep `last` and the accepted guesses; positions after them get overwritten later
+        ts.pos = tpos0 + 1 + a;
+        seq.push(last);
+        d.sess.pos = dpos0 + feed.len() + a.min(k - 1);
+        if a == k {
+            pending.push(guesses[k - 1]); // the draft never read its own last guess
+        }
+        for (i, &g) in guesses[..a].iter().enumerate() {
+            generated += 1;
+            if honour_stop && stop.contains(&g) {
+                ts.pos = tpos0 + 1 + i; // the plain loop does not read a stop token
+                stopped_on = Some(g);
+                break 'decode;
+            }
+            emit(g)?;
+            seq.push(g);
+            if generated >= max_new {
+                ts.pos = tpos0 + 2 + i;
+                break 'decode;
+            }
+        }
+        last = picks[a];
+    }
+    // leave the draft holding exactly the main model's sequence
+    seq.truncate(ts.pos - base);
+    if d.sess.pos > ts.pos {
+        d.sess.pos = ts.pos;
+    } else if d.sess.pos < ts.pos {
+        d.model.forward_batch(&seq[d.sess.pos - base..], &mut d.sess, false)?;
+    }
+    Ok((generated, stopped_on))
+}
+
+impl Engine<'_> {
+    /// Forgets the conversation, in the draft model too.
+    fn reset(&mut self) {
+        self.backend.reset();
+        if let Some(d) = self.draft.as_mut() {
+            d.sess.pos = 0;
+        }
+    }
+
+    fn print_draft_stats(&self) {
+        if let Some(d) = self.draft.as_ref().filter(|d| d.proposed > 0) {
+            eprintln!(
+                "[draft: {} of {} proposed tokens accepted ({:.0}%), {} per step | per step: draft {:.2} ms, verify {:.2} ms]",
+                d.accepted,
+                d.proposed,
+                100.0 * d.accepted as f64 / d.proposed as f64,
+                d.k,
+                1000.0 * d.draft_secs / d.rounds as f64,
+                1000.0 * d.verify_secs / d.rounds as f64
+            );
+        }
+    }
+}
+
+fn warn_draft_unused(o: &Opts) {
+    if o.draft.is_some() && o.temp > 0.0 {
+        eprintln!("[note: the draft model is used for greedy decoding only (-t 0); sampling without it]");
+    }
+}
+
+/// The greedy sampler's pick: the first maximum.
+fn argmax(logits: &[f32]) -> u32 {
+    logits.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32
 }
 
 fn top(path: &PathBuf, text: &str, gpu: bool) -> Result<(), String> {
@@ -338,7 +525,7 @@ fn top(path: &PathBuf, text: &str, gpu: bool) -> Result<(), String> {
 /// Fixed workload: a `prompt_len`-token prompt, then `max_new` greedy tokens; best of 3 runs.
 fn bench(o: &Opts) -> Result<(), String> {
     let g = Gguf::open(&o.model)?;
-    let mut engine = load(&g, o.gpu, o.prompt_len + o.max_new + 8)?;
+    let mut engine = load_with_draft(&g, o.gpu, o.prompt_len + o.max_new + 8, o.draft.as_ref(), o.draft_k)?;
     let base = "The history of the printing press begins in the fifteenth century, when Johannes Gutenberg developed movable metal type. ";
     let mut ids = Vec::new();
     while ids.len() < o.prompt_len {
@@ -348,10 +535,13 @@ fn bench(o: &Opts) -> Result<(), String> {
     let mut sampler = Sampler::new(0.0, 0, 1.0, 1);
     let (mut best_pp, mut best_tg) = (0f64, 0f64);
     for round in 0..3 {
-        engine.backend.reset();
+        engine.reset();
         profile::reset();
         let t0 = Instant::now();
         engine.backend.prefill(&ids)?;
+        if let Some(d) = engine.draft.as_mut() {
+            d.model.prefill(&ids, &mut d.sess)?;
+        }
         let pp = ids.len() as f64 / t0.elapsed().as_secs_f64();
         if round == 2 && profile::enabled() {
             eprintln!("-- prompt phase --");
@@ -359,15 +549,35 @@ fn bench(o: &Opts) -> Result<(), String> {
         }
         profile::reset();
         let t1 = Instant::now();
-        for _ in 0..o.max_new {
-            let next = sampler.sample(engine.backend.logits());
-            engine.backend.step(next)?;
+        if engine.draft.is_some() {
+            engine.speculate(o.max_new, false, &mut |_| Ok(()))?;
+        } else {
+            for _ in 0..o.max_new {
+                let next = sampler.sample(engine.backend.logits());
+                engine.backend.step(next)?;
+            }
         }
         let tg = o.max_new as f64 / t1.elapsed().as_secs_f64();
         best_pp = best_pp.max(pp);
         best_tg = best_tg.max(tg);
     }
     println!("prompt {} tok: {:>8.1} tok/s | generate {} tok: {:>7.1} tok/s | {}", ids.len(), best_pp, o.max_new, best_tg, engine.backend.describe());
+    // BETTERLLAMA_VERIFY_N=n: time one n-token decode batch (a speculative verify step) on its own
+    if let (Some(n), Backend::Gpu(m, s)) = (std::env::var("BETTERLLAMA_VERIFY_N").ok().and_then(|v| v.parse::<usize>().ok()), &mut engine.backend) {
+        let batch: Vec<u32> = ids[..n].to_vec();
+        let pos = s.pos;
+        profile::reset();
+        let t = Instant::now();
+        for _ in 0..10 {
+            s.pos = pos;
+            m.forward_argmax(&batch, s)?;
+        }
+        println!("{n}-token decode batch: {:.2} ms", t.elapsed().as_secs_f64() * 100.0);
+        if profile::enabled() {
+            profile::report(10 * n);
+        }
+    }
+    engine.print_draft_stats();
     if profile::enabled() {
         eprintln!("-- generation phase --");
         profile::report(o.max_new); // last run
@@ -428,19 +638,22 @@ fn run(o: &Opts) -> Result<(), String> {
     let prompt = o.prompt.as_deref().ok_or("run needs -p <prompt>")?;
     let t = Instant::now();
     let g = Gguf::open(&o.model)?;
-    let mut engine = load(&g, o.gpu, o.ctx)?;
+    let mut engine = load_with_draft(&g, o.gpu, o.ctx, o.draft.as_ref(), o.draft_k)?;
+    warn_draft_unused(o);
     let text = if o.raw { prompt.to_string() } else { ChatFormat::detect(&g)?.first_turn(o.system.as_deref(), prompt) };
     let ids = engine.tok.encode(&text);
     eprintln!("[loaded {} on {} in {:.2}s]", g.get("general.name").and_then(Value::as_str).unwrap_or("model"), engine.backend.describe(), t.elapsed().as_secs_f64());
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, o.seed);
     let st = engine.generate(&ids, o.max_new, &mut sampler, o.show_special)?;
     print_stats(&st);
+    engine.print_draft_stats();
     Ok(())
 }
 
 fn chat(o: &Opts) -> Result<(), String> {
     let g = Gguf::open(&o.model)?;
-    let mut engine = load(&g, o.gpu, o.ctx)?;
+    let mut engine = load_with_draft(&g, o.gpu, o.ctx, o.draft.as_ref(), o.draft_k)?;
+    warn_draft_unused(o);
     let fmt = ChatFormat::detect(&g)?;
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, o.seed);
     eprintln!(
@@ -464,7 +677,7 @@ fn chat(o: &Opts) -> Result<(), String> {
             break;
         }
         if msg == "/reset" {
-            engine.backend.reset();
+            engine.reset();
             first = true;
             pending_end = None;
             eprintln!("(conversation cleared)");
@@ -481,7 +694,7 @@ fn chat(o: &Opts) -> Result<(), String> {
         first = false;
         if engine.backend.pos() + ids.len() + 1 >= engine.backend.ctx() {
             eprintln!("(context full - starting a new conversation)");
-            engine.backend.reset();
+            engine.reset();
             ids = engine.tok.encode(&fmt.first_turn(o.system.as_deref(), msg));
         }
         let st = engine.generate(&ids, o.max_new, &mut sampler, o.show_special)?;

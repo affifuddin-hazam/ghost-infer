@@ -30,7 +30,11 @@ and cultural attractions. Paris is a major global city, and its population is ap
   integer multiply-adds and the Q4_K mins go through the tensor cores too. Generation uses `dp4a`
   matrix-vector kernels for K-quants (16-byte loads, 84–97% of DRAM bandwidth on an 8B model), RMSNorm and
   SiLU kernels that write the int8 activations directly, and split-context ("flash-decoding") attention
-  that reads each key/value row once per head group.
+  that reads each key/value row once per head group. One-token steps replay a CUDA graph.
+- **Speculative decoding** (`--draft small.gguf`, GPU, greedy): a small model with the same tokenizer
+  guesses a few tokens ahead and the main model checks them all in one batched pass. The output is
+  exactly the plain greedy output: a token's logits are bit-identical whether it is computed alone or
+  inside a check batch, which is tested on whole replies and multi-turn chats.
 - **Sampling**: greedy, or temperature + top-k + top-p.
 - **Chat**: ChatML template (SmolLM2, Qwen), multi-turn with the KV cache kept between turns.
 
@@ -49,6 +53,7 @@ Remove that file to build a portable binary.
 betterllama run   model.gguf -p "Write a haiku about the ocean."
 betterllama chat  model.gguf --gpu
 betterllama bench model.gguf --prompt-len 256 -n 128 --gpu
+betterllama run   Qwen3-8B-Q4_K_M.gguf -p "Explain DNS." -t 0 --gpu --draft Qwen3-0.6B-Q8_0.gguf
 ```
 
 | Command | What it does |
@@ -76,6 +81,8 @@ Options for `run`, `chat` and `bench`:
 | `--gpu` | | run on the NVIDIA GPU |
 | `--threads <n>` | physical cores | CPU threads (generation is memory-bound, so hyper-threads don't help) |
 | `--special` | | print special tokens |
+| `--draft <gguf>` | | speculative decoding with this small model (`--gpu`, used for greedy replies; same tokenizer needed) |
+| `--draft-k <n>` | 3 | tokens the draft proposes per step (1-7) |
 
 ### GPU requirements
 
@@ -106,8 +113,20 @@ compare rows only within one table)
 | Prompt, ~33 tokens | 745 | **800** |
 | Prompt, ~260 tokens | **1,475** | 1,313 |
 | Prompt, ~1,040 tokens | **1,477** | 1,390 |
-| Generate, short context | **69.7** | 52.7 |
-| Generate at ~1,040 context | **65.2** | 52.2 |
+| Generate, short context | **71.4** | 52.7 |
+| Generate at ~1,040 context | **67.0** | 52.2 |
+
+**Speculative decoding**, the same 8B with `--draft JOSIEFIED-Qwen3-0.6B-Q8_0.gguf` (k = 3), same session as
+Ollama. The gain depends on how often the draft guesses right, so it is shown per text:
+
+| Greedy generation | betterllama | + draft | Ollama | guesses accepted |
+|---|---|---|---|---|
+| bench text, ~32-token prompt (64 tokens) | 71.4 | **96.4** | 52.7 | |
+| bench text, ~256-token prompt | 70.1 | **119.4** | 52.5 | |
+| bench text, ~1,024-token prompt | 67.0 | **108.5** | 52.2 | |
+| "Name three effects of the printing press." (200 tokens) | 69.1 | **80.7** | 52.0 | 55% |
+| "Write a Python function that checks whether a number is primeâ€¦" | 69.0 | **106.0** | 51.8 | 81% |
+| "Explain in simple words why the sky is blue." | 68.7 | **70.1** | 51.7 | 43% |
 
 **Qwen3 8B Q4_K_M, CPU**
 
@@ -168,6 +187,8 @@ Tools for checking this:
 | `BETTERLLAMA_STEPWISE=1` | feed prompts one token at a time, to test the generation path |
 | `BETTERLLAMA_PROFILE=1` | time per operation (CPU and GPU) in `bench` |
 | `BETTERLLAMA_QCH=256` | K-quant GPU prompts: one activation scale per 256 values (~1% faster, about twice the drift) |
+| `BETTERLLAMA_VERIFY_N=n` | `bench --gpu`: also time one n-token decode batch (a speculative check step) |
+| `BETTERLLAMA_NO_GRAPH=1` | GPU: plain kernel launches instead of CUDA-graph replay for one-token steps |
 | `BETTERLLAMA_NO_TC_ATT=1` | GPU prompts: f32 attention instead of f16 tensor cores (more exact, much slower on long prompts) |
 | `BETTERLLAMA_NO_Q8K=1` | K-quant GPU prompts: the older per-32 activation-scale kernel (more exact, ~1.7× slower) |
 | `scripts\golden.ps1 [-Save]` | regression check against saved log-probabilities and a greedy reply |

@@ -18,6 +18,12 @@ fn kq_rpw() -> usize {
     static RPW: OnceLock<usize> = OnceLock::new();
     *RPW.get_or_init(|| std::env::var("BETTERLLAMA_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=16).contains(&v)).unwrap_or(1))
 }
+/// Rows per warp in the K-quant decode-batch matmuls (speculative verify; -DDP4A_BATCH_RPW).
+fn batch_rpw() -> usize {
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| std::env::var("BETTERLLAMA_BATCH_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=8).contains(&v)).unwrap_or(2))
+}
+
 /// Activation values per int8 scale in the K-quant prompt matmuls (passed as -DQCH): 128 or 256.
 /// 128 is ~1% slower than 256 and about halves the log-probability drift; BETTERLLAMA_QCH=256 overrides.
 fn qch() -> usize {
@@ -30,12 +36,14 @@ const TILED_MIN_BATCH: usize = 16; // from this many tokens, the int8 tiled matm
 const ATT_MAX_CHUNK: usize = 256; // must match ATT_MAX_CHUNK
 const ATT_MAX_HD: usize = 128; // must match ATT_MAX_HD
 const ATT_MAX_G: usize = 8; // query heads per kv head the GQA attention kernel handles (must match ATT_MAX_G)
-const SPLIT_MIN_SPAN: usize = 32; // contexts up to this many positions are not split across blocks
+const SPLIT_MIN_SPAN: usize = 32; // contexts up to this many positions are not split across blocks (must match ATT_SPLIT_MIN_SPAN)
 const ATT_TARGET_BLOCKS: usize = 96; // aim for a few blocks per SM when splitting attention for one token
 const PREFILL_QT: usize = 32; // query tokens per prompt-attention block (must match PQT)
 const PREFILL_KT: usize = 32; // key positions per shared-memory tile (must match PKT)
 const PREFILL_TC_QT: usize = 64; // query tokens per tensor-core prompt-attention block (must match BQ)
 const SPLIT_MAX_BATCH: usize = TILED_MIN_BATCH - 1; // tokens per split-attention launch
+/// Most tokens per decode batch: one token, or a speculative verify batch.
+pub const DECODE_MAX_BATCH: usize = 8;
 
 const KERNELS: &str = r#"
 #define TB 8
@@ -158,9 +166,10 @@ __global__ void embed(int fmt, const unsigned char* __restrict__ w, const float*
 // q and k, and k, v copied into the cache. grid (tokens, n_heads + 2 * n_kv), block = 64.
 // neox: pairs (x[i], x[i + rope_dim/2]) (Qwen); otherwise adjacent pairs (x[2i], x[2i+1]) (GGUF llama).
 __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
-                             float* __restrict__ kc, float* __restrict__ vc, int pos0, int n_heads, int n_kv, int hd,
-                             int rope_dim, float base, int neox, float eps) {
+                             float* __restrict__ kc, float* __restrict__ vc, int pos0, const int* __restrict__ posp, int n_heads,
+                             int n_kv, int hd, int rope_dim, float base, int neox, float eps) {
     __shared__ float sh[32];
+    if (posp) pos0 = *posp; // CUDA graphs: the position comes from device memory
     int b = blockIdx.x, h = blockIdx.y, pos = pos0 + b;
     int q_dim = n_heads * hd, kv_dim = n_kv * hd;
     float* row = qkv + (size_t)b * (q_dim + 2 * kv_dim);
@@ -424,69 +433,88 @@ __device__ void q6k_matvec(const unsigned char* __restrict__ w, const float* __r
         }
 }
 
-extern "C" {
+// Decode matmuls with int8 activations (quantize_q8 / rmsnorm_q8 / silu_q8 first): weights stay packed
+// and go straight into __dp4a (4 multiply-adds per instruction), instead of being unpacked to floats.
+// Templated on NT, the most tokens per launch: NT = 1 for normal decoding, NT = 8 for speculative verify
+// batches, where each weight block is read and decoded once and applied to every token (each token's
+// activations come from cache as needed), and on R, the rows per warp. A token's arithmetic is the same sequence of operations in
+// both instances, so it gets bit-identical results alone or in a batch: speculative decoding reproduces
+// plain greedy output exactly. RPW rows per warp (K-quants).
+#define DP4A_PARAMS const unsigned char* __restrict__ w, const float* __restrict__ wd, const signed char* __restrict__ xq, \
+                    const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off
 
-// One-token K-quant matmuls with int8 activations (quantize_q8 first): weights stay packed and go
-// straight into __dp4a (4 multiply-adds per instruction), instead of being unpacked to floats.
-// RPW rows per warp share the activation registers.
-__global__ void matmul_q4k_dp4a(const unsigned char* __restrict__ w, const float* __restrict__ wd, const signed char* __restrict__ xq,
-                                const float* __restrict__ xd, float* __restrict__ out,
-                                int rows, int cols, int accumulate, int out_stride, int out_off) {
-    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RPW;
+// Q4_K: each lane takes 16 bytes of a 32-byte nibble chunk = 16 values of each of two sub-blocks (32
+// values), plus the block's 16-byte header (d, dmin and all 12 scale bytes) in one load; 8 lanes cover a
+// super-block, so the warp walks four super-blocks per step. The R rows of a warp are decoded first, then
+// each token's activations are loaded once for all of them. The "min" term uses the activation block
+// sums from the quantiser (xs): of the two lanes sharing a 32-value block, the first adds it.
+template <int NT, int R>
+__device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
     int lane = threadIdx.x & 31;
     if (row0 >= rows) return;
     int nsb = cols >> 8;
-    // each lane: 16 bytes of a 32-byte nibble chunk = 16 values of each of two sub-blocks (32 values),
-    // plus the block's 16-byte header (d, dmin and all 12 scale bytes) in one load; 8 lanes cover a
-    // super-block, so the warp walks four super-blocks per step
     int qsel = lane >> 3, l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
     size_t row_bytes = (size_t)nsb * Q4K_BYTES;
-    float acc[RPW];
+    float acc[R][NT];
     #pragma unroll
-    for (int r = 0; r < RPW; r++) acc[r] = 0.f;
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) acc[r][j] = 0.f;
     #pragma unroll 2 // more super-blocks' loads in flight before any is used
     for (int sb = qsel; sb < nsb; sb += 4) {
         int pos = sb * 256 + 64 * j2 + 16 * hf;
-        int4 xl = *reinterpret_cast<const int4*>(xq + pos), xh = *reinterpret_cast<const int4*>(xq + pos + 32);
-        float dl = xd[pos >> 5], dh = xd[(pos >> 5) + 1];
-        const int one = 0x01010101;
-        float sl = dl * (float)__dp4a(one, xl.x, __dp4a(one, xl.y, __dp4a(one, xl.z, __dp4a(one, xl.w, 0))));
-        float sh = dh * (float)__dp4a(one, xh.x, __dp4a(one, xh.y, __dp4a(one, xh.z, __dp4a(one, xh.w, 0))));
+        int4 lo4[R], hi4[R];
+        float d[R], dmin[R];
+        int sc1[R], m1[R], sc2[R], m2[R];
         #pragma unroll
-        for (int r = 0; r < RPW; r++) {
-            if (row0 + r < rows) {
-                const unsigned char* b = w + (size_t)(row0 + r) * row_bytes + (size_t)sb * Q4K_BYTES;
-                int4 hdr = *reinterpret_cast<const int4*>(b);
-                int4 p = *reinterpret_cast<const int4*>(b + 16 + 32 * j2 + 16 * hf);
-                float d = h2f((unsigned)hdr.x & 0xFFFF), dmin = h2f((unsigned)hdr.x >> 16);
-                int sc1, m1, sc2, m2;
-                q4k_scale_min2w(2 * j2, hdr.y, hdr.z, hdr.w, &sc1, &m1, &sc2, &m2);
-                int lo = __dp4a(p.x & 0x0F0F0F0F, xl.x, __dp4a(p.y & 0x0F0F0F0F, xl.y,
-                         __dp4a(p.z & 0x0F0F0F0F, xl.z, __dp4a(p.w & 0x0F0F0F0F, xl.w, 0))));
-                int hi = __dp4a((p.x >> 4) & 0x0F0F0F0F, xh.x, __dp4a((p.y >> 4) & 0x0F0F0F0F, xh.y,
-                         __dp4a((p.z >> 4) & 0x0F0F0F0F, xh.z, __dp4a((p.w >> 4) & 0x0F0F0F0F, xh.w, 0))));
-                acc[r] += d * (sc1 * dl * (float)lo + sc2 * dh * (float)hi) - dmin * (m1 * sl + m2 * sh);
+        for (int r = 0; r < R; r++) {
+            int row = min(row0 + r, rows - 1); // past the end: computed, never stored
+            const unsigned char* b = w + (size_t)row * row_bytes + (size_t)sb * Q4K_BYTES;
+            int4 hdr = *reinterpret_cast<const int4*>(b);
+            int4 p = *reinterpret_cast<const int4*>(b + 16 + 32 * j2 + 16 * hf);
+            d[r] = h2f((unsigned)hdr.x & 0xFFFF);
+            dmin[r] = hf ? 0.f : h2f((unsigned)hdr.x >> 16);
+            q4k_scale_min2w(2 * j2, hdr.y, hdr.z, hdr.w, &sc1[r], &m1[r], &sc2[r], &m2[r]);
+            lo4[r] = make_int4(p.x & 0x0F0F0F0F, p.y & 0x0F0F0F0F, p.z & 0x0F0F0F0F, p.w & 0x0F0F0F0F);
+            hi4[r] = make_int4((p.x >> 4) & 0x0F0F0F0F, (p.y >> 4) & 0x0F0F0F0F, (p.z >> 4) & 0x0F0F0F0F, (p.w >> 4) & 0x0F0F0F0F);
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            if (j < n) {
+                const signed char* x = xq + (size_t)j * cols;
+                const float* dx = xd + (size_t)j * (cols >> 5);
+                const int* sx = xs + (size_t)j * (cols >> 5);
+                int4 xl = *reinterpret_cast<const int4*>(x + pos), xh = *reinterpret_cast<const int4*>(x + pos + 32);
+                float dl = dx[pos >> 5], dh = dx[(pos >> 5) + 1];
+                float sl = dl * (float)sx[pos >> 5], sh = dh * (float)sx[(pos >> 5) + 1];
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    int lo = __dp4a(lo4[r].x, xl.x, __dp4a(lo4[r].y, xl.y, __dp4a(lo4[r].z, xl.z, __dp4a(lo4[r].w, xl.w, 0))));
+                    int hi = __dp4a(hi4[r].x, xh.x, __dp4a(hi4[r].y, xh.y, __dp4a(hi4[r].z, xh.z, __dp4a(hi4[r].w, xh.w, 0))));
+                    acc[r][j] += d[r] * (sc1[r] * dl * (float)lo + sc2[r] * dh * (float)hi) - dmin[r] * (m1[r] * sl + m2[r] * sh);
+                }
             }
         }
     }
     #pragma unroll
-    for (int r = 0; r < RPW; r++) {
-        float v = warp_sum(acc[r]);
-        if (lane == 0 && row0 + r < rows) {
-            size_t idx = (size_t)out_off + row0 + r;
-            out[idx] = accumulate ? out[idx] + v : v;
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            float v = warp_sum(acc[r][j]);
+            if (lane == 0 && j < n && row0 + r < rows) {
+                size_t idx = (size_t)j * out_stride + out_off + row0 + r;
+                out[idx] = accumulate ? out[idx] + v : v;
+            }
         }
-    }
-    (void)out_stride;
 }
 
 // Q6_K: per 128-value half, 4 lanes take groups {0,2} and 4 lanes groups {1,3}; each lane 8 consecutive
 // positions of both groups (they share the low-nibble bytes: low nibble = first group, high = second).
-// A half-warp covers a super-block, so the warp walks two super-blocks per step.
-__global__ void matmul_q6k_dp4a(const unsigned char* __restrict__ w, const float* __restrict__ wd, const signed char* __restrict__ xq,
-                                const float* __restrict__ xd, float* __restrict__ out,
-                                int rows, int cols, int accumulate, int out_stride, int out_off) {
-    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RPW;
+// A half-warp covers a super-block, so the warp walks two super-blocks per step. R rows decoded first.
+template <int NT, int R>
+__device__ __forceinline__ void q6k_dp4a(DP4A_PARAMS) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
     int lane = threadIdx.x & 31;
     if (row0 >= rows) return;
     int nsb = cols >> 8;
@@ -494,43 +522,100 @@ __global__ void matmul_q6k_dp4a(const unsigned char* __restrict__ w, const float
     int half = l16 >> 3, gsel = (l16 >> 2) & 1, l = 8 * (l16 & 3), is = l >> 4;
     int ga = gsel, gb = gsel + 2;
     size_t row_bytes = (size_t)nsb * Q6K_BYTES;
-    float acc[RPW];
+    float acc[R][NT];
     #pragma unroll
-    for (int r = 0; r < RPW; r++) acc[r] = 0.f;
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) acc[r][j] = 0.f;
     #pragma unroll 2 // more super-blocks' loads in flight before any is used
     for (int sb = hl; sb < nsb; sb += 2) {
         int pa = sb * 256 + 128 * half + 32 * ga + l, pb = pa + 64;
-        int xa0 = *reinterpret_cast<const int*>(xq + pa), xa1 = *reinterpret_cast<const int*>(xq + pa + 4);
-        int xb0 = *reinterpret_cast<const int*>(xq + pb), xb1 = *reinterpret_cast<const int*>(xq + pb + 4);
-        float da = xd[pa >> 5], db = xd[pb >> 5];
+        int qa0[R], qa1[R], qb0[R], qb1[R], sa[R], sbb[R];
+        float d[R];
         #pragma unroll
-        for (int r = 0; r < RPW; r++) {
-            if (row0 + r < rows) {
-                const unsigned char* b = w + (size_t)(row0 + r) * row_bytes + (size_t)sb * Q6K_BYTES;
-                float d = wd[(size_t)(row0 + r) * nsb + sb];
-                int ql0 =*(const int*)(b + 64 * half + 32 * gsel + l), ql1 = *(const int*)(b + 64 * half + 32 * gsel + l + 4);
-                int qh0 = *(const int*)(b + 128 + 32 * half + l), qh1 = *(const int*)(b + 132 + 32 * half + l);
-                int qa0 = __vsub4((ql0 & 0x0F0F0F0F) | (((qh0 >> (2 * ga)) & 0x03030303) << 4), 0x20202020);
-                int qa1 = __vsub4((ql1 & 0x0F0F0F0F) | (((qh1 >> (2 * ga)) & 0x03030303) << 4), 0x20202020);
-                int qb0 = __vsub4(((ql0 >> 4) & 0x0F0F0F0F) | (((qh0 >> (2 * gb)) & 0x03030303) << 4), 0x20202020);
-                int qb1 = __vsub4(((ql1 >> 4) & 0x0F0F0F0F) | (((qh1 >> (2 * gb)) & 0x03030303) << 4), 0x20202020);
-                const signed char* sc = (const signed char*)(b + 192 + 8 * half + is);
-                acc[r] += d * (sc[2 * ga] * da * (float)__dp4a(qa0, xa0, __dp4a(qa1, xa1, 0))
-                             + sc[2 * gb] * db * (float)__dp4a(qb0, xb0, __dp4a(qb1, xb1, 0)));
+        for (int r = 0; r < R; r++) {
+            int row = min(row0 + r, rows - 1); // past the end: computed, never stored
+            const unsigned char* b = w + (size_t)row * row_bytes + (size_t)sb * Q6K_BYTES;
+            d[r] = wd[(size_t)row * nsb + sb];
+            int ql0 = *(const int*)(b + 64 * half + 32 * gsel + l), ql1 = *(const int*)(b + 64 * half + 32 * gsel + l + 4);
+            int qh0 = *(const int*)(b + 128 + 32 * half + l), qh1 = *(const int*)(b + 132 + 32 * half + l);
+            qa0[r] = __vsub4((ql0 & 0x0F0F0F0F) | (((qh0 >> (2 * ga)) & 0x03030303) << 4), 0x20202020);
+            qa1[r] = __vsub4((ql1 & 0x0F0F0F0F) | (((qh1 >> (2 * ga)) & 0x03030303) << 4), 0x20202020);
+            qb0[r] = __vsub4(((ql0 >> 4) & 0x0F0F0F0F) | (((qh0 >> (2 * gb)) & 0x03030303) << 4), 0x20202020);
+            qb1[r] = __vsub4(((ql1 >> 4) & 0x0F0F0F0F) | (((qh1 >> (2 * gb)) & 0x03030303) << 4), 0x20202020);
+            const signed char* sc = (const signed char*)(b + 192 + 8 * half + is);
+            sa[r] = sc[2 * ga];
+            sbb[r] = sc[2 * gb];
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            if (j < n) {
+                const signed char* x = xq + (size_t)j * cols;
+                const float* dx = xd + (size_t)j * (cols >> 5);
+                int2 xa = *reinterpret_cast<const int2*>(x + pa), xb = *reinterpret_cast<const int2*>(x + pb);
+                float da = dx[pa >> 5], db = dx[pb >> 5];
+                #pragma unroll
+                for (int r = 0; r < R; r++)
+                    acc[r][j] += d[r] * (sa[r] * da * (float)__dp4a(qa0[r], xa.x, __dp4a(qa1[r], xa.y, 0))
+                                      + sbb[r] * db * (float)__dp4a(qb0[r], xb.x, __dp4a(qb1[r], xb.y, 0)));
             }
         }
     }
     #pragma unroll
-    for (int r = 0; r < RPW; r++) {
-        float v = warp_sum(acc[r]);
-        if (lane == 0 && row0 + r < rows) {
-            size_t idx = (size_t)out_off + row0 + r;
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            float v = warp_sum(acc[r][j]);
+            if (lane == 0 && j < n && row0 + r < rows) {
+                size_t idx = (size_t)j * out_stride + out_off + row0 + r;
+                out[idx] = accumulate ? out[idx] + v : v;
+            }
+        }
+}
+// Q8_0 (used for draft models): one row per warp, each lane 16 int8 weights and 16 activations per step.
+template <int NT>
+__device__ __forceinline__ void q8_dp4a(DP4A_PARAMS) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const signed char* wr = reinterpret_cast<const signed char*>(w) + (size_t)row * cols;
+    const float* dr = wd + (size_t)row * (cols >> 5);
+    float acc[NT];
+    #pragma unroll
+    for (int j = 0; j < NT; j++) acc[j] = 0.f;
+    #pragma unroll 2
+    for (int i = lane * 16; i < cols; i += 512) {
+        int4 wv = *reinterpret_cast<const int4*>(wr + i);
+        float dw = dr[i >> 5];
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            if (j < n) {
+                int4 xv = *reinterpret_cast<const int4*>(xq + (size_t)j * cols + i);
+                int s = __dp4a(wv.x, xv.x, __dp4a(wv.y, xv.y, __dp4a(wv.z, xv.z, __dp4a(wv.w, xv.w, 0))));
+                acc[j] += dw * xd[(size_t)j * (cols >> 5) + (i >> 5)] * (float)s;
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < NT; j++) {
+        float v = warp_sum(acc[j]);
+        if (lane == 0 && j < n) {
+            size_t idx = (size_t)j * out_stride + out_off + row;
             out[idx] = accumulate ? out[idx] + v : v;
         }
     }
-    (void)out_stride;
 }
 
+extern "C" {
+
+// the batch instances get a register budget, so the compiler cannot hoist every token's loads at once
+#define DP4A_ARGS w, wd, xq, xd, xs, out, rows, cols, n, accumulate, out_stride, out_off
+__global__ void matmul_q4k_dp4a(DP4A_PARAMS) { q4k_dp4a<1, RPW>(DP4A_ARGS); }
+__global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q4k_dp4a8(DP4A_PARAMS) { q4k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
+__global__ void matmul_q6k_dp4a(DP4A_PARAMS) { q6k_dp4a<1, RPW>(DP4A_ARGS); }
+__global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q6k_dp4a8(DP4A_PARAMS) { q6k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
+__global__ void matmul_q8_dp4a(DP4A_PARAMS) { q8_dp4a<1>(DP4A_ARGS); }
+__global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q8_dp4a8(DP4A_PARAMS) { q8_dp4a<8>(DP4A_ARGS); }
 #define KQ_ARGS const unsigned char* __restrict__ w, const float* __restrict__ wd, const float* __restrict__ x, \
                 float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off
 __global__ void matmul_q4k_1(KQ_ARGS) { q4k_matvec<1>(w, x, out, rows, cols, n, accumulate, out_stride, out_off); }
@@ -541,6 +626,14 @@ __global__ void matmul_q6k_4(KQ_ARGS) { q6k_matvec<4>(w, wd, x, out, rows, cols,
 #define ATT_MAX_CHUNK 256
 #define ATT_MAX_HD 128
 #define ATT_MAX_G 8
+#define ATT_SPLIT_MIN_SPAN 32
+
+// Context slice per decode-attention block for a token that sees span positions: whole contexts up to
+// ATT_SPLIT_MIN_SPAN, otherwise about want slices of 32..ATT_MAX_CHUNK positions. It depends on the
+// token's own span only, so a token is attended the same way alone or inside a batch.
+__device__ __forceinline__ int att_chunk_for(int span, int want) {
+    return span <= ATT_SPLIT_MIN_SPAN ? ATT_MAX_CHUNK : min(max((span + want - 1) / want, 32), ATT_MAX_CHUNK);
+}
 
 // Flash-decoding attention for grouped-query models, part 1: one block per (kv head, token, slice of
 // `chunk` positions) computes all G = n_heads / n_kv query heads that share the kv head, so each key
@@ -549,13 +642,15 @@ __global__ void matmul_q6k_4(KQ_ARGS) { q6k_matvec<4>(w, wd, x, out, rows, cols,
 // Writes each head's unnormalised output, max score and exp-sum to `part`, or (nsplit == 1) the final
 // normalised result to `out`. Needs hd a multiple of 32 (<= 128) and G <= ATT_MAX_G.
 __global__ void attention_partial_gqa(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
-                                      float* __restrict__ part, float* __restrict__ out, int pos0, int n_heads, int n_kv,
-                                      int hd, float scale, int nsplit, int chunk) {
+                                      float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp,
+                                      int n_heads, int n_kv, int hd, float scale, int nsplit, int want) {
+    if (posp) pos0 = *posp;
     __shared__ float sc[ATT_MAX_G][ATT_MAX_CHUNK];
     __shared__ float red[32];
     int kvh = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
     int G = n_heads / n_kv;
     int span = pos0 + b + 1; // causal
+    int chunk = att_chunk_for(span, want);
     int t0 = s * chunk, len = min(span, t0 + chunk) - t0;
     int q_dim = n_heads * hd, kv_dim = n_kv * hd;
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nwarps = blockDim.x >> 5;
@@ -623,7 +718,7 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const float
             if (g < G) {
                 int h = kvh * G + g;
                 if (nsplit == 1) {
-                    out[(size_t)b * q_dim + h * hd + tid] = a[g] / seg[g];
+                    out[(size_t)b * q_dim + h * hd + tid] = a[g] * (1.f / seg[g]); // as attention_combine
                 } else {
                     float* p = part + (((size_t)b * n_heads + h) * nsplit + s) * (hd + 2);
                     p[tid] = a[g];
@@ -639,14 +734,16 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const float
 // its max score and exp-sum to `part` (hd + 2 floats).
 // With nsplit == 1 there is nothing to merge: the block writes the normalised result straight to `out`.
 __global__ void attention_partial(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
-                                  float* __restrict__ part, float* __restrict__ out, int pos0, int n_heads, int n_kv, int hd,
-                                  float scale, int nsplit, int chunk) {
+                                  float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp, int n_heads, int n_kv, int hd,
+                                  float scale, int nsplit, int want) {
+    if (posp) pos0 = *posp;
     __shared__ float sc[ATT_MAX_CHUNK];
     __shared__ float qs[ATT_MAX_HD];
     __shared__ float red[32];
     __shared__ float accs[4][ATT_MAX_HD];
     int h = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
     int span = pos0 + b + 1; // causal
+    int chunk = att_chunk_for(span, want);
     int t0 = s * chunk, len = min(span, t0 + chunk) - t0;
     float* p = part + (((size_t)b * n_heads + h) * nsplit + s) * (hd + 2);
     if (len <= 0) { // same for the whole block, so returning before the barriers is safe
@@ -693,7 +790,7 @@ __global__ void attention_partial(const float* __restrict__ qkv, const float* __
     if (threadIdx.x < hd) {
         float acc = 0.f;
         for (int k = 0; k < groups; k++) acc += accs[k][threadIdx.x];
-        if (nsplit == 1) out[(size_t)b * q_dim + h * hd + threadIdx.x] = acc / se;
+        if (nsplit == 1) out[(size_t)b * q_dim + h * hd + threadIdx.x] = acc * (1.f / se); // as attention_combine
         else p[threadIdx.x] = acc;
     }
     if (threadIdx.x == 0 && nsplit > 1) { p[hd] = mx; p[hd + 1] = se; }
@@ -963,9 +1060,11 @@ __global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { at
 
 // Flash-decoding attention, part 2: merge the slices of each (head, token) into the normalised output.
 __global__ void attention_combine(const float* __restrict__ part, float* __restrict__ out,
-                                  int pos0, int n_heads, int hd, int nsplit, int chunk) {
+                                  int pos0, const int* __restrict__ posp, int n_heads, int hd, int nsplit, int want) {
+    if (posp) pos0 = *posp;
     int h = blockIdx.x, b = blockIdx.y;
     int span = pos0 + b + 1;
+    int chunk = att_chunk_for(span, want);
     int used = min(nsplit, (span + chunk - 1) / chunk);
     const float* p = part + ((size_t)b * n_heads + h) * nsplit * (hd + 2);
     float m = NEG_INF;
@@ -1646,10 +1745,16 @@ extern "C" {
 __global__ void __launch_bounds__(128) matmul_mma_q4k(MMA_K_ARGS) { mma_kquant<1>(wq, wd, xq, xd, xb, out, rows, cols, n, accumulate, out_stride, out_off); }
 __global__ void __launch_bounds__(128) matmul_mma_q6k(MMA_K_ARGS) { mma_kquant<2>(wq, wd, xq, xd, xb, out, rows, cols, n, accumulate, out_stride, out_off); }
 
-// One token: h = silu(gate) * up straight to int8 activations for the down projection (ffn a multiple of 32).
+// Decode: h = silu(gate) * up straight to int8 activations for the down projection (ffn a multiple of 32),
+// one token per grid row.
 __global__ void silu_q8(const float* __restrict__ gu, signed char* __restrict__ xq, float* __restrict__ xd,
                         int* __restrict__ xsum, int ffn) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, nv = ffn >> 2;
+    size_t r = blockIdx.y;
+    gu += r * 2 * ffn;
+    xq += r * ffn;
+    xd += r * (ffn >> 5);
+    xsum += r * (ffn >> 5);
     bool ok = i < nv;
     float4 h = make_float4(0.f, 0.f, 0.f, 0.f);
     if (ok) {
@@ -1658,6 +1763,40 @@ __global__ void silu_q8(const float* __restrict__ gu, signed char* __restrict__ 
                         g.z / (1.f + expf(-g.z)) * u.z, g.w / (1.f + expf(-g.w)) * u.w);
     }
     quant8x4(h, ok, i, xq, xd, xsum);
+}
+
+// Index of each row's largest value, as the greedy sampler picks it: the first maximum, NaN never wins,
+// 0 when nothing beats -inf. One block per row.
+__global__ void argmax_rows(const float* __restrict__ x, int cols, int* __restrict__ out) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const float* r = x + (size_t)blockIdx.x * cols;
+    float bv = NEG_INF;
+    int bi = 0x7FFFFFFF;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = r[i];
+        if (v > bv) { bv = v; bi = i; }
+    }
+    // better: larger value, or the same value at a lower index
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffff, bv, o);
+        int oi = __shfl_xor_sync(0xffffffff, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) { sv[wid] = bv; si[wid] = bi; }
+    __syncthreads();
+    if (wid == 0) {
+        int nw = blockDim.x >> 5;
+        bv = lane < nw ? sv[lane] : NEG_INF;
+        bi = lane < nw ? si[lane] : 0x7FFFFFFF;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) out[blockIdx.x] = bi == 0x7FFFFFFF ? 0 : bi;
+    }
 }
 
 // gu rows are [gate | up]; h = silu(gate) * up
@@ -1748,6 +1887,13 @@ api! {
     cuLaunchKernel: fn(Ptr, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> CuResult;
     cuFuncSetAttribute: fn(Ptr, i32, i32) -> CuResult;
     cuCtxSynchronize: fn() -> CuResult;
+    cuStreamCreate: fn(*mut Ptr, u32) -> CuResult;
+    cuStreamBeginCapture_v2: fn(Ptr, i32) -> CuResult;
+    cuStreamEndCapture: fn(Ptr, *mut Ptr) -> CuResult;
+    cuGraphInstantiateWithFlags: fn(*mut Ptr, Ptr, u64) -> CuResult;
+    cuGraphLaunch: fn(Ptr, Ptr) -> CuResult;
+    cuGraphDestroy: fn(Ptr) -> CuResult;
+    cuGraphExecDestroy: fn(Ptr) -> CuResult;
     cuGetErrorString: fn(CuResult, *mut *const c_char) -> CuResult;
     nvrtcCreateProgram: fn(*mut Ptr, *const c_char, *const c_char, i32, *const *const c_char, *const *const c_char) -> i32;
     nvrtcCompileProgram: fn(Ptr, i32, *const *const c_char) -> i32;
@@ -1893,8 +2039,8 @@ struct Kernels {
     matmul_q8: Ptr,
     matmul_q4k: [Ptr; 2], // f32 activations: one-token and four-token variants
     matmul_q6k: [Ptr; 2],
-    matmul_q4k_dp4a: Ptr, // one token, int8 activations
-    matmul_q6k_dp4a: Ptr,
+    matmul_dp4a: [[Ptr; 2]; 3], // decode, int8 activations: [Q8_0 | Q4_K | Q6_K][1 token | up to 8]
+    argmax_rows: Ptr,
     matmul_tiled: Ptr,
     matmul_mma: Option<Ptr>, // int8 tensor cores, sm_75 and newer
     matmul_mma_k: Option<[Ptr; 2]>, // the same for Q4_K / Q6_K with per-256 activation scales
@@ -1907,6 +2053,9 @@ struct Kernels {
     attention_prefill_tc: Option<[Ptr; 2]>, // f16 tensor cores (sm_75+), head size 64 / 128
     silu_mul: Ptr,
     silu_q8: Ptr,
+    /// every launch goes here (a blocking stream: the synchronous copies still order against it); CUDA
+    /// graphs need a stream other than the legacy default one
+    stream: Ptr,
 }
 
 unsafe impl Send for Kernels {}
@@ -1923,7 +2072,7 @@ impl Kernels {
             if (f.nvrtcCreateProgram)(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) != 0 {
                 return Err("nvrtcCreateProgram failed".into());
             }
-            let opts: Vec<CString> = [format!("--gpu-architecture=compute_{}{}", a.compute.0, a.compute.1), "-std=c++14".into(), format!("-DRPW={}", kq_rpw()), format!("-DQCH={}", qch())]
+            let opts: Vec<CString> = [format!("--gpu-architecture=compute_{}{}", a.compute.0, a.compute.1), "-std=c++14".into(), format!("-DRPW={}", kq_rpw()), format!("-DQCH={}", qch()), format!("-DDP4A_BATCH_MINB={}", std::env::var("BETTERLLAMA_BATCH_MINB").unwrap_or("3".into())), format!("-DDP4A_BATCH_RPW={}", batch_rpw())]
                 .into_iter()
                 .map(|o| CString::new(o).unwrap())
                 .collect();
@@ -1959,8 +2108,12 @@ impl Kernels {
                 matmul_q8: get("matmul_q8")?,
                 matmul_q4k: [get("matmul_q4k_1")?, get("matmul_q4k_4")?],
                 matmul_q6k: [get("matmul_q6k_1")?, get("matmul_q6k_4")?],
-                matmul_q4k_dp4a: get("matmul_q4k_dp4a")?,
-                matmul_q6k_dp4a: get("matmul_q6k_dp4a")?,
+                matmul_dp4a: [
+                    [get("matmul_q8_dp4a")?, get("matmul_q8_dp4a8")?],
+                    [get("matmul_q4k_dp4a")?, get("matmul_q4k_dp4a8")?],
+                    [get("matmul_q6k_dp4a")?, get("matmul_q6k_dp4a8")?],
+                ],
+                argmax_rows: get("argmax_rows")?,
                 matmul_tiled: get("matmul_tiled")?,
                 matmul_mma: if a.compute >= (7, 5) && std::env::var_os("BETTERLLAMA_NO_MMA").is_none() { Some(get("matmul_mma")?) } else { None },
                 // BETTERLLAMA_NO_Q8K=1 keeps K-quant prompts on matmul_mma (per-32 activation scales)
@@ -1983,6 +2136,11 @@ impl Kernels {
                 },
                 silu_mul: get("silu_mul")?,
                 silu_q8: get("silu_q8")?,
+                stream: {
+                    let mut st: Ptr = std::ptr::null_mut();
+                    a.check((f.cuStreamCreate)(&mut st, 0), "stream")?;
+                    st
+                },
             })
         }
     }
@@ -2004,7 +2162,7 @@ impl Kernels {
             .collect();
         let mut params: Vec<Ptr> = slots.iter_mut().map(|s| s as *mut u64 as Ptr).collect();
         a.check(
-            unsafe { (a.f.cuLaunchKernel)(func, grid.0, grid.1, grid.2, block, 1, 1, shared, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()) },
+            unsafe { (a.f.cuLaunchKernel)(func, grid.0, grid.1, grid.2, block, 1, 1, shared, self.stream, params.as_mut_ptr(), std::ptr::null_mut()) },
             "kernel launch",
         )
     }
@@ -2128,6 +2286,8 @@ pub struct GpuModel {
     layers: Vec<GpuLayer>,
     prefill_shared: Option<usize>,
     pub device: String,
+    /// Q8_0 weights decode with int8 activations too (for draft models; otherwise exact f32)
+    pub int8_q8: bool,
 }
 
 impl GpuModel {
@@ -2167,7 +2327,7 @@ impl GpuModel {
         if out_rows != cfg.vocab {
             return Err(format!("output layer has {out_rows} rows but the vocabulary has {} tokens", cfg.vocab));
         }
-        Ok(GpuModel { output_norm: upload_vec(g, "output_norm.weight")?, cfg, k, embd, output, layers, prefill_shared, device })
+        Ok(GpuModel { output_norm: upload_vec(g, "output_norm.weight")?, cfg, k, embd, output, layers, prefill_shared, device, int8_q8: false })
     }
 
     /// With BETTERLLAMA_PROFILE set, waits for the GPU after `f` so its time lands in bucket `op`.
@@ -2220,11 +2380,11 @@ impl GpuModel {
             }
             return Ok(());
         }
-        // one token with K-quant weights: int8 activations + dp4a (BETTERLLAMA_EXACT=1 keeps f32)
-        if Self::dp4a_path(parts, n) {
-            let blocks = cols / 32;
+        // decoding (up to DECODE_MAX_BATCH tokens): int8 activations + dp4a (BETTERLLAMA_EXACT=1 keeps f32)
+        if self.dp4a_path(parts, n) {
+            let blocks = n * cols / 32;
             k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(blocks as i32)])?;
-            return self.matmul_dp4a(parts, out, out_stride, accumulate, s);
+            return self.matmul_dp4a(parts, out, out_stride, n, accumulate, s);
         }
         // otherwise f32 activations; 256 threads = 8 warps, one row each for Q8_0, RPW rows each for K-quants
         for &(m, off) in parts {
@@ -2240,22 +2400,24 @@ impl GpuModel {
         Ok(())
     }
 
-    /// One token with K-quant weights goes through int8 activations and dp4a.
-    fn dp4a_path(parts: &[(&GpuMatrix, usize)], n: usize) -> bool {
-        n == 1 && !crate::quant::exact_mode() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8)
+    /// Decoding batches (1..=DECODE_MAX_BATCH tokens) with K-quant weights go through int8 activations and
+    /// dp4a; Q8_0 too when the model is a draft (`int8_q8`), keeping exact f32 decoding otherwise.
+    fn dp4a_path(&self, parts: &[(&GpuMatrix, usize)], n: usize) -> bool {
+        n <= DECODE_MAX_BATCH && !crate::quant::exact_mode() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8 || self.int8_q8)
     }
 
-    /// The dp4a matmuls on activations already quantised into `s.xq` / `s.xd`.
-    fn matmul_dp4a(&self, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
+    /// The dp4a matmuls on `n` tokens' activations already quantised into `s.xq` / `s.xd`. One token uses
+    /// the 1-token kernels, batches the 8-token ones; both give a token bit-identical results.
+    fn matmul_dp4a(&self, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
         for &(m, off) in parts {
-            let f = if m.fmt == Fmt::Q4K { k.matmul_q4k_dp4a } else { k.matmul_q6k_dp4a };
+            let rpw = if m.fmt == Fmt::Q8 { 1 } else if n > 1 { batch_rpw() } else { kq_rpw() };
             k.launch(
-                f,
-                (m.rows.div_ceil(8 * kq_rpw()) as u32, 1),
+                k.matmul_dp4a[m.fmt as usize][(n > 1) as usize],
+                (m.rows.div_ceil(8 * rpw) as u32, 1),
                 256,
                 0,
-                &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
+                &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
             )?;
         }
         Ok(())
@@ -2265,9 +2427,9 @@ impl GpuModel {
     /// int8 activations directly.
     fn norm_matmul(&self, norm: &DeviceBuf, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, s: &GpuSession) -> Result<(), String> {
         let (k, c) = (&self.k, &self.cfg);
-        if Self::dp4a_path(parts, n) {
-            k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
-            return self.matmul_dp4a(parts, out, out_stride, false, s);
+        if self.dp4a_path(parts, n) {
+            k.launch(k.rmsnorm_q8, (n as u32, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
+            return self.matmul_dp4a(parts, out, out_stride, n, false, s);
         }
         k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xb.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
         self.matmul(parts, s.xb.ptr, out, out_stride, n, false, s)
@@ -2283,18 +2445,30 @@ impl GpuModel {
         c.head_dim % 32 == 0 && c.n_heads % c.n_kv_heads == 0 && c.n_heads / c.n_kv_heads <= ATT_MAX_G
     }
 
-    /// Context slice per attention block when generating: short contexts take one block per head
-    /// (no merge pass); longer ones are split so a single token still spreads over the GPU.
-    fn att_chunk(&self, n: usize, span: usize) -> usize {
-        let blocks_per_slice = if self.gqa_kernel() { self.cfg.n_kv_heads } else { self.cfg.n_heads } * n;
+    /// Slices to aim for per token when generating: enough that a single token spreads over the GPU.
+    /// Each token's slice size then follows from its own span alone (att_chunk_for in the kernels).
+    fn att_want(&self) -> usize {
+        ATT_TARGET_BLOCKS.div_ceil(if self.gqa_kernel() { self.cfg.n_kv_heads } else { self.cfg.n_heads })
+    }
+
+    /// Mirror of the kernels' att_chunk_for: short contexts in one block per head (no merge pass),
+    /// longer ones split.
+    fn att_chunk(span: usize, want: usize) -> usize {
         if span <= SPLIT_MIN_SPAN {
             return ATT_MAX_CHUNK;
         }
-        let want_splits = ATT_TARGET_BLOCKS.div_ceil(blocks_per_slice);
-        span.div_ceil(want_splits).clamp(32, ATT_MAX_CHUNK)
+        span.div_ceil(want).clamp(32, ATT_MAX_CHUNK)
     }
 
-    fn attention(&self, s: &GpuSession, n: usize, kc: u64, vc: u64) -> Result<(), String> {
+    /// Most slices any token of a ctx-position session needs: the fixed split grid of graph decoding.
+    fn max_splits(&self, ctx: usize) -> usize {
+        let want = self.att_want();
+        (1..=ctx).map(|span| span.div_ceil(Self::att_chunk(span, want))).max().unwrap_or(1)
+    }
+
+    /// posp: device pointer to the position (CUDA graphs), else 0 and s.pos is used. ixed_split:
+    /// one-token steps use the session's widest split grid, so a captured graph fits every position.
+    fn attention(&self, s: &GpuSession, n: usize, kc: u64, vc: u64, posp: u64, fixed_split: bool) -> Result<(), String> {
         let c = &self.cfg;
         let k = &self.k;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
@@ -2327,9 +2501,13 @@ impl GpuModel {
         for b0 in (0..n).step_by(SPLIT_MAX_BATCH) {
             let m = (n - b0).min(SPLIT_MAX_BATCH);
             let pos0 = s.pos + b0;
-            let span = pos0 + m;
-            let chunk = self.att_chunk(m, span);
-            let nsplit = span.div_ceil(chunk);
+            // the grid covers the token needing the most slices; the others' extra slices are empty
+            let want = self.att_want();
+            let nsplit = if fixed_split {
+                self.max_splits(s.ctx)
+            } else {
+                (pos0 + 1..=pos0 + m).map(|span| span.div_ceil(Self::att_chunk(span, want))).max().unwrap_or(1)
+            };
             let (qkv, out) = (s.qkv.at(b0 * row), s.att.at(b0 * q_dim * 4));
             let (func, heads) = if self.gqa_kernel() { (k.attention_partial_gqa, c.n_kv_heads) } else { (k.attention_partial, c.n_heads) };
             k.launch3(
@@ -2337,7 +2515,7 @@ impl GpuModel {
                 (heads as u32, m as u32, nsplit as u32),
                 128,
                 0,
-                &[Arg::P(qkv), Arg::P(kc), Arg::P(vc), Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale), Arg::I(nsplit as i32), Arg::I(chunk as i32)],
+                &[Arg::P(qkv), Arg::P(kc), Arg::P(vc), Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale), Arg::I(nsplit as i32), Arg::I(want as i32)],
             )?;
             if nsplit > 1 {
                 k.launch(
@@ -2345,7 +2523,7 @@ impl GpuModel {
                     (c.n_heads as u32, m as u32),
                     128,
                     0,
-                    &[Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::I(c.n_heads as i32), Arg::I(c.head_dim as i32), Arg::I(nsplit as i32), Arg::I(chunk as i32)],
+                    &[Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.head_dim as i32), Arg::I(nsplit as i32), Arg::I(want as i32)],
                 )?;
             }
         }
@@ -2362,10 +2540,23 @@ impl GpuModel {
 
     /// Runs `tokens` at positions `s.pos..`; copies next-token logits into `s.logits` if asked.
     pub fn forward_batch(&self, tokens: &[u32], s: &mut GpuSession, want_logits: bool) -> Result<(), String> {
-        let c = &self.cfg;
+        self.forward(tokens, s, if want_logits { Out::Last } else { Out::None }).map(|_| ())
+    }
+
+    /// Runs up to DECODE_MAX_BATCH `tokens` and returns the greedy next token after each of them (argmax on
+    /// the GPU). Each position gets exactly the logits a one-token step would give it, so this is how a
+    /// speculative draft is checked.
+    pub fn forward_argmax(&self, tokens: &[u32], s: &mut GpuSession) -> Result<Vec<u32>, String> {
+        if tokens.len() > DECODE_MAX_BATCH {
+            return Err(format!("argmax batch of {} exceeds {DECODE_MAX_BATCH}", tokens.len()));
+        }
+        self.forward(tokens, s, Out::Argmax)
+    }
+
+    fn forward(&self, tokens: &[u32], s: &mut GpuSession, want: Out) -> Result<Vec<u32>, String> {
         let n = tokens.len();
         if n == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if n > MAX_BATCH {
             return Err(format!("GPU batch of {n} exceeds {MAX_BATCH}"));
@@ -2373,11 +2564,53 @@ impl GpuModel {
         if s.pos + n > s.ctx {
             return Err(format!("context full ({} tokens)", s.ctx));
         }
+        let k = &self.k;
+        let a = api()?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        s.tokens.write(&ids)?;
+        // one-token steps replay a CUDA graph captured on the session's first one (BETTERLLAMA_NO_GRAPH=1:
+        // plain launches); the kernels then read the position from s.pos_dev
+        if n == 1 && want != Out::None && graphs_enabled() {
+            s.pos_dev.write(&[s.pos as i32])?;
+            let slot = (want == Out::Argmax) as usize;
+            if s.graphs[slot].is_null() {
+                const RELAXED: i32 = 2; // CU_STREAM_CAPTURE_MODE_RELAXED
+                a.check(unsafe { (a.f.cuStreamBeginCapture_v2)(k.stream, RELAXED) }, "begin graph capture")?;
+                let launched = self.launches(1, s, want, s.pos_dev.ptr, true);
+                let mut graph: Ptr = std::ptr::null_mut();
+                let ended = unsafe { (a.f.cuStreamEndCapture)(k.stream, &mut graph) };
+                launched?;
+                a.check(ended, "end graph capture")?;
+                let mut exec: Ptr = std::ptr::null_mut();
+                let made = unsafe { (a.f.cuGraphInstantiateWithFlags)(&mut exec, graph, 0) };
+                unsafe { (a.f.cuGraphDestroy)(graph) };
+                a.check(made, "instantiate graph")?;
+                s.graphs[slot] = exec;
+            }
+            a.check(unsafe { (a.f.cuGraphLaunch)(s.graphs[slot], k.stream) }, "graph launch")?;
+        } else {
+            self.launches(n, s, want, 0, false)?;
+        }
+        let mut picks = Vec::new();
+        if want == Out::Last {
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(s.logits.as_mut_ptr() as *mut c_void, s.logits_dev.ptr, s.logits.len() * 4) }, "copy logits")?;
+        } else if want == Out::Argmax {
+            let mut ids = vec![0i32; n];
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(ids.as_mut_ptr() as *mut c_void, s.picks.ptr, n * 4) }, "copy argmax")?;
+            picks = ids.into_iter().map(|i| i as u32).collect();
+        }
+        s.pos += n;
+        Ok(picks)
+    }
+
+    /// Every kernel of a forward pass over `n` tokens at `s.pos..` (`posp`: the position from device memory
+    /// instead, for graphs), ending with the last token's logits (Last) or every token's argmax (Argmax) on
+    /// the device. Launches only, so it can be captured.
+    fn launches(&self, n: usize, s: &GpuSession, want: Out, posp: u64, fixed_split: bool) -> Result<(), String> {
+        let c = &self.cfg;
         let (dim, hd) = (c.dim, c.head_dim);
         let kv_dim = c.n_kv_heads * hd;
         let k = &self.k;
-        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        s.tokens.write(&ids)?;
 
         // profile buckets match profile::OPS; with profiling off `timed` is a plain call
         self.timed(0, || {
@@ -2399,21 +2632,21 @@ impl GpuModel {
                     (n as u32, (c.n_heads + 2 * c.n_kv_heads) as u32),
                     64,
                     0,
-                    &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
+                    &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
                 )
             })?;
-            self.timed(4, || self.attention(s, n, kc, vc))?;
+            self.timed(4, || self.attention(s, n, kc, vc, posp, fixed_split))?;
             self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
 
             self.timed(6, || {
                 let gate_up: Vec<(&GpuMatrix, usize)> = layer.gate_up.iter().map(|(m, off)| (m, *off)).collect();
                 self.norm_matmul(&layer.ffn_norm, &gate_up, s.gu.ptr, 2 * c.ffn_dim, n, s)?;
                 let down = [(&layer.down, 0)];
-                if Self::dp4a_path(&down, n) {
-                    // one token: silu(gate) * up straight to int8 for the down projection
+                if self.dp4a_path(&down, n) {
+                    // decoding: silu(gate) * up straight to int8 for the down projection
                     let nv = (c.ffn_dim / 4) as u32;
-                    k.launch(k.silu_q8, (nv.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.ffn_dim as i32)])?;
-                    return self.matmul_dp4a(&down, s.x.ptr, dim, true, s);
+                    k.launch(k.silu_q8, (nv.div_ceil(256), n as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.ffn_dim as i32)])?;
+                    return self.matmul_dp4a(&down, s.x.ptr, dim, n, true, s);
                 }
                 let total = (n * c.ffn_dim) as u32;
                 k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(c.ffn_dim as i32), Arg::I(n as i32)])?;
@@ -2421,21 +2654,31 @@ impl GpuModel {
             })?;
         }
 
-        if want_logits {
+        if want != Out::None {
             self.timed(7, || {
-                let last = s.x.at((n - 1) * dim * 4);
-                k.launch(k.rmsnorm, (1, 1), 256, 0, &[Arg::P(last), Arg::P(self.output_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
-                self.matmul_one(self.output.as_ref().unwrap_or(&self.embd), s.xb.ptr, s.logits_dev.ptr, 1, false, s)?;
-                let a = api()?;
-                a.check(
-                    unsafe { (a.f.cuMemcpyDtoH_v2)(s.logits.as_mut_ptr() as *mut c_void, s.logits_dev.ptr, s.logits.len() * 4) },
-                    "copy logits",
-                )
+                // Last: the last token's logits; Argmax: every token's, reduced on the GPU
+                let rows = if want == Out::Last { 1 } else { n };
+                let first = s.x.at((n - rows) * dim * 4);
+                k.launch(k.rmsnorm, (rows as u32, 1), 256, 0, &[Arg::P(first), Arg::P(self.output_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+                self.matmul_one(self.output.as_ref().unwrap_or(&self.embd), s.xb.ptr, s.logits_dev.ptr, rows, false, s)?;
+                if want == Out::Argmax {
+                    k.launch(k.argmax_rows, (rows as u32, 1), 1024, 0, &[Arg::P(s.logits_dev.ptr), Arg::I(c.vocab as i32), Arg::P(s.picks.ptr)])?;
+                }
+                Ok(())
             })?;
         }
-        s.pos += n;
         Ok(())
     }
+}
+
+/// What a forward pass hands back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Out {
+    None,
+    /// the last token's logits, copied to `GpuSession::logits`
+    Last,
+    /// the greedy next token after every token of the batch
+    Argmax,
 }
 
 pub struct GpuSession {
@@ -2454,8 +2697,28 @@ pub struct GpuSession {
     xd: DeviceBuf,       // their per-32 scales
     xsum: DeviceBuf,     // and per-32 sums of the int8 values
     att_part: DeviceBuf, // flash-decoding partial results
-    logits_dev: DeviceBuf,
+    logits_dev: DeviceBuf, // up to DECODE_MAX_BATCH rows
+    picks: DeviceBuf,      // their argmax
+    pos_dev: DeviceBuf,    // the position, for CUDA graphs
+    graphs: [Ptr; 2],      // captured one-token steps: Last, Argmax
     pub logits: Vec<f32>,
+}
+
+impl Drop for GpuSession {
+    fn drop(&mut self) {
+        if let Ok(a) = api() {
+            for g in self.graphs.iter().filter(|g| !g.is_null()) {
+                unsafe { (a.f.cuGraphExecDestroy)(*g) };
+            }
+        }
+    }
+}
+
+/// One-token steps replay CUDA graphs unless BETTERLLAMA_NO_GRAPH is set or the profiler (which
+/// synchronises after every operation) is on.
+fn graphs_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BETTERLLAMA_NO_GRAPH").is_none()) && !profile::enabled()
 }
 
 impl GpuSession {
@@ -2482,7 +2745,10 @@ impl GpuSession {
             h: f(MAX_BATCH * cfg.ffn_dim)?,
             k_cache: f(cfg.n_layers * ctx * kv_dim)?,
             v_cache: f(cfg.n_layers * ctx * kv_dim)?,
-            logits_dev: f(cfg.vocab)?,
+            logits_dev: f(DECODE_MAX_BATCH * cfg.vocab)?,
+            picks: f(DECODE_MAX_BATCH)?,
+            pos_dev: f(1)?,
+            graphs: [std::ptr::null_mut(); 2],
             logits: vec![0.0; cfg.vocab],
         })
     }

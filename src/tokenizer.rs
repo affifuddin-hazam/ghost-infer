@@ -246,6 +246,10 @@ impl Tokenizer {
         })
     }
 
+    pub fn vocab_size(&self) -> usize {
+        self.tokens.len()
+    }
+
     pub fn token_id(&self, text: &str) -> Option<u32> {
         self.token_to_id.get(text).copied()
     }

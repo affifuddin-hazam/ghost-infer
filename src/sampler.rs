@@ -20,6 +20,11 @@ impl Sampler {
         ((self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32) / (1u64 << 24) as f32
     }
 
+    /// Temperature 0: always the most likely token.
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         let argmax = || logits.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
         if self.temperature <= 0.0 {
