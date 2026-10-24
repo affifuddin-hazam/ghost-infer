@@ -1,5 +1,5 @@
 //! OpenAI-compatible HTTP server: /v1/chat/completions, /v1/completions (both with streaming over
-//! server-sent events), /v1/models. A small HTTP/1.1 implementation on std::net, one connection thread
+//! server-sent events), /v1/models, and a chat page at /. A small HTTP/1.1 implementation on std::net, one connection thread
 //! each; generation runs on the main thread, one request at a time. The cache keeps the tokens of the
 //! last conversation, so a request that repeats it (a chat client resending the history) only reads
 //! the new part.
@@ -54,7 +54,8 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         t.elapsed().as_secs_f64(),
         if engine.draft.is_some() { ", with a draft model for greedy requests" } else { "" }
     );
-    eprintln!("listening on http://{host}:{port}/v1 (OpenAI-compatible: /v1/chat/completions, /v1/completions, /v1/models)");
+    eprintln!("chat in your browser: http://{host}:{port}/");
+    eprintln!("OpenAI-compatible API: http://{host}:{port}/v1 (/v1/chat/completions, /v1/completions, /v1/models)");
     if fmt.is_none() {
         eprintln!("[note: no ChatML template in this model, so /v1/chat/completions is off]");
     }
@@ -215,11 +216,18 @@ fn status_text(code: u16) -> &'static str {
 fn respond(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
     let text = body.to_string();
     let head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS}Connection: close\r\n\r\n",
+        "HTTP/1.1 {code} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n{CORS}Connection: close\r\n\r\n",
         status_text(code),
         text.len()
     );
     conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(text.as_bytes())).map_err(|e| e.to_string())
+}
+
+/// The built-in chat page (src/chat.html, compiled into the program).
+fn respond_page(conn: &mut TcpStream) -> Result<(), String> {
+    const PAGE: &str = include_str!("chat.html");
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", PAGE.len());
+    conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(PAGE.as_bytes())).map_err(|e| e.to_string())
 }
 
 fn error_body(message: &str) -> Json {
@@ -241,7 +249,8 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, chat_ok
             let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
             return conn.write_all(head.as_bytes()).map_err(|e| e.to_string());
         }
-        ("GET", "" | "/health") => return respond(&mut conn, 200, &obj(vec![("status", str("ok"))])),
+        ("GET", "" | "/index.html") => return respond_page(&mut conn),
+        ("GET", "/health") => return respond(&mut conn, 200, &obj(vec![("status", str("ok"))])),
         ("GET", "/v1/models") => {
             let m = obj(vec![("id", str(model_id)), ("object", str("model")), ("created", num(created as f64)), ("owned_by", str("betterllama"))]);
             return respond(&mut conn, 200, &obj(vec![("object", str("list")), ("data", Json::Arr(vec![m]))]));

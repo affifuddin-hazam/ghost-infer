@@ -37,8 +37,9 @@ and cultural attractions. Paris is a major global city, and its population is ap
   inside a check batch, which is tested on whole replies and multi-turn chats.
 - **Sampling**: greedy, or temperature + top-k + top-p.
 - **Chat**: ChatML template (SmolLM2, Qwen), multi-turn with the KV cache kept between turns.
-- **OpenAI-compatible server** (`serve`): `/v1/chat/completions` and `/v1/completions` with streaming,
-  `/v1/models`, so chat apps and editor plugins that talk to OpenAI or Ollama can use it. It keeps the
+- **OpenAI-compatible server** (`serve`) with a built-in chat page: open the server's address in a browser,
+  or use `/v1/chat/completions` and `/v1/completions` (with streaming) and `/v1/models`, so chat apps and
+  editor plugins that talk to OpenAI or Ollama can use it. It keeps the
   last conversation in the cache: when a client resends the history with a new message, only the new
   part is read.
 
@@ -94,8 +95,13 @@ Options for `run`, `chat`, `serve` and `bench`:
 
 ### Server
 
-`betterllama serve model.gguf --gpu` listens on `http://127.0.0.1:8080/v1`. Point any OpenAI client at that
-base URL (the API key and model name can be anything):
+`betterllama serve model.gguf --gpu` listens on `http://127.0.0.1:8080`. Open that address in a browser to chat:
+replies stream in, the model's `<think>` reasoning folds into a "Thought for N s" line (with a switch to
+turn thinking off), the conversation is kept in the browser, and Settings has temperature, max tokens and
+a system prompt. The page is part of the program (`src/chat.html`); nothing else is installed.
+
+For other programs, point any OpenAI client at `http://127.0.0.1:8080/v1` (the API key and model name can be
+anything):
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":true}'
@@ -106,6 +112,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `POST /v1/chat/completions` | `messages` (system / user / assistant, text content), `stream`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `stream_options.include_usage` |
 | `POST /v1/completions` | the same with a raw `prompt` instead of messages (no chat template) |
 | `GET /v1/models` | the loaded model (its file name) |
+| `GET /` | the chat page |
 | `GET /health` | `{"status":"ok"}` |
 
 Requests run one at a time. Unset sampling fields use the command-line defaults (`-t`, `--top-k`,
