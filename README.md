@@ -88,8 +88,10 @@ Options for `run`, `chat` and `bench`:
 
 - An NVIDIA GPU with compute capability 6.1 or newer (needs `dp4a`; 7.5+ also uses int8 tensor cores),
   and a current driver (`nvcuda.dll`). The weights must fit in VRAM (an 8B Q4_K_M needs about 5.5 GB).
-- NVRTC from a CUDA toolkit. betterllama picks the newest `nvrtc64_*.dll` under
+- NVRTC 11.1 or newer from a CUDA toolkit. betterllama picks the newest `nvrtc64_*.dll` under
   `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin`, or the one named by `BETTERLLAMA_NVRTC`.
+  The compiled kernels are cached in `%LOCALAPPDATA%\betterllama\kernels` (about 0.6 MB), so only the
+  first start after an update or a GPU change compiles them (a few seconds).
 - Windows only for now (the libraries are loaded with `LoadLibraryExW`).
 
 ## Supported models
@@ -104,6 +106,11 @@ tokenizer split, …) are not supported yet.
 
 Best of 3, tokens per second. Ryzen 5 3600 (6 threads, DDR4-2133) and RTX 2060 Super, compared with
 Ollama 0.22.1 on the same GGUF file and the same prompts. Load time is not included.
+
+**Startup** to ready on the GPU, with the model file in the operating system's cache (any recent run):
+Qwen3 8B Q4_K_M 1.9 s, with the 0.6B draft 2.3 s, SmolLM2-135M 0.3 s. The weights stream to the GPU through
+pinned buffers, read by all cores straight from the file. A first read from disk takes as long as the disk
+needs: about 30 s for the 8B from a USB hard disk, a few seconds from an SSD.
 
 **Qwen3 8B Q4_K_M, GPU** (both measured in the same session; GPU clocks vary between sessions, so
 compare rows only within one table)
@@ -188,6 +195,8 @@ Tools for checking this:
 | `BETTERLLAMA_PROFILE=1` | time per operation (CPU and GPU) in `bench` |
 | `BETTERLLAMA_QCH=256` | K-quant GPU prompts: one activation scale per 256 values (~1% faster, about twice the drift) |
 | `BETTERLLAMA_VERIFY_N=n` | `bench --gpu`: also time one n-token decode batch (a speculative check step) |
+| `BETTERLLAMA_LOAD_TIMES=1` | GPU: time each startup phase (driver, kernels, weights) |
+| `BETTERLLAMA_NO_KERNEL_CACHE=1` | GPU: compile the kernels instead of using (and filling) the on-disk cache |
 | `BETTERLLAMA_NO_GRAPH=1` | GPU: plain kernel launches instead of CUDA-graph replay for one-token steps |
 | `BETTERLLAMA_NO_TC_ATT=1` | GPU prompts: f32 attention instead of f16 tensor cores (more exact, much slower on long prompts) |
 | `BETTERLLAMA_NO_Q8K=1` | K-quant GPU prompts: the older per-32 activation-scale kernel (more exact, ~1.7× slower) |

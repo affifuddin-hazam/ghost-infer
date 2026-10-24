@@ -1888,6 +1888,14 @@ api! {
     cuFuncSetAttribute: fn(Ptr, i32, i32) -> CuResult;
     cuCtxSynchronize: fn() -> CuResult;
     cuStreamCreate: fn(*mut Ptr, u32) -> CuResult;
+    cuStreamSynchronize: fn(Ptr) -> CuResult;
+    cuMemAllocHost_v2: fn(*mut *mut c_void, usize) -> CuResult;
+    cuMemFreeHost: fn(*mut c_void) -> CuResult;
+    cuMemcpyHtoDAsync_v2: fn(u64, *const c_void, usize, Ptr) -> CuResult;
+    cuEventCreate: fn(*mut Ptr, u32) -> CuResult;
+    cuEventRecord: fn(Ptr, Ptr) -> CuResult;
+    cuEventSynchronize: fn(Ptr) -> CuResult;
+    cuEventDestroy_v2: fn(Ptr) -> CuResult;
     cuStreamBeginCapture_v2: fn(Ptr, i32) -> CuResult;
     cuStreamEndCapture: fn(Ptr, *mut Ptr) -> CuResult;
     cuGraphInstantiateWithFlags: fn(*mut Ptr, Ptr, u64) -> CuResult;
@@ -1897,8 +1905,8 @@ api! {
     cuGetErrorString: fn(CuResult, *mut *const c_char) -> CuResult;
     nvrtcCreateProgram: fn(*mut Ptr, *const c_char, *const c_char, i32, *const *const c_char, *const *const c_char) -> i32;
     nvrtcCompileProgram: fn(Ptr, i32, *const *const c_char) -> i32;
-    nvrtcGetPTXSize: fn(Ptr, *mut usize) -> i32;
-    nvrtcGetPTX: fn(Ptr, *mut c_char) -> i32;
+    nvrtcGetCUBINSize: fn(Ptr, *mut usize) -> i32;
+    nvrtcGetCUBIN: fn(Ptr, *mut c_char) -> i32;
     nvrtcGetProgramLogSize: fn(Ptr, *mut usize) -> i32;
     nvrtcGetProgramLog: fn(Ptr, *mut c_char) -> i32;
     nvrtcDestroyProgram: fn(*mut Ptr) -> i32;
@@ -1996,13 +2004,6 @@ impl DeviceBuf {
         Ok(DeviceBuf { ptr, bytes })
     }
 
-    fn upload<T: Copy>(data: &[T]) -> Result<DeviceBuf, String> {
-        let bytes = std::mem::size_of_val(data);
-        let buf = DeviceBuf::alloc(bytes)?;
-        buf.write(data)?;
-        Ok(buf)
-    }
-
     fn write<T: Copy>(&self, data: &[T]) -> Result<(), String> {
         let a = api()?;
         let bytes = std::mem::size_of_val(data);
@@ -2062,21 +2063,42 @@ unsafe impl Send for Kernels {}
 unsafe impl Sync for Kernels {}
 
 impl Kernels {
-    fn compile() -> Result<Kernels, String> {
-        let a = api()?;
+    /// The kernels as a GPU binary (cubin) for the installed GPU: from the on-disk cache when the source,
+    /// options, NVRTC and GPU match a previous run, else compiled with NVRTC (seconds) and cached.
+    /// BETTERLLAMA_NO_KERNEL_CACHE=1 always compiles.
+    fn binary(a: &Api) -> Result<Vec<u8>, String> {
+        let opts = [
+            format!("--gpu-architecture=sm_{}{}", a.compute.0, a.compute.1),
+            "-std=c++14".into(),
+            format!("-DRPW={}", kq_rpw()),
+            format!("-DQCH={}", qch()),
+            format!("-DDP4A_BATCH_MINB={}", std::env::var("BETTERLLAMA_BATCH_MINB").unwrap_or("3".into())),
+            format!("-DDP4A_BATCH_RPW={}", batch_rpw()),
+        ];
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (KERNELS, &opts, &a.nvrtc_path, &a.device_name).hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        let use_cache = std::env::var_os("BETTERLLAMA_NO_KERNEL_CACHE").is_none();
+        let dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("betterllama").join("kernels"));
+        let file = dir.as_ref().map(|d| d.join(format!("{key}.cubin")));
+        if let (true, Some(file)) = (use_cache, &file) {
+            if let Ok(bin) = std::fs::read(file) {
+                return Ok(bin);
+            }
+        }
         let f = &a.f;
-        unsafe {
+        let bin = unsafe {
             let src = CString::new(KERNELS).unwrap();
             let name = CString::new("betterllama.cu").unwrap();
             let mut prog: Ptr = std::ptr::null_mut();
             if (f.nvrtcCreateProgram)(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) != 0 {
                 return Err("nvrtcCreateProgram failed".into());
             }
-            let opts: Vec<CString> = [format!("--gpu-architecture=compute_{}{}", a.compute.0, a.compute.1), "-std=c++14".into(), format!("-DRPW={}", kq_rpw()), format!("-DQCH={}", qch()), format!("-DDP4A_BATCH_MINB={}", std::env::var("BETTERLLAMA_BATCH_MINB").unwrap_or("3".into())), format!("-DDP4A_BATCH_RPW={}", batch_rpw())]
-                .into_iter()
-                .map(|o| CString::new(o).unwrap())
-                .collect();
-            let opt_ptrs: Vec<*const c_char> = opts.iter().map(|o| o.as_ptr()).collect();
+            let copts: Vec<CString> = opts.iter().map(|o| CString::new(o.as_str()).unwrap()).collect();
+            let opt_ptrs: Vec<*const c_char> = copts.iter().map(|o| o.as_ptr()).collect();
             let rc = (f.nvrtcCompileProgram)(prog, opt_ptrs.len() as i32, opt_ptrs.as_ptr());
             if rc != 0 {
                 let mut n = 0usize;
@@ -2087,13 +2109,31 @@ impl Kernels {
                 return Err(format!("kernel compile failed:\n{}", CStr::from_ptr(log.as_ptr()).to_string_lossy()));
             }
             let mut n = 0usize;
-            (f.nvrtcGetPTXSize)(prog, &mut n);
-            let mut ptx = vec![0 as c_char; n];
-            (f.nvrtcGetPTX)(prog, ptx.as_mut_ptr());
+            (f.nvrtcGetCUBINSize)(prog, &mut n);
+            let mut bin = vec![0u8; n];
+            (f.nvrtcGetCUBIN)(prog, bin.as_mut_ptr() as *mut c_char);
             (f.nvrtcDestroyProgram)(&mut prog);
+            bin
+        };
+        if let (true, Some(dir), Some(file)) = (use_cache, &dir, &file) {
+            // best effort: a missing cache only costs the next start a compile
+            if std::fs::create_dir_all(dir).is_ok() {
+                let tmp = file.with_extension("tmp");
+                if std::fs::write(&tmp, &bin).is_ok() {
+                    let _ = std::fs::rename(&tmp, file);
+                }
+            }
+        }
+        Ok(bin)
+    }
 
+    fn compile() -> Result<Kernels, String> {
+        let a = api()?;
+        let f = &a.f;
+        let bin = Self::binary(a)?;
+        unsafe {
             let mut module: Ptr = std::ptr::null_mut();
-            a.check((f.cuModuleLoadData)(&mut module, ptx.as_ptr() as *const c_void), "load kernels")?;
+            a.check((f.cuModuleLoadData)(&mut module, bin.as_ptr() as *const c_void), "load kernels")?;
             let get = |name: &str| -> Result<Ptr, String> {
                 let c = CString::new(name).unwrap();
                 let mut func: Ptr = std::ptr::null_mut();
@@ -2168,6 +2208,207 @@ impl Kernels {
     }
 }
 
+// ---------------------------------------------------------------- weight upload
+
+/// Streams host data into device memory through two pinned staging buffers on a copy stream of its own:
+/// while the GPU copies one buffer, the CPU fills the other (several threads, so reading the mapped
+/// model file overlaps too). Device memory is ready once `finish` returns.
+struct Uploader {
+    pinned: [*mut u8; 2],
+    events: [Ptr; 2],
+    stream: Ptr,
+    next: usize,
+    files: Vec<std::fs::File>, // one read handle per worker thread
+    wait_secs: f64,            // BETTERLLAMA_LOAD_TIMES: time spent waiting for the GPU copies
+    file_secs: f64,            // reading (and repacking) tensors
+    alloc_secs: f64,
+    bytes: usize,
+}
+
+const STAGE_BYTES: usize = 32 << 20;
+
+/// Fills `buf` from `file` at `offset` (positioned reads: no shared cursor).
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> Result<(), String> {
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+    #[cfg(not(windows))]
+    use std::os::unix::fs::FileExt;
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = file.seek_read(buf, offset);
+        #[cfg(not(windows))]
+        let n = file.read_at(buf, offset);
+        match n {
+            Ok(0) => return Err("model file ended early".into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) => return Err(format!("reading the model file: {e}")),
+        }
+    }
+    Ok(())
+}
+const GPU_Q6K_BYTES: usize = 208; // a Q6_K block on the GPU, without its d (must match Q6K_BYTES in the kernels)
+
+impl Uploader {
+    fn new() -> Result<Uploader, String> {
+        let a = api()?;
+        let mut up = Uploader { pinned: [std::ptr::null_mut(); 2], events: [std::ptr::null_mut(); 2], stream: std::ptr::null_mut(), next: 0, files: Vec::new(), wait_secs: 0.0, bytes: 0, file_secs: 0.0, alloc_secs: 0.0 };
+        unsafe {
+            for i in 0..2 {
+                let mut p: *mut c_void = std::ptr::null_mut();
+                a.check((a.f.cuMemAllocHost_v2)(&mut p, STAGE_BYTES), "pinned staging buffer")?;
+                up.pinned[i] = p as *mut u8;
+                a.check((a.f.cuEventCreate)(&mut up.events[i], 0), "event")?;
+            }
+            a.check((a.f.cuStreamCreate)(&mut up.stream, 0), "copy stream")?;
+        }
+        Ok(up)
+    }
+
+    /// Copies `src` to device address `dst`.
+    fn put(&mut self, dst: u64, src: &[u8]) -> Result<(), String> {
+        use rayon::prelude::*;
+        let a = api()?;
+        for (i, chunk) in src.chunks(STAGE_BYTES).enumerate() {
+            let b = self.next;
+            self.next ^= 1;
+            unsafe {
+                let tw = std::time::Instant::now();
+                a.check((a.f.cuEventSynchronize)(self.events[b]), "staging wait")?; // the GPU is done with this buffer
+                self.wait_secs += tw.elapsed().as_secs_f64();
+                self.bytes += chunk.len();
+                let stage = std::slice::from_raw_parts_mut(self.pinned[b], chunk.len());
+                stage.par_chunks_mut(1 << 20).zip(chunk.par_chunks(1 << 20)).for_each(|(d, s)| d.copy_from_slice(s));
+                a.check((a.f.cuMemcpyHtoDAsync_v2)(dst + (i * STAGE_BYTES) as u64, self.pinned[b] as *const c_void, chunk.len(), self.stream), "copy to GPU")?;
+                a.check((a.f.cuEventRecord)(self.events[b], self.stream), "event record")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies `len` bytes of the file at `path`, from `offset`, to device address `dst`: read straight
+    /// into the staging buffers by several threads, each with its own handle (Windows serialises
+    /// synchronous reads on one handle), which is faster than paging the memory-mapped file in.
+    fn put_file(&mut self, dst: u64, path: &std::path::Path, offset: u64, len: usize) -> Result<(), String> {
+        use rayon::prelude::*;
+        let a = api()?;
+        self.open(path)?;
+        let parts = self.files.len();
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(STAGE_BYTES);
+            let b = self.next;
+            self.next ^= 1;
+            unsafe {
+                let tw = std::time::Instant::now();
+                a.check((a.f.cuEventSynchronize)(self.events[b]), "staging wait")?;
+                self.wait_secs += tw.elapsed().as_secs_f64();
+                self.bytes += n;
+                let stage = std::slice::from_raw_parts_mut(self.pinned[b], n);
+                let piece = n.div_ceil(parts);
+                let files = &self.files;
+                stage.par_chunks_mut(piece).enumerate().try_for_each(|(i, buf)| read_exact_at(&files[i], buf, offset + (done + i * piece) as u64))?;
+                a.check((a.f.cuMemcpyHtoDAsync_v2)(dst + done as u64, self.pinned[b] as *const c_void, n, self.stream), "copy to GPU")?;
+                a.check((a.f.cuEventRecord)(self.events[b], self.stream), "event record")?;
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn open(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if self.files.is_empty() {
+            for _ in 0..rayon::current_num_threads().max(1) {
+                self.files.push(std::fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?);
+            }
+        }
+        Ok(())
+    }
+
+    /// A tensor of lk_in-byte blocks from the file, rewritten block by block (split: the
+    /// lk_out-byte GPU block, returning the block's scale for d) straight into the staging buffers
+    /// and copied to dst. Reading and repacking both run on all threads.
+    fn put_repacked(
+        &mut self,
+        dst: u64,
+        path: &std::path::Path,
+        offset: u64,
+        len: usize,
+        (blk_in, blk_out): (usize, usize),
+        d: &mut Vec<f32>,
+        split: fn(&[u8], &mut [u8]) -> f32,
+    ) -> Result<(), String> {
+        use rayon::prelude::*;
+        let a = api()?;
+        self.open(path)?;
+        let mut raw = vec![0u8; len];
+        let piece = len.div_ceil(self.files.len());
+        let files = &self.files;
+        raw.par_chunks_mut(piece).enumerate().try_for_each(|(i, buf)| read_exact_at(&files[i], buf, offset + (i * piece) as u64))?;
+        let blocks = len / blk_in;
+        let per_stage = STAGE_BYTES / blk_out;
+        d.reserve(blocks);
+        for start in (0..blocks).step_by(per_stage) {
+            let nb = per_stage.min(blocks - start);
+            let b = self.next;
+            self.next ^= 1;
+            unsafe {
+                let tw = std::time::Instant::now();
+                a.check((a.f.cuEventSynchronize)(self.events[b]), "staging wait")?;
+                self.wait_secs += tw.elapsed().as_secs_f64();
+                self.bytes += nb * blk_out;
+                let stage = std::slice::from_raw_parts_mut(self.pinned[b], nb * blk_out);
+                let src = &raw[start * blk_in..(start + nb) * blk_in];
+                let scales: Vec<f32> = stage.par_chunks_mut(blk_out).zip(src.par_chunks(blk_in)).map(|(o, i)| split(i, o)).collect();
+                d.extend_from_slice(&scales);
+                a.check((a.f.cuMemcpyHtoDAsync_v2)(dst + (start * blk_out) as u64, self.pinned[b] as *const c_void, nb * blk_out, self.stream), "copy to GPU")?;
+                a.check((a.f.cuEventRecord)(self.events[b], self.stream), "event record")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn put_vec<T: Copy>(&mut self, data: &[T]) -> Result<DeviceBuf, String> {
+        let bytes = std::mem::size_of_val(data);
+        let buf = DeviceBuf::alloc(bytes)?;
+        self.put(buf.ptr, unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) })?;
+        Ok(buf)
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        let a = api()?;
+        let tw = std::time::Instant::now();
+        a.check(unsafe { (a.f.cuStreamSynchronize)(self.stream) }, "weight upload")?;
+        self.wait_secs += tw.elapsed().as_secs_f64();
+        if std::env::var_os("BETTERLLAMA_LOAD_TIMES").is_some() {
+            eprintln!(
+                "[upload: {:.0} MB; reading and repacking {:.0} ms, allocations {:.0} ms, waiting for GPU copies {:.0} ms]",
+                self.bytes as f64 / 1e6,
+                self.file_secs * 1000.0,
+                self.alloc_secs * 1000.0,
+                self.wait_secs * 1000.0
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Uploader {
+    fn drop(&mut self) {
+        if let Ok(a) = api() {
+            unsafe {
+                (a.f.cuStreamSynchronize)(self.stream);
+                for i in 0..2 {
+                    (a.f.cuMemFreeHost)(self.pinned[i] as *mut c_void);
+                    (a.f.cuEventDestroy_v2)(self.events[i]);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- model
 
 /// Weight format on the GPU (matches `fmt` in the kernels).
@@ -2197,73 +2438,80 @@ impl GpuMatrix {
     }
 }
 
-/// Appends one tensor's blocks to `q`/`d` in the GPU layout of its format.
-fn repack(ty: GgmlType, raw: &[u8], q: &mut Vec<u8>, d: &mut Vec<f32>) -> Result<Fmt, String> {
-    let f16 = |b: &[u8]| f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-    match ty {
-        GgmlType::Q8_0 => {
-            for blk in raw.chunks_exact(34) {
-                d.push(f16(blk));
-                q.extend_from_slice(&blk[2..]);
-            }
-            Ok(Fmt::Q8)
-        }
-        GgmlType::Q4K => {
-            q.extend_from_slice(raw); // 144-byte blocks: already 16-byte multiples
-            Ok(Fmt::Q4K)
-        }
-        GgmlType::Q6K => {
-            for blk in raw.chunks_exact(210) {
-                q.extend_from_slice(&blk[..208]);
-                d.push(f16(&blk[208..]));
-            }
-            Ok(Fmt::Q6K)
-        }
-        other => Err(format!("GPU backend does not handle {} weights yet", other.name())),
-    }
-}
-
 /// Uploads tensors whose rows are concatenated in one output (e.g. Q, K and V). Neighbours of the same
 /// format are merged into one matrix (one launch); returns each matrix with its output row offset.
-fn upload_parts(g: &Gguf, names: &[String]) -> Result<Vec<(GpuMatrix, usize)>, String> {
+fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(GpuMatrix, usize)>, String> {
     let mut parts = Vec::new();
     let mut i = 0;
     let mut row_off = 0;
     while i < names.len() {
         let ty = g.tensor(&names[i]).ok_or_else(|| format!("missing tensor {}", names[i]))?.ty;
-        let (mut q, mut d) = (Vec::new(), Vec::new());
-        let (mut rows, mut cols, mut fmt) = (0, 0, Fmt::Q8);
-        while i < names.len() {
-            let t = g.tensor(&names[i]).ok_or_else(|| format!("missing tensor {}", names[i]))?;
-            if t.ty != ty {
-                break;
-            }
-            cols = t.dims[0] as usize;
+        // the run of neighbours with this format, merged into one matrix
+        let mut run = Vec::new();
+        while let Some(t) = names.get(i).and_then(|n| g.tensor(n)).filter(|t| t.ty == ty) {
+            let cols = t.dims[0] as usize;
             if (cols % 256 != 0 && ty != GgmlType::Q8_0) || cols % 32 != 0 {
                 return Err(format!("unsupported row length {cols} in {}", names[i]));
             }
-            rows += t.dims[1] as usize;
-            fmt = repack(t.ty, &g.mmap[t.offset..t.offset + t.n_bytes], &mut q, &mut d)?;
+            run.push(t);
             i += 1;
         }
-        let d = if fmt != Fmt::Q4K { Some(DeviceBuf::upload(&d)?) } else { None };
-        parts.push((GpuMatrix { fmt, q: DeviceBuf::upload(&q)?, d, rows, cols }, row_off));
+        let cols = run[0].dims[0] as usize;
+        let rows: usize = run.iter().map(|t| t.dims[1] as usize).sum();
+        let (fmt, gpu_bytes) = match ty {
+            GgmlType::Q8_0 => (Fmt::Q8, rows * cols),
+            GgmlType::Q4K => (Fmt::Q4K, run.iter().map(|t| t.n_bytes).sum()),
+            GgmlType::Q6K => (Fmt::Q6K, rows * (cols / 256) * GPU_Q6K_BYTES),
+            other => return Err(format!("GPU backend does not handle {} weights yet", other.name())),
+        };
+        let ta = std::time::Instant::now();
+        let q = DeviceBuf::alloc(gpu_bytes)?;
+        up.alloc_secs += ta.elapsed().as_secs_f64();
+        let mut off = 0;
+        let mut d = Vec::new();
+        for t in run {
+            let tf = std::time::Instant::now();
+            let dst = q.ptr + off as u64;
+            match fmt {
+                // the GGUF blocks as they are, straight from the file
+                Fmt::Q4K => up.put_file(dst, &g.path, t.offset as u64, t.n_bytes)?,
+                // 210-byte blocks: the f16 d at the end goes to its own array
+                Fmt::Q6K => up.put_repacked(dst, &g.path, t.offset as u64, t.n_bytes, (210, GPU_Q6K_BYTES), &mut d, |i, o| {
+                    o.copy_from_slice(&i[..GPU_Q6K_BYTES]);
+                    f16_to_f32(u16::from_le_bytes([i[GPU_Q6K_BYTES], i[GPU_Q6K_BYTES + 1]]))
+                })?,
+                // 34-byte blocks: f16 d, then 32 int8 values
+                Fmt::Q8 => up.put_repacked(dst, &g.path, t.offset as u64, t.n_bytes, (34, 32), &mut d, |i, o| {
+                    o.copy_from_slice(&i[2..]);
+                    f16_to_f32(u16::from_le_bytes([i[0], i[1]]))
+                })?,
+            }
+            off += match fmt {
+                Fmt::Q4K => t.n_bytes,
+                Fmt::Q6K => t.n_bytes / 210 * GPU_Q6K_BYTES,
+                Fmt::Q8 => t.n_bytes / 34 * 32,
+            };
+            up.file_secs += tf.elapsed().as_secs_f64();
+        }
+        let d = if fmt != Fmt::Q4K { Some(up.put_vec(&d)?) } else { None };
+        parts.push((GpuMatrix { fmt, q, d, rows, cols }, row_off));
         row_off += rows;
     }
     Ok(parts)
 }
 
-fn upload_one(g: &Gguf, name: &str) -> Result<GpuMatrix, String> {
-    Ok(upload_parts(g, &[name.to_string()])?.pop().unwrap().0)
+fn upload_one(g: &Gguf, name: &str, up: &mut Uploader) -> Result<GpuMatrix, String> {
+    Ok(upload_parts(g, &[name.to_string()], up)?.pop().unwrap().0)
 }
 
-fn upload_vec(g: &Gguf, name: &str) -> Result<DeviceBuf, String> {
+fn upload_vec(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, String> {
     let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     if t.ty != GgmlType::F32 {
         return Err(format!("GPU backend expects F32 norm weights ({name} is {})", t.ty.name()));
     }
-    let v: Vec<f32> = g.mmap[t.offset..t.offset + t.n_bytes].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-    DeviceBuf::upload(&v)
+    let buf = DeviceBuf::alloc(t.n_bytes)?;
+    up.put(buf.ptr, &g.mmap[t.offset..t.offset + t.n_bytes])?;
+    Ok(buf)
 }
 
 struct GpuLayer {
@@ -2295,25 +2543,28 @@ impl GpuModel {
         if cfg.head_dim > ATT_MAX_HD || ATT_MAX_HD % cfg.head_dim != 0 || cfg.head_dim % 4 != 0 {
             return Err(format!("GPU backend: head size {} not supported (needs a divisor of {ATT_MAX_HD})", cfg.head_dim));
         }
+        let t0 = std::time::Instant::now();
         let a = api()?;
+        let t_api = t0.elapsed();
         let k = Arc::new(Kernels::compile()?);
-        let opt_vec = |name: String| g.tensor(&name).map(|_| upload_vec(g, &name)).transpose();
+        let t_kernels = t0.elapsed();
+        let mut up = Uploader::new()?;
+        let up = &mut up;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
-            layers.push(GpuLayer {
-                attn_norm: upload_vec(g, &p("attn_norm"))?,
-                qkv: upload_parts(g, &[p("attn_q"), p("attn_k"), p("attn_v")])?,
-                q_norm: opt_vec(p("attn_q_norm"))?,
-                k_norm: opt_vec(p("attn_k_norm"))?,
-                wo: upload_one(g, &p("attn_output"))?,
-                ffn_norm: upload_vec(g, &p("ffn_norm"))?,
-                gate_up: upload_parts(g, &[p("ffn_gate"), p("ffn_up")])?,
-                down: upload_one(g, &p("ffn_down"))?,
-            });
+            let attn_norm = upload_vec(g, &p("attn_norm"), up)?;
+            let qkv = upload_parts(g, &[p("attn_q"), p("attn_k"), p("attn_v")], up)?;
+            let q_norm = if g.tensor(&p("attn_q_norm")).is_some() { Some(upload_vec(g, &p("attn_q_norm"), up)?) } else { None };
+            let k_norm = if g.tensor(&p("attn_k_norm")).is_some() { Some(upload_vec(g, &p("attn_k_norm"), up)?) } else { None };
+            let wo = upload_one(g, &p("attn_output"), up)?;
+            let ffn_norm = upload_vec(g, &p("ffn_norm"), up)?;
+            let gate_up = upload_parts(g, &[p("ffn_gate"), p("ffn_up")], up)?;
+            let down = upload_one(g, &p("ffn_down"), up)?;
+            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, wo, ffn_norm, gate_up, down });
         }
-        let embd = upload_one(g, "token_embd.weight")?;
-        let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight")?) } else { None };
+        let embd = upload_one(g, "token_embd.weight", up)?;
+        let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight", up)?) } else { None };
 
         // prompt attention: dynamic shared memory above the default 48 KB has to be requested per kernel
         let ld = cfg.head_dim + 1;
@@ -2327,7 +2578,19 @@ impl GpuModel {
         if out_rows != cfg.vocab {
             return Err(format!("output layer has {out_rows} rows but the vocabulary has {} tokens", cfg.vocab));
         }
-        Ok(GpuModel { output_norm: upload_vec(g, "output_norm.weight")?, cfg, k, embd, output, layers, prefill_shared, device, int8_q8: false })
+        let output_norm = upload_vec(g, "output_norm.weight", up)?;
+        up.finish()?;
+        let model = GpuModel { output_norm, cfg, k, embd, output, layers, prefill_shared, device, int8_q8: false };
+        if std::env::var_os("BETTERLLAMA_LOAD_TIMES").is_some() {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[GPU load: driver {:.0} ms, kernels {:.0} ms, weights {:.0} ms]",
+                ms(t_api),
+                ms(t_kernels - t_api),
+                ms(t0.elapsed() - t_kernels)
+            );
+        }
+        Ok(model)
     }
 
     /// With BETTERLLAMA_PROFILE set, waits for the GPU after `f` so its time lands in bucket `op`.

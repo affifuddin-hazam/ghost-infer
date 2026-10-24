@@ -162,6 +162,8 @@ pub struct Gguf {
     pub metadata: BTreeMap<String, Value>,
     pub tensors: Vec<TensorInfo>,
     pub mmap: Mmap,
+    /// where the file is (the GPU loader reads tensors straight from it)
+    pub path: std::path::PathBuf,
 }
 
 struct Reader<'a> {
@@ -268,7 +270,7 @@ impl Gguf {
             tensors.push(TensorInfo { name, dims, ty, offset, n_bytes });
         }
 
-        Ok(Gguf { version, metadata, tensors, mmap })
+        Ok(Gguf { version, metadata, tensors, mmap, path: path.to_path_buf() })
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
