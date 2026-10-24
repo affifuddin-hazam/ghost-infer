@@ -99,6 +99,17 @@ __device__ __forceinline__ float h2f(unsigned int h) {
     asm("{.reg .b16 t; cvt.u16.u32 t, %1; cvt.f32.f16 %0, t;}" : "=f"(f) : "r"(h));
     return f;
 }
+// The KV cache holds f16 (half the memory of f32); attention arithmetic stays in f32.
+__device__ __forceinline__ unsigned short f2h(float f) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+// 4 f16 values (one 8-byte load) to floats
+__device__ __forceinline__ float4 h4f(const unsigned short* p) {
+    uint2 w = *reinterpret_cast<const uint2*>(p);
+    return make_float4(h2f(w.x & 0xFFFF), h2f(w.x >> 16), h2f(w.y & 0xFFFF), h2f(w.y >> 16));
+}
 // d and dmin of a Q4_K block (one 32-bit load)
 __device__ __forceinline__ void q4k_dm(const unsigned char* b, float* d, float* dmin) {
     unsigned int w = *reinterpret_cast<const unsigned int*>(b);
@@ -166,7 +177,7 @@ __global__ void embed(int fmt, const unsigned char* __restrict__ w, const float*
 // q and k, and k, v copied into the cache. grid (tokens, n_heads + 2 * n_kv), block = 64.
 // neox: pairs (x[i], x[i + rope_dim/2]) (Qwen); otherwise adjacent pairs (x[2i], x[2i+1]) (GGUF llama).
 __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
-                             float* __restrict__ kc, float* __restrict__ vc, int pos0, const int* __restrict__ posp, int n_heads,
+                             unsigned short* __restrict__ kc, unsigned short* __restrict__ vc, int pos0, const int* __restrict__ posp, int n_heads,
                              int n_kv, int hd, int rope_dim, float base, int neox, float eps) {
     __shared__ float sh[32];
     if (posp) pos0 = *posp; // CUDA graphs: the position comes from device memory
@@ -175,7 +186,7 @@ __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ 
     float* row = qkv + (size_t)b * (q_dim + 2 * kv_dim);
     if (h >= n_heads + n_kv) { // a v head: straight into the cache (same for the whole block)
         int vh = h - n_heads - n_kv;
-        for (int d = threadIdx.x; d < hd; d += blockDim.x) vc[(size_t)pos * kv_dim + vh * hd + d] = row[q_dim + kv_dim + vh * hd + d];
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) vc[(size_t)pos * kv_dim + vh * hd + d] = f2h(row[q_dim + kv_dim + vh * hd + d]);
         return;
     }
     float* vec = row + h * hd; // k heads directly follow the q heads
@@ -201,7 +212,7 @@ __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ 
     if (h >= n_heads) {
         __syncthreads();
         int kh = h - n_heads;
-        for (int d = threadIdx.x; d < hd; d += blockDim.x) kc[(size_t)pos * kv_dim + kh * hd + d] = vec[d];
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) kc[(size_t)pos * kv_dim + kh * hd + d] = f2h(vec[d]);
     }
 }
 
@@ -641,7 +652,7 @@ __device__ __forceinline__ int att_chunk_for(int span, int want) {
 // floats of the key (one coalesced row read) and the dot products are reduced across the warp.
 // Writes each head's unnormalised output, max score and exp-sum to `part`, or (nsplit == 1) the final
 // normalised result to `out`. Needs hd a multiple of 32 (<= 128) and G <= ATT_MAX_G.
-__global__ void attention_partial_gqa(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
+__global__ void attention_partial_gqa(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
                                       float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp,
                                       int n_heads, int n_kv, int hd, float scale, int nsplit, int want) {
     if (posp) pos0 = *posp;
@@ -671,10 +682,10 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const float
         for (int e = 0; e < 4; e++) q[g][e] = (g < G && e < per) ? qrow[g * hd + e] * scale : 0.f;
 
     for (int t = warp; t < len; t += nwarps) {
-        const float* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd + lane * per;
+        const unsigned short* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd + lane * per;
         float k4[4] = {0.f, 0.f, 0.f, 0.f};
-        if (per == 4) { float4 v = *reinterpret_cast<const float4*>(kt); k4[0] = v.x; k4[1] = v.y; k4[2] = v.z; k4[3] = v.w; }
-        else { float2 v = *reinterpret_cast<const float2*>(kt); k4[0] = v.x; k4[1] = v.y; }
+        if (per == 4) { float4 v = h4f(kt); k4[0] = v.x; k4[1] = v.y; k4[2] = v.z; k4[3] = v.w; }
+        else { unsigned w = *reinterpret_cast<const unsigned*>(kt); k4[0] = h2f(w & 0xFFFF); k4[1] = h2f(w >> 16); }
         #pragma unroll
         for (int g = 0; g < ATT_MAX_G; g++) {
             if (g < G) {
@@ -707,9 +718,9 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const float
         float a[ATT_MAX_G];
         #pragma unroll
         for (int g = 0; g < ATT_MAX_G; g++) a[g] = 0.f;
-        const float* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + tid;
+        const unsigned short* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + tid;
         for (int t = 0; t < len; t++) {
-            float v = vcol[(size_t)t * kv_dim];
+            float v = h2f(vcol[(size_t)t * kv_dim]);
             #pragma unroll
             for (int g = 0; g < ATT_MAX_G; g++) if (g < G) a[g] += sc[g][t] * v;
         }
@@ -733,7 +744,7 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const float
 // one block per (head, token, slice of `chunk` positions). Writes the slice's unnormalised output plus
 // its max score and exp-sum to `part` (hd + 2 floats).
 // With nsplit == 1 there is nothing to merge: the block writes the normalised result straight to `out`.
-__global__ void attention_partial(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
+__global__ void attention_partial(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
                                   float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp, int n_heads, int n_kv, int hd,
                                   float scale, int nsplit, int want) {
     if (posp) pos0 = *posp;
@@ -759,10 +770,10 @@ __global__ void attention_partial(const float* __restrict__ qkv, const float* __
 
     float mx = NEG_INF;
     for (int t = threadIdx.x; t < len; t += blockDim.x) {
-        const float4* kt = reinterpret_cast<const float4*>(kc + (size_t)(t0 + t) * kv_dim + kvh * hd);
+        const unsigned short* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd;
         float acc = 0.f;
         for (int d = 0; d < hd / 4; d++) {
-            float4 k4 = kt[d];
+            float4 k4 = h4f(kt + 4 * d);
             acc += qs[4 * d] * k4.x + qs[4 * d + 1] * k4.y + qs[4 * d + 2] * k4.z + qs[4 * d + 3] * k4.w;
         }
         acc *= scale;
@@ -783,7 +794,7 @@ __global__ void attention_partial(const float* __restrict__ qkv, const float* __
     int g = threadIdx.x / hd, d = threadIdx.x % hd;
     if (g < groups) {
         float acc = 0.f;
-        for (int t = g; t < len; t += groups) acc += sc[t] * vc[(size_t)(t0 + t) * kv_dim + kvh * hd + d];
+        for (int t = g; t < len; t += groups) acc += sc[t] * h2f(vc[(size_t)(t0 + t) * kv_dim + kvh * hd + d]);
         accs[g][d] = acc;
     }
     __syncthreads();
@@ -802,7 +813,7 @@ __global__ void attention_partial(const float* __restrict__ qkv, const float* __
 // covers keys g, g+8, g+16, g+24 of the tile, for outputs the dims g, g+8, ... (interleaved: no bank conflicts).
 #define PQT 32
 #define PKT 32
-__global__ void attention_prefill(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
+__global__ void attention_prefill(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
                                   float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, int hd, float scale) {
     extern __shared__ float smem[];
     int ld = hd + 1; // padded row stride: rows land on different banks
@@ -833,8 +844,8 @@ __global__ void attention_prefill(const float* __restrict__ qkv, const float* __
         for (int idx = tid; idx < PKT * hd; idx += blockDim.x) {
             int k = idx / hd, d = idx % hd, kp = t0 + k;
             bool ok = kp < kv_len;
-            Ks[k * ld + d] = ok ? kc[(size_t)kp * kv_dim + kvh * hd + d] : 0.f;
-            Vs[k * ld + d] = ok ? vc[(size_t)kp * kv_dim + kvh * hd + d] : 0.f;
+            Ks[k * ld + d] = ok ? h2f(kc[(size_t)kp * kv_dim + kvh * hd + d]) : 0.f;
+            Vs[k * ld + d] = ok ? h2f(vc[(size_t)kp * kv_dim + kvh * hd + d]) : 0.f;
         }
         __syncthreads();
 
@@ -921,11 +932,11 @@ __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
 // query tokens), 4 warps of 16 query rows. Q, K and V go through f16 m16n8k8 mma with f32 accumulators:
 // a warp keeps its Q rows as fragments in registers, S = Q K^T comes out in the accumulator layout,
 // which is also the A-fragment layout, so the probabilities feed O += P V without a trip through
-// shared memory. K/V tiles of 32 positions are converted to f16 into shared memory (rows padded by 16
+// shared memory. K/V tiles of 32 positions are copied (f16, as cached) into shared memory (rows padded by 16
 // bytes: ldmatrix rows hit different banks); the same buffer stages Q at the start. Online softmax in
 // base 2 (Q is pre-scaled by scale * log2 e). The row sums come from the tensor cores too (P x ones), so they\n// add up exactly the rounded probabilities that P V uses.
 template <int HD>
-__device__ void attn_prefill_tc(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
+__device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
                                 float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, float scale) {
     constexpr int BQ = 64, BK = 32, LDW = HD / 2 + 4; // row stride in f16x2 words
     __shared__ __align__(16) unsigned sm[2 * BK * LDW]; // Q staging (BQ rows), then K (BK rows) | V (BK rows)
@@ -974,13 +985,13 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const float* __re
         __syncthreads(); // previous tile (or the Q staging) consumed
         for (int idx = tid; idx < BK * HD / 4; idx += 128) {
             int r = idx / (HD / 4), c4 = idx % (HD / 4), kp = t0 + r;
-            float4 k4 = make_float4(0.f, 0.f, 0.f, 0.f), v4 = k4; // positions past the end must be finite: P = 0 there
-            if (kp < kv_len) {
-                k4 = *reinterpret_cast<const float4*>(kc + (size_t)kp * kv_dim + kvh * HD + 4 * c4);
-                v4 = *reinterpret_cast<const float4*>(vc + (size_t)kp * kv_dim + kvh * HD + 4 * c4);
+            uint2 k4 = make_uint2(0u, 0u), v4 = k4; // positions past the end must be finite (zeros): P = 0 there
+            if (kp < kv_len) { // the cache is f16 already: copied as is
+                k4 = *reinterpret_cast<const uint2*>(kc + (size_t)kp * kv_dim + kvh * HD + 4 * c4);
+                v4 = *reinterpret_cast<const uint2*>(vc + (size_t)kp * kv_dim + kvh * HD + 4 * c4);
             }
-            *reinterpret_cast<uint2*>(Ks + r * LDW + 2 * c4) = make_uint2(pack_h2(k4.x, k4.y), pack_h2(k4.z, k4.w));
-            *reinterpret_cast<uint2*>(Vs + r * LDW + 2 * c4) = make_uint2(pack_h2(v4.x, v4.y), pack_h2(v4.z, v4.w));
+            *reinterpret_cast<uint2*>(Ks + r * LDW + 2 * c4) = k4;
+            *reinterpret_cast<uint2*>(Vs + r * LDW + 2 * c4) = v4;
         }
         __syncthreads();
         if (t0 > warp_last) continue; // causal: nothing of this tile is visible to the warp's rows
@@ -1053,7 +1064,7 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const float* __re
 
 extern "C" {
 
-#define ATT_TC_ARGS const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc, \
+#define ATT_TC_ARGS const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc, \
                     float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, int hd, float scale
 __global__ void __launch_bounds__(128) attention_prefill_tc64(ATT_TC_ARGS) { attn_prefill_tc<64>(qkv, kc, vc, out, pos0, n, n_heads, n_kv, scale); }
 __global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { attn_prefill_tc<128>(qkv, kc, vc, out, pos0, n, n_heads, n_kv, scale); }
@@ -1882,6 +1893,7 @@ api! {
     cuModuleGetFunction: fn(*mut Ptr, Ptr, *const c_char) -> CuResult;
     cuMemAlloc_v2: fn(*mut u64, usize) -> CuResult;
     cuMemFree_v2: fn(u64) -> CuResult;
+    cuMemGetInfo_v2: fn(*mut usize, *mut usize) -> CuResult;
     cuMemcpyHtoD_v2: fn(u64, *const c_void, usize) -> CuResult;
     cuMemcpyDtoH_v2: fn(*mut c_void, u64, usize) -> CuResult;
     cuLaunchKernel: fn(Ptr, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> CuResult;
@@ -2879,7 +2891,7 @@ impl GpuModel {
         self.timed(0, || {
             k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(self.embd.fmt as i32), Arg::P(self.embd.q.ptr), Arg::P(self.embd.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)])
         })?;
-        let layer_kv = s.ctx * kv_dim * 4;
+        let layer_kv = s.ctx * kv_dim * 2; // f16
         let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
         for (l, layer) in self.layers.iter().enumerate() {
             let (kc, vc) = (s.k_cache.at(l * layer_kv), s.v_cache.at(l * layer_kv));
@@ -2987,32 +2999,77 @@ fn graphs_enabled() -> bool {
 impl GpuSession {
     pub fn new(cfg: &Config, ctx: usize) -> Result<GpuSession, String> {
         let ctx = ctx.min(cfg.max_ctx);
-        let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
-        let f = |n: usize| DeviceBuf::alloc(n * 4);
-        let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim);
-        // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 32 positions
-        let slices = SPLIT_MAX_BATCH * ctx.div_ceil(32);
+        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, k_cache, v_cache, logits_dev, picks, pos_dev] = Self::sizes(cfg, ctx).map(DeviceBuf::alloc);
         Ok(GpuSession {
-            xq: DeviceBuf::alloc(MAX_BATCH * widest)?,
-            xd: f(MAX_BATCH * widest / 32)?,
-            xsum: f(MAX_BATCH * widest / 32)?,
-            att_part: f(slices * cfg.n_heads * (cfg.head_dim + 2))?,
+            xq: xq?,
+            xd: xd?,
+            xsum: xsum?,
+            att_part: att_part?,
             pos: 0,
             ctx,
-            tokens: f(MAX_BATCH)?,
-            x: f(MAX_BATCH * cfg.dim)?,
-            xb: f(MAX_BATCH * cfg.dim)?,
-            qkv: f(MAX_BATCH * (q_dim + 2 * kv_dim))?,
-            att: f(MAX_BATCH * q_dim)?,
-            gu: f(MAX_BATCH * 2 * cfg.ffn_dim)?,
-            h: f(MAX_BATCH * cfg.ffn_dim)?,
-            k_cache: f(cfg.n_layers * ctx * kv_dim)?,
-            v_cache: f(cfg.n_layers * ctx * kv_dim)?,
-            logits_dev: f(DECODE_MAX_BATCH * cfg.vocab)?,
-            picks: f(DECODE_MAX_BATCH)?,
-            pos_dev: f(1)?,
+            tokens: tokens?,
+            x: x?,
+            xb: xb?,
+            qkv: qkv?,
+            att: att?,
+            gu: gu?,
+            h: h?,
+            k_cache: k_cache?,
+            v_cache: v_cache?,
+            logits_dev: logits_dev?,
+            picks: picks?,
+            pos_dev: pos_dev?,
             graphs: [std::ptr::null_mut(); 2],
             logits: vec![0.0; cfg.vocab],
         })
     }
+
+    /// Bytes of each device buffer, in the order `new` takes them.
+    fn sizes(cfg: &Config, ctx: usize) -> [usize; 16] {
+        let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
+        let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim);
+        // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 32 positions
+        let slices = SPLIT_MAX_BATCH * ctx.div_ceil(32);
+        let kv = cfg.n_layers * ctx * kv_dim * 2; // f16
+        [
+            MAX_BATCH * widest,
+            4 * MAX_BATCH * widest / 32,
+            4 * MAX_BATCH * widest / 32,
+            4 * slices * cfg.n_heads * (cfg.head_dim + 2),
+            4 * MAX_BATCH,
+            4 * MAX_BATCH * cfg.dim,
+            4 * MAX_BATCH * cfg.dim,
+            4 * MAX_BATCH * (q_dim + 2 * kv_dim),
+            4 * MAX_BATCH * q_dim,
+            4 * MAX_BATCH * 2 * cfg.ffn_dim,
+            4 * MAX_BATCH * cfg.ffn_dim,
+            kv,
+            kv,
+            4 * DECODE_MAX_BATCH * cfg.vocab,
+            4 * DECODE_MAX_BATCH,
+            4,
+        ]
+    }
+}
+
+/// GPU memory kept free when the context is sized automatically: the desktop, other programs, and
+/// the driver's own allocations (CUDA graphs, launch buffers). On Windows going over does not fail:
+/// the driver quietly moves memory to the much slower system RAM.
+const FIT_RESERVE: usize = 384 << 20;
+
+/// The longest context (a multiple of 1024, at most every model's limit) for which a session of each
+/// of these models fits in the GPU memory now free.
+pub fn fit_ctx(cfgs: &[&Config]) -> Result<usize, String> {
+    let a = api()?;
+    let (mut free, mut _total) = (0usize, 0usize);
+    a.check(unsafe { (a.f.cuMemGetInfo_v2)(&mut free, &mut _total) }, "memory info")?;
+    let need = |ctx: usize| cfgs.iter().map(|c| GpuSession::sizes(c, ctx).iter().sum::<usize>()).sum::<usize>() + FIT_RESERVE;
+    let limit = cfgs.iter().map(|c| c.max_ctx).min().unwrap_or(2048);
+    let mut ctx = 1024.min(limit);
+    while ctx + 1024 <= limit && need(ctx + 1024) <= free {
+        ctx += 1024;
+    }    if need(ctx) > free {
+        eprintln!("[note: only {} MB of GPU memory is free; a {ctx}-token context will partly live in system RAM and run slowly]", free >> 20);
+    }
+    Ok(ctx)
 }

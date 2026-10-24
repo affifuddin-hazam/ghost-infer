@@ -30,7 +30,9 @@ and cultural attractions. Paris is a major global city, and its population is ap
   integer multiply-adds and the Q4_K mins go through the tensor cores too. Generation uses `dp4a`
   matrix-vector kernels for K-quants (16-byte loads, 84–97% of DRAM bandwidth on an 8B model), RMSNorm and
   SiLU kernels that write the int8 activations directly, and split-context ("flash-decoding") attention
-  that reads each key/value row once per head group. One-token steps replay a CUDA graph.
+  that reads each key/value row once per head group. One-token steps replay a CUDA graph. The KV cache is
+  f16 (half the memory of f32, same greedy output in tests), and `chat`/`serve` size the context to the
+  GPU memory the weights leave free.
 - **Speculative decoding** (`--draft small.gguf`, GPU, greedy): a small model with the same tokenizer
   guesses a few tokens ahead and the main model checks them all in one batched pass. The output is
   exactly the plain greedy output: a token's logits are bit-identical whether it is computed alone or
@@ -39,7 +41,8 @@ and cultural attractions. Paris is a major global city, and its population is ap
 - **Chat**: ChatML template (SmolLM2, Qwen), multi-turn with the KV cache kept between turns.
 - **OpenAI-compatible server** (`serve`) with a built-in chat page: open the server's address in a browser,
   or use `/v1/chat/completions` and `/v1/completions` (with streaming) and `/v1/models`, so chat apps and
-  editor plugins that talk to OpenAI or Ollama can use it. It keeps the
+  editor plugins that talk to OpenAI or Ollama can use it. Tool calling works the OpenAI way (`tools`,
+  `tool_calls`, `role: "tool"` results), so agent harnesses can run on it. It keeps the
   last conversation in the cache: when a client resends the history with a new message, only the new
   part is read.
 
@@ -82,7 +85,7 @@ Options for `run`, `chat`, `serve` and `bench`:
 | `--top-k <n>` | 40 | keep the k most likely tokens (`0` = all) |
 | `--top-p <f>` | 0.9 | nucleus sampling cut-off |
 | `--seed <n>` | time | sampling seed |
-| `--ctx <n>` | 2048 | context window in tokens |
+| `--ctx <n>` | `run`, `bench`: 2048; `chat`, `serve`: as much as fits | context window in tokens. On the GPU `chat` and `serve` take the longest that fits in the free memory, keeping 384 MB spare (on Windows, going over does not fail: the driver quietly moves memory to system RAM and everything slows down); on the CPU 4096 |
 | `--system <text>` | template's | system prompt |
 | `--raw` | | send the prompt as-is, without the chat template |
 | `--gpu` | | run on the NVIDIA GPU |
@@ -109,17 +112,22 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | Endpoint | |
 |---|---|
-| `POST /v1/chat/completions` | `messages` (system / user / assistant, text content), `stream`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `stream_options.include_usage` |
+| `POST /v1/chat/completions` | `messages` (system / user / assistant / tool, text content), `tools`, `tool_choice` (`"none"` hides the tools), `stream`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `stream_options.include_usage`, `chat_template_kwargs.enable_thinking` |
 | `POST /v1/completions` | the same with a raw `prompt` instead of messages (no chat template) |
-| `GET /v1/models` | the loaded model (its file name) |
+| `GET /v1/models` | the loaded model (its file name) and its `context_length` |
 | `GET /` | the chat page |
 | `GET /health` | `{"status":"ok"}` |
 
 Requests run one at a time. Unset sampling fields use the command-line defaults (`-t`, `--top-k`,
 `--top-p`, `-n`). Greedy requests (`"temperature": 0`) use the `--draft` model when one is loaded, with
 the same output. Replies include special tokens such as Qwen3's `<think>` blocks as text, which chat apps
-that understand them can fold away. Images, tools/function calls, log-probabilities and several choices
-per request (`n`) are not supported.
+that understand them can fold away. Images, log-probabilities and several choices per request (`n`) are
+not supported.
+
+Tools are written into the prompt the way Qwen's chat template writes them (checked against the template
+in the GGUF), and the model's `<tool_call>` blocks come back as `tool_calls` with `finish_reason`
+`"tool_calls"`; streamed, each call is one `delta.tool_calls` chunk. The tool list counts against the
+context, so with a small context send only the tools a request needs.
 
 ### GPU requirements
 

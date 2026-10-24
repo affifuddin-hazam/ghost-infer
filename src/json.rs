@@ -61,11 +61,19 @@ impl Json {
     /// Compact JSON text.
     pub fn to_string(&self) -> String {
         let mut out = String::new();
-        self.write(&mut out);
+        self.write(&mut out, false);
         out
     }
 
-    fn write(&self, out: &mut String) {
+    /// JSON as Python's `json.dumps` writes it (", " and ": " between items), which is what chat
+    /// templates' `tojson` gives: tool lists in the prompt then look like what the model was trained on.
+    pub fn to_python_string(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out, true);
+        out
+    }
+
+    fn write(&self, out: &mut String, py: bool) {
         match self {
             Json::Null => out.push_str("null"),
             Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -83,9 +91,9 @@ impl Json {
                 out.push('[');
                 for (i, v) in items.iter().enumerate() {
                     if i > 0 {
-                        out.push(',');
+                        out.push_str(if py { ", " } else { "," });
                     }
-                    v.write(out);
+                    v.write(out, py);
                 }
                 out.push(']');
             }
@@ -93,11 +101,11 @@ impl Json {
                 out.push('{');
                 for (i, (k, v)) in fields.iter().enumerate() {
                     if i > 0 {
-                        out.push(',');
+                        out.push_str(if py { ", " } else { "," });
                     }
                     quote(k, out);
-                    out.push(':');
-                    v.write(out);
+                    out.push_str(if py { ": " } else { ":" });
+                    v.write(out, py);
                 }
                 out.push('}');
             }
@@ -127,6 +135,8 @@ fn quote(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => {
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }

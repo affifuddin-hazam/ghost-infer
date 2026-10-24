@@ -38,7 +38,7 @@ OPTIONS:
         --top-k <n>       keep the k most likely tokens, 0 = all [40]
         --top-p <f>       nucleus sampling cut-off           [0.9]
         --seed <n>        sampling seed                      [time]
-        --ctx <n>         context window in tokens           [2048]
+        --ctx <n>         context window in tokens  [run: 2048; chat, serve: GPU as much as fits, CPU 4096]
         --system <text>   system prompt (chat models)
         --raw             send the prompt as-is, no chat template
         --gpu             run on the NVIDIA GPU (CUDA driver + NVRTC, loaded at runtime)
@@ -58,7 +58,7 @@ struct Opts {
     top_k: usize,
     top_p: f32,
     seed: u64,
-    ctx: usize,
+    ctx: Option<usize>, // None: the command's default (0 = fit to memory)
     system: Option<String>,
     raw: bool,
     show_special: bool,
@@ -87,7 +87,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         top_k: 40,
         top_p: 0.9,
         seed,
-        ctx: 2048,
+        ctx: None,
         system: None,
         raw: false,
         show_special: false,
@@ -108,7 +108,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--top-k" => o.top_k = num(val(a)?, a)? as usize,
             "--top-p" => o.top_p = num(val(a)?, a)? as f32,
             "--seed" => o.seed = num(val(a)?, a)? as u64,
-            "--ctx" => o.ctx = num(val(a)?, a)? as usize,
+            "--ctx" => o.ctx = Some(num(val(a)?, a)? as usize),
             "--prompt-len" => o.prompt_len = num(val(a)?, a)? as usize,
             "--system" => o.system = Some(val(a)?),
             "--threads" => {
@@ -311,10 +311,13 @@ fn load<'a>(g: &'a Gguf, gpu: bool, ctx: usize) -> Result<Engine<'a>, String> {
     load_with_draft(g, gpu, ctx, None, 0)
 }
 
+/// ctx 0: on the GPU the longest context whose caches (the draft's too) fit in the memory the weights
+/// leave free; on the CPU 4096.
 fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBuf>, draft_k: usize) -> Result<Engine<'a>, String> {
-    let backend = Backend::new(g, gpu, ctx)?;
     let tok = Tokenizer::from_gguf(g)?;
-    let draft = match draft {
+    // the models first, then their sessions, so that an automatic context knows what is left
+    let main = if gpu { Some(cuda::GpuModel::load(g, Config::from_gguf(g)?)?) } else { None };
+    let draft_model = match draft {
         None => None,
         Some(path) => {
             if !gpu {
@@ -332,9 +335,27 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
             let cfg = Config::from_gguf(&dg)?;
             let mut model = cuda::GpuModel::load(&dg, cfg)?;
             model.int8_q8 = true; // a draft only has to guess well, not match f32 maths
+            Some(model)
+        }
+    };
+    let ctx = match (ctx, &main) {
+        (0, Some(m)) => cuda::fit_ctx(&[Some(&m.cfg), draft_model.as_ref().map(|d| &d.cfg)].into_iter().flatten().collect::<Vec<_>>())?,
+        (0, None) => 4096,
+        (c, _) => c,
+    };
+    let backend = match main {
+        Some(m) => {
+            let s = cuda::GpuSession::new(&m.cfg, ctx)?;
+            Backend::Gpu(m, s)
+        }
+        None => Backend::new(g, false, ctx)?,
+    };
+    let draft = match draft_model {
+        Some(model) => {
             let sess = cuda::GpuSession::new(&model.cfg, ctx)?;
             Some(Draft { model, sess, k: draft_k, proposed: 0, accepted: 0, draft_secs: 0.0, verify_secs: 0.0, rounds: 0 })
         }
+        None => None,
     };
     let mut stop: Vec<u32> = tok.eos_id.into_iter().collect();
     for t in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
@@ -686,7 +707,7 @@ fn run(o: &Opts) -> Result<(), String> {
     let prompt = o.prompt.as_deref().ok_or("run needs -p <prompt>")?;
     let t = Instant::now();
     let g = Gguf::open(&o.model)?;
-    let mut engine = load_with_draft(&g, o.gpu, o.ctx, o.draft.as_ref(), o.draft_k)?;
+    let mut engine = load_with_draft(&g, o.gpu, o.ctx.unwrap_or(2048), o.draft.as_ref(), o.draft_k)?;
     warn_draft_unused(o);
     let text = if o.raw { prompt.to_string() } else { ChatFormat::detect(&g)?.first_turn(o.system.as_deref(), prompt) };
     let ids = engine.tok.encode(&text);
@@ -700,7 +721,7 @@ fn run(o: &Opts) -> Result<(), String> {
 
 fn chat(o: &Opts) -> Result<(), String> {
     let g = Gguf::open(&o.model)?;
-    let mut engine = load_with_draft(&g, o.gpu, o.ctx, o.draft.as_ref(), o.draft_k)?;
+    let mut engine = load_with_draft(&g, o.gpu, o.ctx.unwrap_or(0), o.draft.as_ref(), o.draft_k)?;
     warn_draft_unused(o);
     let fmt = ChatFormat::detect(&g)?;
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, o.seed);

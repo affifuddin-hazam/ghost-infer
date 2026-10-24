@@ -43,15 +43,16 @@ enum Event {
 pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     let t = Instant::now();
     let g = crate::gguf::Gguf::open(&o.model)?;
-    let mut engine = crate::load_with_draft(&g, o.gpu, o.ctx, o.draft.as_ref(), o.draft_k)?;
+    let mut engine = crate::load_with_draft(&g, o.gpu, o.ctx.unwrap_or(0), o.draft.as_ref(), o.draft_k)?;
     let fmt = ChatFormat::detect(&g).ok();
     let model_id = o.model.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string();
     let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
     eprintln!(
-        "[loaded {} on {} in {:.2}s{}]",
+        "[loaded {} on {} in {:.2}s, {}-token context{}]",
         model_id,
         engine.backend.describe(),
         t.elapsed().as_secs_f64(),
+        engine.backend.ctx(),
         if engine.draft.is_some() { ", with a draft model for greedy requests" } else { "" }
     );
     eprintln!("chat in your browser: http://{host}:{port}/");
@@ -62,6 +63,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
 
     let (jobs, rx) = mpsc::channel::<Job>();
     let defaults = (o.temp, o.top_k, o.top_p, o.max_new);
+    let ctx = engine.backend.ctx();
     let id = model_id.clone();
     let chat_ok = fmt.is_some();
     let default_system = fmt.as_ref().and_then(|f| f.default_system.clone());
@@ -69,7 +71,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         for conn in listener.incoming().flatten() {
             let (jobs, id, sys) = (jobs.clone(), id.clone(), default_system.clone());
             std::thread::spawn(move || {
-                if let Err(e) = handle(conn, &jobs, &id, chat_ok, sys.as_deref(), defaults) {
+                if let Err(e) = handle(conn, &jobs, &id, ctx, chat_ok, sys.as_deref(), defaults) {
                     eprintln!("[connection: {e}]");
                 }
             });
@@ -241,7 +243,7 @@ fn sse(conn: &mut TcpStream, data: &str) -> std::io::Result<()> {
     conn.flush()
 }
 
-fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, chat_ok: bool, default_system: Option<&str>, defaults: (f32, usize, f32, usize)) -> Result<(), String> {
+fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, ctx: usize, chat_ok: bool, default_system: Option<&str>, defaults: (f32, usize, f32, usize)) -> Result<(), String> {
     let req = read_request(&mut conn)?;
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     match (req.method.as_str(), req.path.trim_end_matches('/')) {
@@ -252,7 +254,7 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, chat_ok
         ("GET", "" | "/index.html") => return respond_page(&mut conn),
         ("GET", "/health") => return respond(&mut conn, 200, &obj(vec![("status", str("ok"))])),
         ("GET", "/v1/models") => {
-            let m = obj(vec![("id", str(model_id)), ("object", str("model")), ("created", num(created as f64)), ("owned_by", str("betterllama"))]);
+            let m = obj(vec![("id", str(model_id)), ("object", str("model")), ("created", num(created as f64)), ("owned_by", str("betterllama")), ("context_length", num(ctx as f64))]);
             return respond(&mut conn, 200, &obj(vec![("object", str("list")), ("data", Json::Arr(vec![m]))]));
         }
         ("POST", "/v1/chat/completions") if chat_ok => {}
@@ -310,6 +312,16 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, chat_ok
             obj(vec![("index", num(0)), ("text", str(text.unwrap_or(""))), ("logprobs", Json::Null), ("finish_reason", finish)])
         }
     };
+    // tool calls (chat requests with tools): split out of the text, sent as OpenAI's `tool_calls`
+    let mut calls = (chat && !request_tools(&body).is_empty()).then(ToolCalls::default);
+    let call_json = |index: usize, name: &str, arguments: &str| -> Json {
+        obj(vec![
+            ("index", num(index as f64)),
+            ("id", str(&format!("call_{:08x}{index}", rand_suffix()))),
+            ("type", str("function")),
+            ("function", obj(vec![("name", str(name)), ("arguments", str(arguments))])),
+        ])
+    };
     let usage = |p: usize, c: usize| obj(vec![("prompt_tokens", num(p as f64)), ("completion_tokens", num(c as f64)), ("total_tokens", num((p + c) as f64))]);
     let chunk = |choices: Vec<Json>, extra: Option<(&str, Json)>| -> String {
         let mut fields = vec![
@@ -333,7 +345,24 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, chat_ok
                 Event::Error(code, e) => return respond(&mut conn, code, &error_body(&e)),
                 Event::Done { finish, prompt_tokens, completion_tokens } => {
                     let c = if chat {
-                        obj(vec![("index", num(0)), ("message", obj(vec![("role", str("assistant")), ("content", str(&text))])), ("finish_reason", str(finish))])
+                        let mut message = vec![("role", str("assistant")), ("content", str(&text))];
+                        let mut finish = finish;
+                        if let Some(tc) = calls.as_mut() {
+                            let (mut content, mut found) = (String::new(), Vec::new());
+                            for part in tc.push(&text).into_iter().chain(tc.finish()) {
+                                match part {
+                                    Part::Text(t) => content.push_str(&t),
+                                    Part::Call { name, arguments } => found.push(call_json(found.len(), &name, &arguments)),
+                                }
+                            }
+                            if !found.is_empty() {
+                                let content = content.trim_end();
+                                message[1].1 = if content.is_empty() { Json::Null } else { str(content) };
+                                message.push(("tool_calls", Json::Arr(found)));
+                                finish = "tool_calls";
+                            }
+                        }
+                        obj(vec![("index", num(0)), ("message", obj(message)), ("finish_reason", str(finish))])
                     } else {
                         obj(vec![("index", num(0)), ("text", str(&text)), ("logprobs", Json::Null), ("finish_reason", str(finish))])
                     };
@@ -360,19 +389,41 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, chat_ok
         sse(&mut conn, &chunk(vec![choice(Some(""), None, true)], None)).map_err(|e| e.to_string())?;
         first = false;
     }
+    let mut n_calls = 0;
+    // a failed write means the client is gone: dropping `events` stops the generation
+    let mut send_parts = |conn: &mut TcpStream, parts: Vec<Part>, first: &mut bool| -> Result<(), String> {
+        for part in parts {
+            let c = match part {
+                Part::Text(t) => choice(Some(&t), None, *first),
+                Part::Call { name, arguments } => {
+                    n_calls += 1;
+                    obj(vec![("index", num(0)), ("delta", obj(vec![("tool_calls", Json::Arr(vec![call_json(n_calls - 1, &name, &arguments)]))])), ("finish_reason", Json::Null)])
+                }
+            };
+            sse(conn, &chunk(vec![c], None)).map_err(|e| e.to_string())?;
+            *first = false;
+        }
+        Ok(())
+    };
     for ev in events {
         match ev {
             Event::Text(t) if t.is_empty() => {}
             Event::Text(t) => {
-                // a failed write means the client is gone: dropping `events` stops the generation
-                sse(&mut conn, &chunk(vec![choice(Some(&t), None, first)], None)).map_err(|e| e.to_string())?;
-                first = false;
+                let parts = match calls.as_mut() {
+                    Some(tc) => tc.push(&t),
+                    None => vec![Part::Text(t)],
+                };
+                send_parts(&mut conn, parts, &mut first)?;
             }
             Event::Error(_, e) => {
                 sse(&mut conn, &error_body(&e).to_string()).map_err(|e| e.to_string())?;
                 break;
             }
             Event::Done { finish, prompt_tokens, completion_tokens } => {
+                if let Some(tc) = calls.as_mut() {
+                    send_parts(&mut conn, tc.finish(), &mut first)?;
+                }
+                let finish = if calls.as_ref().is_some_and(|tc| tc.calls > 0) { "tool_calls" } else { finish };
                 let last = if chat { choice(None, Some(finish), false) } else { choice(Some(""), Some(finish), false) };
                 sse(&mut conn, &chunk(vec![last], None)).map_err(|e| e.to_string())?;
                 if include_usage {
@@ -403,28 +454,198 @@ fn content_text(c: Option<&Json>) -> Result<String, String> {
     }
 }
 
-/// The messages in the ChatML template, ending with an open assistant turn.
+/// The tools the model may call in this request (none when `tool_choice` is "none").
+fn request_tools(body: &Json) -> &[Json] {
+    if body.get("tool_choice").and_then(Json::as_str) == Some("none") {
+        return &[];
+    }
+    body.get("tools").and_then(Json::as_array).unwrap_or(&[])
+}
+
+/// The messages in the ChatML template, ending with an open assistant turn. Tools, tool calls and
+/// tool results are written as Qwen's template writes them (`<tools>`, `<tool_call>`,
+/// `<tool_response>`), and the reasoning of turns before the latest user question is left out.
 fn chat_prompt(body: &Json, default_system: Option<&str>) -> Result<String, String> {
     let messages = body.get("messages").and_then(Json::as_array).ok_or("messages must be a list")?;
     if messages.is_empty() {
         return Err("messages is empty".into());
     }
-    let mut s = String::new();
-    let has_system = messages.iter().any(|m| matches!(m.get("role").and_then(Json::as_str), Some("system" | "developer")));
-    if let (false, Some(sys)) = (has_system, default_system) {
-        s.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
-    }
+    let mut roles = Vec::with_capacity(messages.len());
+    let mut contents = Vec::with_capacity(messages.len());
     for m in messages {
-        let role = match m.get("role").and_then(Json::as_str) {
+        roles.push(match m.get("role").and_then(Json::as_str) {
             Some("developer") => "system",
             Some(r @ ("system" | "user" | "assistant" | "tool")) => r,
             Some(other) => return Err(format!("unknown message role {other}")),
             None => return Err("a message has no role".into()),
-        };
-        s.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", content_text(m.get("content"))?));
+        });
+        contents.push(content_text(m.get("content"))?);
+    }
+    let tools = request_tools(body);
+
+    let mut s = String::new();
+    let system = if roles[0] == "system" { Some(contents[0].as_str()) } else if roles.contains(&"system") { None } else { default_system };
+    if !tools.is_empty() {
+        s.push_str("<|im_start|>system\n");
+        if let Some(sys) = system {
+            s.push_str(sys);
+            s.push_str("\n\n");
+        }
+        s.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+        for t in tools {
+            s.push('\n');
+            s.push_str(&t.to_python_string());
+        }
+        s.push_str("\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n");
+    } else if let Some(sys) = system {
+        s.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+    }
+
+    // the latest real question (a user turn that is not a tool result)
+    let is_tool_result = |c: &str| c.starts_with("<tool_response>") && c.ends_with("</tool_response>");
+    let last_query = (0..messages.len()).rev().find(|&i| roles[i] == "user" && !is_tool_result(&contents[i])).unwrap_or(messages.len() - 1);
+    for (i, m) in messages.iter().enumerate() {
+        let content = contents[i].as_str();
+        match roles[i] {
+            "system" if i == 0 => {}
+            r @ ("system" | "user") => s.push_str(&format!("<|im_start|>{r}\n{content}<|im_end|>\n")),
+            "assistant" => {
+                let (mut reasoning, mut content) = (String::new(), content.to_string());
+                if let Some(r) = m.get("reasoning_content").and_then(Json::as_str) {
+                    reasoning = r.to_string();
+                } else if let Some((before, after)) = content.split_once("</think>") {
+                    reasoning = before.trim_end_matches('\n').rsplit("<think>").next().unwrap_or("").trim_start_matches('\n').to_string();
+                    content = after.trim_start_matches('\n').to_string();
+                }
+                s.push_str("<|im_start|>assistant\n");
+                if i > last_query && (i == messages.len() - 1 || !reasoning.is_empty()) {
+                    s.push_str(&format!("<think>\n{}\n</think>\n\n{}", reasoning.trim_matches('\n'), content.trim_start_matches('\n')));
+                } else {
+                    s.push_str(&content);
+                }
+                for (k, call) in m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]).iter().enumerate() {
+                    if k > 0 || !content.is_empty() {
+                        s.push('\n');
+                    }
+                    let f = call.get("function").unwrap_or(call);
+                    let name = f.get("name").and_then(Json::as_str).unwrap_or("");
+                    let args = match f.get("arguments") {
+                        Some(Json::Str(a)) => a.clone(),
+                        Some(a) => a.to_python_string(),
+                        None => "{}".into(),
+                    };
+                    s.push_str(&format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"));
+                }
+                s.push_str("<|im_end|>\n");
+            }
+            _ => {
+                // tool results: consecutive ones share one user turn
+                if i == 0 || roles[i - 1] != "tool" {
+                    s.push_str("<|im_start|>user");
+                }
+                s.push_str(&format!("\n<tool_response>\n{content}\n</tool_response>"));
+                if i + 1 == messages.len() || roles[i + 1] != "tool" {
+                    s.push_str("<|im_end|>\n");
+                }
+            }
+        }
     }
     s.push_str("<|im_start|>assistant\n");
+    let thinking = body.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")).and_then(Json::as_bool);
+    if thinking == Some(false) {
+        s.push_str("<think>\n\n</think>\n\n");
+    }
     Ok(s)
+}
+
+/// One piece of a reply, once tool calls are split out of the text.
+#[derive(Debug, PartialEq)]
+enum Part {
+    Text(String),
+    Call { name: String, arguments: String },
+}
+
+/// Splits `<tool_call>{"name": ..., "arguments": ...}</tool_call>` blocks out of streamed text,
+/// holding back what could still become a tag. Whitespace-only text after a call is dropped; a
+/// block that is not valid JSON stays text.
+#[derive(Default)]
+struct ToolCalls {
+    buf: String,
+    in_call: bool,
+    calls: usize,
+}
+
+impl ToolCalls {
+    const OPEN: &'static str = "<tool_call>";
+    const CLOSE: &'static str = "</tool_call>";
+
+    fn push(&mut self, text: &str) -> Vec<Part> {
+        self.buf.push_str(text);
+        let mut out = Vec::new();
+        loop {
+            if self.in_call {
+                let Some(end) = self.buf.find(Self::CLOSE) else { break };
+                let block: String = self.buf.drain(..end + Self::CLOSE.len()).collect();
+                self.in_call = false;
+                out.push(match self.call(&block[..end]) {
+                    Part::Text(t) => Part::Text(t + Self::CLOSE),
+                    call => call,
+                });
+            } else if let Some(at) = self.buf.find(Self::OPEN) {
+                let before: String = self.buf.drain(..at + Self::OPEN.len()).collect();
+                self.text(&before[..at], &mut out);
+                self.in_call = true;
+            } else {
+                let ready = self.buf.len() - partial_suffix(&self.buf, Self::OPEN);
+                // after a call, wait for something other than whitespace before sending text
+                let ready = if self.calls > 0 && self.buf[..ready].trim().is_empty() { 0 } else { ready };
+                let rest = self.buf.split_off(ready);
+                let text = std::mem::replace(&mut self.buf, rest);
+                self.text(&text, &mut out);
+                break;
+            }
+        }
+        out
+    }
+
+    /// What is left at the end of the reply.
+    fn finish(&mut self) -> Vec<Part> {
+        let rest = std::mem::take(&mut self.buf);
+        let mut out = Vec::new();
+        if self.in_call {
+            // cut off before the closing tag: still a call if the JSON is complete
+            self.in_call = false;
+            out.push(self.call(&rest));
+        } else {
+            self.text(&rest, &mut out);
+        }
+        out
+    }
+
+    fn text(&self, t: &str, out: &mut Vec<Part>) {
+        if !t.is_empty() && !(self.calls > 0 && t.trim().is_empty()) {
+            out.push(Part::Text(t.to_string()));
+        }
+    }
+
+    fn call(&mut self, inner: &str) -> Part {
+        let parsed = Json::parse(inner.trim()).ok().and_then(|j| {
+            let name = j.get("name")?.as_str()?.to_string();
+            let arguments = match j.get("arguments") {
+                Some(Json::Str(s)) => s.clone(),
+                Some(a) => a.to_python_string(),
+                None => "{}".into(),
+            };
+            Some(Part::Call { name, arguments })
+        });
+        match parsed {
+            Some(p) => {
+                self.calls += 1;
+                p
+            }
+            None => Part::Text(format!("{}{inner}", Self::OPEN)),
+        }
+    }
 }
 
 fn completion_prompt(body: &Json) -> Result<String, String> {
@@ -451,5 +672,48 @@ mod tests {
     fn chat_template() {
         let body = Json::parse(r#"{"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]}"#).unwrap();
         assert_eq!(chat_prompt(&body, Some("Be brief.")).unwrap(), "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+    }
+
+    #[test]
+    fn tool_template() {
+        // what the Qwen3 chat template (Jinja, in the GGUF) gives for this conversation
+        let body = Json::parse(
+            r#"{"tools":[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string"}}}}}],
+            "messages":[{"role":"system","content":"Sys"},{"role":"user","content":"Time?"},
+            {"role":"assistant","content":"<think>\nhm\n</think>\n\nLet me check.","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"UTC\"}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"12:00"},{"role":"tool","tool_call_id":"c2","content":"x"}]}"#,
+        )
+        .unwrap();
+        let want = concat!(
+            "<|im_start|>system\nSys\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+            r#"{"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {"tz": {"type": "string"}}}}}"#,
+            "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\nTime?<|im_end|>\n",
+            "<|im_start|>assistant\n<think>\nhm\n</think>\n\nLet me check.\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"tz\": \"UTC\"}}\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\nx\n</tool_response><|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
+        assert_eq!(chat_prompt(&body, None).unwrap(), want);
+    }
+
+    #[test]
+    fn tool_calls_split_from_stream() {
+        let mut tc = ToolCalls::default();
+        let mut parts = Vec::new();
+        let text = "<think>\nok\n</think>\n\nSure.\n<tool_call>\n{\"name\": \"f\", \"arguments\": {\"a\": 1}}\n</tool_call>\n<tool_call>\n{\"name\": \"g\", \"arguments\": {}}\n</tool_call>\n";
+        // one character at a time, as tokens arrive
+        for c in text.chars() {
+            parts.extend(tc.push(&c.to_string()));
+        }
+        parts.extend(tc.finish());
+        let text: String = parts.iter().filter_map(|p| if let Part::Text(t) = p { Some(t.as_str()) } else { None }).collect();
+        assert_eq!(text, "<think>\nok\n</think>\n\nSure.\n");
+        let calls: Vec<_> = parts.iter().filter(|p| matches!(p, Part::Call { .. })).collect();
+        assert_eq!(calls, [&Part::Call { name: "f".into(), arguments: "{\"a\": 1}".into() }, &Part::Call { name: "g".into(), arguments: "{}".into() }]);
+
+        let mut tc = ToolCalls::default();
+        let mut parts = tc.push("a <tool_call>not json</tool_call> b");
+        parts.extend(tc.finish());
+        assert_eq!(parts.iter().map(|p| if let Part::Text(t) = p { t.as_str() } else { "" }).collect::<String>(), "a <tool_call>not json</tool_call> b");
     }
 }
