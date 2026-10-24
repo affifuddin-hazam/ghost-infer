@@ -5,20 +5,36 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, OnceLock};
 
-use crate::gguf::{GgmlType, Gguf, Value};
+use crate::gguf::{GgmlType, Gguf};
 use crate::model::Config;
 use crate::profile;
 use crate::quant::f16_to_f32;
 
 const MAX_BATCH: usize = 1024; // prompt tokens per GPU pass: big batches keep the attention kernel busy
 const MATMUL_TB: usize = 8; // tokens per matmul block row (must match TB in the kernel source)
+/// Rows per warp in the K-quant generation matmuls (passed to the kernels as -DRPW).
+/// BETTERLLAMA_RPW overrides it for tuning.
+fn kq_rpw() -> usize {
+    static RPW: OnceLock<usize> = OnceLock::new();
+    *RPW.get_or_init(|| std::env::var("BETTERLLAMA_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=16).contains(&v)).unwrap_or(2))
+}
+/// Activation values per int8 scale in the K-quant prompt matmuls (passed as -DQCH): 128 or 256.
+/// 128 is ~1% slower than 256 and about halves the log-probability drift; BETTERLLAMA_QCH=256 overrides.
+fn qch() -> usize {
+    static QCH: OnceLock<usize> = OnceLock::new();
+    *QCH.get_or_init(|| std::env::var("BETTERLLAMA_QCH").ok().and_then(|v| v.parse().ok()).filter(|&v| v == 128 || v == 256).unwrap_or(128))
+}
+const KQ_TB: usize = 4; // tokens per block row in the K-quant generation matmuls (must match TBK)
 const TILE: usize = 64; // must match TILE in the kernel source
 const TILED_MIN_BATCH: usize = 16; // from this many tokens, the int8 tiled matmul beats one-warp-per-row
 const ATT_MAX_CHUNK: usize = 256; // must match ATT_MAX_CHUNK
 const ATT_MAX_HD: usize = 128; // must match ATT_MAX_HD
+const ATT_MAX_G: usize = 8; // query heads per kv head the GQA attention kernel handles (must match ATT_MAX_G)
+const SPLIT_MIN_SPAN: usize = 128; // contexts up to this many positions are not split across blocks
 const ATT_TARGET_BLOCKS: usize = 96; // aim for a few blocks per SM when splitting attention for one token
 const PREFILL_QT: usize = 32; // query tokens per prompt-attention block (must match PQT)
 const PREFILL_KT: usize = 32; // key positions per shared-memory tile (must match PKT)
+const PREFILL_TC_QT: usize = 64; // query tokens per tensor-core prompt-attention block (must match BQ)
 const SPLIT_MAX_BATCH: usize = TILED_MIN_BATCH - 1; // tokens per split-attention launch
 
 const KERNELS: &str = r#"
@@ -60,13 +76,100 @@ __device__ float block_max(float v, float* sh) {
     return sh[0];
 }
 
-// x[b] = embedding row of tokens[b]
-__global__ void embed_q8(const signed char* __restrict__ wq, const float* __restrict__ wd,
-                         const int* __restrict__ tokens, float* __restrict__ x, int cols) {
+// ---- weight formats (repacked at upload so every field is naturally aligned) ----
+// fmt 0, Q8_0: int8 values (rows x cols) + a separate f32 scale per 32
+// fmt 1, Q4_K: the GGUF block as is, 144 bytes per 256: f16 d, f16 dmin, 12 bytes of 6-bit scales/mins,
+//              128 bytes of nibbles
+// fmt 2, Q6_K: 208-byte blocks of 256 (128 bytes low nibbles, 64 bytes 2-bit highs, 16 int8 scales), and
+//              the f32 d of each block in a separate array (wd)
+// Both block sizes are multiples of 16 bytes, so the quant bytes can be read with 128-bit loads.
+#define Q4K_BYTES 144
+#define Q6K_BYTES 208
+
+__device__ __forceinline__ float h2f(unsigned int h) {
+    float f;
+    asm("{.reg .b16 t; cvt.u16.u32 t, %1; cvt.f32.f16 %0, t;}" : "=f"(f) : "r"(h));
+    return f;
+}
+// d and dmin of a Q4_K block (one 32-bit load)
+__device__ __forceinline__ void q4k_dm(const unsigned char* b, float* d, float* dmin) {
+    unsigned int w = *reinterpret_cast<const unsigned int*>(b);
+    *d = h2f(w & 0xFFFF);
+    *dmin = h2f(w >> 16);
+}
+
+__device__ __forceinline__ void q4k_scale_min(int j, const unsigned char* s, int* sc, int* m) {
+    if (j < 4) { *sc = s[j] & 63; *m = s[j + 4] & 63; }
+    else { *sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); *m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
+}
+
+// Same, for sub-blocks j and j+1 (j even) of a block whose 12 scale bytes start 4-byte aligned:
+// three word loads instead of a byte load per field.
+__device__ __forceinline__ void q4k_scale_min2(int j, const unsigned char* s, int* sc1, int* m1, int* sc2, int* m2) {
+    const unsigned int* w = reinterpret_cast<const unsigned int*>(s);
+    unsigned int w0 = w[0], w1 = w[1], w2 = w[2];
+    #define SB(i) ((int)(((i) < 4 ? w0 : (i) < 8 ? w1 : w2) >> (8 * ((i) & 3)) & 0xFF))
+    if (j < 4) {
+        *sc1 = SB(j) & 63;            *m1 = SB(j + 4) & 63;
+        *sc2 = SB(j + 1) & 63;        *m2 = SB(j + 5) & 63;
+    } else {
+        *sc1 = (SB(j + 4) & 0xF) | ((SB(j - 4) >> 6) << 4); *m1 = (SB(j + 4) >> 4) | ((SB(j) >> 6) << 4);
+        *sc2 = (SB(j + 5) & 0xF) | ((SB(j - 3) >> 6) << 4); *m2 = (SB(j + 5) >> 4) | ((SB(j + 1) >> 6) << 4);
+    }
+    #undef SB
+}
+
+// value i of a Q4_K / Q6_K row
+__device__ float deq_q4k(const unsigned char* row, int i) {
+    const unsigned char* b = row + (size_t)(i >> 8) * Q4K_BYTES;
+    int k = i & 255, j2 = k >> 6, half = (k >> 5) & 1, l = k & 31;
+    int sc, m;
+    q4k_scale_min(2 * j2 + half, b + 4, &sc, &m);
+    int q = b[16 + 32 * j2 + l];
+    q = half ? (q >> 4) : (q & 15);
+    float d, dmin;
+    q4k_dm(b, &d, &dmin);
+    return d * sc * q - dmin * m;
+}
+__device__ float deq_q6k(const unsigned char* row, const float* drow, int i) {
+    const unsigned char* b = row + (size_t)(i >> 8) * Q6K_BYTES;
+    int k = i & 255, half = k >> 7, g = (k >> 5) & 3, l = k & 31;
+    int lo = b[64 * half + (g & 1) * 32 + l];
+    lo = (g >= 2) ? (lo >> 4) : (lo & 15);
+    int hi = (b[128 + 32 * half + l] >> (2 * g)) & 3;
+    return drow[i >> 8] * (float)(signed char)b[192 + 8 * half + 2 * g + (l >> 4)] * ((lo | (hi << 4)) - 32);
+}
+
+// x[b] = embedding row of tokens[b], any weight format
+__global__ void embed(int fmt, const unsigned char* __restrict__ w, const float* __restrict__ wd,
+                      const int* __restrict__ tokens, float* __restrict__ x, int cols) {
     int b = blockIdx.x;
     size_t tok = tokens[b];
-    for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        x[(size_t)b * cols + i] = wd[tok * (cols >> 5) + (i >> 5)] * (float)wq[tok * cols + i];
+    float* o = x + (size_t)b * cols;
+    if (fmt == 0) {
+        for (int i = threadIdx.x; i < cols; i += blockDim.x)
+            o[i] = wd[tok * (cols >> 5) + (i >> 5)] * (float)(signed char)w[tok * cols + i];
+    } else {
+        size_t row_bytes = (size_t)(cols >> 8) * (fmt == 1 ? Q4K_BYTES : Q6K_BYTES);
+        const unsigned char* row = w + tok * row_bytes;
+        const float* drow = wd + tok * (cols >> 8); // Q6_K
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) o[i] = fmt == 1 ? deq_q4k(row, i) : deq_q6k(row, drow, i);
+    }
+}
+
+// RMSNorm over each head of q and k in the packed qkv rows (Qwen3). grid (tokens, n_heads + n_kv), block = 128
+__global__ void head_rmsnorm(float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
+                             int n_heads, int n_kv, int hd, float eps) {
+    __shared__ float sh[32];
+    int b = blockIdx.x, h = blockIdx.y;
+    int row_stride = (n_heads + 2 * n_kv) * hd;
+    float* v = qkv + (size_t)b * row_stride + h * hd; // k heads directly follow the q heads
+    const float* w = h < n_heads ? qn : kn;
+    float ss = 0.f;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) ss += v[d] * v[d];
+    ss = block_sum(ss, sh);
+    float scale = rsqrtf(ss / hd + eps);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) v[d] = v[d] * scale * w[d];
 }
 
 // one block per row
@@ -82,11 +185,13 @@ __global__ void rmsnorm(const float* __restrict__ x, const float* __restrict__ w
     for (int i = threadIdx.x; i < cols; i += blockDim.x) o[i] = xr[i] * scale * w[i];
 }
 
-// out[b*rows + r] (+)= dot(W[r], x[b]). One warp per row, TB tokens per block in y.
-// W is int8 (rows x cols) with one f32 scale per 32 values.
+// Generation matmuls: out[b*out_stride + out_off + r] (+)= dot(W[r], x[b]), f32 activations.
+// One warp per row, TB tokens per block in y.
+
+// Q8_0: W is int8 (rows x cols) with one f32 scale per 32 values.
 __global__ void matmul_q8(const signed char* __restrict__ wq, const float* __restrict__ wd,
                           const float* __restrict__ x, float* __restrict__ out,
-                          int rows, int cols, int n, int accumulate) {
+                          int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
     int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     int lane = threadIdx.x & 31;
     if (row >= rows) return;
@@ -116,15 +221,260 @@ __global__ void matmul_q8(const signed char* __restrict__ wq, const float* __res
     for (int j = 0; j < TB; j++) {
         float v = warp_sum(acc[j]);
         if (lane == 0 && j < nb) {
-            size_t idx = (size_t)(b0 + j) * rows + row;
+            size_t idx = (size_t)(b0 + j) * out_stride + out_off + row;
             out[idx] = accumulate ? out[idx] + v : v;
         }
     }
 }
 
-// qkv rows are [q | k | v]; rotates q and k (adjacent pairs) and stores k, v at their positions
+// K-quant generation matmuls: each warp handles RPW rows so the activations a lane needs are loaded
+// once into registers and reused for all of them (4-bit weights are ~7x smaller than f32 activations,
+// so re-reading the activations per row would dominate). TBK tokens per block in y.
+// Compiled twice: TBK = 1 for generation (few registers, so many warps keep loads in flight) and
+// TBK = 4 for short multi-token batches. RPW (rows per warp) comes from the compile options.
+
+}  // extern "C": the templates below need C++ linkage
+
+// Q4_K: per super-block each lane takes 4 bytes of a 64-value chunk, i.e. 4 values of two sub-blocks.
+template <int TBK>
+__device__ void q4k_matvec(const unsigned char* __restrict__ w, const float* __restrict__ x, float* __restrict__ out,
+                           int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RPW;
+    int lane = threadIdx.x & 31;
+    if (row0 >= rows) return;
+    int b0 = blockIdx.y * TBK, nb = min(TBK, n - b0);
+    int nsb = cols >> 8;
+    int j2 = lane >> 3, sub = lane & 7;
+    size_t row_bytes = (size_t)nsb * Q4K_BYTES;
+    float acc[RPW][TBK];
+    #pragma unroll
+    for (int r = 0; r < RPW; r++)
+        #pragma unroll
+        for (int j = 0; j < TBK; j++) acc[r][j] = 0.f;
+    #pragma unroll 4 // several super-blocks' loads in flight before any is used
+    for (int sb = 0; sb < nsb; sb++) {
+        int base = sb * 256 + 64 * j2 + 4 * sub;
+        float4 xl[TBK], xh[TBK];
+        float sl[TBK], sh[TBK];
+        #pragma unroll
+        for (int j = 0; j < TBK; j++) {
+            if (j < nb) {
+                const float* xr = x + (size_t)(b0 + j) * cols + base;
+                xl[j] = *reinterpret_cast<const float4*>(xr);
+                xh[j] = *reinterpret_cast<const float4*>(xr + 32);
+                sl[j] = xl[j].x + xl[j].y + xl[j].z + xl[j].w;
+                sh[j] = xh[j].x + xh[j].y + xh[j].z + xh[j].w;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            if (row0 + r < rows) {
+                const unsigned char* b = w + (size_t)(row0 + r) * row_bytes + (size_t)sb * Q4K_BYTES;
+                float d, dmin;
+                q4k_dm(b, &d, &dmin);
+                int sc1, m1, sc2, m2;
+                q4k_scale_min(2 * j2, b + 4, &sc1, &m1);
+                q4k_scale_min(2 * j2 + 1, b + 4, &sc2, &m2);
+                int p = *(const int*)(b + 16 + 32 * j2 + 4 * sub);
+                float a1 = d * sc1, c1 = dmin * m1, a2 = d * sc2, c2 = dmin * m2;
+                float lo0 = p & 15, lo1 = (p >> 8) & 15, lo2 = (p >> 16) & 15, lo3 = (p >> 24) & 15;
+                float hi0 = (p >> 4) & 15, hi1 = (p >> 12) & 15, hi2 = (p >> 20) & 15, hi3 = (p >> 28) & 15;
+                #pragma unroll
+                for (int j = 0; j < TBK; j++) {
+                    if (j < nb) {
+                        acc[r][j] += a1 * (lo0 * xl[j].x + lo1 * xl[j].y + lo2 * xl[j].z + lo3 * xl[j].w) - c1 * sl[j]
+                                   + a2 * (hi0 * xh[j].x + hi1 * xh[j].y + hi2 * xh[j].z + hi3 * xh[j].w) - c2 * sh[j];
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++)
+        #pragma unroll
+        for (int j = 0; j < TBK; j++) {
+            float v = warp_sum(acc[r][j]);
+            if (lane == 0 && j < nb && row0 + r < rows) {
+                size_t idx = (size_t)(b0 + j) * out_stride + out_off + row0 + r;
+                out[idx] = accumulate ? out[idx] + v : v;
+            }
+        }
+}
+
+// Q6_K: 16 lanes per 128-value half; each lane takes 2 adjacent positions of all 4 groups (8 values).
+template <int TBK>
+__device__ void q6k_matvec(const unsigned char* __restrict__ w, const float* __restrict__ wd, const float* __restrict__ x,
+                           float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RPW;
+    int lane = threadIdx.x & 31;
+    if (row0 >= rows) return;
+    int b0 = blockIdx.y * TBK, nb = min(TBK, n - b0);
+    int nsb = cols >> 8;
+    int half = lane >> 4, l = 2 * (lane & 15), is = l >> 4;
+    size_t row_bytes = (size_t)nsb * Q6K_BYTES;
+    float acc[RPW][TBK];
+    #pragma unroll
+    for (int r = 0; r < RPW; r++)
+        #pragma unroll
+        for (int j = 0; j < TBK; j++) acc[r][j] = 0.f;
+    #pragma unroll 4 // several super-blocks' loads in flight before any is used
+    for (int sb = 0; sb < nsb; sb++) {
+        float2 xv[4][TBK]; // [group][token]
+        #pragma unroll
+        for (int g = 0; g < 4; g++)
+            #pragma unroll
+            for (int j = 0; j < TBK; j++)
+                if (j < nb) xv[g][j] = *reinterpret_cast<const float2*>(x + (size_t)(b0 + j) * cols + sb * 256 + 128 * half + 32 * g + l);
+        #pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            if (row0 + r < rows) {
+                const unsigned char* b = w + (size_t)(row0 + r) * row_bytes + (size_t)sb * Q6K_BYTES;
+                float d = wd[(size_t)(row0 + r) * nsb + sb];
+                int qla =*(const unsigned short*)(b + 64 * half + l);
+                int qlb = *(const unsigned short*)(b + 64 * half + 32 + l);
+                int qh = *(const unsigned short*)(b + 128 + 32 * half + l);
+                #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    int ql = (g & 1) ? qlb : qla;
+                    int s4 = (g >= 2) ? 4 : 0;
+                    float q0 = (float)((((ql >> s4) & 15) | (((qh >> (2 * g)) & 3) << 4)) - 32);
+                    float q1 = (float)((((ql >> (8 + s4)) & 15) | (((qh >> (8 + 2 * g)) & 3) << 4)) - 32);
+                    float s = d * (float)(signed char)b[192 + 8 * half + 2 * g + is];
+                    #pragma unroll
+                    for (int j = 0; j < TBK; j++)
+                        if (j < nb) acc[r][j] += s * (q0 * xv[g][j].x + q1 * xv[g][j].y);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++)
+        #pragma unroll
+        for (int j = 0; j < TBK; j++) {
+            float v = warp_sum(acc[r][j]);
+            if (lane == 0 && j < nb && row0 + r < rows) {
+                size_t idx = (size_t)(b0 + j) * out_stride + out_off + row0 + r;
+                out[idx] = accumulate ? out[idx] + v : v;
+            }
+        }
+}
+
+extern "C" {
+
+// One-token K-quant matmuls with int8 activations (quantize_q8 first): weights stay packed and go
+// straight into __dp4a (4 multiply-adds per instruction), instead of being unpacked to floats.
+// RPW rows per warp share the activation registers.
+__global__ void matmul_q4k_dp4a(const unsigned char* __restrict__ w, const float* __restrict__ wd, const signed char* __restrict__ xq,
+                                const float* __restrict__ xd, float* __restrict__ out,
+                                int rows, int cols, int accumulate, int out_stride, int out_off) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RPW;
+    int lane = threadIdx.x & 31;
+    if (row0 >= rows) return;
+    int nsb = cols >> 8;
+    // each lane: 2 words = 8 bytes of a 32-byte chunk = 8 values of each of two sub-blocks (16 values);
+    // a half-warp covers a super-block, so the warp walks two super-blocks per step
+    int hl = lane >> 4, l16 = lane & 15, j2 = l16 >> 2, q4 = l16 & 3;
+    size_t row_bytes = (size_t)nsb * Q4K_BYTES;
+    float acc[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) acc[r] = 0.f;
+    #pragma unroll 2 // more super-blocks' loads in flight before any is used
+    for (int sb = hl; sb < nsb; sb += 2) {
+        int pos = sb * 256 + 64 * j2 + 8 * q4;
+        int xl0 = *reinterpret_cast<const int*>(xq + pos), xl1 = *reinterpret_cast<const int*>(xq + pos + 4);
+        int xh0 = *reinterpret_cast<const int*>(xq + pos + 32), xh1 = *reinterpret_cast<const int*>(xq + pos + 36);
+        float dl = xd[pos >> 5], dh = xd[(pos >> 5) + 1];
+        float sl = dl * (float)__dp4a(0x01010101, xl0, __dp4a(0x01010101, xl1, 0));
+        float sh = dh * (float)__dp4a(0x01010101, xh0, __dp4a(0x01010101, xh1, 0));
+        #pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            if (row0 + r < rows) {
+                const unsigned char* b = w + (size_t)(row0 + r) * row_bytes + (size_t)sb * Q4K_BYTES;
+                float d, dmin;
+                q4k_dm(b, &d, &dmin);
+                int sc1, m1, sc2, m2;
+                q4k_scale_min2(2 * j2, b + 4, &sc1, &m1, &sc2, &m2);
+                int2 pp = *reinterpret_cast<const int2*>(b + 16 + 32 * j2 + 8 * q4);
+                int p0 = pp.x, p1 = pp.y;
+                int lo = __dp4a(p0 & 0x0F0F0F0F, xl0, __dp4a(p1 & 0x0F0F0F0F, xl1, 0));
+                int hi = __dp4a((p0 >> 4) & 0x0F0F0F0F, xh0, __dp4a((p1 >> 4) & 0x0F0F0F0F, xh1, 0));
+                acc[r] += d * (sc1 * dl * (float)lo + sc2 * dh * (float)hi) - dmin * (m1 * sl + m2 * sh);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) {
+        float v = warp_sum(acc[r]);
+        if (lane == 0 && row0 + r < rows) {
+            size_t idx = (size_t)out_off + row0 + r;
+            out[idx] = accumulate ? out[idx] + v : v;
+        }
+    }
+    (void)out_stride;
+}
+
+// Q6_K: per 128-value half, 4 lanes take groups {0,2} and 4 lanes groups {1,3}; each lane 8 consecutive
+// positions of both groups (they share the low-nibble bytes: low nibble = first group, high = second).
+// A half-warp covers a super-block, so the warp walks two super-blocks per step.
+__global__ void matmul_q6k_dp4a(const unsigned char* __restrict__ w, const float* __restrict__ wd, const signed char* __restrict__ xq,
+                                const float* __restrict__ xd, float* __restrict__ out,
+                                int rows, int cols, int accumulate, int out_stride, int out_off) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RPW;
+    int lane = threadIdx.x & 31;
+    if (row0 >= rows) return;
+    int nsb = cols >> 8;
+    int hl = lane >> 4, l16 = lane & 15;
+    int half = l16 >> 3, gsel = (l16 >> 2) & 1, l = 8 * (l16 & 3), is = l >> 4;
+    int ga = gsel, gb = gsel + 2;
+    size_t row_bytes = (size_t)nsb * Q6K_BYTES;
+    float acc[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) acc[r] = 0.f;
+    #pragma unroll 2 // more super-blocks' loads in flight before any is used
+    for (int sb = hl; sb < nsb; sb += 2) {
+        int pa = sb * 256 + 128 * half + 32 * ga + l, pb = pa + 64;
+        int xa0 = *reinterpret_cast<const int*>(xq + pa), xa1 = *reinterpret_cast<const int*>(xq + pa + 4);
+        int xb0 = *reinterpret_cast<const int*>(xq + pb), xb1 = *reinterpret_cast<const int*>(xq + pb + 4);
+        float da = xd[pa >> 5], db = xd[pb >> 5];
+        #pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            if (row0 + r < rows) {
+                const unsigned char* b = w + (size_t)(row0 + r) * row_bytes + (size_t)sb * Q6K_BYTES;
+                float d = wd[(size_t)(row0 + r) * nsb + sb];
+                int ql0 =*(const int*)(b + 64 * half + 32 * gsel + l), ql1 = *(const int*)(b + 64 * half + 32 * gsel + l + 4);
+                int qh0 = *(const int*)(b + 128 + 32 * half + l), qh1 = *(const int*)(b + 132 + 32 * half + l);
+                int qa0 = __vsub4((ql0 & 0x0F0F0F0F) | (((qh0 >> (2 * ga)) & 0x03030303) << 4), 0x20202020);
+                int qa1 = __vsub4((ql1 & 0x0F0F0F0F) | (((qh1 >> (2 * ga)) & 0x03030303) << 4), 0x20202020);
+                int qb0 = __vsub4(((ql0 >> 4) & 0x0F0F0F0F) | (((qh0 >> (2 * gb)) & 0x03030303) << 4), 0x20202020);
+                int qb1 = __vsub4(((ql1 >> 4) & 0x0F0F0F0F) | (((qh1 >> (2 * gb)) & 0x03030303) << 4), 0x20202020);
+                const signed char* sc = (const signed char*)(b + 192 + 8 * half + is);
+                acc[r] += d * (sc[2 * ga] * da * (float)__dp4a(qa0, xa0, __dp4a(qa1, xa1, 0))
+                             + sc[2 * gb] * db * (float)__dp4a(qb0, xb0, __dp4a(qb1, xb1, 0)));
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++) {
+        float v = warp_sum(acc[r]);
+        if (lane == 0 && row0 + r < rows) {
+            size_t idx = (size_t)out_off + row0 + r;
+            out[idx] = accumulate ? out[idx] + v : v;
+        }
+    }
+    (void)out_stride;
+}
+
+#define KQ_ARGS const unsigned char* __restrict__ w, const float* __restrict__ wd, const float* __restrict__ x, \
+                float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off
+__global__ void matmul_q4k_1(KQ_ARGS) { q4k_matvec<1>(w, x, out, rows, cols, n, accumulate, out_stride, out_off); }
+__global__ void matmul_q4k_4(KQ_ARGS) { q4k_matvec<4>(w, x, out, rows, cols, n, accumulate, out_stride, out_off); }
+__global__ void matmul_q6k_1(KQ_ARGS) { q6k_matvec<1>(w, wd, x, out, rows, cols, n, accumulate, out_stride, out_off); }
+__global__ void matmul_q6k_4(KQ_ARGS) { q6k_matvec<4>(w, wd, x, out, rows, cols, n, accumulate, out_stride, out_off); }
+
+// qkv rows are [q | k | v]; rotates q and k and stores k, v at their positions.
+// neox: pairs (x[i], x[i + rope_dim/2]) (Qwen); otherwise adjacent pairs (x[2i], x[2i+1]) (GGUF llama).
 __global__ void rope_cache(float* __restrict__ qkv, float* __restrict__ kc, float* __restrict__ vc,
-                           int pos0, int n_heads, int n_kv, int hd, int rope_dim, float base) {
+                           int pos0, int n_heads, int n_kv, int hd, int rope_dim, float base, int neox) {
     int b = blockIdx.x, pos = pos0 + b;
     int q_dim = n_heads * hd, kv_dim = n_kv * hd;
     float* row = qkv + (size_t)b * (q_dim + 2 * kv_dim);
@@ -135,9 +485,10 @@ __global__ void rope_cache(float* __restrict__ qkv, float* __restrict__ kc, floa
         float freq = powf(base, -2.0f * (float)i / (float)rope_dim);
         float s, c;
         sincosf((float)pos * freq, &s, &c);
-        float a = vec[2 * i], bb = vec[2 * i + 1];
-        vec[2 * i] = a * c - bb * s;
-        vec[2 * i + 1] = a * s + bb * c;
+        int ia = neox ? i : 2 * i, ib = neox ? i + half : 2 * i + 1;
+        float a = vec[ia], bb = vec[ib];
+        vec[ia] = a * c - bb * s;
+        vec[ib] = a * s + bb * c;
     }
     __syncthreads();
     for (int j = threadIdx.x; j < kv_dim; j += blockDim.x) {
@@ -146,10 +497,105 @@ __global__ void rope_cache(float* __restrict__ qkv, float* __restrict__ kc, floa
     }
 }
 
-// Flash-decoding attention, part 1: one block per (head, token, slice of `chunk` positions).
-// Writes the slice's unnormalised output plus its max score and exp-sum to `part` (hd + 2 floats).
 #define ATT_MAX_CHUNK 256
 #define ATT_MAX_HD 128
+#define ATT_MAX_G 8
+
+// Flash-decoding attention for grouped-query models, part 1: one block per (kv head, token, slice of
+// `chunk` positions) computes all G = n_heads / n_kv query heads that share the kv head, so each key
+// and value row is read once. A warp scores one position at a time: every lane loads hd/32 consecutive
+// floats of the key (one coalesced row read) and the dot products are reduced across the warp.
+// Writes each head's unnormalised output, max score and exp-sum to `part`, or (nsplit == 1) the final
+// normalised result to `out`. Needs hd a multiple of 32 (<= 128) and G <= ATT_MAX_G.
+__global__ void attention_partial_gqa(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
+                                      float* __restrict__ part, float* __restrict__ out, int pos0, int n_heads, int n_kv,
+                                      int hd, float scale, int nsplit, int chunk) {
+    __shared__ float sc[ATT_MAX_G][ATT_MAX_CHUNK];
+    __shared__ float red[32];
+    int kvh = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
+    int G = n_heads / n_kv;
+    int span = pos0 + b + 1; // causal
+    int t0 = s * chunk, len = min(span, t0 + chunk) - t0;
+    int q_dim = n_heads * hd, kv_dim = n_kv * hd;
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nwarps = blockDim.x >> 5;
+    if (len <= 0) { // same for the whole block, so returning before the barriers is safe
+        for (int g = 0; g < G; g++) {
+            float* p = part + (((size_t)b * n_heads + kvh * G + g) * nsplit + s) * (hd + 2);
+            for (int d = tid; d < hd; d += blockDim.x) p[d] = 0.f;
+            if (tid == 0) { p[hd] = NEG_INF; p[hd + 1] = 0.f; }
+        }
+        return;
+    }
+    int per = hd >> 5; // floats per lane: 2 (hd 64) or 4 (hd 128)
+    float q[ATT_MAX_G][4];
+    const float* qrow = qkv + (size_t)b * (q_dim + 2 * kv_dim) + kvh * G * hd + lane * per;
+    #pragma unroll
+    for (int g = 0; g < ATT_MAX_G; g++)
+        #pragma unroll
+        for (int e = 0; e < 4; e++) q[g][e] = (g < G && e < per) ? qrow[g * hd + e] * scale : 0.f;
+
+    for (int t = warp; t < len; t += nwarps) {
+        const float* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd + lane * per;
+        float k4[4] = {0.f, 0.f, 0.f, 0.f};
+        if (per == 4) { float4 v = *reinterpret_cast<const float4*>(kt); k4[0] = v.x; k4[1] = v.y; k4[2] = v.z; k4[3] = v.w; }
+        else { float2 v = *reinterpret_cast<const float2*>(kt); k4[0] = v.x; k4[1] = v.y; }
+        #pragma unroll
+        for (int g = 0; g < ATT_MAX_G; g++) {
+            if (g < G) {
+                float d = q[g][0] * k4[0] + q[g][1] * k4[1] + q[g][2] * k4[2] + q[g][3] * k4[3];
+                for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffff, d, o);
+                if (lane == 0) sc[g][t] = d;
+            }
+        }
+    }
+    __syncthreads();
+    float mxg[ATT_MAX_G], seg[ATT_MAX_G];
+    #pragma unroll
+    for (int g = 0; g < ATT_MAX_G; g++) {
+        if (g < G) {
+            float m = NEG_INF;
+            for (int t = tid; t < len; t += blockDim.x) m = fmaxf(m, sc[g][t]);
+            m = block_max(m, red);
+            float se = 0.f;
+            for (int t = tid; t < len; t += blockDim.x) {
+                float e = expf(sc[g][t] - m);
+                sc[g][t] = e;
+                se += e;
+            }
+            se = block_sum(se, red); // barrier: the probabilities are visible to every thread
+            mxg[g] = m;
+            seg[g] = se;
+        }
+    }
+    if (tid < hd) {
+        float a[ATT_MAX_G];
+        #pragma unroll
+        for (int g = 0; g < ATT_MAX_G; g++) a[g] = 0.f;
+        const float* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + tid;
+        for (int t = 0; t < len; t++) {
+            float v = vcol[(size_t)t * kv_dim];
+            #pragma unroll
+            for (int g = 0; g < ATT_MAX_G; g++) if (g < G) a[g] += sc[g][t] * v;
+        }
+        #pragma unroll
+        for (int g = 0; g < ATT_MAX_G; g++) {
+            if (g < G) {
+                int h = kvh * G + g;
+                if (nsplit == 1) {
+                    out[(size_t)b * q_dim + h * hd + tid] = a[g] / seg[g];
+                } else {
+                    float* p = part + (((size_t)b * n_heads + h) * nsplit + s) * (hd + 2);
+                    p[tid] = a[g];
+                    if (tid == 0) { p[hd] = mxg[g]; p[hd + 1] = seg[g]; }
+                }
+            }
+        }
+    }
+}
+
+// Flash-decoding attention, part 1 (one head per block; used when attention_partial_gqa does not apply):
+// one block per (head, token, slice of `chunk` positions). Writes the slice's unnormalised output plus
+// its max score and exp-sum to `part` (hd + 2 floats).
 // With nsplit == 1 there is nothing to merge: the block writes the normalised result straight to `out`.
 __global__ void attention_partial(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
                                   float* __restrict__ part, float* __restrict__ out, int pos0, int n_heads, int n_kv, int hd,
@@ -318,6 +764,162 @@ __global__ void attention_prefill(const float* __restrict__ qkv, const float* __
     }
 }
 
+}  // extern "C": the template below needs C++ linkage
+
+// two floats -> one f16x2 word (low half first); sm_75 has no packed f32->f16x2 convert
+__device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
+    unsigned r;
+    asm("{.reg .f16 l, h; cvt.rn.f16.f32 l, %1; cvt.rn.f16.f32 h, %2; mov.b32 %0, {l, h};}" : "=r"(r) : "f"(lo), "f"(hi));
+    return r;
+}
+#define MMA_F16(c, a0, a1, b) \
+    asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};" \
+        : "+f"((c)[0]), "+f"((c)[1]), "+f"((c)[2]), "+f"((c)[3]) : "r"(a0), "r"(a1), "r"(b))
+#define LDSM_X4(r, addr, trans) \
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4" trans ".shared.b16 {%0,%1,%2,%3}, [%4];" \
+                 : "=r"((r)[0]), "=r"((r)[1]), "=r"((r)[2]), "=r"((r)[3]) : "r"(addr))
+
+// Tensor-core version of attention_prefill (sm_75+, FlashAttention-2 style): one block per (head, 64
+// query tokens), 4 warps of 16 query rows. Q, K and V go through f16 m16n8k8 mma with f32 accumulators:
+// a warp keeps its Q rows as fragments in registers, S = Q K^T comes out in the accumulator layout,
+// which is also the A-fragment layout, so the probabilities feed O += P V without a trip through
+// shared memory. K/V tiles of 32 positions are converted to f16 into shared memory (rows padded by 16
+// bytes: ldmatrix rows hit different banks); the same buffer stages Q at the start. Online softmax in
+// base 2 (Q is pre-scaled by scale * log2 e). The row sums come from the tensor cores too (P x ones), so they\n// add up exactly the rounded probabilities that P V uses.
+template <int HD>
+__device__ void attn_prefill_tc(const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc,
+                                float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, float scale) {
+    constexpr int BQ = 64, BK = 32, LDW = HD / 2 + 4; // row stride in f16x2 words
+    __shared__ __align__(16) unsigned sm[2 * BK * LDW]; // Q staging (BQ rows), then K (BK rows) | V (BK rows)
+    unsigned* Ks = sm;
+    unsigned* Vs = sm + BK * LDW;
+    int h = blockIdx.x;
+    int q0 = (gridDim.y - 1 - blockIdx.y) * BQ; // the longest (latest) query tiles start first
+    int kvh = h / (n_heads / n_kv);
+    int q_dim = n_heads * HD, kv_dim = n_kv * HD, row_stride = q_dim + 2 * kv_dim;
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int kv_len = pos0 + n;
+    const float qs = scale * 1.4426950408889634f;
+
+    // stage Q (rows past n are zeros), then each warp takes its 16 rows as A fragments
+    for (int idx = tid; idx < BQ * HD / 4; idx += 128) {
+        int r = idx / (HD / 4), c4 = idx % (HD / 4);
+        float4 v = q0 + r < n ? *reinterpret_cast<const float4*>(qkv + (size_t)(q0 + r) * row_stride + h * HD + 4 * c4) : make_float4(0.f, 0.f, 0.f, 0.f);
+        *reinterpret_cast<uint2*>(sm + r * LDW + 2 * c4) = make_uint2(pack_h2(v.x * qs, v.y * qs), pack_h2(v.z * qs, v.w * qs));
+    }
+    __syncthreads();
+    unsigned qf[HD / 8][2]; // per k8 step: rows 0-7, rows 8-15
+    {
+        int m = lane >> 3; // ldmatrix.x4 matrices: (rows 0-7 | 8-15) x (k0 | k0+8)
+        unsigned base = (unsigned)__cvta_generic_to_shared(sm + (16 * warp + (lane & 7) + 8 * (m & 1)) * LDW + 4 * (m >> 1));
+        #pragma unroll
+        for (int k = 0; k < HD / 16; k++) {
+            unsigned r[4];
+            LDSM_X4(r, base + 32 * k, "");
+            qf[2 * k][0] = r[0]; qf[2 * k][1] = r[1]; qf[2 * k + 1][0] = r[2]; qf[2 * k + 1][1] = r[3];
+        }
+    }
+
+    float o[HD / 8][4]; // 16 rows x HD dims: per dim tile of 8, rows lo (c0, c1) and hi (c2, c3)
+    #pragma unroll
+    for (int d = 0; d < HD / 8; d++) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.f;
+    float m_lo = NEG_INF, m_hi = NEG_INF;
+    float l[4] = {0.f, 0.f, 0.f, 0.f}; // row sums of the f16 probabilities: P x ones (c0 = row lo, c2 = row hi)
+    int p_lo = pos0 + q0 + 16 * warp + (lane >> 2), p_hi = p_lo + 8; // positions of this thread's two rows
+    int warp_last = pos0 + q0 + 16 * warp + 15;
+    int kmax = min(kv_len, pos0 + q0 + BQ);
+    // ldmatrix row addresses: K (keys as rows, non-transposed = B fragments of K^T), V (transposed)
+    unsigned kaddr = (unsigned)__cvta_generic_to_shared(Ks + (8 * 0 + (lane & 7)) * LDW + 4 * (lane >> 3));
+    unsigned vaddr = (unsigned)__cvta_generic_to_shared(Vs + lane * LDW);
+
+    for (int t0 = 0; t0 < kmax; t0 += BK) {
+        __syncthreads(); // previous tile (or the Q staging) consumed
+        for (int idx = tid; idx < BK * HD / 4; idx += 128) {
+            int r = idx / (HD / 4), c4 = idx % (HD / 4), kp = t0 + r;
+            float4 k4 = make_float4(0.f, 0.f, 0.f, 0.f), v4 = k4; // positions past the end must be finite: P = 0 there
+            if (kp < kv_len) {
+                k4 = *reinterpret_cast<const float4*>(kc + (size_t)kp * kv_dim + kvh * HD + 4 * c4);
+                v4 = *reinterpret_cast<const float4*>(vc + (size_t)kp * kv_dim + kvh * HD + 4 * c4);
+            }
+            *reinterpret_cast<uint2*>(Ks + r * LDW + 2 * c4) = make_uint2(pack_h2(k4.x, k4.y), pack_h2(k4.z, k4.w));
+            *reinterpret_cast<uint2*>(Vs + r * LDW + 2 * c4) = make_uint2(pack_h2(v4.x, v4.y), pack_h2(v4.z, v4.w));
+        }
+        __syncthreads();
+        if (t0 > warp_last) continue; // causal: nothing of this tile is visible to the warp's rows
+
+        // S = Q K^T: 4 key tiles of 8; per key tile ldmatrix.x4 covers 4 k8 steps (32 dims)
+        float s[BK / 8][4];
+        #pragma unroll
+        for (int j = 0; j < BK / 8; j++) {
+            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+            #pragma unroll
+            for (int k = 0; k < HD / 32; k++) {
+                unsigned b[4];
+                LDSM_X4(b, kaddr + (8 * j * LDW + 16 * k) * 4, "");
+                #pragma unroll
+                for (int q = 0; q < 4; q++) MMA_F16(s[j], qf[4 * k + q][0], qf[4 * k + q][1], b[q]);
+            }
+        }
+        // causal / length mask, online softmax (row max over the 4 lanes of a quad)
+        float mx_lo = NEG_INF, mx_hi = NEG_INF;
+        #pragma unroll
+        for (int j = 0; j < BK / 8; j++)
+            #pragma unroll
+            for (int e = 0; e < 2; e++) {
+                int kp = t0 + 8 * j + 2 * (lane & 3) + e;
+                if (kp > p_lo || kp >= kv_len) s[j][e] = NEG_INF;
+                if (kp > p_hi || kp >= kv_len) s[j][2 + e] = NEG_INF;
+                mx_lo = fmaxf(mx_lo, s[j][e]);
+                mx_hi = fmaxf(mx_hi, s[j][2 + e]);
+            }
+        #pragma unroll
+        for (int x = 1; x < 4; x <<= 1) {
+            mx_lo = fmaxf(mx_lo, __shfl_xor_sync(0xffffffff, mx_lo, x));
+            mx_hi = fmaxf(mx_hi, __shfl_xor_sync(0xffffffff, mx_hi, x));
+        }
+        // every row sees position 0 in the first tile, so the running max is finite from then on
+        float mn_lo = fmaxf(m_lo, mx_lo), mn_hi = fmaxf(m_hi, mx_hi);
+        float a_lo = exp2f(m_lo - mn_lo), a_hi = exp2f(m_hi - mn_hi);
+        m_lo = mn_lo; m_hi = mn_hi;
+        unsigned pf[BK / 8][2]; // probabilities as A fragments, one per k8 step of keys
+        #pragma unroll
+        for (int j = 0; j < BK / 8; j++) {
+            float p0 = exp2f(s[j][0] - mn_lo), p1 = exp2f(s[j][1] - mn_lo);
+            float p2 = exp2f(s[j][2] - mn_hi), p3 = exp2f(s[j][3] - mn_hi);
+            pf[j][0] = pack_h2(p0, p1);
+            pf[j][1] = pack_h2(p2, p3);
+        }
+        // normalise by the sum of the rounded probabilities that P V actually uses
+        l[0] *= a_lo; l[1] *= a_lo; l[2] *= a_hi; l[3] *= a_hi;
+        #pragma unroll
+        for (int j = 0; j < BK / 8; j++) MMA_F16(l, pf[j][0], pf[j][1], 0x3C003C00u); // f16 1.0 x2
+        // O = O * alpha + P V: per dim tile one ldmatrix.x4.trans gives the B fragments of all 4 key steps
+        #pragma unroll
+        for (int d = 0; d < HD / 8; d++) {
+            o[d][0] *= a_lo; o[d][1] *= a_lo; o[d][2] *= a_hi; o[d][3] *= a_hi;
+            unsigned b[4];
+            LDSM_X4(b, vaddr + 16 * d, ".trans");
+            #pragma unroll
+            for (int j = 0; j < BK / 8; j++) MMA_F16(o[d], pf[j][0], pf[j][1], b[j]);
+        }
+    }
+    int r_lo = q0 + 16 * warp + (lane >> 2), r_hi = r_lo + 8;
+    float i_lo = 1.f / l[0], i_hi = 1.f / l[2];
+    #pragma unroll
+    for (int d = 0; d < HD / 8; d++) {
+        int col = h * HD + 8 * d + 2 * (lane & 3);
+        if (r_lo < n) *reinterpret_cast<float2*>(out + (size_t)r_lo * q_dim + col) = make_float2(o[d][0] * i_lo, o[d][1] * i_lo);
+        if (r_hi < n) *reinterpret_cast<float2*>(out + (size_t)r_hi * q_dim + col) = make_float2(o[d][2] * i_hi, o[d][3] * i_hi);
+    }
+}
+
+extern "C" {
+
+#define ATT_TC_ARGS const float* __restrict__ qkv, const float* __restrict__ kc, const float* __restrict__ vc, \
+                    float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, int hd, float scale
+__global__ void __launch_bounds__(128) attention_prefill_tc64(ATT_TC_ARGS) { attn_prefill_tc<64>(qkv, kc, vc, out, pos0, n, n_heads, n_kv, scale); }
+__global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { attn_prefill_tc<128>(qkv, kc, vc, out, pos0, n, n_heads, n_kv, scale); }
+
 // Flash-decoding attention, part 2: merge the slices of each (head, token) into the normalised output.
 __global__ void attention_combine(const float* __restrict__ part, float* __restrict__ out,
                                   int pos0, int n_heads, int hd, int nsplit, int chunk) {
@@ -337,8 +939,10 @@ __global__ void attention_combine(const float* __restrict__ part, float* __restr
     }
 }
 
-// Activations to int8 in blocks of 32 (one warp per block): q = round(x / d), d = max|x| / 127.
-__global__ void quantize_q8(const float* __restrict__ x, signed char* __restrict__ q, float* __restrict__ d, int n_blocks) {
+// Activations to int8 in blocks of 32 (one warp per block): q = round(x / d), d = max|x| / 127,
+// plus each block's sum of q (for the K-quant "min" terms).
+__global__ void quantize_q8(const float* __restrict__ x, signed char* __restrict__ q, float* __restrict__ d,
+                            int* __restrict__ sums, int n_blocks) {
     int blk = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (blk >= n_blocks) return;
@@ -347,58 +951,113 @@ __global__ void quantize_q8(const float* __restrict__ x, signed char* __restrict
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
     float dd = amax / 127.f;
     float inv = dd != 0.f ? 1.f / dd : 0.f;
-    q[(size_t)blk * 32 + lane] = (signed char)roundf(v * inv);
-    if (lane == 0) d[blk] = dd;
+    int qi = (int)roundf(v * inv);
+    q[(size_t)blk * 32 + lane] = (signed char)qi;
+    for (int o = 16; o > 0; o >>= 1) qi += __shfl_xor_sync(0xffffffff, qi, o);
+    if (lane == 0) { d[blk] = dd; sums[blk] = qi; }
 }
 
-// Batched int8 matmul for prompts: out[t*rows + r] (+)= sum_k W[r][k] * X[t][k], both Q8 (int8 + scale per 32).
-// 64x64 output tile per 256-thread block; each thread owns 4 rows x 4 tokens; __dp4a does 4 int8 MACs.
+// Batched int8 matmul for prompts: out[t*out_stride + out_off + r] (+)= sum_k W[r][k] * X[t][k].
+// Activations are int8 + scale per 32. Each weight 32-block becomes int8 values plus a scale for each
+// 16-value half and a "min": Q8_0 (one scale, no min), Q4_K (values 0..15, scale and min),
+// Q6_K (values -32..31, two scales). 64x64 output tile per 256-thread block; each thread owns
+// 4 rows x 4 tokens; __dp4a does 4 int8 multiply-adds.
 #define TILE 64
-__global__ void matmul_q8_tiled(const signed char* __restrict__ wq, const float* __restrict__ wd,
-                                const signed char* __restrict__ xq, const float* __restrict__ xd,
-                                float* __restrict__ out, int rows, int cols, int n, int accumulate) {
-    __shared__ int ws[TILE][9]; // 8 ints = 32 int8 per row, +1 to spread rows over banks
-    __shared__ int xs[TILE][9];
-    __shared__ float wds[TILE], xds[TILE];
+__global__ void matmul_tiled(int fmt, const unsigned char* __restrict__ wq, const float* __restrict__ wd,
+                             const signed char* __restrict__ xq, const float* __restrict__ xd, const int* __restrict__ xsum,
+                             float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    // one step covers up to 8 blocks of 32 (a whole K-quant super-block): fewer barriers and scale decodes
+    __shared__ int ws[TILE][65]; // 64 ints = 256 int8 per row, +1 to spread rows over banks
+    __shared__ int xs[TILE][65];
+    __shared__ float wsa[TILE][8], wsb[TILE][8], wmn[TILE][8], xds[TILE][8], xss[TILE][8];
     int tid = threadIdx.x;
     int tx = tid & 15, ty = tid >> 4; // tx picks rows (coalesced stores), ty picks tokens
     int row0 = blockIdx.x * TILE, tok0 = blockIdx.y * TILE;
-    int nb = cols >> 5;
+    int nb = cols >> 5, nsb = cols >> 8;
     float acc[4][4];
     #pragma unroll
     for (int i = 0; i < 4; i++)
         #pragma unroll
         for (int j = 0; j < 4; j++) acc[i][j] = 0.f;
 
-    for (int kb = 0; kb < nb; kb++) {
-        for (int idx = tid; idx < TILE * 8; idx += 256) {
-            int r = idx >> 3, w = idx & 7;
-            int gr = row0 + r, gt = tok0 + r;
-            ws[r][w] = gr < rows ? *reinterpret_cast<const int*>(wq + (size_t)gr * cols + kb * 32 + w * 4) : 0;
-            xs[r][w] = gt < n ? *reinterpret_cast<const int*>(xq + (size_t)gt * cols + kb * 32 + w * 4) : 0;
+    for (int kc = 0; kc < nb; kc += 8) {
+        int nk = min(8, nb - kc);
+        for (int idx = tid; idx < TILE * 64; idx += 256) {
+            int r = idx >> 6, wi = idx & 63, k8 = wi >> 3, w = wi & 7;
+            int gr = row0 + r, gt = tok0 + r, kb = kc + k8;
+            int v = 0, xv = 0;
+            if (k8 < nk) {
+                if (gr < rows) {
+                    if (fmt == 0) {
+                        v = *reinterpret_cast<const int*>(wq + (size_t)gr * cols + kb * 32 + w * 4);
+                    } else if (fmt == 1) {
+                        const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q4K_BYTES;
+                        int p = *reinterpret_cast<const int*>(b + 16 + 32 * (k8 >> 1) + 4 * w);
+                        v = (k8 & 1) ? ((p >> 4) & 0x0F0F0F0F) : (p & 0x0F0F0F0F);
+                    } else {
+                        const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q6K_BYTES;
+                        int half = k8 >> 2, g = k8 & 3;
+                        int p = *reinterpret_cast<const int*>(b + 64 * half + (g & 1) * 32 + 4 * w);
+                        int lo = (g >= 2) ? ((p >> 4) & 0x0F0F0F0F) : (p & 0x0F0F0F0F);
+                        int h = *reinterpret_cast<const int*>(b + 128 + 32 * half + 4 * w);
+                        v = __vsub4(lo | (((h >> (2 * g)) & 0x03030303) << 4), 0x20202020); // bytewise -32
+                    }
+                }
+                if (gt < n) xv = *reinterpret_cast<const int*>(xq + (size_t)gt * cols + kb * 32 + w * 4);
+            }
+            ws[r][wi] = v;
+            xs[r][wi] = xv;
         }
-        if (tid < TILE) {
-            int gr = row0 + tid;
-            wds[tid] = gr < rows ? wd[(size_t)gr * nb + kb] : 0.f;
-        } else if (tid < 2 * TILE) {
-            int t = tid - TILE, gt = tok0 + t;
-            xds[t] = gt < n ? xd[(size_t)gt * nb + kb] : 0.f;
+        // per-32 scales: 64 rows x 8 blocks for the weights, the same for the activations
+        for (int idx = tid; idx < TILE * 8; idx += 256) {
+            int r = idx >> 3, k8 = idx & 7, kb = kc + k8;
+            int gr = row0 + r, gt = tok0 + r;
+            float sa = 0.f, sb = 0.f, mn = 0.f;
+            if (k8 < nk && gr < rows) {
+                if (fmt == 0) {
+                    sa = sb = wd[(size_t)gr * nb + kb];
+                } else if (fmt == 1) {
+                    const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q4K_BYTES;
+                    int sc, m;
+                    q4k_scale_min(k8, b + 4, &sc, &m);
+                    float d, dmin;
+                    q4k_dm(b, &d, &dmin);
+                    sa = sb = d * sc;
+                    mn = dmin * m;
+                } else {
+                    const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q6K_BYTES;
+                    float d = wd[(size_t)gr * nsb + (kb >> 3)];
+                    const signed char* sc = (const signed char*)(b + 192 + 8 * (k8 >> 2) + 2 * (k8 & 3));
+                    sa = d * sc[0];
+                    sb = d * sc[1];
+                }
+            }
+            wsa[r][k8] = sa; wsb[r][k8] = sb; wmn[r][k8] = mn;
+            bool tok_ok = k8 < nk && gt < n;
+            xds[r][k8] = tok_ok ? xd[(size_t)gt * nb + kb] : 0.f;
+            xss[r][k8] = tok_ok ? (float)xsum[(size_t)gt * nb + kb] : 0.f;
         }
         __syncthreads();
-        int wr[4][8], xr[4][8];
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
+        for (int k8 = 0; k8 < nk; k8++) {
+            int wr[4][8], xr[4][8];
             #pragma unroll
-            for (int w = 0; w < 8; w++) { wr[i][w] = ws[tx + 16 * i][w]; xr[i][w] = xs[ty + 16 * i][w]; }
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            float dw = wds[tx + 16 * i];
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                int s = 0;
+            for (int i = 0; i < 4; i++)
                 #pragma unroll
-                for (int w = 0; w < 8; w++) s = __dp4a(wr[i][w], xr[j][w], s);
-                acc[i][j] += (float)s * dw * xds[ty + 16 * j];
+                for (int w = 0; w < 8; w++) { wr[i][w] = ws[tx + 16 * i][k8 * 8 + w]; xr[i][w] = xs[ty + 16 * i][k8 * 8 + w]; }
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int r = tx + 16 * i;
+                float sa = wsa[r][k8], sb = wsb[r][k8], mn = wmn[r][k8];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    int lo = 0, hi = 0;
+                    #pragma unroll
+                    for (int w = 0; w < 4; w++) lo = __dp4a(wr[i][w], xr[j][w], lo);
+                    #pragma unroll
+                    for (int w = 4; w < 8; w++) hi = __dp4a(wr[i][w], xr[j][w], hi);
+                    int t = ty + 16 * j;
+                    acc[i][j] += xds[t][k8] * (sa * (float)lo + sb * (float)hi - mn * xss[t][k8]);
+                }
             }
         }
         __syncthreads();
@@ -410,12 +1069,541 @@ __global__ void matmul_q8_tiled(const signed char* __restrict__ wq, const float*
         for (int j = 0; j < 4; j++) {
             int t = tok0 + ty + 16 * j;
             if (r < rows && t < n) {
-                size_t idx = (size_t)t * rows + r;
+                size_t idx = (size_t)t * out_stride + out_off + r;
                 out[idx] = accumulate ? out[idx] + acc[i][j] : acc[i][j];
             }
         }
     }
 }
+
+// Tensor-core version of matmul_tiled (sm_75+): int8 mma.sync.m8n8k16, whose register layout is
+// documented, so every thread knows the (row, token) of its two results and can apply the per-block
+// weight and activation scales. One k16 step is exactly one Q6_K sub-block (half a 32-block).
+// 128 threads = 2x2 warps over a 64x64 output tile; each warp owns 32 rows x 32 tokens (4x4 mma tiles).
+// K advances 128 values (4 blocks of 32) per shared-memory stage. Rows are padded to 36 words so the
+// fragment loads (8 rows x 4 words per warp) hit 32 different banks.
+#define MMA_KB 4
+#define MMA_LD 36
+__global__ void matmul_mma(int fmt, const unsigned char* __restrict__ wq, const float* __restrict__ wd,
+                           const signed char* __restrict__ xq, const float* __restrict__ xd, const int* __restrict__ xsum,
+                           float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    __shared__ int ws[TILE * MMA_LD];
+    __shared__ int xs[TILE * MMA_LD];
+    __shared__ float wsa[TILE][MMA_KB], wsb[TILE][MMA_KB], wmn[TILE][MMA_KB], xds[TILE][MMA_KB], xms[TILE][MMA_KB];
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int row0 = blockIdx.x * TILE, tok0 = blockIdx.y * TILE;
+    int wr = (warp >> 1) * 32, wt = (warp & 1) * 32; // this warp's rows / tokens inside the tile
+    int nb = cols >> 5, nsb = cols >> 8;
+    int fr = lane >> 2, fk = lane & 3; // fragment row (or token) and word within the k16 step
+    float acc[4][4][2];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { acc[i][j][0] = 0.f; acc[i][j][1] = 0.f; }
+
+    // Software pipeline: each thread fetches the next stage into registers (its global loads stay in
+    // flight) while the warps run tensor-core math on the current stage in shared memory, then writes
+    // it to shared memory. Per stage and thread (128 threads): 16 weight words, 16 activation words,
+    // 2 (row, block) scale entries.
+    int wreg[16], xreg[16];
+    float sreg[2][5];
+    auto fetch = [&](int kc) {
+        int nk = min(MMA_KB, nb - kc);
+        if (fmt == 1) {
+            // Q4_K: one word holds the low nibbles of block 2p and the high nibbles of block 2p+1
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                int idx = tid + 128 * s;
+                int r = idx >> 4, pi = (idx >> 3) & 1, w = idx & 7;
+                int gr = row0 + r, kk = 2 * pi, kb = kc + kk;
+                int p = 0;
+                if (kk < nk && gr < rows) {
+                    const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q4K_BYTES;
+                    p = *reinterpret_cast<const int*>(b + 16 + 32 * ((kb & 7) >> 1) + 4 * w);
+                }
+                wreg[2 * s] = p & 0x0F0F0F0F;
+                wreg[2 * s + 1] = (kk + 1 < nk) ? ((p >> 4) & 0x0F0F0F0F) : 0;
+            }
+        } else {
+            #pragma unroll
+            for (int s = 0; s < 16; s++) {
+                int idx = tid + 128 * s;
+                int r = idx >> 5, wi = idx & 31, kk = wi >> 3, w = wi & 7;
+                int gr = row0 + r, kb = kc + kk, k8 = kb & 7;
+                int v = 0;
+                if (kk < nk && gr < rows) {
+                    if (fmt == 0) {
+                        v = *reinterpret_cast<const int*>(wq + (size_t)gr * cols + kb * 32 + w * 4);
+                    } else {
+                        const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q6K_BYTES;
+                        int half = k8 >> 2, g = k8 & 3;
+                        int p = *reinterpret_cast<const int*>(b + 64 * half + (g & 1) * 32 + 4 * w);
+                        int lo = (g >= 2) ? ((p >> 4) & 0x0F0F0F0F) : (p & 0x0F0F0F0F);
+                        int h = *reinterpret_cast<const int*>(b + 128 + 32 * half + 4 * w);
+                        v = __vsub4(lo | (((h >> (2 * g)) & 0x03030303) << 4), 0x20202020);
+                    }
+                }
+                wreg[s] = v;
+            }
+        }
+        #pragma unroll
+        for (int s = 0; s < 16; s++) {
+            int idx = tid + 128 * s;
+            int r = idx >> 5, wi = idx & 31, kk = wi >> 3, w = wi & 7;
+            int gt = tok0 + r;
+            xreg[s] = (kk < nk && gt < n) ? *reinterpret_cast<const int*>(xq + (size_t)gt * cols + (kc + kk) * 32 + w * 4) : 0;
+        }
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            int idx = tid + 128 * s;
+            int r = idx / MMA_KB, kk = idx % MMA_KB, kb = kc + kk, k8 = kb & 7;
+            int gr = row0 + r, gt = tok0 + r;
+            float sa = 0.f, sb = 0.f, mn = 0.f;
+            if (kk < nk && gr < rows) {
+                if (fmt == 0) {
+                    sa = sb = wd[(size_t)gr * nb + kb];
+                } else if (fmt == 1) {
+                    const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q4K_BYTES;
+                    int sc, m;
+                    q4k_scale_min(k8, b + 4, &sc, &m);
+                    float d, dmin;
+                    q4k_dm(b, &d, &dmin);
+                    sa = sb = d * sc;
+                    mn = dmin * m;
+                } else {
+                    const unsigned char* b = wq + ((size_t)gr * nsb + (kb >> 3)) * Q6K_BYTES;
+                    float d = wd[(size_t)gr * nsb + (kb >> 3)];
+                    const signed char* sc = (const signed char*)(b + 192 + 8 * (k8 >> 2) + 2 * (k8 & 3));
+                    sa = d * sc[0];
+                    sb = d * sc[1];
+                }
+            }
+            bool ok = kk < nk && gt < n;
+            float dx = ok ? xd[(size_t)gt * nb + kb] : 0.f;
+            sreg[s][0] = sa; sreg[s][1] = sb; sreg[s][2] = mn;
+            sreg[s][3] = dx;
+            sreg[s][4] = ok ? dx * (float)xsum[(size_t)gt * nb + kb] : 0.f;
+        }
+    };
+    auto commit = [&]() {
+        if (fmt == 1) {
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                int idx = tid + 128 * s;
+                int r = idx >> 4, kk = 2 * ((idx >> 3) & 1), w = idx & 7;
+                ws[r * MMA_LD + kk * 8 + w] = wreg[2 * s];
+                ws[r * MMA_LD + (kk + 1) * 8 + w] = wreg[2 * s + 1];
+            }
+        } else {
+            #pragma unroll
+            for (int s = 0; s < 16; s++) {
+                int idx = tid + 128 * s;
+                ws[(idx >> 5) * MMA_LD + (idx & 31)] = wreg[s];
+            }
+        }
+        #pragma unroll
+        for (int s = 0; s < 16; s++) {
+            int idx = tid + 128 * s;
+            xs[(idx >> 5) * MMA_LD + (idx & 31)] = xreg[s];
+        }
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            int idx = tid + 128 * s;
+            int r = idx / MMA_KB, kk = idx % MMA_KB;
+            wsa[r][kk] = sreg[s][0]; wsb[r][kk] = sreg[s][1]; wmn[r][kk] = sreg[s][2];
+            xds[r][kk] = sreg[s][3]; xms[r][kk] = sreg[s][4];
+        }
+    };
+
+    fetch(0);
+    commit();
+    __syncthreads();
+    for (int kc = 0; kc < nb; kc += MMA_KB) {
+        int nk = min(MMA_KB, nb - kc);
+        bool more = kc + MMA_KB < nb;
+        if (more) fetch(kc + MMA_KB); // issued now, consumed after the math below
+
+        for (int kk = 0; kk < nk; kk++) {
+            // this thread's scales for the block, in registers: 4 rows, 8 tokens
+            float ra[4], rb[4], ts[4][2];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) { ra[i] = wsa[wr + i * 8 + fr][kk]; rb[i] = wsb[wr + i * 8 + fr][kk]; }
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { ts[j][0] = xds[wt + j * 8 + fk * 2][kk]; ts[j][1] = xds[wt + j * 8 + fk * 2 + 1][kk]; }
+            int c[4][4][2];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) { c[i][j][0] = 0; c[i][j][1] = 0; }
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                int kw = kk * 8 + h * 4 + fk;
+                int a[4], bq[4];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) a[i] = ws[(wr + i * 8 + fr) * MMA_LD + kw];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) bq[j] = xs[(wt + j * 8 + fr) * MMA_LD + kw];
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                            : "+r"(c[i][j][0]), "+r"(c[i][j][1]) : "r"(a[i]), "r"(bq[j]));
+                // Q6_K has a scale per 16 values (one k16 step): fold in each half separately.
+                // Q8_0 / Q4_K have one scale per 32: integers keep accumulating, folded in once below.
+                if (fmt == 2) {
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float s = h ? rb[i] : ra[i];
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            acc[i][j][0] += (float)c[i][j][0] * (s * ts[j][0]);
+                            acc[i][j][1] += (float)c[i][j][1] * (s * ts[j][1]);
+                            c[i][j][0] = 0; c[i][j][1] = 0;
+                        }
+                    }
+                }
+            }
+            if (fmt != 2) {
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    float mn = wmn[wr + i * 8 + fr][kk]; // Q4_K mins (0 for Q8_0)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        int t = wt + j * 8 + fk * 2;
+                        acc[i][j][0] += (float)c[i][j][0] * (ra[i] * ts[j][0]) - mn * xms[t][kk];
+                        acc[i][j][1] += (float)c[i][j][1] * (ra[i] * ts[j][1]) - mn * xms[t + 1][kk];
+                    }
+                }
+            }
+        }
+        __syncthreads(); // everyone done reading this stage
+        if (more) {
+            commit();
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int r = row0 + wr + i * 8 + fr;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 2; e++) {
+                int t = tok0 + wt + j * 8 + fk * 2 + e;
+                if (r < rows && t < n) {
+                    size_t idx = (size_t)t * out_stride + out_off + r;
+                    out[idx] = accumulate ? out[idx] + acc[i][j][e] : acc[i][j][e];
+                }
+            }
+        }
+    }
+}
+
+// Activations for the K-quant prompt matmuls: int8 with one scale per QCH values (128 or 256, set by the
+// compile options; one warp per chunk), plus each 32-block's sum split into a high part (sum >> 6) and the
+// low 6 bits, so the Q4_K min term fits int8 tensor cores. Per chunk, QCH/64 sum words: the QCH/32 high
+// bytes, then the QCH/32 low bytes.
+#define QVPL (QCH / 32) // values per lane
+__global__ void quantize_q8k(const float* __restrict__ x, signed char* __restrict__ q, float* __restrict__ d,
+                             int* __restrict__ sums, int n_chunks) {
+    int c = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (c >= n_chunks) return;
+    const float4* src = reinterpret_cast<const float4*>(x + (size_t)c * QCH + lane * QVPL);
+    float v[QVPL];
+    #pragma unroll
+    for (int i = 0; i < QVPL / 4; i++) { float4 f = src[i]; v[4 * i] = f.x; v[4 * i + 1] = f.y; v[4 * i + 2] = f.z; v[4 * i + 3] = f.w; }
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < QVPL; i++) amax = fmaxf(amax, fabsf(v[i]));
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    float dd = amax / 127.f;
+    float inv = dd != 0.f ? 1.f / dd : 0.f;
+    int s = 0, packed[QVPL / 4];
+    #pragma unroll
+    for (int i = 0; i < QVPL / 4; i++) {
+        int q0 = (int)roundf(v[4 * i] * inv), q1 = (int)roundf(v[4 * i + 1] * inv);
+        int q2 = (int)roundf(v[4 * i + 2] * inv), q3 = (int)roundf(v[4 * i + 3] * inv);
+        packed[i] = (q0 & 255) | ((q1 & 255) << 8) | ((q2 & 255) << 16) | ((unsigned)q3 << 24);
+        s += q0 + q1 + q2 + q3;
+    }
+    int* dst = reinterpret_cast<int*>(q + (size_t)c * QCH + lane * QVPL);
+    #pragma unroll
+    for (int i = 0; i < QVPL / 4; i++) dst[i] = packed[i];
+    for (int o = 1; o < 32 / QVPL; o <<= 1) s += __shfl_xor_sync(0xffffffff, s, o); // lanes of one 32-block
+    if (lane == 0) d[c] = dd;
+    if ((lane & (32 / QVPL - 1)) == 0) {
+        signed char* bs = reinterpret_cast<signed char*>(sums + (size_t)c * (QCH / 64));
+        int j = lane / (32 / QVPL);
+        bs[j] = (signed char)(s >> 6);
+        bs[QCH / 32 + j] = (signed char)(s & 63);
+    }
+}
+
+}  // extern "C": the template below needs C++ linkage
+
+// K-quant prompt matmul with an integer epilogue (activations from quantize_q8k). Within one activation
+// scale (QCH values) everything stays integer: the 6-bit (Q4_K) or int8 (Q6_K) sub-block scales multiply
+// the tensor-core sums with IMAD, the Q4_K mins go through one extra pair of mma (mins x the split
+// activation sums), and floats are touched once per QCH values instead of once per 32 or 16.
+// Same tiling as matmul_mma: 64x64 tile, 2x2 warps of 32x32, 128 K-values per shared-memory stage, so
+// two stages per super-block. Per tile and 32-block the two k16 mma run back to back into a fresh pair
+// of registers, which keeps the per-block integer sums out of the register file.
+#define XBW (QCH / 64) // split-sum words per token and activation chunk
+template <int FMT>
+__device__ void mma_kquant(const unsigned char* __restrict__ wq, const float* __restrict__ wd, const signed char* __restrict__ xq,
+                           const float* __restrict__ xd, const int* __restrict__ xb, float* __restrict__ out,
+                           int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    __shared__ __align__(16) int ws[TILE * MMA_LD];
+    __shared__ __align__(16) int xs[TILE * MMA_LD];
+    __shared__ float wdm[TILE][2]; // d, and dmin for Q4_K
+    __shared__ int wsc[TILE][2];   // this stage's sub-block scales as packed bytes (Q4_K: 4, Q6_K: 8)
+    __shared__ int wmn[TILE][2];   // Q4_K: the super-block's 8 mins as packed bytes
+    __shared__ float xds[TILE];    // activation scale of each token for the current QCH chunk
+    __shared__ int xbs[TILE][4];   // its split 32-block sums (XBW words used)
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int row0 = blockIdx.x * TILE, tok0 = blockIdx.y * TILE;
+    int wr = (warp >> 1) * 32, wt = (warp & 1) * 32;
+    int nsb = cols >> 8, nst = 2 * nsb;
+    int fr = lane >> 2, fk = lane & 3;
+    const int bytes = FMT == 1 ? Q4K_BYTES : Q6K_BYTES;
+    float acc[4][4][2];
+    int iacc[4][4][2];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { acc[i][j][0] = acc[i][j][1] = 0.f; iacc[i][j][0] = iacc[i][j][1] = 0; }
+
+    // Register-staged pipeline as in matmul_mma. fetch() only issues loads into raw words; all the
+    // unpacking happens in commit(), after the math, so no thread waits on its loads early.
+    // Quant bytes and activations move in 16-byte pieces (128-bit loads and shared stores). Each group
+    // of 8 lanes reads one cache line (activations: 8 pieces of one token) or one piece of 8 rows
+    // (weights), and the 8 lanes of a shared store hit 32 different banks. Rows and tokens past the end
+    // are clamped instead of tested; they only feed results that are never stored.
+    int4 wraw[FMT == 1 ? 2 : 3], xreg[4];
+    const signed char* xp[4];
+    #pragma unroll
+    for (int s = 0; s < 4; s++) xp[s] = xq + (size_t)min(tok0 + (tid >> 3) + 16 * s, n - 1) * cols + 16 * (tid & 7);
+    // weights: Q4_K piece q (of 4 per row and stage) of rows wl + 32*s; Q6_K piece half wh of row wl
+    int wl = FMT == 1 ? (tid & 7) + 8 * (tid >> 5) : (tid & 7) + 8 * (tid >> 4);
+    int wqp = FMT == 1 ? (tid >> 3) & 3 : (tid >> 3) & 1;
+    const unsigned char* wp[FMT == 1 ? 2 : 1];
+    #pragma unroll
+    for (int s = 0; s < (FMT == 1 ? 2 : 1); s++) wp[s] = wq + (size_t)min(row0 + wl + 32 * s, rows - 1) * nsb * bytes;
+    // metadata: two threads per row and per token
+    int lr = tid >> 1, hh = tid & 1;
+    int grc = min(row0 + lr, rows - 1), gtc = min(tok0 + lr, n - 1);
+    const unsigned char* mrow = wq + (size_t)grc * nsb * bytes;
+    const float* wdrow = wd + (size_t)grc * nsb; // Q6_K
+    float xf;
+    unsigned int wm, ma0, ma1; // wm: Q4_K d|dmin as two f16, Q6_K the f32 d's bits
+    int xi0, xi1;
+    // Two halves, issued at different points of the math so the load queue doesn't overflow:
+    // the weights and their metadata (half 0), the activations and theirs (half 1).
+    auto fetch = [&](int st, int half) {
+        int sb = st >> 1, hs = st & 1;
+        if (half == 1) {
+            #pragma unroll
+            for (int s = 0; s < 4; s++) xreg[s] = *reinterpret_cast<const int4*>(xp[s] + st * 128);
+            size_t c = (size_t)gtc * (cols / QCH) + st * 128 / QCH;
+            xf = xd[c];
+            xi0 = xb[c * XBW + hh * (XBW / 2)];
+            xi1 = XBW == 4 ? xb[c * XBW + hh * (XBW / 2) + 1] : 0;
+            return;
+        }
+        if (FMT == 1) {
+            // nibble bytes 64*hs .. +63 = [blocks 0 (low) / 1 (high): 32 bytes] [blocks 2 / 3: 32 bytes]
+            #pragma unroll
+            for (int s = 0; s < 2; s++) wraw[s] = *reinterpret_cast<const int4*>(wp[s] + (size_t)sb * bytes + 16 + 64 * hs + 16 * wqp);
+        } else {
+            // half wqp (16 bytes) of the low-nibble words of blocks 0/2, of blocks 1/3, and of the 2-bit highs
+            const unsigned char* b = wp[0] + (size_t)sb * bytes;
+            wraw[0] = *reinterpret_cast<const int4*>(b + 64 * hs + 16 * wqp);
+            wraw[FMT - 1] = *reinterpret_cast<const int4*>(b + 64 * hs + 32 + 16 * wqp);
+            wraw[2 * (FMT - 1)] = *reinterpret_cast<const int4*>(b + 128 + 32 * hs + 16 * wqp);
+        }
+        const unsigned char* b = mrow + (size_t)sb * bytes;
+        if (FMT == 1) {
+            wm = *reinterpret_cast<const unsigned int*>(b);                     // d, dmin
+            ma0 = *reinterpret_cast<const unsigned int*>(b + 4 + 4 * hh);       // scales / mins of sub-blocks 0..3
+            ma1 = *reinterpret_cast<const unsigned int*>(b + 12);               // low 4 bits of both for 4..7
+        } else {
+            wm = __float_as_uint(wdrow[sb]);
+            ma0 = *reinterpret_cast<const unsigned int*>(b + 192 + 8 * hs + 4 * hh);
+        }
+    };
+    auto commit = [&](int st) {
+        int hs = st & 1;
+        float wf = FMT == 1 ? h2f(hh ? wm >> 16 : wm & 0xFFFF) : __uint_as_float(wm);
+        if (FMT == 1) {
+            // piece q = words 4*(q&1) .. +3 of the 32 bytes of blocks 2*(q>>1) (low) and 2*(q>>1)+1 (high)
+            int kb = 2 * (wqp >> 1), h = wqp & 1;
+            #pragma unroll
+            for (int s = 0; s < 2; s++) {
+                int4 p = wraw[s];
+                int* dst = ws + (wl + 32 * s) * MMA_LD + kb * 8 + h * 4;
+                *reinterpret_cast<int4*>(dst) = make_int4(p.x & 0x0F0F0F0F, p.y & 0x0F0F0F0F, p.z & 0x0F0F0F0F, p.w & 0x0F0F0F0F);
+                *reinterpret_cast<int4*>(dst + 8) = make_int4((p.x >> 4) & 0x0F0F0F0F, (p.y >> 4) & 0x0F0F0F0F, (p.z >> 4) & 0x0F0F0F0F, (p.w >> 4) & 0x0F0F0F0F);
+            }
+        } else {
+            int l0[4] = {wraw[0].x, wraw[0].y, wraw[0].z, wraw[0].w};
+            int l1[4] = {wraw[FMT - 1].x, wraw[FMT - 1].y, wraw[FMT - 1].z, wraw[FMT - 1].w};
+            int hb[4] = {wraw[2 * (FMT - 1)].x, wraw[2 * (FMT - 1)].y, wraw[2 * (FMT - 1)].z, wraw[2 * (FMT - 1)].w};
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                int v[4];
+                #pragma unroll
+                for (int f = 0; f < 4; f++) {
+                    int p = (g & 1) ? l1[f] : l0[f];
+                    int lo = (g >= 2) ? ((p >> 4) & 0x0F0F0F0F) : (p & 0x0F0F0F0F);
+                    v[f] = __vsub4(lo | (((hb[f] >> (2 * g)) & 0x03030303) << 4), 0x20202020); // bytewise -32
+                }
+                *reinterpret_cast<int4*>(ws + wl * MMA_LD + g * 8 + wqp * 4) = make_int4(v[0], v[1], v[2], v[3]);
+            }
+        }
+        #pragma unroll
+        for (int s = 0; s < 4; s++) *reinterpret_cast<int4*>(xs + ((tid >> 3) + 16 * s) * MMA_LD + 4 * (tid & 7)) = xreg[s];
+        if (FMT == 1) {
+            // 6-bit fields: sub-blocks 0..3 in the low 6 bits of ma0's bytes; 4..7 from ma1's nibbles + ma0's top 2 bits
+            unsigned int hi = ((ma1 >> (4 * hh)) & 0x0F0F0F0F) | ((ma0 >> 2) & 0x30303030);
+            wdm[lr][hh] = wf;
+            if (hh == 0) wsc[lr][0] = (int)(hs ? hi : ma0 & 0x3F3F3F3F);
+            else { wmn[lr][0] = (int)(ma0 & 0x3F3F3F3F); wmn[lr][1] = (int)hi; }
+        } else {
+            if (hh == 0) wdm[lr][0] = wf;
+            wsc[lr][hh] = (int)ma0;
+        }
+        if (hh == 0) xds[lr] = xf;
+        xbs[lr][hh * (XBW / 2)] = xi0;
+        if (XBW == 4) xbs[lr][2 * hh + 1] = xi1;
+    };
+
+    // shared-memory byte addresses of this lane's ldmatrix rows (rows 36 words apart: conflict-free)
+    unsigned lda = (unsigned)__cvta_generic_to_shared(ws + (wr + (lane >> 3) * 8 + (lane & 7)) * MMA_LD);
+    unsigned ldb = (unsigned)__cvta_generic_to_shared(xs + (wt + (lane >> 3) * 8 + (lane & 7)) * MMA_LD);
+
+    // ldmatrix.x4: four 8x8 b16 matrices (= 8 rows x 16 int8) per instruction, already in the m8n8k16
+    // fragment layout; lane l gives the address of row l&7 of matrix l>>3. Block kb's fragments are
+    // loaded while block kb-1 is still in the tensor cores.
+    int fa[2][4][2], fb[2][4][2];
+    auto frags = [&](int kb, int buf) {
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(fa[buf][0][h]), "=r"(fa[buf][1][h]), "=r"(fa[buf][2][h]), "=r"(fa[buf][3][h]) : "r"(lda + (kb * 8 + h * 4) * 4));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(fb[buf][0][h]), "=r"(fb[buf][1][h]), "=r"(fb[buf][2][h]), "=r"(fb[buf][3][h]) : "r"(ldb + (kb * 8 + h * 4) * 4));
+        }
+    };
+
+    fetch(0, 0);
+    fetch(0, 1);
+    commit(0);
+    __syncthreads();
+    for (int st = 0; st < nst; st++) {
+        bool more = st + 1 < nst;
+        frags(0, 0);
+        if (more) fetch(st + 1, 0); // issued now, consumed after the math below
+
+        int scw[4][FMT == 1 ? 1 : 2];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            scw[i][0] = wsc[wr + i * 8 + fr][0];
+            if (FMT == 2) scw[i][FMT - 1] = wsc[wr + i * 8 + fr][1];
+        }
+        #pragma unroll
+        for (int kb = 0; kb < 4; kb++) {
+            if (kb < 3) frags(kb + 1, (kb + 1) & 1);
+            if (kb == 1 && more) fetch(st + 1, 1);
+            int (&a)[4][2] = fa[kb & 1];
+            int (&bq)[4][2] = fb[kb & 1];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    if (FMT == 1) {
+                        // Q4_K: one scale per 32 values
+                        int sc = (scw[i][0] >> (8 * kb)) & 0xFF;
+                        int c0 = 0, c1 = 0;
+                        #pragma unroll
+                        for (int h = 0; h < 2; h++)
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(c0), "+r"(c1) : "r"(a[i][h]), "r"(bq[j][h]));
+                        iacc[i][j][0] += sc * c0;
+                        iacc[i][j][1] += sc * c1;
+                    } else {
+                        // Q6_K: one signed scale per 16 values, i.e. per k16 step
+                        #pragma unroll
+                        for (int h = 0; h < 2; h++) {
+                            int sc = (int)(signed char)(scw[i][(FMT - 1) * (kb >> 1)] >> (8 * ((2 * kb + h) & 3)));
+                            int c0 = 0, c1 = 0;
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(c0), "+r"(c1) : "r"(a[i][h]), "r"(bq[j][h]));
+                            iacc[i][j][0] += sc * c0;
+                            iacc[i][j][1] += sc * c1;
+                        }
+                    }
+                }
+            }
+        }
+        if ((st + 1) % (QCH / 128) == 0) {
+            // activation chunk done: one float fold per result, plus the Q4_K mins of its sub-blocks
+            const int nf = QCH / 128; // fragment words holding those mins / sums (4 per word)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int r = wr + i * 8 + fr;
+                float d = wdm[r][0], dm = FMT == 1 ? wdm[r][1] : 0.f;
+                int ma = (FMT == 1 && fk < nf) ? wmn[r][(nf == 1 ? (st & 1) : 0) + fk] : 0; // A fragment: mins, zeros above
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    int t = wt + j * 8 + fk * 2;
+                    float D0 = xds[t], D1 = xds[t + 1];
+                    int m0 = 0, m1 = 0;
+                    if (FMT == 1) {
+                        int tb = wt + j * 8 + fr; // B fragment: column = token
+                        int bh = fk < nf ? xbs[tb][fk] : 0, bl = fk < nf ? xbs[tb][nf + fk] : 0;
+                        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                            : "+r"(m0), "+r"(m1) : "r"(ma), "r"(bh));
+                        m0 *= 64; m1 *= 64;
+                        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                            : "+r"(m0), "+r"(m1) : "r"(ma), "r"(bl));
+                    }
+                    acc[i][j][0] += D0 * (d * (float)iacc[i][j][0] - dm * (float)m0);
+                    acc[i][j][1] += D1 * (d * (float)iacc[i][j][1] - dm * (float)m1);
+                    iacc[i][j][0] = iacc[i][j][1] = 0;
+                }
+            }
+        }
+        __syncthreads(); // everyone done reading this stage
+        if (more) {
+            commit(st + 1);
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int r = row0 + wr + i * 8 + fr;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 2; e++) {
+                int t = tok0 + wt + j * 8 + fk * 2 + e;
+                if (r < rows && t < n) {
+                    size_t idx = (size_t)t * out_stride + out_off + r;
+                    out[idx] = accumulate ? out[idx] + acc[i][j][e] : acc[i][j][e];
+                }
+            }
+        }
+    }
+}
+
+extern "C" {
+
+#define MMA_K_ARGS const unsigned char* __restrict__ wq, const float* __restrict__ wd, const signed char* __restrict__ xq, const float* __restrict__ xd, \
+                   const int* __restrict__ xb, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off
+__global__ void __launch_bounds__(128) matmul_mma_q4k(MMA_K_ARGS) { mma_kquant<1>(wq, wd, xq, xd, xb, out, rows, cols, n, accumulate, out_stride, out_off); }
+__global__ void __launch_bounds__(128) matmul_mma_q6k(MMA_K_ARGS) { mma_kquant<2>(wq, wd, xq, xd, xb, out, rows, cols, n, accumulate, out_stride, out_off); }
 
 // gu rows are [gate | up]; h = silu(gate) * up
 __global__ void silu_mul(const float* __restrict__ gu, float* __restrict__ h, int ffn, int n) {
@@ -503,6 +1691,7 @@ api! {
     cuMemcpyHtoD_v2: fn(u64, *const c_void, usize) -> CuResult;
     cuMemcpyDtoH_v2: fn(*mut c_void, u64, usize) -> CuResult;
     cuLaunchKernel: fn(Ptr, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> CuResult;
+    cuFuncSetAttribute: fn(Ptr, i32, i32) -> CuResult;
     cuCtxSynchronize: fn() -> CuResult;
     cuGetErrorString: fn(CuResult, *mut *const c_char) -> CuResult;
     nvrtcCreateProgram: fn(*mut Ptr, *const c_char, *const c_char, i32, *const *const c_char, *const *const c_char) -> i32;
@@ -642,15 +1831,25 @@ enum Arg {
 }
 
 struct Kernels {
-    embed_q8: Ptr,
+    embed: Ptr,
     rmsnorm: Ptr,
+    head_rmsnorm: Ptr,
     matmul_q8: Ptr,
-    matmul_q8_tiled: Ptr,
+    matmul_q4k: [Ptr; 2], // f32 activations: one-token and four-token variants
+    matmul_q6k: [Ptr; 2],
+    matmul_q4k_dp4a: Ptr, // one token, int8 activations
+    matmul_q6k_dp4a: Ptr,
+    matmul_tiled: Ptr,
+    matmul_mma: Option<Ptr>, // int8 tensor cores, sm_75 and newer
+    matmul_mma_k: Option<[Ptr; 2]>, // the same for Q4_K / Q6_K with per-256 activation scales
     quantize_q8: Ptr,
+    quantize_q8k: Ptr,
     rope_cache: Ptr,
     attention_partial: Ptr,
+    attention_partial_gqa: Ptr,
     attention_combine: Ptr,
     attention_prefill: Ptr,
+    attention_prefill_tc: Option<[Ptr; 2]>, // f16 tensor cores (sm_75+), head size 64 / 128
     silu_mul: Ptr,
 }
 
@@ -668,7 +1867,7 @@ impl Kernels {
             if (f.nvrtcCreateProgram)(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) != 0 {
                 return Err("nvrtcCreateProgram failed".into());
             }
-            let opts: Vec<CString> = [format!("--gpu-architecture=compute_{}{}", a.compute.0, a.compute.1), "-std=c++14".into()]
+            let opts: Vec<CString> = [format!("--gpu-architecture=compute_{}{}", a.compute.0, a.compute.1), "-std=c++14".into(), format!("-DRPW={}", kq_rpw()), format!("-DQCH={}", qch())]
                 .into_iter()
                 .map(|o| CString::new(o).unwrap())
                 .collect();
@@ -697,15 +1896,35 @@ impl Kernels {
                 Ok(func)
             };
             Ok(Kernels {
-                embed_q8: get("embed_q8")?,
+                embed: get("embed")?,
                 rmsnorm: get("rmsnorm")?,
+                head_rmsnorm: get("head_rmsnorm")?,
                 matmul_q8: get("matmul_q8")?,
-                matmul_q8_tiled: get("matmul_q8_tiled")?,
+                matmul_q4k: [get("matmul_q4k_1")?, get("matmul_q4k_4")?],
+                matmul_q6k: [get("matmul_q6k_1")?, get("matmul_q6k_4")?],
+                matmul_q4k_dp4a: get("matmul_q4k_dp4a")?,
+                matmul_q6k_dp4a: get("matmul_q6k_dp4a")?,
+                matmul_tiled: get("matmul_tiled")?,
+                matmul_mma: if a.compute >= (7, 5) && std::env::var_os("BETTERLLAMA_NO_MMA").is_none() { Some(get("matmul_mma")?) } else { None },
+                // BETTERLLAMA_NO_Q8K=1 keeps K-quant prompts on matmul_mma (per-32 activation scales)
+                matmul_mma_k: if a.compute >= (7, 5) && std::env::var_os("BETTERLLAMA_NO_MMA").is_none() && std::env::var_os("BETTERLLAMA_NO_Q8K").is_none() {
+                    Some([get("matmul_mma_q4k")?, get("matmul_mma_q6k")?])
+                } else {
+                    None
+                },
                 quantize_q8: get("quantize_q8")?,
+                quantize_q8k: get("quantize_q8k")?,
                 rope_cache: get("rope_cache")?,
                 attention_partial: get("attention_partial")?,
+                attention_partial_gqa: get("attention_partial_gqa")?,
                 attention_combine: get("attention_combine")?,
                 attention_prefill: get("attention_prefill")?,
+                // BETTERLLAMA_NO_TC_ATT=1 keeps prompts on the f32 attention kernel
+                attention_prefill_tc: if a.compute >= (7, 5) && std::env::var_os("BETTERLLAMA_NO_TC_ATT").is_none() {
+                    Some([get("attention_prefill_tc64")?, get("attention_prefill_tc128")?])
+                } else {
+                    None
+                },
                 silu_mul: get("silu_mul")?,
             })
         }
@@ -736,35 +1955,91 @@ impl Kernels {
 
 // ---------------------------------------------------------------- model
 
-/// A Q8_0 matrix split into aligned int8 values and f32 scales (one per 32 values).
+/// Weight format on the GPU (matches `fmt` in the kernels).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fmt {
+    /// int8 values + separate f32 scale per 32
+    Q8 = 0,
+    /// the GGUF blocks as is: 144 bytes per 256 (f16 d, f16 dmin, 12 scale bytes, 128 nibble bytes)
+    Q4K = 1,
+    /// 208-byte blocks of 256 (128 low-nibble bytes, 64 high-bit bytes, 16 int8 scales) + f32 d per block
+    Q6K = 2,
+}
+
+/// A weight matrix on the GPU, repacked from its GGUF blocks so every field is naturally aligned and
+/// every block starts on a 16-byte boundary.
 struct GpuMatrix {
-    q: DeviceBuf,
-    d: DeviceBuf,
+    fmt: Fmt,
+    q: DeviceBuf,         // Q8: int8 values; K-quants: the blocks
+    d: Option<DeviceBuf>, // Q8: scale per 32; Q6K: d per block
     rows: usize,
     cols: usize,
 }
 
-/// Concatenates the rows of several Q8_0 tensors (e.g. Q, K and V) into one GPU matrix.
-fn upload_q8(g: &Gguf, names: &[String]) -> Result<GpuMatrix, String> {
-    let mut q: Vec<i8> = Vec::new();
-    let mut d: Vec<f32> = Vec::new();
-    let (mut rows, mut cols) = (0, 0);
-    for name in names {
-        let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
-        if t.ty != GgmlType::Q8_0 {
-            return Err(format!("GPU backend handles Q8_0 weights only for now ({name} is {})", t.ty.name()));
-        }
-        cols = t.dims[0] as usize;
-        rows += t.dims[1] as usize;
-        for blk in g.mmap[t.offset..t.offset + t.n_bytes].chunks_exact(34) {
-            d.push(f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
-            q.extend(blk[2..].iter().map(|&b| b as i8));
-        }
+impl GpuMatrix {
+    fn d_ptr(&self) -> u64 {
+        self.d.as_ref().map_or(0, |d| d.ptr)
     }
-    if cols % 32 != 0 {
-        return Err(format!("unsupported row length {cols}"));
+}
+
+/// Appends one tensor's blocks to `q`/`d` in the GPU layout of its format.
+fn repack(ty: GgmlType, raw: &[u8], q: &mut Vec<u8>, d: &mut Vec<f32>) -> Result<Fmt, String> {
+    let f16 = |b: &[u8]| f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    match ty {
+        GgmlType::Q8_0 => {
+            for blk in raw.chunks_exact(34) {
+                d.push(f16(blk));
+                q.extend_from_slice(&blk[2..]);
+            }
+            Ok(Fmt::Q8)
+        }
+        GgmlType::Q4K => {
+            q.extend_from_slice(raw); // 144-byte blocks: already 16-byte multiples
+            Ok(Fmt::Q4K)
+        }
+        GgmlType::Q6K => {
+            for blk in raw.chunks_exact(210) {
+                q.extend_from_slice(&blk[..208]);
+                d.push(f16(&blk[208..]));
+            }
+            Ok(Fmt::Q6K)
+        }
+        other => Err(format!("GPU backend does not handle {} weights yet", other.name())),
     }
-    Ok(GpuMatrix { q: DeviceBuf::upload(&q)?, d: DeviceBuf::upload(&d)?, rows, cols })
+}
+
+/// Uploads tensors whose rows are concatenated in one output (e.g. Q, K and V). Neighbours of the same
+/// format are merged into one matrix (one launch); returns each matrix with its output row offset.
+fn upload_parts(g: &Gguf, names: &[String]) -> Result<Vec<(GpuMatrix, usize)>, String> {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    let mut row_off = 0;
+    while i < names.len() {
+        let ty = g.tensor(&names[i]).ok_or_else(|| format!("missing tensor {}", names[i]))?.ty;
+        let (mut q, mut d) = (Vec::new(), Vec::new());
+        let (mut rows, mut cols, mut fmt) = (0, 0, Fmt::Q8);
+        while i < names.len() {
+            let t = g.tensor(&names[i]).ok_or_else(|| format!("missing tensor {}", names[i]))?;
+            if t.ty != ty {
+                break;
+            }
+            cols = t.dims[0] as usize;
+            if (cols % 256 != 0 && ty != GgmlType::Q8_0) || cols % 32 != 0 {
+                return Err(format!("unsupported row length {cols} in {}", names[i]));
+            }
+            rows += t.dims[1] as usize;
+            fmt = repack(t.ty, &g.mmap[t.offset..t.offset + t.n_bytes], &mut q, &mut d)?;
+            i += 1;
+        }
+        let d = if fmt != Fmt::Q4K { Some(DeviceBuf::upload(&d)?) } else { None };
+        parts.push((GpuMatrix { fmt, q: DeviceBuf::upload(&q)?, d, rows, cols }, row_off));
+        row_off += rows;
+    }
+    Ok(parts)
+}
+
+fn upload_one(g: &Gguf, name: &str) -> Result<GpuMatrix, String> {
+    Ok(upload_parts(g, &[name.to_string()])?.pop().unwrap().0)
 }
 
 fn upload_vec(g: &Gguf, name: &str) -> Result<DeviceBuf, String> {
@@ -778,10 +2053,12 @@ fn upload_vec(g: &Gguf, name: &str) -> Result<DeviceBuf, String> {
 
 struct GpuLayer {
     attn_norm: DeviceBuf,
-    qkv: GpuMatrix,
+    qkv: Vec<(GpuMatrix, usize)>, // with output row offsets in the packed [q | k | v] rows
+    q_norm: Option<DeviceBuf>,    // Qwen3 per-head norms
+    k_norm: Option<DeviceBuf>,
     wo: GpuMatrix,
     ffn_norm: DeviceBuf,
-    gate_up: GpuMatrix,
+    gate_up: Vec<(GpuMatrix, usize)>, // [gate | up]
     down: GpuMatrix,
 }
 
@@ -792,36 +2069,48 @@ pub struct GpuModel {
     output: Option<GpuMatrix>, // None = tied to the embedding
     output_norm: DeviceBuf,
     layers: Vec<GpuLayer>,
+    prefill_shared: Option<usize>,
     pub device: String,
 }
 
 impl GpuModel {
     pub fn load(g: &Gguf, cfg: Config) -> Result<GpuModel, String> {
-        let arch = g.get("general.architecture").and_then(Value::as_str).unwrap_or("");
-        if arch != "llama" {
-            return Err(format!("GPU backend: architecture \"{arch}\" not supported yet"));
-        }
         if cfg.head_dim > ATT_MAX_HD || ATT_MAX_HD % cfg.head_dim != 0 || cfg.head_dim % 4 != 0 {
             return Err(format!("GPU backend: head size {} not supported (needs a divisor of {ATT_MAX_HD})", cfg.head_dim));
         }
         let a = api()?;
         let k = Arc::new(Kernels::compile()?);
+        let opt_vec = |name: String| g.tensor(&name).map(|_| upload_vec(g, &name)).transpose();
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
             layers.push(GpuLayer {
                 attn_norm: upload_vec(g, &p("attn_norm"))?,
-                qkv: upload_q8(g, &[p("attn_q"), p("attn_k"), p("attn_v")])?,
-                wo: upload_q8(g, &[p("attn_output")])?,
+                qkv: upload_parts(g, &[p("attn_q"), p("attn_k"), p("attn_v")])?,
+                q_norm: opt_vec(p("attn_q_norm"))?,
+                k_norm: opt_vec(p("attn_k_norm"))?,
+                wo: upload_one(g, &p("attn_output"))?,
                 ffn_norm: upload_vec(g, &p("ffn_norm"))?,
-                gate_up: upload_q8(g, &[p("ffn_gate"), p("ffn_up")])?,
-                down: upload_q8(g, &[p("ffn_down")])?,
+                gate_up: upload_parts(g, &[p("ffn_gate"), p("ffn_up")])?,
+                down: upload_one(g, &p("ffn_down"))?,
             });
         }
-        let embd = upload_q8(g, &["token_embd.weight".to_string()])?;
-        let output = if g.tensor("output.weight").is_some() { Some(upload_q8(g, &["output.weight".to_string()])?) } else { None };
+        let embd = upload_one(g, "token_embd.weight")?;
+        let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight")?) } else { None };
+
+        // prompt attention: dynamic shared memory above the default 48 KB has to be requested per kernel
+        let ld = cfg.head_dim + 1;
+        let bytes = ((2 * PREFILL_KT + PREFILL_QT) * ld + PREFILL_QT * (PREFILL_KT + 1)) * 4;
+        const MAX_DYNAMIC_SHARED: i32 = 8; // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+        let prefill_shared = (bytes <= 48 * 1024 || unsafe { (a.f.cuFuncSetAttribute)(k.attention_prefill, MAX_DYNAMIC_SHARED, bytes as i32) } == 0).then_some(bytes);
+
         let device = format!("{} (sm_{}{}, NVRTC {})", a.device_name, a.compute.0, a.compute.1, std::path::Path::new(&a.nvrtc_path).file_name().and_then(|n| n.to_str()).unwrap_or("?"));
-        Ok(GpuModel { output_norm: upload_vec(g, "output_norm.weight")?, cfg, k, embd, output, layers, device })
+        // the logits buffer is sized from cfg.vocab; a mismatch would write past it
+        let out_rows = output.as_ref().unwrap_or(&embd).rows;
+        if out_rows != cfg.vocab {
+            return Err(format!("output layer has {out_rows} rows but the vocabulary has {} tokens", cfg.vocab));
+        }
+        Ok(GpuModel { output_norm: upload_vec(g, "output_norm.weight")?, cfg, k, embd, output, layers, prefill_shared, device })
     }
 
     /// With BETTERLLAMA_PROFILE set, waits for the GPU after `f` so its time lands in bucket `op`.
@@ -836,55 +2125,114 @@ impl GpuModel {
         })
     }
 
-    /// `out[t*rows + r] (+)= W[r] · x[t]` for `n` input rows of `m.cols` floats at `x`.
-    fn matmul(&self, m: &GpuMatrix, x: u64, out: u64, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
+    /// For each part, `out[t*out_stride + off + r] (+)= W[r] · x[t]` over `n` input rows of `cols` floats.
+    fn matmul(&self, parts: &[(&GpuMatrix, usize)], x: u64, out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
+        let cols = parts[0].0.cols;
         if n >= TILED_MIN_BATCH {
+            if let Some(mk) = k.matmul_mma_k.filter(|_| parts.iter().all(|(m, _)| m.fmt != Fmt::Q8)) {
+                // K-quant prompts: one activation scale per 128 (or 256) values keeps the tensor-core epilogue integer
+                let chunks = n * cols / qch();
+                k.launch(k.quantize_q8k, ((chunks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(chunks as i32)])?;
+                for &(m, off) in parts {
+                    k.launch(
+                        mk[(m.fmt == Fmt::Q6K) as usize],
+                        (m.rows.div_ceil(TILE) as u32, n.div_ceil(TILE) as u32),
+                        128,
+                        0,
+                        &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
+                    )?;
+                }
+                return Ok(());
+            }
             // prompts: quantise the activations once, then int8 tiles with dp4a
-            let blocks = n * m.cols / 32;
-            k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::I(blocks as i32)])?;
-            return k.launch(
-                k.matmul_q8_tiled,
-                (m.rows.div_ceil(TILE) as u32, n.div_ceil(TILE) as u32),
-                256,
-                0,
-                &[Arg::P(m.q.ptr), Arg::P(m.d.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32)],
-            );
+            let blocks = n * cols / 32;
+            k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(blocks as i32)])?;
+            for &(m, off) in parts {
+                let (func, threads) = match k.matmul_mma {
+                    Some(f) => (f, 128),
+                    None => (k.matmul_tiled, 256),
+                };
+                k.launch(
+                    func,
+                    (m.rows.div_ceil(TILE) as u32, n.div_ceil(TILE) as u32),
+                    threads,
+                    0,
+                    &[Arg::I(m.fmt as i32), Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
+                )?;
+            }
+            return Ok(());
         }
-        // generation: one warp per weight row, f32 activations
-        let rows_per_block = 8; // 256 threads = 8 warps, one row each
-        k.launch(
-            k.matmul_q8,
-            (m.rows.div_ceil(rows_per_block) as u32, n.div_ceil(MATMUL_TB) as u32),
-            256,
-            0,
-            &[Arg::P(m.q.ptr), Arg::P(m.d.ptr), Arg::P(x), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32)],
-        )
+        // one token with K-quant weights: int8 activations + dp4a (BETTERLLAMA_EXACT=1 keeps f32)
+        if n == 1 && !crate::quant::exact_mode() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8) {
+            let blocks = cols / 32;
+            k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(blocks as i32)])?;
+            for &(m, off) in parts {
+                let f = if m.fmt == Fmt::Q4K { k.matmul_q4k_dp4a } else { k.matmul_q6k_dp4a };
+                k.launch(
+                    f,
+                    (m.rows.div_ceil(8 * kq_rpw()) as u32, 1),
+                    256,
+                    0,
+                    &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
+                )?;
+            }
+            return Ok(());
+        }
+        // otherwise f32 activations; 256 threads = 8 warps, one row each for Q8_0, RPW rows each for K-quants
+        for &(m, off) in parts {
+            let tail = [Arg::P(x), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)];
+            let (variant, tb) = if n == 1 { (0, 1) } else { (1, KQ_TB) };
+            let kq_grid = (m.rows.div_ceil(8 * kq_rpw()) as u32, n.div_ceil(tb) as u32);
+            match m.fmt {
+                Fmt::Q8 => k.launch(k.matmul_q8, (m.rows.div_ceil(8) as u32, n.div_ceil(MATMUL_TB) as u32), 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(m.d_ptr())][..], &tail].concat())?,
+                Fmt::Q4K => k.launch(k.matmul_q4k[variant], kq_grid, 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(0)][..], &tail].concat())?,
+                Fmt::Q6K => k.launch(k.matmul_q6k[variant], kq_grid, 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(m.d_ptr())][..], &tail].concat())?,
+            }
+        }
+        Ok(())
     }
 
-    /// Context slice per attention block when generating. Up to 256 positions one block per head is
-    /// enough (and needs no merge pass); beyond that the context is split so a single token still
-    /// spreads over the GPU.
+    fn matmul_one(&self, m: &GpuMatrix, x: u64, out: u64, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
+        self.matmul(&[(m, 0)], x, out, m.rows, n, accumulate, s)
+    }
+
+    /// The grouped-query attention kernel applies (head size a multiple of 32, at most 8 heads per kv head).
+    fn gqa_kernel(&self) -> bool {
+        let c = &self.cfg;
+        c.head_dim % 32 == 0 && c.n_heads % c.n_kv_heads == 0 && c.n_heads / c.n_kv_heads <= ATT_MAX_G
+    }
+
+    /// Context slice per attention block when generating: short contexts take one block per head
+    /// (no merge pass); longer ones are split so a single token still spreads over the GPU.
     fn att_chunk(&self, n: usize, span: usize) -> usize {
-        if span <= ATT_MAX_CHUNK {
+        let blocks_per_slice = if self.gqa_kernel() { self.cfg.n_kv_heads } else { self.cfg.n_heads } * n;
+        if span <= SPLIT_MIN_SPAN {
             return ATT_MAX_CHUNK;
         }
-        let want_splits = ATT_TARGET_BLOCKS.div_ceil(self.cfg.n_heads * n);
-        span.div_ceil(want_splits).clamp(64, ATT_MAX_CHUNK)
-    }
-
-    /// Shared memory for the prompt attention kernel, if it fits the default 48 KB.
-    fn prefill_shared(&self) -> Option<usize> {
-        let ld = self.cfg.head_dim + 1;
-        let bytes = ((2 * PREFILL_KT + PREFILL_QT) * ld + PREFILL_QT * (PREFILL_KT + 1)) * 4;
-        (bytes <= 48 * 1024).then_some(bytes)
+        let want_splits = ATT_TARGET_BLOCKS.div_ceil(blocks_per_slice);
+        span.div_ceil(want_splits).clamp(32, ATT_MAX_CHUNK)
     }
 
     fn attention(&self, s: &GpuSession, n: usize, kc: u64, vc: u64) -> Result<(), String> {
         let c = &self.cfg;
         let k = &self.k;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
-        if let (true, Some(shared)) = (n >= TILED_MIN_BATCH, self.prefill_shared()) {
+        let tc = k.attention_prefill_tc.and_then(|f| match c.head_dim {
+            64 => Some(f[0]),
+            128 => Some(f[1]),
+            _ => None,
+        });
+        if let (true, Some(func)) = (n >= TILED_MIN_BATCH, tc) {
+            return k.launch(
+                func,
+                (c.n_heads as u32, n.div_ceil(PREFILL_TC_QT) as u32),
+                128,
+                0,
+                &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(n as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale)],
+            );
+        }
+        if let (true, Some(shared)) = (n >= TILED_MIN_BATCH, self.prefill_shared) {
             return k.launch(
                 k.attention_prefill,
                 (c.n_heads as u32, n.div_ceil(PREFILL_QT) as u32),
@@ -903,9 +2251,10 @@ impl GpuModel {
             let chunk = self.att_chunk(m, span);
             let nsplit = span.div_ceil(chunk);
             let (qkv, out) = (s.qkv.at(b0 * row), s.att.at(b0 * q_dim * 4));
+            let (func, heads) = if self.gqa_kernel() { (k.attention_partial_gqa, c.n_kv_heads) } else { (k.attention_partial, c.n_heads) };
             k.launch3(
-                k.attention_partial,
-                (c.n_heads as u32, m as u32, nsplit as u32),
+                func,
+                (heads as u32, m as u32, nsplit as u32),
                 128,
                 0,
                 &[Arg::P(qkv), Arg::P(kc), Arg::P(vc), Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale), Arg::I(nsplit as i32), Arg::I(chunk as i32)],
@@ -951,30 +2300,44 @@ impl GpuModel {
         s.tokens.write(&ids)?;
 
         // profile buckets match profile::OPS; with profiling off `timed` is a plain call
-        self.timed(0, || k.launch(k.embed_q8, (n as u32, 1), 256, 0, &[Arg::P(self.embd.q.ptr), Arg::P(self.embd.d.ptr), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)]))?;
+        self.timed(0, || {
+            k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(self.embd.fmt as i32), Arg::P(self.embd.q.ptr), Arg::P(self.embd.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)])
+        })?;
         let layer_kv = s.ctx * kv_dim * 4;
+        let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
         for (l, layer) in self.layers.iter().enumerate() {
             let (kc, vc) = (s.k_cache.at(l * layer_kv), s.v_cache.at(l * layer_kv));
             self.timed(1, || k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.attn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)]))?;
-            self.timed(2, || self.matmul(&layer.qkv, s.xb.ptr, s.qkv.ptr, n, false, s))?;
+            let qkv: Vec<(&GpuMatrix, usize)> = layer.qkv.iter().map(|(m, off)| (m, *off)).collect();
+            self.timed(2, || self.matmul(&qkv, s.xb.ptr, s.qkv.ptr, qkv_rows, n, false, s))?;
             self.timed(3, || {
+                if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                    k.launch(
+                        k.head_rmsnorm,
+                        (n as u32, (c.n_heads + c.n_kv_heads) as u32),
+                        128,
+                        0,
+                        &[Arg::P(s.qkv.ptr), Arg::P(qn.ptr), Arg::P(kn.ptr), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::F(c.norm_eps)],
+                    )?;
+                }
                 k.launch(
                     k.rope_cache,
                     (n as u32, 1),
                     256,
                     0,
-                    &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base)],
+                    &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32)],
                 )
             })?;
             self.timed(4, || self.attention(s, n, kc, vc))?;
-            self.timed(5, || self.matmul(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
+            self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
 
             self.timed(1, || k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)]))?;
             self.timed(6, || {
-                self.matmul(&layer.gate_up, s.xb.ptr, s.gu.ptr, n, false, s)?;
+                let gate_up: Vec<(&GpuMatrix, usize)> = layer.gate_up.iter().map(|(m, off)| (m, *off)).collect();
+                self.matmul(&gate_up, s.xb.ptr, s.gu.ptr, 2 * c.ffn_dim, n, false, s)?;
                 let total = (n * c.ffn_dim) as u32;
                 k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(c.ffn_dim as i32), Arg::I(n as i32)])?;
-                self.matmul(&layer.down, s.h.ptr, s.x.ptr, n, true, s)
+                self.matmul_one(&layer.down, s.h.ptr, s.x.ptr, n, true, s)
             })?;
         }
 
@@ -982,7 +2345,7 @@ impl GpuModel {
             self.timed(7, || {
                 let last = s.x.at((n - 1) * dim * 4);
                 k.launch(k.rmsnorm, (1, 1), 256, 0, &[Arg::P(last), Arg::P(self.output_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
-                self.matmul(self.output.as_ref().unwrap_or(&self.embd), s.xb.ptr, s.logits_dev.ptr, 1, false, s)?;
+                self.matmul_one(self.output.as_ref().unwrap_or(&self.embd), s.xb.ptr, s.logits_dev.ptr, 1, false, s)?;
                 let a = api()?;
                 a.check(
                     unsafe { (a.f.cuMemcpyDtoH_v2)(s.logits.as_mut_ptr() as *mut c_void, s.logits_dev.ptr, s.logits.len() * 4) },
@@ -1009,6 +2372,7 @@ pub struct GpuSession {
     v_cache: DeviceBuf,
     xq: DeviceBuf,       // int8 activations for the tiled matmul
     xd: DeviceBuf,       // their per-32 scales
+    xsum: DeviceBuf,     // and per-32 sums of the int8 values
     att_part: DeviceBuf, // flash-decoding partial results
     logits_dev: DeviceBuf,
     pub logits: Vec<f32>,
@@ -1020,11 +2384,12 @@ impl GpuSession {
         let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
         let f = |n: usize| DeviceBuf::alloc(n * 4);
         let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim);
-        // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 64 positions
-        let slices = SPLIT_MAX_BATCH * ctx.div_ceil(64);
+        // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 32 positions
+        let slices = SPLIT_MAX_BATCH * ctx.div_ceil(32);
         Ok(GpuSession {
             xq: DeviceBuf::alloc(MAX_BATCH * widest)?,
             xd: f(MAX_BATCH * widest / 32)?,
+            xsum: f(MAX_BATCH * widest / 32)?,
             att_part: f(slices * cfg.n_heads * (cfg.head_dim + 2))?,
             pos: 0,
             ctx,

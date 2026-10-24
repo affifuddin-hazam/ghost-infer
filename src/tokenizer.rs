@@ -14,6 +14,8 @@ enum PreTokenizer {
     Gpt2,
     /// GPT-2 split regex, but every digit is its own piece first (SmolLM, StarCoder).
     Gpt2IsolatedDigits,
+    /// Qwen2/Qwen3 split regex (see `split_qwen2`).
+    Qwen2,
 }
 
 pub struct Tokenizer {
@@ -117,6 +119,65 @@ fn split_gpt2(text: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Splits text the way the Qwen2 regex does:
+/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+fn split_qwen2(text: &str, out: &mut Vec<String>) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let is_nl = |c: char| c == '\r' || c == '\n';
+    let run = |mut j: usize, pred: &dyn Fn(char) -> bool| {
+        while j < n && pred(chars[j]) {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        let piece_end: usize = 'm: {
+            // 1. contractions, any case
+            if c == '\'' && i + 1 < n {
+                let a = chars[i + 1].to_ascii_lowercase();
+                let b = chars.get(i + 2).map(|c| c.to_ascii_lowercase());
+                if matches!((a, b), ('r', Some('e')) | ('v', Some('e')) | ('l', Some('l'))) {
+                    break 'm i + 3;
+                }
+                if matches!(a, 's' | 't' | 'm' | 'd') {
+                    break 'm i + 2;
+                }
+            }
+            // 2. letters, optionally led by one char that is not a letter, digit or newline
+            if is_letter(c) {
+                break 'm run(i, &is_letter);
+            }
+            if !is_nl(c) && !is_number(c) && i + 1 < n && is_letter(chars[i + 1]) {
+                break 'm run(i + 1, &is_letter);
+            }
+            // 3. a single digit
+            if is_number(c) {
+                break 'm i + 1;
+            }
+            // 4. optional space, a run of symbols, then any newlines
+            let start = if c == ' ' && i + 1 < n && is_other(chars[i + 1]) { i + 1 } else { i };
+            if is_other(chars[start]) {
+                let e = run(start, &is_other);
+                break 'm run(e, &is_nl);
+            }
+            // 5-7. whitespace
+            let ws_end = run(i, &char::is_whitespace);
+            if let Some(last_nl) = (i..ws_end).rev().find(|&k| is_nl(chars[k])) {
+                break 'm last_nl + 1; // \s*[\r\n]+ : up to and including the last newline
+            }
+            if ws_end == n || ws_end - i == 1 {
+                break 'm ws_end; // \s+(?!\S) at the end of the text, or the single-char \s+ fallback
+            }
+            ws_end - 1 // \s+(?!\S): leave the last space to lead the next piece
+        };
+        out.push(chars[i..piece_end].iter().collect());
+        i = piece_end;
+    }
+}
+
 impl Tokenizer {
     pub fn from_gguf(g: &Gguf) -> Result<Tokenizer, String> {
         let model = g.get("tokenizer.ggml.model").and_then(Value::as_str).unwrap_or("");
@@ -125,6 +186,7 @@ impl Tokenizer {
         }
         let pre = match g.get("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("default") {
             "smollm" | "starcoder" | "refact" => PreTokenizer::Gpt2IsolatedDigits,
+            "qwen2" => PreTokenizer::Qwen2,
             _ => PreTokenizer::Gpt2,
         };
 
@@ -228,6 +290,7 @@ impl Tokenizer {
         let mut pieces = Vec::new();
         match self.pre {
             PreTokenizer::Gpt2 => split_gpt2(text, &mut pieces),
+            PreTokenizer::Qwen2 => split_qwen2(text, &mut pieces),
             PreTokenizer::Gpt2IsolatedDigits => {
                 let mut chunk = String::new();
                 for c in text.chars() {
@@ -346,6 +409,24 @@ mod tests {
         assert_eq!(split("end   "), ["end", "   "]);
         assert_eq!(split("hi!!! ok?"), ["hi", "!!!", " ok", "?"]);
         assert_eq!(split(" 42"), [" 42"]);
+    }
+
+    #[test]
+    fn qwen2_split_matches_regex() {
+        let split = |s: &str| {
+            let mut v = Vec::new();
+            split_qwen2(s, &mut v);
+            v
+        };
+        assert_eq!(split("Hello world"), ["Hello", " world"]);
+        assert_eq!(split("I'M here"), ["I", "'M", " here"]);
+        assert_eq!(split("(hello) 123"), ["(hello", ")", " ", "1", "2", "3"]);
+        assert_eq!(split("a.\n\nb"), ["a", ".\n\n", "b"]);
+        assert_eq!(split("x  \n  y"), ["x", "  \n", " ", " y"]);
+        assert_eq!(split("x\n\ny"), ["x", "\n\n", "y"]);
+        assert_eq!(split("a  b"), ["a", " ", " b"]);
+        assert_eq!(split("end   "), ["end", "   "]);
+        assert_eq!(split("hi !!"), ["hi", " !!"]);
     }
 
     #[test]

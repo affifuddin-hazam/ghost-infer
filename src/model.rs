@@ -1,4 +1,5 @@
-//! Llama-architecture transformer (Llama 2/3, SmolLM, Mistral-style GQA) on the CPU.
+//! Llama-family transformer on the CPU: Llama 2/3, SmolLM, Mistral-style GQA, and Qwen3
+//! (per-head RMSNorm on queries and keys, NEOX-style RoPE).
 
 use rayon::prelude::*;
 
@@ -21,14 +22,19 @@ pub struct Config {
     pub max_ctx: usize,
     pub rope_dim: usize,
     pub rope_base: f32,
+    /// NEOX RoPE rotates (x[i], x[i + rope_dim/2]); otherwise adjacent pairs (x[2i], x[2i+1]).
+    /// GGUF converters permute llama's Q/K for adjacent pairs but leave Qwen's as trained.
+    pub rope_neox: bool,
     pub norm_eps: f32,
 }
+
+pub const SUPPORTED_ARCHS: [&str; 2] = ["llama", "qwen3"];
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Config, String> {
         let arch = g.get("general.architecture").and_then(Value::as_str).unwrap_or("").to_string();
-        if arch != "llama" {
-            return Err(format!("architecture \"{arch}\" is not supported yet (only \"llama\")"));
+        if !SUPPORTED_ARCHS.contains(&arch.as_str()) {
+            return Err(format!("architecture \"{arch}\" is not supported yet (supported: {})", SUPPORTED_ARCHS.join(", ")));
         }
         let u = |k: &str| g.get(&format!("{arch}.{k}")).and_then(Value::as_u64).map(|v| v as usize);
         let f = |k: &str| g.get(&format!("{arch}.{k}")).and_then(Value::as_f32);
@@ -44,10 +50,12 @@ impl Config {
             n_kv_heads: u("attention.head_count_kv").unwrap_or(n_heads),
             head_dim,
             ffn_dim: need("feed_forward_length")?,
-            vocab: u("vocab_size").unwrap_or(0),
+            // not every GGUF has <arch>.vocab_size; the embedding table always says
+            vocab: u("vocab_size").or_else(|| g.tensor("token_embd.weight").and_then(|t| t.dims.get(1)).map(|&v| v as usize)).ok_or("cannot tell the vocabulary size")?,
             max_ctx: need("context_length")?,
             rope_dim: u("rope.dimension_count").unwrap_or(head_dim),
             rope_base: f("rope.freq_base").unwrap_or(10_000.0),
+            rope_neox: arch == "qwen3",
             norm_eps: f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
         })
     }
@@ -67,6 +75,8 @@ struct Layer<'a> {
     wk: Matrix<'a>,
     wv: Matrix<'a>,
     wo: Matrix<'a>,
+    q_norm: Option<Vec<f32>>, // Qwen3: RMSNorm over each query head before RoPE
+    k_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
     w_gate: Matrix<'a>,
     w_up: Matrix<'a>,
@@ -110,11 +120,8 @@ fn vector(g: &Gguf, name: &str) -> Result<Vec<f32>, String> {
 
 impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> Result<Model<'a>, String> {
-        let mut cfg = Config::from_gguf(g)?;
+        let cfg = Config::from_gguf(g)?;
         let token_embd = matrix(g, "token_embd.weight")?;
-        if cfg.vocab == 0 {
-            cfg.vocab = token_embd.rows;
-        }
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
@@ -124,6 +131,8 @@ impl<'a> Model<'a> {
                 wk: matrix(g, &p("attn_k"))?,
                 wv: matrix(g, &p("attn_v"))?,
                 wo: matrix(g, &p("attn_output"))?,
+                q_norm: g.tensor(&p("attn_q_norm")).map(|_| vector(g, &p("attn_q_norm"))).transpose()?,
+                k_norm: g.tensor(&p("attn_k_norm")).map(|_| vector(g, &p("attn_k_norm"))).transpose()?,
                 ffn_norm: vector(g, &p("ffn_norm"))?,
                 w_gate: matrix(g, &p("ffn_gate"))?,
                 w_up: matrix(g, &p("ffn_up"))?,
@@ -212,14 +221,27 @@ fn rms_norm_rows(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     }
 }
 
-/// GGUF llama weights are stored so RoPE rotates adjacent pairs (x[2i], x[2i+1]).
-fn rope(row: &mut [f32], head_dim: usize, rope_dim: usize, pos: usize, inv_freq: &[f32]) {
+/// RMSNorm of every `w.len()`-sized chunk in place (Qwen3's per-head query/key norm).
+fn rms_norm_inplace(buf: &mut [f32], w: &[f32], eps: f32) {
+    for chunk in buf.chunks_exact_mut(w.len()) {
+        let scale = 1.0 / (dot_f32(chunk, chunk) / w.len() as f32 + eps).sqrt();
+        for (v, g) in chunk.iter_mut().zip(w) {
+            *v *= scale * g;
+        }
+    }
+}
+
+/// Rotary position embedding on every head of `row`. Pairs are (x[2i], x[2i+1]) for GGUF llama
+/// weights, or (x[i], x[i + rope_dim/2]) for NEOX-style models such as Qwen.
+fn rope(row: &mut [f32], head_dim: usize, rope_dim: usize, pos: usize, inv_freq: &[f32], neox: bool) {
+    let half = rope_dim / 2;
     for head in row.chunks_exact_mut(head_dim) {
-        for i in 0..rope_dim / 2 {
+        for i in 0..half {
             let (s, c) = (pos as f32 * inv_freq[i]).sin_cos();
-            let (a, b) = (head[2 * i], head[2 * i + 1]);
-            head[2 * i] = a * c - b * s;
-            head[2 * i + 1] = a * s + b * c;
+            let (ia, ib) = if neox { (i, i + half) } else { (2 * i, 2 * i + 1) };
+            let (a, b) = (head[ia], head[ib]);
+            head[ia] = a * c - b * s;
+            head[ib] = a * s + b * c;
         }
     }
 }
@@ -273,9 +295,15 @@ impl Model<'_> {
             });
             let layer_base = l * s.ctx * kv_dim;
             profile::time(3, || {
+                if let Some(w) = &layer.q_norm {
+                    rms_norm_inplace(&mut s.q, w, c.norm_eps);
+                }
+                if let Some(w) = &layer.k_norm {
+                    rms_norm_inplace(&mut s.k, w, c.norm_eps);
+                }
                 for b in 0..n {
-                    rope(&mut s.q[b * q_dim..(b + 1) * q_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq);
-                    rope(&mut s.k[b * kv_dim..(b + 1) * kv_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq);
+                    rope(&mut s.q[b * q_dim..(b + 1) * q_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq, c.rope_neox);
+                    rope(&mut s.k[b * kv_dim..(b + 1) * kv_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq, c.rope_neox);
                 }
                 let at = layer_base + pos0 * kv_dim;
                 s.k_cache[at..at + n * kv_dim].copy_from_slice(&s.k);
