@@ -5,160 +5,254 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>betterllama</title>
 <style>
+  @font-face { font-family: "Instrument Sans"; src: url("/vendor/instrument-sans-5.3.0.woff2") format("woff2"); font-weight: 400 700; font-style: normal; font-display: swap; }
+  @font-face { font-family: "Instrument Sans"; src: url("/vendor/instrument-sans-italic-5.3.0.woff2") format("woff2"); font-weight: 400 700; font-style: italic; font-display: swap; }
   :root {
-    --night: #161c2c; --glass: rgba(255, 255, 255, 0.06); --glass-line: rgba(255, 255, 255, 0.11);
-    --ink: #eef1f8; --muted: #9aa3bb; --accent: #b9c7ff; --accent-ink: #141a2a; --danger: #ff9b8a; --code: rgba(0, 0, 0, 0.28);
-    --ui: Bahnschrift, "DIN Alternate", "Segoe UI", system-ui, sans-serif;
-    --text: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
-    --mono: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+    --side: #10141f; --bg: #151a27; --raise: #1c2232; --raise-2: #232a3d; --line: rgba(233, 237, 247, 0.08); --line-2: rgba(233, 237, 247, 0.15);
+    --text: #e8ebf3; --muted: #8e96ab; --faint: #646c82; --accent: #b9c7ff; --accent-ink: #121726; --accent-soft: rgba(185, 199, 255, 0.12); --danger: #ff9b8a;
+    --code: #0f131d;
+    --sans: "Instrument Sans", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    --mono: "Cascadia Code", "Cascadia Mono", Consolas, "SF Mono", ui-monospace, monospace;
+    --column: min(760px, calc(100% - 48px));
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; overflow: hidden; }
-  body { background: radial-gradient(120% 90% at 50% 38%, #26304a 0%, var(--night) 62%, #0f1320 100%); color: var(--ink); font: 16px/1.55 var(--text); }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15.5px/1.65 var(--sans); display: grid; grid-template-columns: 272px minmax(0, 1fr); overflow: hidden;
+         -webkit-font-smoothing: antialiased; }
   button, input, textarea { font: inherit; color: inherit; }
   button { cursor: pointer; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  canvas#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  svg { flex: none; }
+  .ibtn { width: 34px; height: 34px; border: 0; border-radius: 9px; background: none; color: var(--muted); display: grid; place-items: center; }
+  .ibtn:hover { background: var(--raise-2); color: var(--text); }
 
-  header { position: fixed; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 14px 18px; z-index: 3; }
-  .model { font: 500 14px/1.2 var(--ui); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-  .status { font: 14px/1 var(--ui); display: inline-flex; align-items: center; gap: 8px; margin-left: auto; white-space: nowrap; }
-  .status i { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
-  .status.error i { background: var(--danger); box-shadow: 0 0 10px var(--danger); }
-  .icon { width: 38px; height: 38px; flex: none; border-radius: 12px; border: 1px solid var(--glass-line); background: var(--glass); display: grid; place-items: center; backdrop-filter: blur(8px); }
-  .icon:hover { border-color: rgba(185, 199, 255, 0.45); }
+  /* ---- sidebar: brand, new chat, saved conversations, the model */
+  aside { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 16px 16px 14px 18px; font-weight: 600; font-size: 16px; letter-spacing: -0.01em; }
+  .brand svg { color: var(--text); }
+  .brand .ibtn { margin-left: auto; display: none; }
+  .new { margin: 0 12px 10px; display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--raise); font-weight: 500; font-size: 14.5px; }
+  .new:hover { background: var(--raise-2); }
+  .chats { flex: 1; overflow-y: auto; padding: 4px 8px 12px; }
+  .group { font-size: 12.5px; color: var(--faint); font-weight: 500; padding: 14px 10px 6px; }
+  .chat { position: relative; display: flex; align-items: center; border-radius: 8px; }
+  .chat button.open { flex: 1; min-width: 0; text-align: left; border: 0; background: none; padding: 7px 34px 7px 10px; font-size: 14px; color: var(--muted);
+                      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 8px; }
+  .chat:hover button.open { background: var(--raise); color: var(--text); }
+  .chat.current button.open { background: var(--raise-2); color: var(--text); }
+  .chat .del { position: absolute; right: 4px; width: 26px; height: 26px; border-radius: 6px; opacity: 0; }
+  .chat:hover .del, .chat .del:focus-visible { opacity: 1; }
+  .none { color: var(--faint); font-size: 13.5px; padding: 10px; }
+  .machine { border-top: 1px solid var(--line); padding: 10px 8px; }
+  .machine button { width: 100%; display: flex; align-items: center; gap: 10px; border: 0; background: none; border-radius: 8px; padding: 8px 10px; font-size: 14px; color: var(--muted); text-align: left; }
+  .machine button:hover, .machine button[aria-expanded="true"] { background: var(--raise); color: var(--text); }
+  .tag { font: 11px/1 var(--mono); color: var(--muted); border: 1px solid var(--line-2); border-radius: 5px; padding: 3px 5px; white-space: nowrap; }
 
-  .subtitle { position: fixed; left: 50%; transform: translateX(-50%); bottom: 150px; width: min(700px, calc(100% - 32px)); text-align: center; z-index: 2;
-              font: 19px/1.5 var(--text); text-shadow: 0 2px 14px rgba(0, 0, 0, 0.6); max-height: 34vh; overflow: hidden; }
-  .subtitle .you { display: block; font: 14px/1.4 var(--ui); color: var(--muted); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .subtitle .err { color: var(--danger); }
-  .subtitle .more { display: block; margin: 6px auto 0; border: 0; background: none; color: var(--accent); font: 14px/1 var(--ui); padding: 6px; }
-  .subtitle .hint { font: 15px/1.5 var(--ui); color: var(--muted); }
+  /* ---- the conversation */
+  .main { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .top { flex: none; height: 52px; display: flex; align-items: center; gap: 6px; padding: 0 14px; }
+  .top .ibtn { display: none; }
+  .title { font-size: 14.5px; font-weight: 500; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 6px; }
+  .scroll { flex: 1; overflow-y: auto; scrollbar-gutter: stable both-edges; }
+  .column { width: var(--column); margin: 0 auto; padding: 8px 0 200px; }
+  .welcome { min-height: calc(100vh - 330px); display: flex; flex-direction: column; justify-content: center; padding-bottom: 40px; }
+  .welcome h1 { font-size: 30px; line-height: 1.2; font-weight: 560; letter-spacing: -0.02em; margin: 0 0 8px; }
+  .welcome p { color: var(--muted); margin: 0 0 22px; font-size: 16px; }
+  .starters { display: flex; flex-wrap: wrap; gap: 8px; }
+  .starters button { border: 1px solid var(--line-2); background: none; border-radius: 999px; padding: 7px 14px; font-size: 14px; color: var(--muted); }
+  .starters button:hover { color: var(--text); background: var(--raise); }
 
-  .composer { position: fixed; left: 50%; transform: translateX(-50%); bottom: 26px; width: min(700px, calc(100% - 24px)); z-index: 3;
-              display: flex; align-items: flex-end; gap: 10px; padding: 10px 10px 10px 18px; border-radius: 24px;
-              background: rgba(29, 37, 57, 0.74); border: 1px solid var(--glass-line); backdrop-filter: blur(14px); }
-  .composer:focus-within { border-color: rgba(185, 199, 255, 0.5); }
-  .composer textarea { flex: 1; min-width: 0; border: 0; outline: none; resize: none; background: transparent; min-height: 28px; max-height: 30vh; padding: 7px 0; line-height: 1.5; }
-  .composer textarea::placeholder { color: var(--muted); }
-  .toggle { flex: none; align-self: center; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--glass-line); background: var(--glass); border-radius: 999px; padding: 6px 11px 6px 7px; font: 13px/1 var(--ui); }
-  .toggle .knob { width: 26px; height: 15px; border-radius: 8px; background: rgba(255, 255, 255, 0.18); position: relative; transition: background 0.15s; }
-  .toggle .knob::after { content: ""; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--ink); transition: transform 0.15s; }
-  .toggle[aria-pressed="true"] .knob { background: var(--accent); }
-  .toggle[aria-pressed="true"] .knob::after { transform: translateX(11px); background: var(--accent-ink); }
-  .speed { flex: none; font: 500 14px/1 var(--ui); color: var(--muted); font-variant-numeric: tabular-nums; align-self: center; white-space: nowrap; min-width: 4.5em; text-align: right; }
-  .send { width: 42px; height: 42px; border-radius: 50%; border: 0; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; flex: none; }
-  .send.stop { background: var(--ink); }
+  .msg { margin: 0 0 28px; overflow-wrap: anywhere; }
+  .msg.user { display: flex; justify-content: flex-end; margin-bottom: 22px; }
+  .msg.user .bubble { background: var(--raise-2); padding: 10px 16px; border-radius: 18px 18px 6px 18px; white-space: pre-wrap; max-width: 82%; }
+  .answer > :first-child { margin-top: 0; }
+  .answer > :last-child { margin-bottom: 0; }
+  .answer p { margin: 0 0 14px; }
+  .answer h1, .answer h2, .answer h3 { font-size: 17px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01em; margin: 24px 0 8px; }
+  .answer ul, .answer ol { margin: 4px 0 14px; padding-left: 22px; }
+  .answer li { margin: 4px 0; }
+  .answer li::marker { color: var(--muted); }
+  .answer strong { font-weight: 600; }
+  .answer hr { border: 0; border-top: 1px solid var(--line-2); margin: 20px 0; }
+  .answer a { color: var(--accent); text-underline-offset: 2px; }
+  .answer code { background: var(--raise-2); border-radius: 5px; padding: 1.5px 5px; font: 13.5px/1.5 var(--mono); font-variant-ligatures: none; } /* -> stays -> */
+  .code { background: var(--code); border: 1px solid var(--line); border-radius: 12px; margin: 10px 0 16px; overflow: hidden; }
+  .code-top { display: flex; align-items: center; justify-content: space-between; padding: 3px 6px 3px 14px; background: var(--raise); font-size: 12.5px; color: var(--muted); }
+  .copy { display: inline-flex; align-items: center; gap: 6px; border: 0; background: none; color: var(--muted); font-size: 12.5px; padding: 6px 8px; border-radius: 6px; }
+  .copy:hover { color: var(--text); background: var(--raise-2); }
+  .code pre { margin: 0; padding: 14px 16px; overflow-x: auto; }
+  .code pre code { background: none; padding: 0; font: 13.5px/1.6 var(--mono); font-variant-ligatures: none; white-space: pre; overflow-wrap: normal; }
+  .table { overflow-x: auto; margin: 10px 0 16px; border: 1px solid var(--line-2); border-radius: 10px; }
+  .table table { border-collapse: collapse; font-size: 14.5px; width: 100%; }
+  .table th, .table td { padding: 8px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+  .table tr:last-child td { border-bottom: 0; }
+  .table th { font-weight: 600; background: var(--raise); }
+  details.think { margin: 0 0 12px; }
+  details.think summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--muted); }
+  details.think summary::-webkit-details-marker { display: none; }
+  details.think summary::after { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(-45deg); margin-left: 2px; transition: transform 0.15s; }
+  details.think[open] summary::after { transform: rotate(45deg) translate(-2px, -1px); }
+  details.think summary:hover { color: var(--text); }
+  details.think .body { white-space: pre-wrap; margin-top: 8px; padding-left: 14px; border-left: 2px solid var(--line-2); color: var(--muted); font-size: 14px; }
+  .error { margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 14px; border-radius: 10px; background: rgba(255, 155, 138, 0.08); border: 1px solid rgba(255, 155, 138, 0.25); color: var(--danger); font-size: 14.5px; }
+  .error button { border: 1px solid rgba(255, 155, 138, 0.4); background: none; color: var(--danger); border-radius: 8px; padding: 4px 12px; font-size: 13.5px; }
+  .actions { display: flex; align-items: center; gap: 2px; margin: 8px 0 0 -8px; opacity: 0; transition: opacity 0.15s; }
+  .msg:hover .actions, .msg.last .actions, .actions:focus-within { opacity: 1; }
+  .actions .ibtn { width: 30px; height: 30px; }
+  .actions .stat { font-size: 12.5px; color: var(--faint); margin-left: 8px; font-variant-numeric: tabular-nums; }
 
-  .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 94vw); z-index: 5; background: rgba(20, 26, 42, 0.94); border-left: 1px solid var(--glass-line);
-            backdrop-filter: blur(16px); transform: translateX(100%); transition: transform 0.25s ease; display: flex; flex-direction: column; }
-  .drawer.open { transform: none; }
-  .drawer .top { display: flex; align-items: center; gap: 8px; padding: 16px 16px 12px 20px; }
-  .drawer h2 { font: 600 16px/1 var(--ui); margin: 0 auto 0 0; }
-  .drawer .log { overflow-y: auto; padding: 4px 20px 24px; font-size: 15px; flex: 1; }
-  .drawer .empty { color: var(--muted); font: 15px/1.5 var(--ui); }
-  .msg { margin-bottom: 18px; overflow-wrap: anywhere; }
-  .msg.user { text-align: right; }
-  .msg.user .bubble { display: inline-block; text-align: left; background: rgba(185, 199, 255, 0.16); padding: 8px 13px; border-radius: 16px 16px 5px 16px; white-space: pre-wrap; max-width: 92%; }
-  .bubble p { margin: 0 0 10px; }
-  .bubble p:last-child { margin-bottom: 0; }
-  .bubble h1, .bubble h2, .bubble h3 { font: 600 16px/1.3 var(--ui); margin: 14px 0 6px; }
-  .bubble ul, .bubble ol { margin: 4px 0 10px; padding-left: 22px; }
-  .bubble code { background: var(--code); border-radius: 5px; padding: 1px 5px; font: 13.5px/1.5 var(--mono); }
-  .bubble pre { background: var(--code); border: 1px solid var(--glass-line); border-radius: 10px; padding: 10px 12px; overflow-x: auto; margin: 6px 0 10px; }
-  .bubble pre code { background: none; padding: 0; }
-  .bubble a { color: var(--accent); }
-  details.think { margin: 0 0 8px; color: var(--muted); font-size: 14px; }
-  details.think summary { cursor: pointer; font: 13px/1 var(--ui); }
-  details.think .body { white-space: pre-wrap; margin-top: 6px; padding-left: 10px; border-left: 2px solid var(--glass-line); }
-  .meta { font: 12.5px/1.4 var(--ui); color: var(--muted); margin-top: 4px; }
-  .error { color: var(--danger); }
+  /* ---- the dock: the ghost sits on the message box; its canvas reaches below the box's top edge so the hem tucks behind it */
+  .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 24px 10px; pointer-events: none;
+          background: linear-gradient(to bottom, rgba(21, 26, 39, 0), var(--bg) 34%); }
+  .dock > * { width: var(--column); margin: 0 auto; }
+  .perch { position: relative; height: 62px; }
+  canvas#ghost { position: absolute; left: 0; bottom: -10px; width: 160px; height: 120px; display: block; }
+  .status { position: absolute; left: 92px; bottom: 14px; display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--muted); white-space: nowrap; transition: opacity 0.2s; }
+  .status i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .status.quiet { opacity: 0; }
+  .status.error { color: var(--danger); }
+  .status.error i { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+  .speed { color: var(--text); font-variant-numeric: tabular-nums; }
+  body.noghost .status { left: 4px; }
+  .composer { position: relative; pointer-events: auto; border-radius: 22px; background: var(--raise); border: 1px solid var(--line-2); box-shadow: 0 16px 40px -18px rgba(0, 0, 0, 0.8); }
+  .composer:focus-within { border-color: rgba(185, 199, 255, 0.4); }
+  .composer textarea { display: block; width: 100%; border: 0; outline: none; resize: none; background: transparent; min-height: 52px; max-height: 40vh; padding: 14px 18px 4px; line-height: 1.55; }
+  .composer textarea::placeholder { color: var(--faint); }
+  .tools { display: flex; align-items: center; gap: 8px; padding: 6px 8px 8px 10px; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line-2); background: none; border-radius: 999px; padding: 5px 12px 5px 9px; font-size: 13.5px; color: var(--muted); }
+  .pill:hover { color: var(--text); }
+  .pill[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: rgba(185, 199, 255, 0.3); }
+  /* the model picker: which GGUF in the models folder answers; switching reloads the server's model */
+  .picker { position: relative; min-width: 0; }
+  .pill.model { max-width: 100%; color: var(--text); }
+  .pill.model > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pill.model.down { color: var(--danger); }
+  .pill.model:disabled { cursor: default; color: var(--muted); }
+  .models { position: absolute; left: 0; bottom: calc(100% + 8px); z-index: 4; width: min(380px, calc(100vw - 32px)); padding: 6px; border-radius: 14px;
+            background: var(--raise-2); border: 1px solid var(--line-2); box-shadow: 0 24px 50px -20px rgba(0, 0, 0, 0.85); }
+  .models p { margin: 4px 10px 8px; font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+  .models button { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto 18px; align-items: center; gap: 10px; border: 0; background: none; border-radius: 9px; padding: 8px 10px; text-align: left; }
+  .models button:hover, .models button:focus-visible { background: var(--raise); }
+  .models .mname { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .models .msize { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .models .mname .tag { margin-left: 8px; }
+  .models svg { color: var(--accent); }
+  .send { margin-left: auto; width: 36px; height: 36px; border-radius: 50%; border: 0; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; }
+  .send:disabled { background: var(--raise-2); color: var(--faint); cursor: default; }
+  .send.stop { background: var(--text); color: var(--accent-ink); }
+  .note { text-align: center; font-size: 12px; color: var(--faint); padding-top: 8px; }
 
-  .settings { position: fixed; right: 16px; top: 62px; z-index: 6; width: min(360px, calc(100% - 32px)); padding: 18px; border-radius: 16px; display: none;
-              background: rgba(24, 31, 49, 0.96); border: 1px solid var(--glass-line); box-shadow: 0 18px 40px -16px rgba(0, 0, 0, 0.6); }
+  /* ---- settings */
+  .settings { position: fixed; left: 12px; bottom: 70px; z-index: 8; width: min(340px, calc(100vw - 24px)); padding: 18px; border-radius: 14px; display: none;
+              background: var(--raise); border: 1px solid var(--line-2); box-shadow: 0 24px 50px -20px rgba(0, 0, 0, 0.8); }
   .settings.open { display: block; }
-  .settings h2 { font: 600 16px/1 var(--ui); margin: 0 0 14px; }
-  .field { display: grid; gap: 6px; margin-bottom: 14px; font-size: 14px; }
-  .field .row { display: flex; justify-content: space-between; color: var(--muted); font: 14px/1 var(--ui); font-variant-numeric: tabular-nums; }
+  .settings h2 { font-size: 15px; font-weight: 600; margin: 0 0 16px; }
+  .field { display: grid; gap: 6px; margin-bottom: 16px; font-size: 14px; }
+  .field .row { display: flex; justify-content: space-between; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .field .row span:first-child { color: var(--text); }
   .field input[type=range] { accent-color: var(--accent); width: 100%; }
-  .field textarea { background: rgba(0, 0, 0, 0.25); border: 1px solid var(--glass-line); border-radius: 10px; padding: 8px 10px; resize: vertical; min-height: 64px; }
-  .field small { color: var(--muted); font-size: 12.5px; }
-  .check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; margin-bottom: 4px; }
+  .field textarea { background: var(--bg); border: 1px solid var(--line-2); border-radius: 10px; padding: 8px 10px; resize: vertical; min-height: 64px; font-size: 14px; }
+  .field small, .check small { color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+  .check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; }
   .check input { accent-color: var(--accent); margin-top: 4px; }
+  .scrim { display: none; }
 
-  @media (max-width: 700px) {
-    header { padding: 10px 12px; gap: 8px; }
-    .subtitle { bottom: 136px; font-size: 17px; }
-    .composer { padding-left: 14px; }
-    .speed { display: none; }
+  @media (max-width: 820px) {
+    :root { --column: calc(100% - 28px); }
+    body { grid-template-columns: minmax(0, 1fr); }
+    aside { position: fixed; inset: 0 auto 0 0; width: min(300px, 86vw); z-index: 7; transform: translateX(-100%); transition: transform 0.22s ease; }
+    body.menu aside { transform: none; }
+    body.menu .scrim { display: block; position: fixed; inset: 0; z-index: 6; background: rgba(5, 7, 12, 0.55); }
+    .brand .ibtn, .top .ibtn { display: grid; }
+    .top { padding: 0 8px; }
+    .dock { padding: 0 0 8px; }
+    .welcome h1 { font-size: 25px; }
+    .note { display: none; }
   }
+  @media (prefers-reduced-motion: reduce) { aside, .actions, .status { transition: none; } }
 </style>
 <script type="importmap">{ "imports": { "three": "/vendor/three-0.160.0.module.min.js" } }</script>
 </head>
 <body>
-<canvas id="stage" aria-hidden="true"></canvas>
-
-<header>
-  <span class="model" id="model">connecting…</span>
-  <span class="status" id="status"><i></i><span id="statusText">Here</span></span>
-  <button class="icon" id="newBtn" aria-label="New conversation" title="New conversation">
-    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 4v10M4 9h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-  </button>
-  <button class="icon" id="logBtn" aria-label="Show the conversation" title="Conversation">
-    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M4 10h12M4 15h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-  </button>
-  <button class="icon" id="settingsBtn" aria-label="Settings" title="Settings">
-    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M15 6h1M4 14h1M8 14h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="13.5" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="6.5" cy="14" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
-  </button>
-</header>
+<aside id="side" aria-label="Conversations">
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><path d="M4 19V10a7 7 0 0 1 14 0v9l-2.3-1.6L13.3 19 11 17.4 8.7 19l-2.4-1.6Z" fill="currentColor"/><ellipse cx="8.6" cy="10.5" rx="1.1" ry="1.5" fill="#10141f"/><ellipse cx="13.4" cy="10.5" rx="1.1" ry="1.5" fill="#10141f"/></svg>
+    betterllama
+    <button class="ibtn" id="closeMenu" aria-label="Close the menu"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
+  </div>
+  <button class="new" id="newBtn"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>New chat</button>
+  <nav class="chats" id="chats" aria-label="Saved conversations"></nav>
+  <div class="machine">
+    <button type="button" id="settingsBtn" aria-expanded="false">
+      <svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M15 6h1M4 14h1M8 14h8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="13.5" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="6.5" cy="14" r="2" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+      Reply settings
+    </button>
+  </div>
+</aside>
+<div class="scrim" id="scrim"></div>
 
 <section class="settings" id="settings" aria-label="Settings">
   <h2>Reply settings</h2>
   <label class="field"><span class="row"><span>Temperature</span><span id="tempVal"></span></span><input type="range" id="temp" min="0" max="2" step="0.1" value="0"><small>0 gives the same answer every time and is fastest (it uses the draft model if the server has one).</small></label>
   <label class="field"><span class="row"><span>Longest reply</span><span id="maxVal"></span></span><input type="range" id="maxTokens" min="64" max="8192" step="64" value="2048"></label>
   <label class="field"><span class="row"><span>System prompt</span></span><textarea id="system" placeholder="Leave empty to use the model's default"></textarea></label>
-  <label class="check"><input type="checkbox" id="moods" checked><span>Let the model set the ghost's mood<br><small style="color:var(--muted)">It starts replies with a hidden tag such as [happy]. Turn off for models that don't follow it.</small></span></label>
+  <label class="check"><input type="checkbox" id="moods" checked><span>Let the model set the ghost's mood<br><small>It starts replies with a hidden tag such as [happy]. Turn off for models that don't follow it.</small></span></label>
 </section>
 
-<div class="subtitle" id="subtitle" aria-live="polite"></div>
-
-<form class="composer" id="form">
-  <textarea id="input" rows="1" placeholder="Say something" aria-label="Message"></textarea>
-  <button type="button" class="toggle" id="think" aria-pressed="true" title="Let the model think before it answers"><span class="knob"></span>Thinking</button>
-  <span class="speed" id="speed"></span>
-  <button class="send" type="submit" id="sendBtn" aria-label="Send">
-    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" id="sendIcon"><path d="M9 14V4M4.5 8.5 9 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-  </button>
-</form>
-
-<aside class="drawer" id="drawer" aria-label="Conversation">
+<div class="main">
   <div class="top">
-    <h2>Conversation</h2>
-    <button class="icon" id="closeLog" aria-label="Close the conversation">
-      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-    </button>
+    <button class="ibtn" id="menuBtn" aria-label="Show conversations"><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M3 5h12M3 9h12M3 13h8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
+    <span class="title" id="title"></span>
   </div>
-  <div class="log" id="log"></div>
-</aside>
+  <div class="scroll" id="scroll"><div class="column" id="log" role="log" aria-label="Conversation"></div></div>
+  <div class="dock" id="dock">
+    <div class="perch">
+      <canvas id="ghost" aria-hidden="true"></canvas>
+      <span class="status quiet" id="status"><i></i><span id="statusText"></span><span class="speed" id="speed"></span></span>
+    </div>
+    <form class="composer" id="form">
+      <textarea id="input" rows="1" placeholder="Ask anything, or paste code" aria-label="Message"></textarea>
+      <div class="tools">
+        <div class="picker">
+          <button type="button" class="pill model" id="modelBtn" aria-haspopup="true" aria-expanded="false" title="Choose the model">
+            <span id="modelName">Connecting…</span>
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5l3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="models" id="models" hidden></div>
+        </div>
+        <button type="button" class="pill" id="think" aria-pressed="true" title="Let the model reason before it answers: better on hard questions, slower to start">
+          <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8a4.6 4.6 0 0 0-2.7 8.3c.5.4.8.9.8 1.5V12h3.8v-.4c0-.6.3-1.1.8-1.5A4.6 4.6 0 0 0 8 1.8ZM6.2 14.2h3.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>Think
+        </button>
+        <button class="send" type="submit" id="sendBtn" aria-label="Send" disabled>
+          <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" id="sendIcon"><path d="M9 14V4M4.5 8.5 9 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </form>
+    <div class="note">Runs on your computer. Conversations are kept in this browser.</div>
+  </div>
+</div>
 
 <script type="module">
 "use strict";
 const $ = (id) => document.getElementById(id);
 
 // ================================================================ the ghost
-// A small 3D ghost drawn in code (three.js): every state is a set of pose targets the animation eases
-// toward, so changes always blend. ghost.set(state), ghost.token() on each streamed token, ghost.rate(tok/s).
+// A small 3D ghost drawn in code (three.js), sitting on the message box: every state is a set of pose targets the
+// animation eases toward, so changes always blend. ghost.set(state), ghost.token() on each streamed token, ghost.rate(tok/s).
 const ghost = await (async () => {
   let THREE;
   try { THREE = await import("three"); } catch { return null; }
-  const canvas = $("stage");
+  const canvas = $("ghost");
   let renderer;
   try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true }); } catch { return null; }
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 3));
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
-  camera.position.set(0, 0.35, 9);
+  // framed so the ghost stands in the canvas's left part with its hem just above the box's edge, leaving room
+  // above and to the right for raised arms, the magnifier and the z / ? / steam effects
+  const camera = new THREE.PerspectiveCamera(32, 4 / 3, 0.1, 100);
+  camera.position.set(2.0, 0.69, 10.5);
   scene.add(new THREE.HemisphereLight(0xf2f5ff, 0x3a4566, 1.7));
   const key = new THREE.DirectionalLight(0xffffff, 2.0);
   key.position.set(-3, 5, 6);
@@ -171,10 +265,6 @@ const ghost = await (async () => {
   const body = new THREE.Group(); // squash and stretch
   root.add(body);
   scene.add(root);
-  // where it floats: above the message box, and above the subtitles when there are some (it rises and,
-  // if it must, shrinks to make room; see room())
-  const BASE_Y = 0.55, BASE_SCALE = 0.72, TOP_Y = 1.3, MIN_SCALE = 0.5, HEM = 1.62; // HEM: dome top to hem, unscaled
-  let homeY = BASE_Y, size = BASE_SCALE, wantY = BASE_Y, wantSize = BASE_SCALE;
 
   // body: a lathe dome with straight sides; the hem is waved per frame
   const R = 1.25, H = 1.55;
@@ -251,25 +341,11 @@ const ghost = await (async () => {
   prop.scale.setScalar(0.001);
   arms[1].add(prop);
 
-  const shadow = new THREE.Mesh(new THREE.CircleGeometry(1, 48), new THREE.MeshBasicMaterial({ color: 0x05070e, transparent: true, opacity: 0.4, depthWrite: false }));
-  shadow.rotation.x = -Math.PI / 2;
-  shadow.position.y = -1.0;
-  scene.add(shadow);
-
-  // background orbs, and the small effects (z, ?, steam)
+  // the small effects (z, ?, steam)
   function orbTexture(alpha) {
     const c = document.createElement("canvas"); c.width = c.height = 64; const x = c.getContext("2d"); const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
     g.addColorStop(0, `rgba(255,255,255,${alpha})`); g.addColorStop(0.6, `rgba(220,228,255,${alpha / 3})`); g.addColorStop(1, "rgba(220,228,255,0)");
     x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
-  }
-  const orbTex = orbTexture(0.55);
-  const orbs = [];
-  for (let i = 0; i < 28; i++) {
-    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: orbTex, transparent: true, depthWrite: false, opacity: 0.25 + Math.random() * 0.45 }));
-    s.scale.setScalar(0.15 + Math.random() * 0.65);
-    s.position.set((Math.random() - 0.5) * 12, (Math.random() - 0.5) * 7, -2 - Math.random() * 4);
-    s.userData = { vy: 0.05 + Math.random() * 0.12, phase: Math.random() * 6.28 };
-    scene.add(s); orbs.push(s);
   }
   function glyph(text) {
     const c = document.createElement("canvas"); c.width = c.height = 128; const x = c.getContext("2d");
@@ -280,7 +356,7 @@ const ghost = await (async () => {
   const floaters = [];
   function emit(kind) {
     const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: fx[kind], transparent: true, depthWrite: false }));
-    s.scale.setScalar(kind === "z" ? 0.38 : kind === "puff" ? 0.3 + Math.random() * 0.15 : 0.55);
+    s.scale.setScalar(kind === "z" ? 0.6 : kind === "puff" ? 0.4 + Math.random() * 0.2 : 0.85);
     const side = Math.random() < 0.5 ? -1 : 1;
     if (kind === "puff") s.position.set(root.position.x + side * (0.35 + Math.random() * 0.25), root.position.y + 0.95, 0.3);
     else s.position.set(root.position.x + 0.9 + Math.random() * 0.2, root.position.y + 1.2, 0.5);
@@ -300,14 +376,14 @@ const ghost = await (async () => {
     talking:   pose({ lean: 0.04, glow: 0.1, height: 0.05, hem: 1.4 }),
     cheerful:  pose({ lean: 0.04, glow: 0.12, blush: 0.4, height: 0.12, hem: 1.4 }), // talking, happily
     tool:      pose({ eyeOpen: 0.8, lookX: 0.75, lookY: 0.35, lean: 0.04, tilt: -0.06, glow: 0.25, height: 0.02, arms: [0.7, 1], armLift: [0.3, 0.75], front: [0, 0.35], prop: 1, hem: 1.2 }),
-    happy:     pose({ eye: "arc", glow: 0.15, blush: 0.75, height: 0.3, arms: [1, 1], armLift: [1.2, 1.2], hem: 1.3 }),
+    happy:     pose({ eye: "arc", glow: 0.15, blush: 0.75, height: 0.3, arms: [1, 1], armLift: [1.0, 1.0], hem: 1.3 }),
     sorry:     pose({ eyeOpen: 0.6, lookY: -0.55, lean: 0.05, tilt: -0.08, height: -0.35, hem: 0.4, opacity: 0.85, brow: [1, -0.4, 0.02] }),
     surprised: pose({ eyeOpen: 1.45, lookY: 0.1, lean: -0.08, glow: 0.2, height: 0.25, arms: [1, 1], armLift: [0.9, 0.9], hem: 1.8 }),
     angry:     pose({ eyeOpen: 0.62, lookY: -0.05, lean: 0.14, glow: 0.3, height: -0.08, arms: [1, 1], armLift: [-0.35, -0.35], hem: 0.55, brow: [1, 0.5, -0.07], bob: 0.35, heat: 1 }),
     serious:   pose({ eyeOpen: 0.78, lean: 0.03, height: -0.02, arms: [1, 1], armLift: [0.28, 0.28], front: [1, 1], hem: 0.5, brow: [1, 0.06, -0.05], bob: 0.2 }),
     confused:  pose({ eye: "squint", eyeOpen: 0.75, lookX: -0.3, lookY: 0.2, tilt: 0.22, arms: [0, 1], armLift: [0, 1.5], hem: 0.8, brow: [0.8, -0.25, 0.03] }),
-    sleepy:    pose({ eye: "line", lookY: -0.2, lean: 0.02, tilt: 0.05, height: -0.45, hem: 0.3, opacity: 0.8, bob: 0.6 }),
-    wave:      pose({ eye: "arc", tilt: 0.06, glow: 0.1, blush: 0.4, height: 0.15, arms: [0, 1], armLift: [0, 2.3], hem: 1.2 }),
+    sleepy:    pose({ eye: "line", lookY: -0.2, lean: 0.02, tilt: 0.05, height: -0.45, hem: 0.3, opacity: 0.8, bob: 0.6 }), // sinks into the box
+    wave:      pose({ eye: "arc", tilt: 0.06, glow: 0.1, blush: 0.4, height: 0.15, arms: [0, 1], armLift: [0, 0.95], hem: 1.2 }), // up and out, so the arm clears the body's outline
   };
   let state = "idle", target = poses.idle;
   const cur = { ...rest, arms: [0, 0], armLift: [0, 0], front: [0, 0], brow: [0, 0, 0], talk: 0 };
@@ -317,8 +393,13 @@ const ghost = await (async () => {
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
   const motion = reduced ? 0.3 : 1;
 
+  // it looks toward the pointer: up at the conversation while you read, down at the box while you type
   const pointer = new THREE.Vector2();
-  addEventListener("pointermove", (e) => pointer.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight * 2 - 1)));
+  const clamp = (v) => Math.max(-1, Math.min(1, v));
+  addEventListener("pointermove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    pointer.set(clamp((e.clientX - (r.left + r.width / 4)) / 400), clamp(-(e.clientY - (r.top + r.height * 0.55)) / 300));
+  });
 
   const ease = (a, b, k) => a + (b - a) * k;
   const clock = new THREE.Clock();
@@ -327,24 +408,16 @@ const ghost = await (async () => {
     for (const key of ["eyeOpen", "lookX", "lookY", "lean", "tilt", "glow", "blush", "height", "prop", "hem", "opacity", "bob", "heat"]) cur[key] = ease(cur[key], target[key], k);
     for (const key of ["arms", "armLift", "front", "brow"]) cur[key].forEach((v, i) => (cur[key][i] = ease(v, target[key][i], k)));
     const speaking = t - lastTokenAt < 0.35 && !["thinking", "tool", "sleepy"].includes(state);
-    homeY = ease(homeY, wantY, k * 0.6);
-    size = ease(size, wantSize, k * 0.6);
-    root.scale.setScalar(size);
-    const HOME_Y = homeY;
 
     // float: livelier while speaking (only a little faster with speed)
     const energy = (speaking ? 1 + Math.min(rate, 60) / 200 : state === "sleepy" ? 0.4 : 1) * motion;
     root.position.x = state === "angry" ? Math.sin(t * 38) * 0.012 * motion : 0; // a small tremble
-    root.position.y = HOME_Y + cur.height + Math.sin(t * 1.6 * energy) * 0.12 * cur.bob * motion + (state === "happy" ? Math.abs(Math.sin(t * 6)) * 0.12 * motion : 0);
+    root.position.y = cur.height + Math.sin(t * 1.6 * energy) * 0.12 * cur.bob * motion + (state === "happy" ? Math.abs(Math.sin(t * 6)) * 0.12 * motion : 0);
     root.rotation.x = cur.lean + pointer.y * -0.06;
     root.rotation.y = pointer.x * 0.25 + Math.sin(t * 0.7) * 0.04 * motion;
     root.rotation.z = cur.tilt + Math.sin(t * 1.1) * 0.025 * motion;
     const breathe = 1 + Math.sin(t * 1.6 * energy + 1) * 0.015;
     body.scale.set(1 / Math.sqrt(breathe), breathe, 1 / Math.sqrt(breathe));
-    const lift = root.position.y - HOME_Y;
-    shadow.position.y = HOME_Y - HEM * size * 0.95 - 0.08;
-    shadow.scale.setScalar((0.78 - lift * 0.15) * size / BASE_SCALE);
-    shadow.material.opacity = 0.4 - lift * 0.12;
 
     // the hem ripples
     const pos = geo.attributes.position;
@@ -416,12 +489,6 @@ const ghost = await (async () => {
     prop.rotation.z = -arms[1].rotation.z - 0.25 + Math.sin(t * 2) * 0.06 * motion;
     prop.rotation.y = -arms[1].rotation.y - 0.3;
 
-    const flow = (speaking ? 1 + Math.min(rate, 60) / 50 : state === "thinking" ? 1.6 : state === "sleepy" ? 0.4 : 1) * motion;
-    for (const o of orbs) {
-      o.position.y += o.userData.vy * dt * flow;
-      o.position.x += Math.sin(t * 0.5 + o.userData.phase) * 0.002 * flow;
-      if (o.position.y > 4) o.position.y = -4;
-    }
     if (state === "sleepy" && (fxTimer -= dt) < 0) { emit("z"); fxTimer = 1.6; }
     if (state === "angry" && (fxTimer -= dt) < 0) { emit("puff"); fxTimer = 0.35; }
     for (let i = floaters.length - 1; i >= 0; i--) {
@@ -431,62 +498,74 @@ const ghost = await (async () => {
     renderer.render(scene, camera);
     requestAnimationFrame(frame);
   }
-  function resize() {
-    renderer.setSize(innerWidth, innerHeight, false);
-    camera.aspect = innerWidth / innerHeight;
-    camera.position.z = innerWidth < 700 ? 12 : 9;
+  new ResizeObserver(() => {
+    renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+    camera.aspect = canvas.clientWidth / canvas.clientHeight;
     camera.updateProjectionMatrix();
-  }
-  addEventListener("resize", resize);
-  resize();
+  }).observe(canvas);
   frame();
-  // the world height (on the ghost's plane) of a point `px` from the top of the window
-  const worldY = (px) => camera.position.y + (0.5 - px / innerHeight) * 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   return {
     get state() { return state; },
-    // keep the hem (and its shadow) above window line `px`, e.g. the top of the subtitles; null: back home
-    room(px) {
-      if (px == null) { wantY = BASE_Y; wantSize = BASE_SCALE; return; }
-      const floor = worldY(px) + 0.22;                    // the hem's lowest allowed point
-      const top = worldY(64) - 0.1;                       // below the header
-      let s = BASE_SCALE, y = Math.max(BASE_Y, floor + HEM * s * 0.95);
-      if (y + R * s > top) { s = Math.max(MIN_SCALE, (top - floor) / (HEM * 0.95 + R)); y = floor + HEM * s * 0.95; }
-      wantY = Math.min(y, TOP_Y); wantSize = s;
-    },
     set(s) { if (!poses[s] || s === state) return; state = s; target = poses[s]; if (s === "confused") emit("q"); },
     token() { lastTokenAt = clock.elapsedTime; },
     rate(r) { rate = r; },
   };
 })();
 
-// ================================================================ conversation
+
+// ================================================================ conversations
 const store = {
   get(k, d) { try { const v = localStorage.getItem("betterllama." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem("betterllama." + k, JSON.stringify(v)); } catch {} },
 };
-let messages = store.get("messages", []); // {role, content, sent?, think?, thinkSecs?, meta?, error?}
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const blank = () => ({ id: uid(), title: "", messages: [], at: Date.now() });
+function titleOf(messages) {
+  const u = messages.find((m) => m.role === "user");
+  if (!u) return "";
+  const line = u.content.trim().split("\n")[0];
+  return line.length > 60 ? line.slice(0, 57).trimEnd() + "…" : line;
+}
+// each conversation: {id, title, at, messages: [{role, content, sent?, think?, thinkSecs?, meta?, error?}]}
+let chats = store.get("chats", null);
+if (!Array.isArray(chats)) { // the page used to keep a single conversation
+  const old = store.get("messages", []);
+  chats = old.length ? [{ id: uid(), title: titleOf(old), messages: old, at: Date.now() }] : [];
+  store.set("chats", chats);
+}
+let chat = chats.find((c) => c.id === store.get("current", null)) || chats[0] || blank(); // a new chat joins the list when it gets its first message
 let busy = null; // AbortController of the running request
 let settle = null; // timer back to idle after a reply's mood
 let lastActive = performance.now();
+function save() { store.set("chats", chats); store.set("current", chat.id); }
 
-const LABELS = { idle: "Here", listening: "Listening", thinking: "Thinking", talking: "Talking", cheerful: "Talking", tool: "Using a tool", happy: "Done",
-                 sorry: "Sorry", surprised: "Oh!", angry: "Not happy", serious: "Serious", confused: "Puzzled", sleepy: "Dozing", wave: "Hello" };
+const ICON = {
+  copy: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="5.2" width="8.6" height="8.6" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.8 5V3.9a1.9 1.9 0 0 0-1.9-1.9H3.9A1.9 1.9 0 0 0 2 3.9v5a1.9 1.9 0 0 0 1.9 1.9H5" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>',
+  done: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.2 8.6l3 3 6.6-7.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  retry: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8.2A5.2 5.2 0 1 1 11.6 4.4M13.2 2.4v3.2H10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  trash: '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.2c.1.7.6 1.3 1.4 1.3h3c.8 0 1.3-.6 1.4-1.3l.6-8.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+};
+
+// ---- the ghost's status line: quiet unless something is happening
+const LABELS = { thinking: "Thinking", talking: "Writing", cheerful: "Writing", tool: "Using a tool", wave: "Hello" };
 function mood(s, label, error = false) {
   ghost?.set(s);
-  $("statusText").textContent = label || LABELS[s] || "";
+  const text = label ?? LABELS[s] ?? "";
+  $("statusText").textContent = text;
+  $("status").classList.toggle("quiet", !text);
   $("status").classList.toggle("error", error);
 }
 // after a reply or an error: hold the face a moment, then rest
 function settleTo(s, ms, label, error = false) {
   clearTimeout(settle);
   mood(s, label, error);
-  settle = setTimeout(() => { if (!busy) mood($("input").value ? "listening" : "idle"); }, ms);
+  settle = setTimeout(() => { if (!busy) mood($("input").value.trim() ? "listening" : "idle"); }, ms);
 }
 // nobody around for two minutes: doze off; any activity wakes it
 setInterval(() => { if (!busy && ghost?.state === "idle" && performance.now() - lastActive > 120000) mood("sleepy"); }, 5000);
-for (const ev of ["pointermove", "keydown", "pointerdown"]) addEventListener(ev, () => { lastActive = performance.now(); if (ghost?.state === "sleepy") mood("idle"); });
+for (const ev of ["pointermove", "keydown", "pointerdown", "wheel"]) addEventListener(ev, () => { lastActive = performance.now(); if (ghost?.state === "sleepy") mood("idle"); });
 
-// settings, kept in this browser
+// ---- settings, kept in this browser
 const think = $("think");
 const prefs = { temp: ["temp", 0], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true] };
 for (const [id, [key, d]] of Object.entries(prefs)) {
@@ -501,51 +580,182 @@ function showSettings() {
   $("maxVal").textContent = Number($("maxTokens").value).toLocaleString() + " tokens";
 }
 showSettings();
-$("settingsBtn").onclick = () => $("settings").classList.toggle("open");
-$("logBtn").onclick = () => { $("drawer").classList.add("open"); renderLog(); };
-$("closeLog").onclick = () => $("drawer").classList.remove("open");
-addEventListener("keydown", (e) => { if (e.key === "Escape") { $("settings").classList.remove("open"); $("drawer").classList.remove("open"); } });
-$("newBtn").onclick = () => {
+function openSettings(on) { $("settings").classList.toggle("open", on); $("settingsBtn").setAttribute("aria-expanded", String(on)); }
+$("settingsBtn").onclick = (e) => { e.stopPropagation(); openSettings(!$("settings").classList.contains("open")); };
+addEventListener("click", (e) => { if (!$("settings").contains(e.target)) openSettings(false); });
+
+// ---- the sidebar
+const menu = (on) => document.body.classList.toggle("menu", on);
+$("menuBtn").onclick = () => menu(true);
+$("closeMenu").onclick = $("scrim").onclick = () => menu(false);
+addEventListener("keydown", (e) => { if (e.key === "Escape") { openSettings(false); menu(false); closeModels(); } });
+
+function renderChats() {
+  const nav = $("chats");
+  nav.innerHTML = "";
+  if (!chats.length) { nav.innerHTML = '<p class="none">Your conversations will show up here.</p>'; return; }
+  const today = new Date().setHours(0, 0, 0, 0), day = 86400000;
+  const groupOf = (at) => at >= today ? "Today" : at >= today - day ? "Yesterday" : at >= today - 7 * day ? "Previous 7 days" : "Older";
+  let group = null;
+  for (const c of [...chats].sort((a, b) => b.at - a.at)) {
+    if (groupOf(c.at) !== group) {
+      group = groupOf(c.at);
+      const h = document.createElement("div");
+      h.className = "group"; h.textContent = group;
+      nav.appendChild(h);
+    }
+    const row = document.createElement("div");
+    row.className = "chat" + (c === chat ? " current" : "");
+    const open = document.createElement("button");
+    open.className = "open"; open.textContent = open.title = c.title || "New chat";
+    if (c === chat) open.setAttribute("aria-current", "true");
+    open.onclick = () => switchTo(c);
+    const del = document.createElement("button");
+    del.className = "ibtn del"; del.innerHTML = ICON.trash; del.title = "Delete"; del.setAttribute("aria-label", `Delete ${c.title || "this chat"}`);
+    del.onclick = () => remove(c);
+    row.append(open, del);
+    nav.appendChild(row);
+  }
+}
+function switchTo(c) {
   if (busy) busy.abort();
-  messages = []; save(); renderLog(); subtitle("");
-  settleTo("wave", 2200);
+  chat = c;
+  save(); renderChats(); renderAll(); menu(false);
   $("input").focus();
+}
+function remove(c) {
+  if (!confirm(`Delete "${c.title || "this chat"}"? This can't be undone.`)) return;
+  chats = chats.filter((x) => x !== c);
+  if (c === chat) { if (busy) busy.abort(); chat = blank(); renderAll(); }
+  save(); renderChats();
+}
+$("newBtn").onclick = () => {
+  if (!chat.messages.length) { menu(false); $("input").focus(); return; }
+  switchTo(blank());
+  settleTo("wave", 2200);
 };
 
-fetch("/v1/models").then((r) => r.json()).then((j) => { $("model").textContent = j.data[0].id; })
-  .catch(() => { $("model").textContent = "server not reachable"; });
-
-function save() { store.set("messages", messages); }
-
-// ---- a small Markdown renderer (escaped first, so model output can never become HTML)
-function esc(s) { return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-function inline(s) {
-  return s
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+// ---- the model picker: the GGUF files in the server's models folder; choosing one makes the server switch to it.
+// Models are named the way people say them: "JOSIEFIED-Qwen3-8B-Q4_K_M" is JOSIEFIED Qwen3 8B, quantized Q4_K_M.
+const pretty = (id) => {
+  const m = id.match(/^(.*?)[-_.]((?:I?Q\d\w*)|F16|BF16|F32)$/i);
+  return { name: (m ? m[1] : id).replace(/[-_]+/g, " "), quant: m ? m[2].toUpperCase() : "" };
+};
+const size = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.round(n / 1e6) + " MB";
+let model = null, loadingModel = null; // the server's model, and the one it is switching to
+function showModel() {
+  const b = $("modelBtn");
+  b.classList.remove("down");
+  b.disabled = !!loadingModel;
+  $("modelName").textContent = loadingModel ? `Loading ${pretty(loadingModel).name}…` : model ? pretty(model).name : "No model";
+  b.title = model ? `${model}: choose another model` : "Choose the model";
+  canSend();
 }
+async function refreshModels() {
+  try {
+    const j = await (await fetch("/api/models")).json();
+    model = j.current; loadingModel = j.loading;
+    showModel();
+    if (loadingModel) setTimeout(refreshModels, 1500); // a switch is under way (another tab, or the server starting): watch it finish
+    return j;
+  } catch {
+    model = loadingModel = null;
+    showModel();
+    $("modelName").textContent = "Server not reachable";
+    $("modelBtn").classList.add("down");
+  }
+}
+function closeModels() { $("models").hidden = true; $("modelBtn").setAttribute("aria-expanded", "false"); }
+async function openModels() {
+  const menu = $("models");
+  if (!menu.hidden) return closeModels();
+  const j = await refreshModels();
+  if (!j || loadingModel) return;
+  menu.innerHTML = "<p>The models in the server's models folder. Switching loads the new one, which can take a minute.</p>";
+  for (const m of j.models) {
+    const { name, quant } = pretty(m.id);
+    const b = document.createElement("button");
+    b.type = "button"; b.title = m.id;
+    b.innerHTML = `<span class="mname">${esc(name)}${quant ? `<span class="tag">${esc(quant)}</span>` : ""}</span><span class="msize">${size(m.size)}</span>` +
+      (m.id === j.current ? ICON.done : "<span></span>");
+    if (m.id === j.current) b.setAttribute("aria-current", "true");
+    b.onclick = () => { closeModels(); if (m.id !== j.current) switchModel(m.id); };
+    menu.appendChild(b);
+  }
+  menu.hidden = false;
+  $("modelBtn").setAttribute("aria-expanded", "true");
+  (menu.querySelector("[aria-current]") || menu.querySelector("button"))?.focus();
+}
+$("modelBtn").onclick = (e) => { e.stopPropagation(); openModels(); };
+addEventListener("click", (e) => { if (!$("models").contains(e.target)) closeModels(); });
+async function switchModel(id) {
+  if (busy || loadingModel) return;
+  const name = pretty(id).name, t0 = performance.now();
+  loadingModel = id;
+  showModel();
+  clearTimeout(settle);
+  mood("thinking", `Loading ${name}`);
+  const tick = setInterval(() => mood("thinking", `Loading ${name}, ${Math.round((performance.now() - t0) / 1000)} s`), 1000);
+  try {
+    const r = await fetch("/api/models/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+    clearInterval(tick);
+    await refreshModels();
+    settleTo("happy", 2600, `${name} is ready`);
+  } catch (e) {
+    clearInterval(tick);
+    await refreshModels();
+    settleTo("confused", 8000, e instanceof TypeError ? "Can't reach the server" : String(e.message || e), true);
+  }
+}
+refreshModels();
+addEventListener("focus", () => { if (!loadingModel) refreshModels(); }); // another tab or client may have switched it
+
+// ---- a small Markdown renderer (everything is escaped, so model output can never become HTML)
+function esc(s) { return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+// inline code first, so `a*b*c` stays as written
+function inline(s) {
+  return s.split(/(`[^`\n]+`)/).map((p, i) => i % 2 ? "<code>" + esc(p.slice(1, -1)) + "</code>" : esc(p)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')).join("");
+}
+const cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+const TABLE_RULE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/;
 function markdown(src) {
   const out = [];
-  src.split(/```/).forEach((part, i) => {
-    if (i % 2 === 1) { // a code block (possibly still open while streaming)
+  src.split(/```/).forEach((part, n) => {
+    if (n % 2 === 1) { // a code block (possibly still open while streaming); its first line names the language
       const nl = part.indexOf("\n");
-      out.push("<pre><code>" + esc((nl >= 0 ? part.slice(nl + 1) : "").replace(/\n$/, "")) + "</code></pre>");
+      const lang = (nl >= 0 ? part.slice(0, nl) : part).trim();
+      const code = nl >= 0 ? part.slice(nl + 1).replace(/\n$/, "") : "";
+      out.push(`<div class="code"><div class="code-top"><span>${esc(lang || "code")}</span><button class="copy" type="button">${ICON.copy}<span>Copy</span></button></div><pre><code>${esc(code)}</code></pre></div>`);
       return;
     }
     let list = null, para = [];
     const close = () => { if (list) { out.push("</" + list + ">"); list = null; } };
-    const flush = () => { if (para.length) { out.push("<p>" + inline(esc(para.join("\n"))).replace(/\n/g, "<br>") + "</p>"); para = []; } };
-    for (const line of part.split("\n")) {
+    const flush = () => { if (para.length) { out.push("<p>" + inline(para.join("\n")).replace(/\n/g, "<br>") + "</p>"); para = []; } };
+    const lines = part.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       let m;
       if (!line.trim()) { flush(); close(); continue; }
-      if ((m = line.match(/^(#{1,6})\s+(.*)/))) { flush(); close(); const n = Math.min(m[1].length, 3); out.push(`<h${n}>${inline(esc(m[2]))}</h${n}>`); continue; }
+      if ((m = line.match(/^(#{1,6})\s+(.*)/))) { flush(); close(); const h = Math.min(m[1].length, 3); out.push(`<h${h}>${inline(m[2])}</h${h}>`); continue; }
+      if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); close(); out.push("<hr>"); continue; }
+      if (line.includes("|") && TABLE_RULE.test(lines[i + 1] || "")) {
+        flush(); close();
+        let html = "<thead><tr>" + cells(line).map((c) => `<th>${inline(c)}</th>`).join("") + "</tr></thead><tbody>";
+        for (i += 2; i < lines.length && lines[i].includes("|") && lines[i].trim(); i++) html += "<tr>" + cells(lines[i]).map((c) => `<td>${inline(c)}</td>`).join("") + "</tr>";
+        i--;
+        out.push(`<div class="table"><table>${html}</tbody></table></div>`);
+        continue;
+      }
       if ((m = line.match(/^\s*([-*•]|\d+[.)])\s+(.*)/))) {
         flush();
         const kind = /\d/.test(m[1]) ? "ol" : "ul";
         if (list !== kind) { close(); out.push("<" + kind + ">"); list = kind; }
-        out.push("<li>" + inline(esc(m[2])) + "</li>");
+        out.push("<li>" + inline(m[2]) + "</li>");
         continue;
       }
       close();
@@ -556,56 +766,96 @@ function markdown(src) {
   return out.join("");
 }
 
-// ---- the full conversation (drawer); drawn only while it is open
-function renderLog() {
-  if (!$("drawer").classList.contains("open")) return;
-  const log = $("log");
-  log.innerHTML = "";
-  if (!messages.length) { log.innerHTML = '<p class="empty">Nothing yet. Say something to the ghost below.</p>'; return; }
-  for (const m of messages) {
-    const div = document.createElement("div");
-    div.className = "msg " + m.role;
-    const bubble = document.createElement("div");
-    bubble.className = "bubble";
-    if (m.role === "user") bubble.textContent = m.content;
-    else {
-      if (m.think && m.think.trim()) {
-        const d = document.createElement("details");
-        d.className = "think";
-        const s = document.createElement("summary");
-        s.textContent = m.thinkSecs === undefined ? "Thinking…" : `Thought for ${m.thinkSecs.toFixed(1)} s`;
-        const b = document.createElement("div");
-        b.className = "body";
-        b.textContent = m.think.trim();
-        d.append(s, b);
-        bubble.appendChild(d);
-      }
-      const body = document.createElement("div");
-      body.innerHTML = markdown(m.content);
-      bubble.appendChild(body);
-      if (m.error) { const e = document.createElement("div"); e.className = "error"; e.textContent = m.error; bubble.appendChild(e); }
-    }
-    div.appendChild(bubble);
-    if (m.meta) { const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = m.meta; div.appendChild(meta); }
-    log.appendChild(div);
+// ---- the conversation
+const scroll = $("scroll"), log = $("log");
+const STARTERS = [["Explain some code", "Explain what this code does:\n\n"], ["Find a bug", "Find the bug in this code:\n\n"], ["Write a function", "Write a function that "], ["Plan a feature", "Help me plan "]];
+function view(m) {
+  const div = document.createElement("div");
+  div.className = "msg " + m.role;
+  if (m.role === "user") {
+    const b = document.createElement("div");
+    b.className = "bubble";
+    b.textContent = m.content;
+    div.appendChild(b);
+    return div;
   }
-  log.scrollTop = log.scrollHeight;
+  div.innerHTML = '<details class="think" hidden><summary></summary><div class="body"></div></details><div class="answer"></div>' +
+    '<div class="error" hidden><span></span><button type="button" class="retry">Try again</button></div>' +
+    `<div class="actions"><button type="button" class="ibtn copyall" title="Copy" aria-label="Copy the reply">${ICON.copy}</button>` +
+    `<button type="button" class="ibtn retry" title="Write it again" aria-label="Write the reply again">${ICON.retry}</button><span class="stat"></span></div>`;
+  div.reply = m;
+  fill(div, m);
+  return div;
 }
+function fill(div, m) {
+  const th = div.querySelector(".think"), hasThink = !!(m.think && m.think.trim());
+  th.hidden = !hasThink;
+  if (hasThink) {
+    th.querySelector("summary").textContent = m.thinkSecs === undefined ? "Thinking…" : `Thought for ${m.thinkSecs.toFixed(1)} s`;
+    th.querySelector(".body").textContent = m.think.trim();
+  }
+  div.querySelector(".answer").innerHTML = markdown(m.content);
+  const err = div.querySelector(".error");
+  err.hidden = !m.error;
+  err.querySelector("span").textContent = m.error || "";
+  const live = busy && div === log.lastElementChild;
+  div.querySelector(".actions").hidden = live || !!m.error;
+  const stat = div.querySelector(".stat");
+  stat.textContent = m.meta === "stopped" ? "Stopped" : (m.meta?.match(/[\d.]+ tok\/s/) || [""])[0];
+  stat.title = [m.model && pretty(m.model).name, m.meta].filter(Boolean).join(": ");
+}
+const nearBottom = () => scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 140;
+const toBottom = () => { scroll.scrollTop = scroll.scrollHeight; };
+function renderAll() {
+  $("title").textContent = chat.title;
+  document.title = chat.title ? `${chat.title} - betterllama` : "betterllama";
+  if (!chat.messages.length) {
+    log.innerHTML = '<div class="welcome"><h1>What are we working on?</h1><p>Ask a question, or paste code to explain, fix or review.</p><div class="starters"></div></div>';
+    for (const [label, text] of STARTERS) {
+      const b = document.createElement("button");
+      b.type = "button"; b.textContent = label;
+      b.onclick = () => { input.value = text; input.focus(); input.setSelectionRange(text.length, text.length); typed(); };
+      log.querySelector(".starters").appendChild(b);
+    }
+    return;
+  }
+  log.replaceChildren(...chat.messages.map(view));
+  const last = log.lastElementChild;
+  if (last?.classList.contains("assistant")) last.classList.add("last");
+  log.querySelectorAll(".msg.assistant:not(.last) .actions .retry").forEach((b) => (b.hidden = true)); // only the last reply can be written again
+  toBottom();
+}
+// while a reply streams, redraw it at most once a frame, following it down unless you scrolled up to read
+let drawReq = 0;
+function draw(div, m, now = false) {
+  if (drawReq) { cancelAnimationFrame(drawReq); drawReq = 0; }
+  const run = () => { drawReq = 0; const stick = nearBottom(); fill(div, m); if (stick) toBottom(); };
+  now ? run() : (drawReq = requestAnimationFrame(run));
+}
+// the transcript ends above the ghost and the message box, whatever height the box has grown to
+new ResizeObserver(() => {
+  const stick = nearBottom();
+  log.style.paddingBottom = $("dock").offsetHeight + 16 + "px";
+  if (stick) toBottom();
+}).observe($("dock"));
 
-// ---- subtitles: your line, then the reply's latest words as plain text
-function plain(s) {
-  return s.replace(/```[\s\S]*?(```|$)/g, " (code in the conversation) ").replace(/[*_`#>]+/g, "").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/\s+/g, " ").trim();
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
 }
-function subtitle(you, reply = "", extra = "") {
-  const el = $("subtitle");
-  if (!you && !reply && !extra) { el.innerHTML = ""; ghost?.room(null); return; }
-  let text = plain(reply), cut = false;
-  if (text.length > 260) { const at = text.indexOf(" ", text.length - 260); text = "…" + text.slice(at > 0 ? at : text.length - 260); cut = true; }
-  el.innerHTML = (you ? `<span class="you">${esc(you)}</span>` : "") + esc(text) + extra + (cut ? '<button class="more" type="button">Read the whole reply</button>' : "");
-  el.querySelector(".more")?.addEventListener("click", () => $("logBtn").click());
-  ghost?.room(el.getBoundingClientRect().top);
-}
-addEventListener("resize", () => { const el = $("subtitle"); ghost?.room(el.innerHTML ? el.getBoundingClientRect().top : null); });
+log.addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.classList.contains("copy")) {
+    await copyText(b.closest(".code").querySelector("code").textContent);
+    b.innerHTML = ICON.done + "<span>Copied</span>";
+    setTimeout(() => (b.innerHTML = ICON.copy + "<span>Copy</span>"), 1500);
+  } else if (b.classList.contains("copyall")) {
+    await copyText(b.closest(".msg").reply.content);
+    b.innerHTML = ICON.done;
+    setTimeout(() => (b.innerHTML = ICON.copy), 1500);
+  } else if (b.classList.contains("retry")) retry();
+});
 
 // ---- moods: the model starts its reply (or a sentence) with a hidden tag
 const MOOD_TAGS = ["happy", "neutral", "serious", "sorry", "surprised", "angry", "confused"];
@@ -616,7 +866,7 @@ const TAG_RE = new RegExp(`\\[(${MOOD_TAGS.join("|")})\\]\\s*`, "gi");
 function moodOf(answer, streaming) {
   let last = null;
   let shown = answer.replace(TAG_RE, (_, t) => { last = t.toLowerCase(); return ""; });
-  if (streaming) shown = shown.replace(/\[[a-z]{0,9}$/i, "");
+  if (streaming || /\[[a-z]{0,9}$/i.test(shown.trim())) shown = shown.replace(/\[[a-z]{0,9}\s*$/i, ""); // a tag cut off at the end
   return { shown, last };
 }
 const TALKING_FACE = { happy: "cheerful", neutral: "talking", serious: "serious", sorry: "sorry", surprised: "surprised", angry: "angry", confused: "confused" };
@@ -633,21 +883,34 @@ function split(raw, m, t0) {
   m.answer = raw.slice(close + 8).replace(/^\s+/, "");
 }
 
-async function send(text) {
-  clearTimeout(settle);
+function send(text) {
   const thinking = think.getAttribute("aria-pressed") === "true";
   // `sent` is what the model reads; resending exactly that keeps the server's cache of the conversation valid
-  messages.push({ role: "user", content: text, sent: thinking ? text : text + " /no_think" });
-  const reply = { role: "assistant", content: "" };
-  messages.push(reply);
+  chat.messages.push({ role: "user", content: text, sent: thinking ? text : text + " /no_think" });
+  if (!chats.includes(chat)) { chat.title = titleOf(chat.messages); chats.push(chat); }
+  chat.at = Date.now();
+  ask(thinking);
+}
+// the last reply again, from the same question
+function retry() {
+  if (busy) return;
+  const msgs = chat.messages;
+  if (msgs.at(-1)?.role === "assistant") msgs.pop();
+  if (msgs.at(-1)?.role === "user") ask(!(msgs.at(-1).sent ?? "").endsWith(" /no_think"));
+}
+
+async function ask(thinking) {
+  clearTimeout(settle);
+  const c = chat, reply = { role: "assistant", content: "", model };
+  c.messages.push(reply);
   busy = new AbortController();
   setBusy(true);
-  mood("thinking", "Waiting for the model");
-  subtitle(text);
-  renderLog();
+  mood("thinking", "Reading");
+  save(); renderChats(); renderAll();
+  const el = log.lastElementChild;
 
   // earlier replies go back without their thinking (as Qwen3 expects), with their mood tags
-  const history = messages.slice(0, -1).map((m) => ({ role: m.role, content: m.sent ?? m.content }));
+  const history = c.messages.slice(0, -1).map((m) => ({ role: m.role, content: m.sent ?? m.content }));
   const sys = [$("system").value.trim(), $("moods").checked ? MOOD_PROMPT : ""].filter(Boolean).join("\n\n");
   if (sys) history.unshift({ role: "system", content: sys });
   const body = {
@@ -658,6 +921,7 @@ async function send(text) {
 
   const t0 = performance.now();
   let raw = "", firstAt = null, usage = null, finish = null, lastMood = null, tool = null;
+  let tagChunks = 0, tagLoop = false; // small models can repeat the mood tags instead of answering
   const stamps = []; // token arrival times, for the live speed
   try {
     const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: busy.signal });
@@ -674,10 +938,10 @@ async function send(text) {
         if (!ev.startsWith("data: ")) continue;
         const data = ev.slice(6);
         if (data === "[DONE]") continue;
-        const c = JSON.parse(data);
-        if (c.error) throw new Error(c.error.message);
-        if (c.usage) usage = c.usage;
-        const ch = c.choices && c.choices[0];
+        const ch0 = JSON.parse(data);
+        if (ch0.error) throw new Error(ch0.error.message);
+        if (ch0.usage) usage = ch0.usage;
+        const ch = ch0.choices && ch0.choices[0];
         if (!ch) continue;
         if (ch.finish_reason) finish = ch.finish_reason;
         const delta = ch.delta || {};
@@ -696,20 +960,15 @@ async function send(text) {
         $("speed").textContent = rate ? `${rate.toFixed(0)} tok/s` : "";
         raw += delta.content;
         split(raw, reply, t0);
-        if (reply.think !== undefined && reply.thinkSecs === undefined) {
-          mood("thinking"); // reasoning before the answer
-          subtitle(text, "", '<span class="hint">Thinking…</span>');
-        } else {
+        if (reply.think !== undefined && reply.thinkSecs === undefined) mood("thinking"); // reasoning before the answer
+        else {
           const { shown, last } = moodOf(reply.answer || "", true);
           if (last) lastMood = last;
           reply.content = shown;
-          if (shown.trim()) {
-            ghost?.token();
-            mood(TALKING_FACE[lastMood] || "talking", "Talking");
-            subtitle(text, shown);
-          }
+          if (shown.trim()) { ghost?.token(); mood(TALKING_FACE[lastMood] || "talking", "Writing"); }
+          else if (lastMood && ++tagChunks > 48) { tagLoop = true; busy.abort(); }
         }
-        renderLog();
+        draw(el, reply);
       }
     }
     const { shown } = moodOf(reply.answer || "", false);
@@ -720,16 +979,18 @@ async function send(text) {
       const rate = usage.completion_tokens / Math.max(secs, 1e-3);
       reply.meta = `${usage.completion_tokens} tokens in ${secs.toFixed(1)} s, ${rate.toFixed(1)} tok/s, first token after ${((firstAt ?? t0) - t0).toFixed(0)} ms` + (finish === "length" ? ", stopped at the length limit" : "");
     }
-    subtitle(text, shown);
     if (finish === "tool_calls") settleTo("tool", 3000, `Asked to use ${tool}`);
     else settleTo(AFTER_FACE[lastMood] || "happy", lastMood && !["happy", "neutral"].includes(lastMood) ? 5000 : 2200);
   } catch (e) {
-    if (e.name === "AbortError") { reply.meta = "stopped"; subtitle(text, reply.content || ""); settleTo("idle", 10); }
+    if (tagLoop) {
+      reply.content = "";
+      reply.error = "This model kept repeating the ghost's mood tags instead of answering. Turn off \"Let the model set the ghost's mood\" in Reply settings, then try again.";
+      settleTo("confused", 8000, "Stuck on mood tags", true);
+    } else if (e.name === "AbortError") { reply.meta = "stopped"; settleTo("idle", 10); }
     else {
       // a network failure (the browser only says "Failed to fetch"): say what it means
-      reply.error = e instanceof TypeError ? "Can't reach the server. Check that betterllama serve is still running, then send again." : String(e.message || e);
-      subtitle(text, reply.content || "", ` <span class="err">${esc(reply.error)}</span>`);
-      settleTo("confused", 5000, "Something went wrong", true);
+      reply.error = e instanceof TypeError ? "Can't reach the server. Check that betterllama serve is still running, then try again." : String(e.message || e);
+      settleTo("confused", 5000, "Couldn't answer", true);
     }
   } finally {
     if (reply.think !== undefined && reply.thinkSecs === undefined) reply.thinkSecs = (performance.now() - t0) / 1000;
@@ -738,7 +999,7 @@ async function send(text) {
     $("speed").textContent = "";
     setBusy(false);
     save();
-    renderLog();
+    draw(el, reply, true);
   }
 }
 
@@ -746,18 +1007,20 @@ function setBusy(on) {
   const b = $("sendBtn");
   b.classList.toggle("stop", on);
   b.setAttribute("aria-label", on ? "Stop the reply" : "Send");
-  $("sendIcon").innerHTML = on ? '<rect x="4" y="4" width="10" height="10" rx="2" fill="currentColor"/>'
+  $("sendIcon").innerHTML = on ? '<rect x="4.5" y="4.5" width="9" height="9" rx="2" fill="currentColor"/>'
                                : '<path d="M9 14V4M4.5 8.5 9 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>';
+  canSend();
 }
-
 const input = $("input");
-const grow = () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight + 2, innerHeight * 0.3) + "px"; };
-input.addEventListener("input", () => {
-  grow();
+const canSend = () => { $("sendBtn").disabled = !busy && (!input.value.trim() || !!loadingModel); };
+const grow = () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight + 2, innerHeight * 0.4) + "px"; };
+function typed() {
+  grow(); canSend();
   if (busy) return;
   clearTimeout(settle);
   mood(input.value.trim() ? "listening" : "idle");
-});
+}
+input.addEventListener("input", typed);
 input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); } });
 $("form").onsubmit = (e) => {
   e.preventDefault();
@@ -765,17 +1028,14 @@ $("form").onsubmit = (e) => {
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
-  grow();
+  grow(); canSend();
   send(text);
 };
 
-// without 3D (no WebGL), the conversation stays open instead
-if (!ghost) { $("stage").remove(); $("drawer").classList.add("open"); }
-// the last exchange as subtitles, and a wave hello
-const lastUser = [...messages].reverse().find((m) => m.role === "user");
-const lastReply = messages[messages.length - 1];
-if (lastUser && lastReply?.role === "assistant") subtitle(lastUser.content, lastReply.content);
-renderLog();
+// without 3D (no WebGL), the status sits alone above the box
+if (!ghost) { $("ghost").remove(); document.body.classList.add("noghost"); }
+renderChats();
+renderAll();
 settleTo("wave", 2400);
 input.focus();
 </script>

@@ -2,11 +2,13 @@
 //! server-sent events), /v1/models, and a chat page at /. A small HTTP/1.1 implementation on std::net, one connection thread
 //! each; generation runs on the main thread, one request at a time. The cache keeps the tokens of the
 //! last conversation, so a request that repeats it (a chat client resending the history) only reads
-//! the new part.
+//! the new part. /api/models lists the GGUF files next to the model and /api/models/load switches to
+//! one of them: the model thread drops the running model (freeing its GPU memory) and loads the other.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::json::{Json, num, obj, str};
@@ -21,8 +23,16 @@ enum Kind {
     Completion,
 }
 
+/// Work for the model thread.
+enum Work {
+    Job(Job),
+    /// switch to this GGUF file; the reply comes once a model is running again (Err: it stayed on the old one)
+    Load(PathBuf, mpsc::Sender<Result<(), String>>),
+}
+
 /// A generation request handed from a connection thread to the model thread.
 struct Job {
+    model: String, // the model the prompt was written for: if another one runs by then, the job is refused
     kind: Kind,
     prompt: String, // the full text the model reads (chat: already in the chat template)
     max_tokens: Option<usize>,
@@ -40,53 +50,148 @@ enum Event {
     Error(u16, String),
 }
 
-pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
-    let t = Instant::now();
-    let g = crate::gguf::Gguf::open(&o.model)?;
-    let mut engine = crate::load_with_draft(&g, o.gpu, o.ctx.unwrap_or(0), o.draft.as_ref(), o.draft_k)?;
-    let fmt = ChatFormat::detect(&g).ok();
-    let model_id = o.model.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string();
-    let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
-    eprintln!(
-        "[loaded {} on {} in {:.2}s, {}-token context{}]",
-        model_id,
-        engine.backend.describe(),
-        t.elapsed().as_secs_f64(),
-        engine.backend.ctx(),
-        if engine.draft.is_some() { ", with a draft model for greedy requests" } else { "" }
-    );
-    eprintln!("chat in your browser: http://{host}:{port}/");
-    eprintln!("OpenAI-compatible API: http://{host}:{port}/v1 (/v1/chat/completions, /v1/completions, /v1/models)");
-    if fmt.is_none() {
-        eprintln!("[note: no ChatML template in this model, so /v1/chat/completions is off]");
-    }
+/// The running model, as the connection threads see it.
+#[derive(Clone)]
+struct Loaded {
+    id: String,
+    ctx: usize,
+    chat_ok: bool,
+    default_system: Option<String>,
+}
 
-    let (jobs, rx) = mpsc::channel::<Job>();
-    let defaults = (o.temp, o.top_k, o.top_p, o.max_new);
-    let think_default = !o.no_think;
-    let ctx = engine.backend.ctx();
-    let id = model_id.clone();
-    let chat_ok = fmt.is_some();
-    let default_system = fmt.as_ref().and_then(|f| f.default_system.clone());
+#[derive(Default)]
+struct Status {
+    current: Option<Loaded>,
+    loading: Option<String>, // the model being loaded; requests get 503 meanwhile
+}
+
+/// What the connection threads share: the model's status, and where the models are.
+struct Shared {
+    status: Mutex<Status>,
+    dir: PathBuf,
+    defaults: (f32, usize, f32, usize),
+    think_default: bool,
+}
+
+fn model_id(path: &Path) -> String {
+    path.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string()
+}
+
+/// The GGUF files in the models folder, by name.
+fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")))
+        .map(|p| (model_id(&p), std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0), p))
+        .map(|(id, size, p)| (id, p, size))
+        .collect();
+    found.sort_by_key(|m| m.0.to_lowercase());
+    found
+}
+
+pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
+    let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
+    let dir = o.model.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+    let shared = Arc::new(Shared { status: Mutex::new(Status::default()), dir, defaults: (o.temp, o.top_k, o.top_p, o.max_new), think_default: !o.no_think });
+    let (work, rx) = mpsc::channel::<Work>();
+    let s = shared.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
-            let (jobs, id, sys) = (jobs.clone(), id.clone(), default_system.clone());
+            let (work, s) = (work.clone(), s.clone());
             std::thread::spawn(move || {
-                if let Err(e) = handle(conn, &jobs, &id, ctx, chat_ok, sys.as_deref(), defaults, think_default) {
+                if let Err(e) = handle(conn, &work, &s) {
                     eprintln!("[connection: {e}]");
                 }
             });
         }
     });
 
-    // the model thread: the engine (GPU state included) never leaves it
-    for job in rx {
-        run(&mut engine, job);
+    // the model thread: the engine (GPU state included) never leaves it. Each turn of this loop loads a
+    // model and serves it until a switch is asked for; the engine and its file are dropped before the next.
+    let mut path = o.model.clone();
+    let mut last_good: Option<PathBuf> = None;
+    let mut waiting: Option<(mpsc::Sender<Result<(), String>>, Option<String>)> = None; // who asked for this switch, and an error to report
+    loop {
+        let id = model_id(&path);
+        shared.status.lock().unwrap().loading = Some(id.clone());
+        let t = Instant::now();
+        // a failed switch goes back to the model that was running; failing at startup (or on the way back) ends the server
+        let mut fall_back = |e: String, path: &mut PathBuf| -> Result<(), String> {
+            match (&mut waiting, &last_good) {
+                (Some(w), Some(prev)) if prev != path => {
+                    eprintln!("[could not load {}: {e}; going back to {}]", model_id(path), model_id(prev));
+                    w.1 = Some(format!("could not load {}: {e}", model_id(path)));
+                    *path = prev.clone();
+                    Ok(())
+                }
+                _ => Err(e),
+            }
+        };
+        let g = match crate::gguf::Gguf::open(&path) {
+            Ok(g) => g,
+            Err(e) => {
+                fall_back(e, &mut path)?;
+                continue;
+            }
+        };
+        // the draft model only fits the model it was given with
+        let draft = if path == o.model { o.draft.as_ref() } else { None };
+        let mut engine = match crate::load_with_draft(&g, o.gpu, o.ctx.unwrap_or(0), draft, o.draft_k) {
+            Ok(e) => e,
+            Err(e) => {
+                fall_back(e, &mut path)?;
+                continue;
+            }
+        };
+        let fmt = ChatFormat::detect(&g).ok();
+        eprintln!(
+            "[loaded {} on {} in {:.2}s, {}-token context{}]",
+            id,
+            engine.backend.describe(),
+            t.elapsed().as_secs_f64(),
+            engine.backend.ctx(),
+            if engine.draft.is_some() { ", with a draft model for greedy requests" } else { "" }
+        );
+        if last_good.is_none() {
+            eprintln!("chat in your browser: http://{host}:{port}/");
+            eprintln!("OpenAI-compatible API: http://{host}:{port}/v1 (/v1/chat/completions, /v1/completions, /v1/models)");
+        }
+        if fmt.is_none() {
+            eprintln!("[note: no ChatML template in this model, so /v1/chat/completions is off]");
+        }
+        *shared.status.lock().unwrap() = Status {
+            current: Some(Loaded { id: id.clone(), ctx: engine.backend.ctx(), chat_ok: fmt.is_some(), default_system: fmt.and_then(|f| f.default_system) }),
+            loading: None,
+        };
+        if let Some((w, err)) = waiting.take() {
+            let _ = w.send(err.map_or(Ok(()), Err));
+        }
+        last_good = Some(path.clone());
+
+        let (next, reply) = loop {
+            match rx.recv() {
+                Err(_) => return Ok(()),
+                Ok(Work::Job(job)) => run(&mut engine, &id, job),
+                Ok(Work::Load(p, reply)) if p == path => {
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(Work::Load(p, reply)) => break (p, reply),
+            }
+        };
+        eprintln!("[switching from {id} to {}]", model_id(&next));
+        path = next;
+        waiting = Some((reply, None));
     }
-    Ok(())
 }
 
-fn run(engine: &mut Engine, job: Job) {
+fn run(engine: &mut Engine, model: &str, job: Job) {
+    if job.model != model {
+        let _ = job.events.send(Event::Error(409, format!("the model changed to {model} while this request waited; send it again")));
+        return;
+    }
     let t0 = Instant::now();
     let ids = engine.tok.encode(&job.prompt);
     let ctx = engine.backend.ctx();
@@ -228,16 +333,20 @@ fn respond(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
 
 /// The built-in chat page (src/chat.html, compiled into the program).
 fn respond_page(conn: &mut TcpStream) -> Result<(), String> {
-    respond_file(conn, include_str!("chat.html"), "text/html; charset=utf-8", "no-cache")
+    respond_file(conn, include_bytes!("chat.html"), "text/html; charset=utf-8", "no-cache")
 }
 
-/// The chat page's 3D library (three.js, MIT; src/vendor), compiled in so the page works offline.
-/// The path names the version, so browsers may keep it for good.
-const THREE_JS_PATH: &str = "/vendor/three-0.160.0.module.min.js";
+/// The chat page's 3D library (three.js, MIT) and typeface (Instrument Sans, OFL), from src/vendor, compiled in
+/// so the page works offline. The paths name the version, so browsers may keep them for good.
+const VENDOR: [(&str, &[u8], &str); 3] = [
+    ("/vendor/three-0.160.0.module.min.js", include_bytes!("vendor/three.module.min.js"), "text/javascript; charset=utf-8"),
+    ("/vendor/instrument-sans-5.3.0.woff2", include_bytes!("vendor/instrument-sans.woff2"), "font/woff2"),
+    ("/vendor/instrument-sans-italic-5.3.0.woff2", include_bytes!("vendor/instrument-sans-italic.woff2"), "font/woff2"),
+];
 
-fn respond_file(conn: &mut TcpStream, body: &str, content_type: &str, cache: &str) -> Result<(), String> {
+fn respond_file(conn: &mut TcpStream, body: &[u8], content_type: &str, cache: &str) -> Result<(), String> {
     let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nConnection: close\r\n\r\n", body.len());
-    conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body.as_bytes())).map_err(|e| e.to_string())
+    conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body)).map_err(|e| e.to_string())
 }
 
 fn error_body(message: &str) -> Json {
@@ -251,17 +360,74 @@ fn sse(conn: &mut TcpStream, data: &str) -> std::io::Result<()> {
     conn.flush()
 }
 
-fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, ctx: usize, chat_ok: bool, default_system: Option<&str>, defaults: (f32, usize, f32, usize), think_default: bool) -> Result<(), String> {
+fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Result<(), String> {
     let req = read_request(&mut conn)?;
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (current, loading) = {
+        let s = shared.status.lock().unwrap();
+        (s.current.clone(), s.loading.clone())
+    };
+    let (defaults, think_default) = (shared.defaults, shared.think_default);
+    match (req.method.as_str(), req.path.trim_end_matches('/')) {
+        // the models folder, for the chat page's model picker
+        ("GET", "/api/models") => {
+            let models = list_models(&shared.dir)
+                .into_iter()
+                .map(|(id, _, size)| obj(vec![("id", str(&id)), ("size", num(size as f64))]))
+                .collect();
+            let opt = |s: Option<&str>| s.map(str).unwrap_or(Json::Null);
+            let body = obj(vec![
+                ("current", opt(current.as_ref().map(|c| c.id.as_str()))),
+                ("loading", opt(loading.as_deref())),
+                ("context_length", current.as_ref().map(|c| num(c.ctx as f64)).unwrap_or(Json::Null)),
+                ("models", Json::Arr(models)),
+            ]);
+            return respond(&mut conn, 200, &body);
+        }
+        // {"id": "<file name without .gguf>"}: answers once the switch is done (it can take a minute)
+        ("POST", "/api/models/load") => {
+            let id = std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse).ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from));
+            let Some(id) = id else { return respond(&mut conn, 400, &error_body("send {\"id\": \"<model>\"}")) };
+            let Some((_, path, _)) = list_models(&shared.dir).into_iter().find(|m| m.0 == id) else {
+                return respond(&mut conn, 404, &error_body(&format!("no {id}.gguf in {}", shared.dir.display())));
+            };
+            if let Some(l) = &loading {
+                return respond(&mut conn, 409, &error_body(&format!("{l} is loading; wait for it")));
+            }
+            let (tx, done) = mpsc::channel();
+            work.send(Work::Load(path, tx)).map_err(|_| "the model thread stopped")?;
+            return match done.recv() {
+                Ok(Ok(())) => respond(&mut conn, 200, &obj(vec![("current", str(&id))])),
+                Ok(Err(e)) => respond(&mut conn, 500, &error_body(&e)),
+                Err(_) => respond(&mut conn, 500, &error_body("the model thread stopped")),
+            };
+        }
+        _ => {}
+    }
+    // everything else needs a running model
+    let Some(Loaded { id: model_id, ctx, chat_ok, default_system }) = current.filter(|_| loading.is_none()) else {
+        if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
+            let what = loading.as_deref().unwrap_or("the model");
+            return respond(&mut conn, 503, &error_body(&format!("loading {what}; try again in a moment")));
+        }
+        if let ("GET", "" | "/index.html") = (req.method.as_str(), req.path.trim_end_matches('/')) {
+            return respond_page(&mut conn);
+        }
+        if let Some((_, body, content_type)) = VENDOR.iter().find(|v| v.0 == req.path) {
+            return respond_file(&mut conn, body, content_type, "public, max-age=31536000, immutable");
+        }
+        return respond(&mut conn, 503, &error_body("loading"));
+    };
+    let (model_id, default_system) = (model_id.as_str(), default_system.as_deref());
     match (req.method.as_str(), req.path.trim_end_matches('/')) {
         ("OPTIONS", _) => {
             let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
             return conn.write_all(head.as_bytes()).map_err(|e| e.to_string());
         }
         ("GET", "" | "/index.html") => return respond_page(&mut conn),
-        ("GET", p) if p == THREE_JS_PATH => {
-            return respond_file(&mut conn, include_str!("vendor/three.module.min.js"), "text/javascript; charset=utf-8", "public, max-age=31536000, immutable")
+        ("GET", p) if VENDOR.iter().any(|v| v.0 == p) => {
+            let (_, body, content_type) = VENDOR.iter().find(|v| v.0 == p).unwrap();
+            return respond_file(&mut conn, body, content_type, "public, max-age=31536000, immutable");
         }
         ("GET", "/health") => return respond(&mut conn, 200, &obj(vec![("status", str("ok"))])),
         ("GET", "/v1/models") => {
@@ -294,6 +460,7 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, ctx: us
     let include_usage = body.get("stream_options").and_then(|s| s.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
     let (tx, events) = mpsc::channel();
     let job = Job {
+        model: model_id.to_string(),
         kind: if chat { Kind::Chat } else { Kind::Completion },
         prompt,
         max_tokens: f("max_completion_tokens").or(f("max_tokens")).map(|n| n.max(1.0) as usize).or(Some(defaults.3)),
@@ -304,7 +471,7 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, ctx: us
         stop,
         events: tx,
     };
-    jobs.send(job).map_err(|_| "the model thread stopped")?;
+    work.send(Work::Job(job)).map_err(|_| "the model thread stopped")?;
 
     let id = format!("{}-{created:x}{:08x}", if chat { "chatcmpl" } else { "cmpl" }, rand_suffix());
     let object = if chat { "chat.completion" } else { "text_completion" };
