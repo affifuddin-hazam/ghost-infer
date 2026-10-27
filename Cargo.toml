@@ -2,7 +2,9 @@
 name = "ghost-infer"
 version = "0.1.0"
 edition = "2024"
-description = "A small, dependency-light LLM inference engine for GGUF models"
+description = "Fast local LLM inference for consumer GPUs: GGUF models, an OpenAI-compatible server and a chat page"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/affifuddin-hazam/ghost-infer"
 
 [dependencies]
 memmap2 = "0.9"
