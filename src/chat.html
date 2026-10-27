@@ -308,7 +308,7 @@ const ghost = await (async () => {
   const eyes = [makeEye(-0.36), makeEye(0.36)];
   eyes.forEach((e) => face.add(e.g));
   const mouth = new THREE.Mesh(new THREE.SphereGeometry(0.09, 24, 12), dark);
-  mouth.position.set(0, -0.36, R * 0.94);
+  mouth.position.set(0, -0.36, R * 1.0); // on the surface: the body is a little wider than R just below the dome
   mouth.scale.set(1, 0.05, 0.4);
   face.add(mouth);
   const blushMat = new THREE.MeshBasicMaterial({ color: 0xff9db5, transparent: true, opacity: 0, depthWrite: false });
@@ -352,22 +352,31 @@ const ghost = await (async () => {
     x.font = "600 84px Bahnschrift, Segoe UI, sans-serif"; x.fillStyle = "#dfe6ff"; x.textAlign = "center"; x.textBaseline = "middle"; x.fillText(text, 64, 70);
     return new THREE.CanvasTexture(c);
   }
-  const fx = { z: glyph("z"), q: glyph("?"), puff: orbTexture(0.9) };
+  function drop() {
+    const c = document.createElement("canvas"); c.width = c.height = 64; const x = c.getContext("2d");
+    x.fillStyle = "#4f8dff"; x.strokeStyle = "#1d3f8f"; x.lineWidth = 4; x.beginPath(); x.moveTo(32, 6); x.bezierCurveTo(34, 24, 50, 34, 50, 44); x.arc(32, 44, 18, 0, Math.PI); x.bezierCurveTo(14, 34, 30, 24, 32, 6); x.fill(); x.stroke();
+    return new THREE.CanvasTexture(c);
+  }
+  const fx = { z: glyph("z"), q: glyph("?"), ex: glyph("!"), puff: orbTexture(0.9), tear: drop() };
   const floaters = [];
   function emit(kind) {
     const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: fx[kind], transparent: true, depthWrite: false }));
-    s.scale.setScalar(kind === "z" ? 0.6 : kind === "puff" ? 0.4 + Math.random() * 0.2 : 0.85);
+    s.scale.setScalar(kind === "z" ? 0.6 : kind === "puff" ? 0.4 + Math.random() * 0.2 : kind === "tear" ? 0.28 : 0.85);
     const side = Math.random() < 0.5 ? -1 : 1;
+    s.userData = { age: 0, vx: 0.15, vy: 0.45 }; // drift up and to the right
     if (kind === "puff") s.position.set(root.position.x + side * (0.35 + Math.random() * 0.25), root.position.y + 0.95, 0.3);
-    else s.position.set(root.position.x + 0.9 + Math.random() * 0.2, root.position.y + 1.2, 0.5);
-    s.userData = { age: 0 };
+    else if (kind === "tear") { // from under one eye, falling
+      s.position.set(root.position.x + side * 0.36 + face.position.x, root.position.y + 0.08, 1.35);
+      s.userData = { age: 0, vx: 0, vy: -0.6 };
+    } else s.position.set(root.position.x + 0.9 + Math.random() * 0.2, root.position.y + 1.2, 0.5);
     scene.add(s); floaters.push(s);
   }
 
   // brow: [shown 0..1, angle (+ = inner ends down, angry; - = inner ends up, worried), height]; front: an arm
-  // brought round to the front (chin hand, crossed arms); bob: how much it floats; heat: white glow .. red
+  // brought round to the front (chin hand, crossed arms); bob: how much it floats; heat: white glow .. red;
+  // mouthO: the mouth held open in an "o" (surprise), apart from talking
   const rest = { eye: "oval", eyeOpen: 1, lookX: 0, lookY: 0, lean: 0, tilt: 0, glow: 0, blush: 0, height: 0, arms: [0, 0], armLift: [0, 0], front: [0, 0],
-                 prop: 0, hem: 1, opacity: 1, brow: [0, 0, 0], bob: 1, heat: 0 };
+                 prop: 0, hem: 1, opacity: 1, brow: [0, 0, 0], bob: 1, heat: 0, mouthO: 0 };
   const pose = (p) => ({ ...rest, ...p });
   const poses = {
     idle:      pose({}),
@@ -378,14 +387,20 @@ const ghost = await (async () => {
     tool:      pose({ eyeOpen: 0.8, lookX: 0.75, lookY: 0.35, lean: 0.04, tilt: -0.06, glow: 0.25, height: 0.02, arms: [0.7, 1], armLift: [0.3, 0.75], front: [0, 0.35], prop: 1, hem: 1.2 }),
     happy:     pose({ eye: "arc", glow: 0.15, blush: 0.75, height: 0.3, arms: [1, 1], armLift: [1.0, 1.0], hem: 1.3 }),
     sorry:     pose({ eyeOpen: 0.6, lookY: -0.55, lean: 0.05, tilt: -0.08, height: -0.35, hem: 0.4, opacity: 0.85, brow: [1, -0.4, 0.02] }),
-    surprised: pose({ eyeOpen: 1.45, lookY: 0.1, lean: -0.08, glow: 0.2, height: 0.25, arms: [1, 1], armLift: [0.9, 0.9], hem: 1.8 }),
+    surprised: pose({ eyeOpen: 1.45, lookY: 0.1, lean: -0.08, glow: 0.2, height: 0.25, arms: [1, 1], armLift: [0.9, 0.9], hem: 1.8, mouthO: 0.6 }),
+    shocked:   pose({ eyeOpen: 1.75, lookY: 0.05, lean: -0.18, glow: 0.25, height: 0.38, arms: [1, 1], armLift: [1.1, 1.1], hem: 2.2, brow: [1, -0.1, 0.12], bob: 0.5, mouthO: 1 }), // jolts, see frame()
+    excited:   pose({ eye: "arc", glow: 0.3, blush: 0.8, height: 0.35, arms: [1, 1], armLift: [0.95, 0.95], hem: 1.9, bob: 1.3 }), // bounces fast, arms waving
+    curious:   pose({ eyeOpen: 1.25, lookX: 0.15, lookY: 0.15, lean: 0.14, tilt: 0.28, glow: 0.15, height: 0.05, arms: [0.7, 1], armLift: [0.3, 0.75], front: [0, 0.35], prop: 1, hem: 1.1, brow: [0.7, -0.12, 0.07] }),
+    shy:       pose({ eye: "arc", eyeOpen: 0.9, lookX: -0.6, lookY: -0.45, lean: 0.08, tilt: -0.14, blush: 1, height: -0.12, arms: [1, 1], armLift: [0.1, 0.1], front: [1, 1], hem: 0.6, bob: 0.6 }),
+    proud:     pose({ eyeOpen: 0.5, lookX: 0.25, lookY: 0.45, lean: -0.14, tilt: -0.04, glow: 0.2, blush: 0.2, height: 0.22, arms: [1, 1], armLift: [-0.15, -0.15], front: [0.45, 0.45], hem: 1, brow: [0.8, 0.1, 0.06] }),
+    sad:       pose({ eyeOpen: 0.5, lookY: -0.75, lean: 0.06, tilt: 0.1, height: -0.42, hem: 0.25, opacity: 0.75, brow: [1, -0.6, 0], bob: 0.35 }), // a tear now and then
     angry:     pose({ eyeOpen: 0.62, lookY: -0.05, lean: 0.14, glow: 0.3, height: -0.08, arms: [1, 1], armLift: [-0.35, -0.35], hem: 0.55, brow: [1, 0.5, -0.07], bob: 0.35, heat: 1 }),
     serious:   pose({ eyeOpen: 0.78, lean: 0.03, height: -0.02, arms: [1, 1], armLift: [0.28, 0.28], front: [1, 1], hem: 0.5, brow: [1, 0.06, -0.05], bob: 0.2 }),
     confused:  pose({ eye: "squint", eyeOpen: 0.75, lookX: -0.3, lookY: 0.2, tilt: 0.22, arms: [0, 1], armLift: [0, 1.5], hem: 0.8, brow: [0.8, -0.25, 0.03] }),
     sleepy:    pose({ eye: "line", lookY: -0.2, lean: 0.02, tilt: 0.05, height: -0.45, hem: 0.3, opacity: 0.8, bob: 0.6 }), // sinks into the box
     wave:      pose({ eye: "arc", tilt: 0.06, glow: 0.1, blush: 0.4, height: 0.15, arms: [0, 1], armLift: [0, 0.95], hem: 1.2 }), // up and out, so the arm clears the body's outline
   };
-  let state = "idle", target = poses.idle;
+  let state = "idle", target = poses.idle, setAt = 0;
   const cur = { ...rest, arms: [0, 0], armLift: [0, 0], front: [0, 0], brow: [0, 0, 0], talk: 0 };
   const coolGlow = new THREE.Color(0xdfe5ff), hotGlow = new THREE.Color(0xff6a5c);
   let rate = 0, lastTokenAt = -1, syllable = 0, openness = 0.7, mouthTarget = 0;
@@ -405,14 +420,17 @@ const ghost = await (async () => {
   const clock = new THREE.Clock();
   function frame() {
     const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime, k = 1 - Math.pow(0.0015, dt);
-    for (const key of ["eyeOpen", "lookX", "lookY", "lean", "tilt", "glow", "blush", "height", "prop", "hem", "opacity", "bob", "heat"]) cur[key] = ease(cur[key], target[key], k);
+    for (const key of ["eyeOpen", "lookX", "lookY", "lean", "tilt", "glow", "blush", "height", "prop", "hem", "opacity", "bob", "heat", "mouthO"]) cur[key] = ease(cur[key], target[key], k);
     for (const key of ["arms", "armLift", "front", "brow"]) cur[key].forEach((v, i) => (cur[key][i] = ease(v, target[key][i], k)));
     const speaking = t - lastTokenAt < 0.35 && !["thinking", "tool", "sleepy"].includes(state);
 
     // float: livelier while speaking (only a little faster with speed)
     const energy = (speaking ? 1 + Math.min(rate, 60) / 200 : state === "sleepy" ? 0.4 : 1) * motion;
-    root.position.x = state === "angry" ? Math.sin(t * 38) * 0.012 * motion : 0; // a small tremble
-    root.position.y = cur.height + Math.sin(t * 1.6 * energy) * 0.12 * cur.bob * motion + (state === "happy" ? Math.abs(Math.sin(t * 6)) * 0.12 * motion : 0);
+    // a small tremble when angry; a jolt that dies away when shocked
+    const jolt = state === "shocked" ? Math.max(0, 1 - (t - setAt) / 0.6) * 0.05 : 0;
+    root.position.x = (state === "angry" ? Math.sin(t * 38) * 0.012 : Math.sin(t * 50) * jolt) * motion;
+    root.position.y = cur.height + Math.sin(t * 1.6 * energy) * 0.12 * cur.bob * motion + (state === "happy" ? Math.abs(Math.sin(t * 6)) * 0.12 * motion : 0) +
+      (state === "excited" ? Math.abs(Math.sin(t * 9)) * 0.16 * motion : 0);
     root.rotation.x = cur.lean + pointer.y * -0.06;
     root.rotation.y = pointer.x * 0.25 + Math.sin(t * 0.7) * 0.04 * motion;
     root.rotation.z = cur.tilt + Math.sin(t * 1.1) * 0.025 * motion;
@@ -467,9 +485,10 @@ const ghost = await (async () => {
       mouthTarget = openness * Math.pow(Math.sin(syllable * Math.PI), 0.8);
     } else mouthTarget = 0;
     cur.talk = ease(cur.talk, mouthTarget, 1 - Math.pow(0.0001, dt));
-    mouth.scale.set(1 + cur.talk * 0.2, 0.05 + cur.talk * 0.75, 0.4);
-    mouth.visible = cur.talk > 0.03 || state === "surprised";
-    if (state === "surprised" && cur.talk < 0.3) mouth.scale.set(0.8, 0.7, 0.4);
+    // the mouth talks, or stays open in an "o" (surprised, shocked), whichever is wider
+    const open = Math.max(cur.talk, cur.mouthO);
+    mouth.scale.set(cur.mouthO > cur.talk ? 0.75 + 0.1 * cur.mouthO : 1 + cur.talk * 0.2, 0.05 + open * 0.75, 0.4);
+    mouth.visible = open > 0.03;
 
     // arms: out (scale), raised (rotation), or round to the front
     arms.forEach((a, i) => {
@@ -477,6 +496,7 @@ const ghost = await (async () => {
       a.scale.setScalar(Math.max(cur.arms[i], 0.001));
       let raise = cur.armLift[i];
       if (state === "wave" && i === 1) raise += Math.sin(t * 9) * 0.35 * motion;
+      if (state === "excited") raise += Math.sin(t * 12 + i * Math.PI) * 0.3 * motion;
       if (speaking) raise += Math.max(0, Math.sin(t * 1.3 + i * 2)) * 0.18 * Math.min(1, cur.talk * 2);
       a.rotation.z = side * raise;
       const f = cur.front[i], cross = state === "serious" ? f : 0;
@@ -491,8 +511,9 @@ const ghost = await (async () => {
 
     if (state === "sleepy" && (fxTimer -= dt) < 0) { emit("z"); fxTimer = 1.6; }
     if (state === "angry" && (fxTimer -= dt) < 0) { emit("puff"); fxTimer = 0.35; }
+    if (state === "sad" && (fxTimer -= dt) < 0) { emit("tear"); fxTimer = 2.4; }
     for (let i = floaters.length - 1; i >= 0; i--) {
-      const f = floaters[i]; f.userData.age += dt; f.position.y += dt * 0.45; f.position.x += dt * 0.15; f.material.opacity = Math.max(0, 1 - f.userData.age / 2.4);
+      const f = floaters[i]; f.userData.age += dt; f.position.y += dt * f.userData.vy; f.position.x += dt * f.userData.vx; f.material.opacity = Math.max(0, 1 - f.userData.age / 2.4);
       if (f.userData.age > 2.4) { scene.remove(f); f.material.dispose(); floaters.splice(i, 1); }
     }
     renderer.render(scene, camera);
@@ -506,7 +527,12 @@ const ghost = await (async () => {
   frame();
   return {
     get state() { return state; },
-    set(s) { if (!poses[s] || s === state) return; state = s; target = poses[s]; if (s === "confused") emit("q"); },
+    set(s) {
+      if (!poses[s] || s === state) return;
+      state = s; target = poses[s]; setAt = clock.elapsedTime; fxTimer = 0.8;
+      if (s === "confused") emit("q");
+      if (s === "shocked") emit("ex");
+    },
     token() { lastTokenAt = clock.elapsedTime; },
     rate(r) { rate = r; },
   };
@@ -869,19 +895,43 @@ log.addEventListener("click", async (e) => {
 });
 
 // ---- moods: the model starts its reply (or a sentence) with a hidden tag
-const MOOD_TAGS = ["happy", "neutral", "serious", "sorry", "surprised", "angry", "confused"];
-const MOOD_PROMPT = "You appear to the user as a small ghost whose face follows your mood. Start every reply with one mood tag in square brackets: " +
-  MOOD_TAGS.map((t) => `[${t}]`).join(", ") + ". You may put another tag before a sentence where your mood changes. The tags are hidden from the user; never mention them.";
-const TAG_RE = new RegExp(`\\[(${MOOD_TAGS.join("|")})\\]\\s*`, "gi");
-// the shown text without its tags (and without a tag still being typed at the very end), and the latest mood
+const MOOD_TAGS = ["happy", "excited", "neutral", "curious", "serious", "proud", "surprised", "shocked", "confused", "shy", "sorry", "sad", "angry"];
+const MOOD_PROMPT = "You appear to the user as a small ghost whose face follows your mood. Start every reply with one mood tag in square brackets, one of: " +
+  MOOD_TAGS.map((t) => `[${t}]`).join(", ") + ". Use only these tags. You may put another tag before a sentence where your mood changes. " +
+  "The tags are hidden from the user; never mention them.";
+// tags models make up anyway, as the nearest mood
+const MOOD_SYNONYMS = {
+  joyful: "happy", glad: "happy", cheerful: "happy", delighted: "happy", playful: "happy", laughing: "happy", grateful: "happy", friendly: "happy",
+  thrilled: "excited", enthusiastic: "excited", eager: "excited", energetic: "excited", amazed: "surprised", astonished: "surprised", impressed: "surprised",
+  awed: "surprised", awestruck: "surprised", wonder: "surprised", wowed: "surprised", fascinated: "curious", intrigued: "curious", inquisitive: "curious",
+  stunned: "shocked", horrified: "shocked", startled: "shocked", calm: "neutral", relaxed: "neutral", content: "neutral", helpful: "neutral",
+  thinking: "curious", thoughtful: "curious", pondering: "curious", interested: "curious", focused: "serious", determined: "serious",
+  confident: "proud", smug: "proud", puzzled: "confused", unsure: "confused", uncertain: "confused", embarrassed: "shy", blushing: "shy",
+  nervous: "shy", apologetic: "sorry", worried: "sorry", anxious: "sorry", unhappy: "sad", disappointed: "sad", upset: "sad",
+  annoyed: "angry", frustrated: "angry", mad: "angry", grumpy: "angry",
+};
+// [word] as a whole word, not a link's text ([text](url)) and not part of an expression (a[i])
+const TAG_RE = /(^|[\s(*_])\[([A-Za-z]{3,14})\](?!\()[ \t]*/g;
+// the shown text without its tags (and without a tag still being typed at the very end), and the latest mood.
+// A listed mood or a known synonym is a tag anywhere; another lower-case word only where a tag would go:
+// at the start of the reply, a line or a sentence.
 function moodOf(answer, streaming) {
   let last = null;
-  let shown = answer.replace(TAG_RE, (_, t) => { last = t.toLowerCase(); return ""; });
-  if (streaming || /\[[a-z]{0,9}$/i.test(shown.trim())) shown = shown.replace(/\[[a-z]{0,9}\s*$/i, ""); // a tag cut off at the end
-  return { shown, last };
+  let shown = answer.replace(TAG_RE, (all, before, word, at) => {
+    const w = word.toLowerCase(), mood = MOOD_TAGS.includes(w) ? w : MOOD_SYNONYMS[w];
+    const tagSpot = /(^|\n|[.!?…:]\s)\s*$/.test(answer.slice(0, at) + before);
+    if (!mood && !(tagSpot && word === w)) return all;
+    if (mood) last = mood;
+    return before;
+  });
+  if (streaming || /\[[a-z]{0,14}$/i.test(shown.trim())) shown = shown.replace(/\[[a-z]{0,14}\s*$/i, ""); // a tag cut off at the end
+  return { shown: shown.replace(/^\s+/, ""), last };
 }
-const TALKING_FACE = { happy: "cheerful", neutral: "talking", serious: "serious", sorry: "sorry", surprised: "surprised", angry: "angry", confused: "confused" };
-const AFTER_FACE = { happy: "happy", neutral: "happy", serious: "serious", sorry: "sorry", surprised: "surprised", angry: "angry", confused: "confused" };
+// the face while a reply in that mood streams, and the one it holds afterwards
+const TALKING_FACE = { happy: "cheerful", neutral: "talking" };
+const AFTER_FACE = { neutral: "happy" };
+const talkingFace = (m) => TALKING_FACE[m] || m || "talking";
+const afterFace = (m) => AFTER_FACE[m] || m || "happy";
 
 // splits the raw reply into its <think> part and the answer
 function split(raw, m, t0) {
@@ -988,7 +1038,7 @@ async function ask(thinking) {
           const { shown, last } = moodOf(reply.answer || "", true);
           if (last) lastMood = last;
           reply.content = shown;
-          if (shown.trim()) { ghost?.token(); mood(TALKING_FACE[lastMood] || "talking", "Writing"); }
+          if (shown.trim()) { ghost?.token(); mood(talkingFace(lastMood), "Writing"); }
           else if (lastMood && ++tagChunks > 48) { tagLoop = true; busy.abort(); }
         }
         draw(el, reply);
@@ -1003,7 +1053,7 @@ async function ask(thinking) {
       reply.meta = `${usage.completion_tokens} tokens in ${secs.toFixed(1)} s, ${rate.toFixed(1)} tok/s, first token after ${((firstAt ?? t0) - t0).toFixed(0)} ms` + (finish === "length" ? ", stopped at the length limit" : "");
     }
     if (finish === "tool_calls") settleTo("tool", 3000, `Asked to use ${tool}`);
-    else settleTo(AFTER_FACE[lastMood] || "happy", lastMood && !["happy", "neutral"].includes(lastMood) ? 5000 : 2200);
+    else settleTo(afterFace(lastMood), lastMood && !["happy", "neutral"].includes(lastMood) ? 5000 : 2200);
   } catch (e) {
     if (tagLoop) {
       reply.content = "";
@@ -1060,7 +1110,10 @@ $("form").onsubmit = (e) => {
 if (!ghost) { $("ghost").remove(); document.body.classList.add("noghost"); }
 renderChats();
 renderAll();
-settleTo("wave", 2400);
+// ?mood=shocked holds that face, to preview it; otherwise a wave hello
+const preview = new URLSearchParams(location.search).get("mood");
+if (preview) mood(preview, preview);
+else settleTo("wave", 2400);
 input.focus();
 </script>
 </body>
