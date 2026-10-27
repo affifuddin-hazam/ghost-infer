@@ -48,6 +48,7 @@ OPTIONS:
         --special         print special tokens
         --host <addr>     serve: address to listen on        [127.0.0.1]
         --port <n>        serve: port                        [8080]
+        --no-think        serve: Qwen3 answers without thinking unless a request asks for it
 ";
 
 struct Opts {
@@ -64,6 +65,7 @@ struct Opts {
     show_special: bool,
     prompt_len: usize,
     gpu: bool,
+    no_think: bool,
     draft: Option<PathBuf>,
     draft_k: usize,
     host: String,
@@ -93,6 +95,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         show_special: false,
         prompt_len: 256,
         gpu: false,
+        no_think: false,
         draft: None,
         draft_k: 3,
         host: "127.0.0.1".into(),
@@ -118,6 +121,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--raw" => o.raw = true,
             "--special" => o.show_special = true,
             "--gpu" => o.gpu = true,
+            "--no-think" => o.no_think = true,
             "--draft" => o.draft = Some(PathBuf::from(val(a)?)),
             "--draft-k" => o.draft_k = num(val(a)?, a)? as usize,
             "--host" => o.host = val(a)?,

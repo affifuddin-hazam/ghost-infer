@@ -233,6 +233,7 @@ async function send(text) {
   if (sys) history.unshift({ role: "system", content: sys });
   const body = {
     messages: history, stream: true, stream_options: { include_usage: true },
+    chat_template_kwargs: { enable_thinking: think }, // explicit, so a server started with --no-think still follows the switch
     temperature: Number($("temp").value) || 0, max_tokens: Number($("maxTokens").value) || 2048,
   };
 
