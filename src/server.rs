@@ -228,9 +228,16 @@ fn respond(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
 
 /// The built-in chat page (src/chat.html, compiled into the program).
 fn respond_page(conn: &mut TcpStream) -> Result<(), String> {
-    const PAGE: &str = include_str!("chat.html");
-    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", PAGE.len());
-    conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(PAGE.as_bytes())).map_err(|e| e.to_string())
+    respond_file(conn, include_str!("chat.html"), "text/html; charset=utf-8", "no-cache")
+}
+
+/// The chat page's 3D library (three.js, MIT; src/vendor), compiled in so the page works offline.
+/// The path names the version, so browsers may keep it for good.
+const THREE_JS_PATH: &str = "/vendor/three-0.160.0.module.min.js";
+
+fn respond_file(conn: &mut TcpStream, body: &str, content_type: &str, cache: &str) -> Result<(), String> {
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nConnection: close\r\n\r\n", body.len());
+    conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body.as_bytes())).map_err(|e| e.to_string())
 }
 
 fn error_body(message: &str) -> Json {
@@ -253,6 +260,9 @@ fn handle(mut conn: TcpStream, jobs: &mpsc::Sender<Job>, model_id: &str, ctx: us
             return conn.write_all(head.as_bytes()).map_err(|e| e.to_string());
         }
         ("GET", "" | "/index.html") => return respond_page(&mut conn),
+        ("GET", p) if p == THREE_JS_PATH => {
+            return respond_file(&mut conn, include_str!("vendor/three.module.min.js"), "text/javascript; charset=utf-8", "public, max-age=31536000, immutable")
+        }
         ("GET", "/health") => return respond(&mut conn, 200, &obj(vec![("status", str("ok"))])),
         ("GET", "/v1/models") => {
             let m = obj(vec![("id", str(model_id)), ("object", str("model")), ("created", num(created as f64)), ("owned_by", str("betterllama")), ("context_length", num(ctx as f64))]);

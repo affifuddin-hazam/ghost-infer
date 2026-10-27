@@ -6,116 +6,511 @@
 <title>betterllama</title>
 <style>
   :root {
-    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --line: #e3e3e0;
-    --accent: #2f6fde; --accent-text: #ffffff; --user: #e9eefb; --code: #f0f0ed; --danger: #c43d3d;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #161618; --panel: #1f1f22; --text: #ececee; --muted: #9a9aa2; --line: #2e2e33;
-      --accent: #5b8ff0; --accent-text: #0e1117; --user: #26304a; --code: #2a2a2f; --danger: #e06c6c;
-    }
+    --night: #161c2c; --glass: rgba(255, 255, 255, 0.06); --glass-line: rgba(255, 255, 255, 0.11);
+    --ink: #eef1f8; --muted: #9aa3bb; --accent: #b9c7ff; --accent-ink: #141a2a; --danger: #ff9b8a; --code: rgba(0, 0, 0, 0.28);
+    --ui: Bahnschrift, "DIN Alternate", "Segoe UI", system-ui, sans-serif;
+    --text: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    --mono: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+    color-scheme: dark;
   }
   * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--bg); color: var(--text);
-    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display: flex; flex-direction: column;
-  }
-  header {
-    display: flex; align-items: center; gap: 10px; padding: 10px 16px;
-    border-bottom: 1px solid var(--line); background: var(--panel);
-  }
-  header .name { font-weight: 600; }
-  header .model { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-  button {
-    font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
-    border-radius: 8px; padding: 6px 12px; cursor: pointer;
-  }
-  button:hover { border-color: var(--muted); }
-  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-  button.stop { background: var(--danger); color: #fff; border-color: var(--danger); }
-  #settings {
-    display: none; gap: 14px; flex-wrap: wrap; align-items: center; padding: 10px 16px;
-    border-bottom: 1px solid var(--line); background: var(--panel); font-size: 14px;
-  }
-  #settings.open { display: flex; }
-  #settings label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
-  #settings input[type=number] { width: 80px; }
-  #settings input[type=text] { width: min(420px, 80vw); }
-  input, textarea {
-    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
-    border-radius: 8px; padding: 6px 8px;
-  }
-  main { flex: 1; overflow-y: auto; }
-  #log { max-width: 820px; margin: 0 auto; padding: 20px 16px 8px; }
-  .empty { color: var(--muted); text-align: center; margin-top: 18vh; }
-  .msg { margin: 0 0 18px; }
-  .msg.user .bubble {
-    background: var(--user); border-radius: 14px; padding: 9px 14px; margin-left: auto; max-width: 85%;
-    width: fit-content; white-space: pre-wrap; word-wrap: break-word;
-  }
-  .msg.assistant .bubble { padding: 2px 2px; word-wrap: break-word; }
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  body { background: radial-gradient(120% 90% at 50% 38%, #26304a 0%, var(--night) 62%, #0f1320 100%); color: var(--ink); font: 16px/1.55 var(--text); }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  canvas#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  header { position: fixed; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 14px 18px; z-index: 3; }
+  .model { font: 500 14px/1.2 var(--ui); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .status { font: 14px/1 var(--ui); display: inline-flex; align-items: center; gap: 8px; margin-left: auto; white-space: nowrap; }
+  .status i { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  .status.error i { background: var(--danger); box-shadow: 0 0 10px var(--danger); }
+  .icon { width: 38px; height: 38px; flex: none; border-radius: 12px; border: 1px solid var(--glass-line); background: var(--glass); display: grid; place-items: center; backdrop-filter: blur(8px); }
+  .icon:hover { border-color: rgba(185, 199, 255, 0.45); }
+
+  .subtitle { position: fixed; left: 50%; transform: translateX(-50%); bottom: 150px; width: min(700px, calc(100% - 32px)); text-align: center; z-index: 2;
+              font: 19px/1.5 var(--text); text-shadow: 0 2px 14px rgba(0, 0, 0, 0.6); max-height: 34vh; overflow: hidden; }
+  .subtitle .you { display: block; font: 14px/1.4 var(--ui); color: var(--muted); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .subtitle .err { color: var(--danger); }
+  .subtitle .more { display: block; margin: 6px auto 0; border: 0; background: none; color: var(--accent); font: 14px/1 var(--ui); padding: 6px; }
+  .subtitle .hint { font: 15px/1.5 var(--ui); color: var(--muted); }
+
+  .composer { position: fixed; left: 50%; transform: translateX(-50%); bottom: 26px; width: min(700px, calc(100% - 24px)); z-index: 3;
+              display: flex; align-items: flex-end; gap: 10px; padding: 10px 10px 10px 18px; border-radius: 24px;
+              background: rgba(29, 37, 57, 0.74); border: 1px solid var(--glass-line); backdrop-filter: blur(14px); }
+  .composer:focus-within { border-color: rgba(185, 199, 255, 0.5); }
+  .composer textarea { flex: 1; min-width: 0; border: 0; outline: none; resize: none; background: transparent; min-height: 28px; max-height: 30vh; padding: 7px 0; line-height: 1.5; }
+  .composer textarea::placeholder { color: var(--muted); }
+  .toggle { flex: none; align-self: center; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--glass-line); background: var(--glass); border-radius: 999px; padding: 6px 11px 6px 7px; font: 13px/1 var(--ui); }
+  .toggle .knob { width: 26px; height: 15px; border-radius: 8px; background: rgba(255, 255, 255, 0.18); position: relative; transition: background 0.15s; }
+  .toggle .knob::after { content: ""; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--ink); transition: transform 0.15s; }
+  .toggle[aria-pressed="true"] .knob { background: var(--accent); }
+  .toggle[aria-pressed="true"] .knob::after { transform: translateX(11px); background: var(--accent-ink); }
+  .speed { flex: none; font: 500 14px/1 var(--ui); color: var(--muted); font-variant-numeric: tabular-nums; align-self: center; white-space: nowrap; min-width: 4.5em; text-align: right; }
+  .send { width: 42px; height: 42px; border-radius: 50%; border: 0; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; flex: none; }
+  .send.stop { background: var(--ink); }
+
+  .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 94vw); z-index: 5; background: rgba(20, 26, 42, 0.94); border-left: 1px solid var(--glass-line);
+            backdrop-filter: blur(16px); transform: translateX(100%); transition: transform 0.25s ease; display: flex; flex-direction: column; }
+  .drawer.open { transform: none; }
+  .drawer .top { display: flex; align-items: center; gap: 8px; padding: 16px 16px 12px 20px; }
+  .drawer h2 { font: 600 16px/1 var(--ui); margin: 0 auto 0 0; }
+  .drawer .log { overflow-y: auto; padding: 4px 20px 24px; font-size: 15px; flex: 1; }
+  .drawer .empty { color: var(--muted); font: 15px/1.5 var(--ui); }
+  .msg { margin-bottom: 18px; overflow-wrap: anywhere; }
+  .msg.user { text-align: right; }
+  .msg.user .bubble { display: inline-block; text-align: left; background: rgba(185, 199, 255, 0.16); padding: 8px 13px; border-radius: 16px 16px 5px 16px; white-space: pre-wrap; max-width: 92%; }
   .bubble p { margin: 0 0 10px; }
   .bubble p:last-child { margin-bottom: 0; }
-  .bubble h1, .bubble h2, .bubble h3 { font-size: 1.05em; margin: 14px 0 6px; }
+  .bubble h1, .bubble h2, .bubble h3 { font: 600 16px/1.3 var(--ui); margin: 14px 0 6px; }
   .bubble ul, .bubble ol { margin: 4px 0 10px; padding-left: 22px; }
-  .bubble code { background: var(--code); border-radius: 4px; padding: 1px 4px; font: 13px/1.5 ui-monospace, Consolas, monospace; }
-  .bubble pre { background: var(--code); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 6px 0 10px; }
+  .bubble code { background: var(--code); border-radius: 5px; padding: 1px 5px; font: 13.5px/1.5 var(--mono); }
+  .bubble pre { background: var(--code); border: 1px solid var(--glass-line); border-radius: 10px; padding: 10px 12px; overflow-x: auto; margin: 6px 0 10px; }
   .bubble pre code { background: none; padding: 0; }
-  details.think {
-    border-left: 3px solid var(--line); padding: 2px 0 2px 10px; margin: 0 0 10px; color: var(--muted); font-size: 14px;
-  }
-  details.think summary { cursor: pointer; user-select: none; }
-  details.think .body { white-space: pre-wrap; margin-top: 6px; }
-  .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .bubble a { color: var(--accent); }
+  details.think { margin: 0 0 8px; color: var(--muted); font-size: 14px; }
+  details.think summary { cursor: pointer; font: 13px/1 var(--ui); }
+  details.think .body { white-space: pre-wrap; margin-top: 6px; padding-left: 10px; border-left: 2px solid var(--glass-line); }
+  .meta { font: 12.5px/1.4 var(--ui); color: var(--muted); margin-top: 4px; }
   .error { color: var(--danger); }
-  .cursor::after { content: "▍"; animation: blink 1s steps(1) infinite; color: var(--muted); }
-  @keyframes blink { 50% { opacity: 0; } }
-  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 16px; }
-  #form { max-width: 820px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
-  #input { flex: 1; resize: none; max-height: 40vh; min-height: 42px; }
-  .hint { max-width: 820px; margin: 6px auto 0; color: var(--muted); font-size: 12px; }
+
+  .settings { position: fixed; right: 16px; top: 62px; z-index: 6; width: min(360px, calc(100% - 32px)); padding: 18px; border-radius: 16px; display: none;
+              background: rgba(24, 31, 49, 0.96); border: 1px solid var(--glass-line); box-shadow: 0 18px 40px -16px rgba(0, 0, 0, 0.6); }
+  .settings.open { display: block; }
+  .settings h2 { font: 600 16px/1 var(--ui); margin: 0 0 14px; }
+  .field { display: grid; gap: 6px; margin-bottom: 14px; font-size: 14px; }
+  .field .row { display: flex; justify-content: space-between; color: var(--muted); font: 14px/1 var(--ui); font-variant-numeric: tabular-nums; }
+  .field input[type=range] { accent-color: var(--accent); width: 100%; }
+  .field textarea { background: rgba(0, 0, 0, 0.25); border: 1px solid var(--glass-line); border-radius: 10px; padding: 8px 10px; resize: vertical; min-height: 64px; }
+  .field small { color: var(--muted); font-size: 12.5px; }
+  .check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; margin-bottom: 4px; }
+  .check input { accent-color: var(--accent); margin-top: 4px; }
+
+  @media (max-width: 700px) {
+    header { padding: 10px 12px; gap: 8px; }
+    .subtitle { bottom: 136px; font-size: 17px; }
+    .composer { padding-left: 14px; }
+    .speed { display: none; }
+  }
 </style>
+<script type="importmap">{ "imports": { "three": "/vendor/three-0.160.0.module.min.js" } }</script>
 </head>
 <body>
+<canvas id="stage" aria-hidden="true"></canvas>
+
 <header>
-  <span class="name">betterllama</span>
   <span class="model" id="model">connecting…</span>
-  <button id="settingsBtn" title="Settings">Settings</button>
-  <button id="newBtn" title="Start a new conversation">New chat</button>
+  <span class="status" id="status"><i></i><span id="statusText">Here</span></span>
+  <button class="icon" id="newBtn" aria-label="New conversation" title="New conversation">
+    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 4v10M4 9h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+  </button>
+  <button class="icon" id="logBtn" aria-label="Show the conversation" title="Conversation">
+    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M4 10h12M4 15h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+  </button>
+  <button class="icon" id="settingsBtn" aria-label="Settings" title="Settings">
+    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M15 6h1M4 14h1M8 14h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="13.5" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="6.5" cy="14" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+  </button>
 </header>
-<div id="settings">
-  <label><input type="checkbox" id="think" checked> Thinking</label>
-  <label>Temperature <input type="number" id="temp" min="0" max="2" step="0.1" value="0"></label>
-  <label>Max tokens <input type="number" id="maxTokens" min="1" step="64" value="2048"></label>
-  <label>System prompt <input type="text" id="system" placeholder="(the model's default)"></label>
-</div>
-<main id="scroller"><div id="log"></div></main>
-<footer>
-  <form id="form">
-    <textarea id="input" rows="1" placeholder="Message" autofocus></textarea>
-    <button type="submit" class="primary" id="sendBtn">Send</button>
-  </form>
-  <div class="hint">Enter to send, Shift+Enter for a new line. Temperature 0 is fastest (it uses the draft model if the server has one).</div>
-</footer>
-<script>
+
+<section class="settings" id="settings" aria-label="Settings">
+  <h2>Reply settings</h2>
+  <label class="field"><span class="row"><span>Temperature</span><span id="tempVal"></span></span><input type="range" id="temp" min="0" max="2" step="0.1" value="0"><small>0 gives the same answer every time and is fastest (it uses the draft model if the server has one).</small></label>
+  <label class="field"><span class="row"><span>Longest reply</span><span id="maxVal"></span></span><input type="range" id="maxTokens" min="64" max="8192" step="64" value="2048"></label>
+  <label class="field"><span class="row"><span>System prompt</span></span><textarea id="system" placeholder="Leave empty to use the model's default"></textarea></label>
+  <label class="check"><input type="checkbox" id="moods" checked><span>Let the model set the ghost's mood<br><small style="color:var(--muted)">It starts replies with a hidden tag such as [happy]. Turn off for models that don't follow it.</small></span></label>
+</section>
+
+<div class="subtitle" id="subtitle" aria-live="polite"></div>
+
+<form class="composer" id="form">
+  <textarea id="input" rows="1" placeholder="Say something" aria-label="Message"></textarea>
+  <button type="button" class="toggle" id="think" aria-pressed="true" title="Let the model think before it answers"><span class="knob"></span>Thinking</button>
+  <span class="speed" id="speed"></span>
+  <button class="send" type="submit" id="sendBtn" aria-label="Send">
+    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" id="sendIcon"><path d="M9 14V4M4.5 8.5 9 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+</form>
+
+<aside class="drawer" id="drawer" aria-label="Conversation">
+  <div class="top">
+    <h2>Conversation</h2>
+    <button class="icon" id="closeLog" aria-label="Close the conversation">
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+  <div class="log" id="log"></div>
+</aside>
+
+<script type="module">
 "use strict";
 const $ = (id) => document.getElementById(id);
+
+// ================================================================ the ghost
+// A small 3D ghost drawn in code (three.js): every state is a set of pose targets the animation eases
+// toward, so changes always blend. ghost.set(state), ghost.token() on each streamed token, ghost.rate(tok/s).
+const ghost = await (async () => {
+  let THREE;
+  try { THREE = await import("three"); } catch { return null; }
+  const canvas = $("stage");
+  let renderer;
+  try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true }); } catch { return null; }
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
+  camera.position.set(0, 0.35, 9);
+  scene.add(new THREE.HemisphereLight(0xf2f5ff, 0x3a4566, 1.7));
+  const key = new THREE.DirectionalLight(0xffffff, 2.0);
+  key.position.set(-3, 5, 6);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x9fb2ff, 1.2);
+  rim.position.set(4, 2, -5);
+  scene.add(rim);
+
+  const root = new THREE.Group(); // floats and leans
+  const body = new THREE.Group(); // squash and stretch
+  root.add(body);
+  scene.add(root);
+  // where it floats: above the message box, and above the subtitles when there are some (it rises and,
+  // if it must, shrinks to make room; see room())
+  const BASE_Y = 0.55, BASE_SCALE = 0.72, TOP_Y = 1.3, MIN_SCALE = 0.5, HEM = 1.62; // HEM: dome top to hem, unscaled
+  let homeY = BASE_Y, size = BASE_SCALE, wantY = BASE_Y, wantSize = BASE_SCALE;
+
+  // body: a lathe dome with straight sides; the hem is waved per frame
+  const R = 1.25, H = 1.55;
+  const prof = [];
+  for (let i = 0; i <= 24; i++) { const a = (i / 24) * Math.PI / 2; prof.push(new THREE.Vector2(Math.sin(a) * R + 1e-4, Math.cos(a) * R)); }
+  for (let i = 1; i <= 12; i++) prof.push(new THREE.Vector2(R * (1 + 0.05 * i / 12), -H * (i / 12)));
+  prof.reverse(); // hem to top: the lathe's faces then point outward
+  const geo = new THREE.LatheGeometry(prof, 96);
+  const base = geo.attributes.position.array.slice();
+  // a soft self-glow keeps it ghostly white under the blue light; working states add to it
+  const white = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85, metalness: 0, emissive: 0xdfe5ff, emissiveIntensity: 0.12, transparent: true, opacity: 1 });
+  const inner = new THREE.MeshStandardMaterial({ color: 0x8e99b8, roughness: 0.9, side: THREE.BackSide, transparent: true, opacity: 1 });
+  body.add(new THREE.Mesh(geo, white), new THREE.Mesh(geo, inner));
+
+  // face: eyes (oval, happy arc, closed line) with brows for angry / serious / worried faces, mouth, blush
+  const dark = new THREE.MeshBasicMaterial({ color: 0x1a2030 });
+  const shine = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const face = new THREE.Group();
+  face.position.set(0, 0.28, 0);
+  body.add(face);
+  function makeEye(x) {
+    const g = new THREE.Group();
+    g.position.set(x, 0, R * 0.985);
+    const oval = new THREE.Mesh(new THREE.SphereGeometry(0.15, 32, 16), dark);
+    oval.scale.set(1, 1.42, 0.2);
+    const hi = new THREE.Mesh(new THREE.CircleGeometry(0.042, 16), shine);
+    hi.position.set(0.045, 0.07, 0.16);
+    oval.add(hi);
+    const arc = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.032, 10, 32, Math.PI), dark); // ^ shape
+    arc.visible = false;
+    const line = new THREE.Mesh(new THREE.CapsuleGeometry(0.03, 0.2, 4, 12), dark);
+    line.rotation.z = Math.PI / 2;
+    line.visible = false;
+    const brow = new THREE.Mesh(new THREE.CapsuleGeometry(0.032, 0.2, 4, 12), dark);
+    brow.rotation.z = Math.PI / 2;
+    brow.position.set(0, 0.29, 0.02);
+    brow.scale.setScalar(0.001);
+    g.add(oval, arc, line, brow);
+    return { g, oval, arc, line, brow, side: Math.sign(x) };
+  }
+  const eyes = [makeEye(-0.36), makeEye(0.36)];
+  eyes.forEach((e) => face.add(e.g));
+  const mouth = new THREE.Mesh(new THREE.SphereGeometry(0.09, 24, 12), dark);
+  mouth.position.set(0, -0.36, R * 0.94);
+  mouth.scale.set(1, 0.05, 0.4);
+  face.add(mouth);
+  const blushMat = new THREE.MeshBasicMaterial({ color: 0xff9db5, transparent: true, opacity: 0, depthWrite: false });
+  [-0.68, 0.68].forEach((x) => { const m = new THREE.Mesh(new THREE.CircleGeometry(0.13, 24), blushMat); m.position.set(x, -0.18, R * 0.9); m.rotation.y = x * 0.55; face.add(m); });
+
+  // arms: small rounded nubs that slide out of the sides when there is something to do
+  function makeArm(side) {
+    const pivot = new THREE.Group();
+    pivot.position.set(side * (R * 0.92), -0.45, 0.05);
+    const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.15, 0.42, 6, 16), white);
+    arm.position.set(side * 0.28, 0, 0);
+    arm.rotation.z = side * Math.PI / 2;
+    pivot.add(arm);
+    pivot.scale.setScalar(0.001);
+    body.add(pivot);
+    return pivot;
+  }
+  const arms = [makeArm(-1), makeArm(1)];
+
+  // a magnifying glass gripped by its handle at the tip of the right arm (the group's origin is the grip)
+  const prop = new THREE.Group();
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.055, 0.46, 14), new THREE.MeshStandardMaterial({ color: 0x5a648a, roughness: 0.6 }));
+  handle.position.set(0, 0.12, 0);
+  const lens = new THREE.Mesh(new THREE.TorusGeometry(0.24, 0.05, 12, 36), new THREE.MeshStandardMaterial({ color: 0xb9c7ff, roughness: 0.3, metalness: 0.4 }));
+  lens.position.set(0, 0.6, 0);
+  const glass = new THREE.Mesh(new THREE.CircleGeometry(0.22, 32), new THREE.MeshStandardMaterial({ color: 0xd8e2ff, transparent: true, opacity: 0.35, depthWrite: false }));
+  glass.position.copy(lens.position);
+  prop.add(handle, lens, glass);
+  prop.position.set(0.6, 0, 0.22);
+  prop.scale.setScalar(0.001);
+  arms[1].add(prop);
+
+  const shadow = new THREE.Mesh(new THREE.CircleGeometry(1, 48), new THREE.MeshBasicMaterial({ color: 0x05070e, transparent: true, opacity: 0.4, depthWrite: false }));
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.y = -1.0;
+  scene.add(shadow);
+
+  // background orbs, and the small effects (z, ?, steam)
+  function orbTexture(alpha) {
+    const c = document.createElement("canvas"); c.width = c.height = 64; const x = c.getContext("2d"); const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, `rgba(255,255,255,${alpha})`); g.addColorStop(0.6, `rgba(220,228,255,${alpha / 3})`); g.addColorStop(1, "rgba(220,228,255,0)");
+    x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
+  }
+  const orbTex = orbTexture(0.55);
+  const orbs = [];
+  for (let i = 0; i < 28; i++) {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: orbTex, transparent: true, depthWrite: false, opacity: 0.25 + Math.random() * 0.45 }));
+    s.scale.setScalar(0.15 + Math.random() * 0.65);
+    s.position.set((Math.random() - 0.5) * 12, (Math.random() - 0.5) * 7, -2 - Math.random() * 4);
+    s.userData = { vy: 0.05 + Math.random() * 0.12, phase: Math.random() * 6.28 };
+    scene.add(s); orbs.push(s);
+  }
+  function glyph(text) {
+    const c = document.createElement("canvas"); c.width = c.height = 128; const x = c.getContext("2d");
+    x.font = "600 84px Bahnschrift, Segoe UI, sans-serif"; x.fillStyle = "#dfe6ff"; x.textAlign = "center"; x.textBaseline = "middle"; x.fillText(text, 64, 70);
+    return new THREE.CanvasTexture(c);
+  }
+  const fx = { z: glyph("z"), q: glyph("?"), puff: orbTexture(0.9) };
+  const floaters = [];
+  function emit(kind) {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: fx[kind], transparent: true, depthWrite: false }));
+    s.scale.setScalar(kind === "z" ? 0.38 : kind === "puff" ? 0.3 + Math.random() * 0.15 : 0.55);
+    const side = Math.random() < 0.5 ? -1 : 1;
+    if (kind === "puff") s.position.set(root.position.x + side * (0.35 + Math.random() * 0.25), root.position.y + 0.95, 0.3);
+    else s.position.set(root.position.x + 0.9 + Math.random() * 0.2, root.position.y + 1.2, 0.5);
+    s.userData = { age: 0 };
+    scene.add(s); floaters.push(s);
+  }
+
+  // brow: [shown 0..1, angle (+ = inner ends down, angry; - = inner ends up, worried), height]; front: an arm
+  // brought round to the front (chin hand, crossed arms); bob: how much it floats; heat: white glow .. red
+  const rest = { eye: "oval", eyeOpen: 1, lookX: 0, lookY: 0, lean: 0, tilt: 0, glow: 0, blush: 0, height: 0, arms: [0, 0], armLift: [0, 0], front: [0, 0],
+                 prop: 0, hem: 1, opacity: 1, brow: [0, 0, 0], bob: 1, heat: 0 };
+  const pose = (p) => ({ ...rest, ...p });
+  const poses = {
+    idle:      pose({}),
+    listening: pose({ eyeOpen: 1.12, lookY: -0.6, lean: 0.16, glow: 0.05, height: -0.05 }),
+    thinking:  pose({ eyeOpen: 0.55, lookX: 0.55, lookY: 0.65, lean: -0.04, tilt: 0.12, glow: 0.35, height: 0.08, arms: [0, 1], armLift: [0, 1.1], front: [0, 1], hem: 0.6 }),
+    talking:   pose({ lean: 0.04, glow: 0.1, height: 0.05, hem: 1.4 }),
+    cheerful:  pose({ lean: 0.04, glow: 0.12, blush: 0.4, height: 0.12, hem: 1.4 }), // talking, happily
+    tool:      pose({ eyeOpen: 0.8, lookX: 0.75, lookY: 0.35, lean: 0.04, tilt: -0.06, glow: 0.25, height: 0.02, arms: [0.7, 1], armLift: [0.3, 0.75], front: [0, 0.35], prop: 1, hem: 1.2 }),
+    happy:     pose({ eye: "arc", glow: 0.15, blush: 0.75, height: 0.3, arms: [1, 1], armLift: [1.2, 1.2], hem: 1.3 }),
+    sorry:     pose({ eyeOpen: 0.6, lookY: -0.55, lean: 0.05, tilt: -0.08, height: -0.35, hem: 0.4, opacity: 0.85, brow: [1, -0.4, 0.02] }),
+    surprised: pose({ eyeOpen: 1.45, lookY: 0.1, lean: -0.08, glow: 0.2, height: 0.25, arms: [1, 1], armLift: [0.9, 0.9], hem: 1.8 }),
+    angry:     pose({ eyeOpen: 0.62, lookY: -0.05, lean: 0.14, glow: 0.3, height: -0.08, arms: [1, 1], armLift: [-0.35, -0.35], hem: 0.55, brow: [1, 0.5, -0.07], bob: 0.35, heat: 1 }),
+    serious:   pose({ eyeOpen: 0.78, lean: 0.03, height: -0.02, arms: [1, 1], armLift: [0.28, 0.28], front: [1, 1], hem: 0.5, brow: [1, 0.06, -0.05], bob: 0.2 }),
+    confused:  pose({ eye: "squint", eyeOpen: 0.75, lookX: -0.3, lookY: 0.2, tilt: 0.22, arms: [0, 1], armLift: [0, 1.5], hem: 0.8, brow: [0.8, -0.25, 0.03] }),
+    sleepy:    pose({ eye: "line", lookY: -0.2, lean: 0.02, tilt: 0.05, height: -0.45, hem: 0.3, opacity: 0.8, bob: 0.6 }),
+    wave:      pose({ eye: "arc", tilt: 0.06, glow: 0.1, blush: 0.4, height: 0.15, arms: [0, 1], armLift: [0, 2.3], hem: 1.2 }),
+  };
+  let state = "idle", target = poses.idle;
+  const cur = { ...rest, arms: [0, 0], armLift: [0, 0], front: [0, 0], brow: [0, 0, 0], talk: 0 };
+  const coolGlow = new THREE.Color(0xdfe5ff), hotGlow = new THREE.Color(0xff6a5c);
+  let rate = 0, lastTokenAt = -1, syllable = 0, openness = 0.7, mouthTarget = 0;
+  let blinkAt = 2, blinkT = -1, glanceAt = 4, glance = [0, 0], fxTimer = 0;
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const motion = reduced ? 0.3 : 1;
+
+  const pointer = new THREE.Vector2();
+  addEventListener("pointermove", (e) => pointer.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight * 2 - 1)));
+
+  const ease = (a, b, k) => a + (b - a) * k;
+  const clock = new THREE.Clock();
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime, k = 1 - Math.pow(0.0015, dt);
+    for (const key of ["eyeOpen", "lookX", "lookY", "lean", "tilt", "glow", "blush", "height", "prop", "hem", "opacity", "bob", "heat"]) cur[key] = ease(cur[key], target[key], k);
+    for (const key of ["arms", "armLift", "front", "brow"]) cur[key].forEach((v, i) => (cur[key][i] = ease(v, target[key][i], k)));
+    const speaking = t - lastTokenAt < 0.35 && !["thinking", "tool", "sleepy"].includes(state);
+    homeY = ease(homeY, wantY, k * 0.6);
+    size = ease(size, wantSize, k * 0.6);
+    root.scale.setScalar(size);
+    const HOME_Y = homeY;
+
+    // float: livelier while speaking (only a little faster with speed)
+    const energy = (speaking ? 1 + Math.min(rate, 60) / 200 : state === "sleepy" ? 0.4 : 1) * motion;
+    root.position.x = state === "angry" ? Math.sin(t * 38) * 0.012 * motion : 0; // a small tremble
+    root.position.y = HOME_Y + cur.height + Math.sin(t * 1.6 * energy) * 0.12 * cur.bob * motion + (state === "happy" ? Math.abs(Math.sin(t * 6)) * 0.12 * motion : 0);
+    root.rotation.x = cur.lean + pointer.y * -0.06;
+    root.rotation.y = pointer.x * 0.25 + Math.sin(t * 0.7) * 0.04 * motion;
+    root.rotation.z = cur.tilt + Math.sin(t * 1.1) * 0.025 * motion;
+    const breathe = 1 + Math.sin(t * 1.6 * energy + 1) * 0.015;
+    body.scale.set(1 / Math.sqrt(breathe), breathe, 1 / Math.sqrt(breathe));
+    const lift = root.position.y - HOME_Y;
+    shadow.position.y = HOME_Y - HEM * size * 0.95 - 0.08;
+    shadow.scale.setScalar((0.78 - lift * 0.15) * size / BASE_SCALE);
+    shadow.material.opacity = 0.4 - lift * 0.12;
+
+    // the hem ripples
+    const pos = geo.attributes.position;
+    const amp = 0.11 * cur.hem, speed = 2.2 * (speaking ? 1 + Math.min(rate, 60) / 120 : 1) * Math.min(cur.hem, 1.3) * motion;
+    for (let i = 0; i < pos.count; i++) {
+      const y0 = base[3 * i + 1];
+      if (y0 > -H * 0.45) continue;
+      const x0 = base[3 * i], z0 = base[3 * i + 2], a = Math.atan2(z0, x0);
+      const w = (-y0 - H * 0.45) / (H * 0.55);
+      pos.array[3 * i + 1] = y0 + Math.sin(a * 6 + t * speed) * amp * w * w;
+      const r = 1 + Math.sin(a * 6 + t * speed + 1.4) * 0.025 * w;
+      pos.array[3 * i] = x0 * r; pos.array[3 * i + 2] = z0 * r;
+    }
+    pos.needsUpdate = true;
+
+    white.emissiveIntensity = 0.12 + cur.glow * (0.75 + 0.25 * Math.sin(t * 3));
+    white.emissive.copy(coolGlow).lerp(hotGlow, cur.heat);
+    white.opacity = inner.opacity = cur.opacity;
+    blushMat.opacity = cur.blush * 0.7;
+
+    // eyes: state + pointer + idle glances; blinks
+    if (t > glanceAt) { glance = [(Math.random() - 0.5) * 0.8, (Math.random() - 0.5) * 0.4]; glanceAt = t + 2.5 + Math.random() * 4; setTimeout(() => (glance = [0, 0]), 700); }
+    const idle = state === "idle";
+    const lx = cur.lookX + pointer.x * 0.35 + (idle ? glance[0] : 0), ly = cur.lookY + pointer.y * 0.25 + (idle ? glance[1] : 0);
+    face.position.x = ease(face.position.x, lx * 0.14, k);
+    face.position.y = ease(face.position.y, 0.28 + ly * 0.1, k);
+    if (t > blinkAt && blinkT < 0) blinkT = 0;
+    let lid = 1;
+    if (blinkT >= 0) { blinkT += dt; lid = Math.abs(Math.cos(Math.min(blinkT / 0.16, 1) * Math.PI)); if (blinkT > 0.16) { blinkT = -1; blinkAt = t + 2.5 + Math.random() * 4; } }
+    eyes.forEach((e, i) => {
+      const shape = target.eye;
+      e.oval.visible = shape === "oval" || shape === "squint";
+      e.arc.visible = shape === "arc";
+      e.line.visible = shape === "line";
+      const open = cur.eyeOpen * lid * (shape === "squint" && i === 0 ? 0.35 : 1);
+      e.oval.scale.set(0.9 + 0.1 * cur.eyeOpen, 1.42 * Math.max(open, 0.06), 0.2);
+      const [shown, angle, by] = cur.brow;
+      e.brow.scale.setScalar(Math.max(shown, 0.001));
+      e.brow.rotation.z = Math.PI / 2 + e.side * angle;
+      e.brow.position.y = 0.27 + by - (1 - cur.eyeOpen) * 0.08;
+    });
+
+    // mouth: a speaking rhythm of its own (about 4.5 syllables a second) while tokens keep arriving
+    if (speaking) {
+      syllable += dt * 4.5 * (0.92 + Math.min(rate, 60) / 400);
+      if (syllable >= 1) { syllable -= 1; openness = 0.45 + Math.random() * 0.55; }
+      mouthTarget = openness * Math.pow(Math.sin(syllable * Math.PI), 0.8);
+    } else mouthTarget = 0;
+    cur.talk = ease(cur.talk, mouthTarget, 1 - Math.pow(0.0001, dt));
+    mouth.scale.set(1 + cur.talk * 0.2, 0.05 + cur.talk * 0.75, 0.4);
+    mouth.visible = cur.talk > 0.03 || state === "surprised";
+    if (state === "surprised" && cur.talk < 0.3) mouth.scale.set(0.8, 0.7, 0.4);
+
+    // arms: out (scale), raised (rotation), or round to the front
+    arms.forEach((a, i) => {
+      const side = i ? 1 : -1;
+      a.scale.setScalar(Math.max(cur.arms[i], 0.001));
+      let raise = cur.armLift[i];
+      if (state === "wave" && i === 1) raise += Math.sin(t * 9) * 0.35 * motion;
+      if (speaking) raise += Math.max(0, Math.sin(t * 1.3 + i * 2)) * 0.18 * Math.min(1, cur.talk * 2);
+      a.rotation.z = side * raise;
+      const f = cur.front[i], cross = state === "serious" ? f : 0;
+      a.rotation.y = side * -(1.25 + 1.1 * cross) * f;
+      a.position.x = side * R * (0.92 - 0.37 * f - 0.25 * cross);
+      a.position.z = 0.05 + (R * 0.95 + (i ? 0.09 : 0)) * f;
+      a.position.y = -0.45 - 0.1 * f - (i ? 0.02 : 0.08) * cross;
+    });
+    prop.scale.setScalar(Math.max(cur.prop, 0.001));
+    prop.rotation.z = -arms[1].rotation.z - 0.25 + Math.sin(t * 2) * 0.06 * motion;
+    prop.rotation.y = -arms[1].rotation.y - 0.3;
+
+    const flow = (speaking ? 1 + Math.min(rate, 60) / 50 : state === "thinking" ? 1.6 : state === "sleepy" ? 0.4 : 1) * motion;
+    for (const o of orbs) {
+      o.position.y += o.userData.vy * dt * flow;
+      o.position.x += Math.sin(t * 0.5 + o.userData.phase) * 0.002 * flow;
+      if (o.position.y > 4) o.position.y = -4;
+    }
+    if (state === "sleepy" && (fxTimer -= dt) < 0) { emit("z"); fxTimer = 1.6; }
+    if (state === "angry" && (fxTimer -= dt) < 0) { emit("puff"); fxTimer = 0.35; }
+    for (let i = floaters.length - 1; i >= 0; i--) {
+      const f = floaters[i]; f.userData.age += dt; f.position.y += dt * 0.45; f.position.x += dt * 0.15; f.material.opacity = Math.max(0, 1 - f.userData.age / 2.4);
+      if (f.userData.age > 2.4) { scene.remove(f); f.material.dispose(); floaters.splice(i, 1); }
+    }
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  function resize() {
+    renderer.setSize(innerWidth, innerHeight, false);
+    camera.aspect = innerWidth / innerHeight;
+    camera.position.z = innerWidth < 700 ? 12 : 9;
+    camera.updateProjectionMatrix();
+  }
+  addEventListener("resize", resize);
+  resize();
+  frame();
+  // the world height (on the ghost's plane) of a point `px` from the top of the window
+  const worldY = (px) => camera.position.y + (0.5 - px / innerHeight) * 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  return {
+    get state() { return state; },
+    // keep the hem (and its shadow) above window line `px`, e.g. the top of the subtitles; null: back home
+    room(px) {
+      if (px == null) { wantY = BASE_Y; wantSize = BASE_SCALE; return; }
+      const floor = worldY(px) + 0.22;                    // the hem's lowest allowed point
+      const top = worldY(64) - 0.1;                       // below the header
+      let s = BASE_SCALE, y = Math.max(BASE_Y, floor + HEM * s * 0.95);
+      if (y + R * s > top) { s = Math.max(MIN_SCALE, (top - floor) / (HEM * 0.95 + R)); y = floor + HEM * s * 0.95; }
+      wantY = Math.min(y, TOP_Y); wantSize = s;
+    },
+    set(s) { if (!poses[s] || s === state) return; state = s; target = poses[s]; if (s === "confused") emit("q"); },
+    token() { lastTokenAt = clock.elapsedTime; },
+    rate(r) { rate = r; },
+  };
+})();
+
+// ================================================================ conversation
 const store = {
   get(k, d) { try { const v = localStorage.getItem("betterllama." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem("betterllama." + k, JSON.stringify(v)); } catch {} },
 };
-let messages = store.get("messages", []); // {role, content, think?, thinkSecs?, meta?}
+let messages = store.get("messages", []); // {role, content, sent?, think?, thinkSecs?, meta?, error?}
 let busy = null; // AbortController of the running request
+let settle = null; // timer back to idle after a reply's mood
+let lastActive = performance.now();
 
-for (const [id, key] of [["think", "think"], ["temp", "temp"], ["maxTokens", "maxTokens"], ["system", "system"]]) {
-  const el = $(id), saved = store.get(key, null);
-  if (saved !== null) el.type === "checkbox" ? (el.checked = saved) : (el.value = saved);
-  el.addEventListener("change", () => store.set(key, el.type === "checkbox" ? el.checked : el.value));
+const LABELS = { idle: "Here", listening: "Listening", thinking: "Thinking", talking: "Talking", cheerful: "Talking", tool: "Using a tool", happy: "Done",
+                 sorry: "Sorry", surprised: "Oh!", angry: "Not happy", serious: "Serious", confused: "Puzzled", sleepy: "Dozing", wave: "Hello" };
+function mood(s, label, error = false) {
+  ghost?.set(s);
+  $("statusText").textContent = label || LABELS[s] || "";
+  $("status").classList.toggle("error", error);
 }
+// after a reply or an error: hold the face a moment, then rest
+function settleTo(s, ms, label, error = false) {
+  clearTimeout(settle);
+  mood(s, label, error);
+  settle = setTimeout(() => { if (!busy) mood($("input").value ? "listening" : "idle"); }, ms);
+}
+// nobody around for two minutes: doze off; any activity wakes it
+setInterval(() => { if (!busy && ghost?.state === "idle" && performance.now() - lastActive > 120000) mood("sleepy"); }, 5000);
+for (const ev of ["pointermove", "keydown", "pointerdown"]) addEventListener(ev, () => { lastActive = performance.now(); if (ghost?.state === "sleepy") mood("idle"); });
+
+// settings, kept in this browser
+const think = $("think");
+const prefs = { temp: ["temp", 0], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true] };
+for (const [id, [key, d]] of Object.entries(prefs)) {
+  const el = $(id), v = store.get(key, d);
+  el.type === "checkbox" ? (el.checked = v) : (el.value = v);
+  el.addEventListener("input", () => { store.set(key, el.type === "checkbox" ? el.checked : el.value); showSettings(); });
+}
+think.setAttribute("aria-pressed", String(store.get("think", true)));
+think.onclick = () => { const on = think.getAttribute("aria-pressed") !== "true"; think.setAttribute("aria-pressed", String(on)); store.set("think", on); };
+function showSettings() {
+  $("tempVal").textContent = Number($("temp").value).toFixed(1);
+  $("maxVal").textContent = Number($("maxTokens").value).toLocaleString() + " tokens";
+}
+showSettings();
 $("settingsBtn").onclick = () => $("settings").classList.toggle("open");
-$("newBtn").onclick = () => { if (busy) busy.abort(); messages = []; save(); render(); $("input").focus(); };
+$("logBtn").onclick = () => { $("drawer").classList.add("open"); renderLog(); };
+$("closeLog").onclick = () => $("drawer").classList.remove("open");
+addEventListener("keydown", (e) => { if (e.key === "Escape") { $("settings").classList.remove("open"); $("drawer").classList.remove("open"); } });
+$("newBtn").onclick = () => {
+  if (busy) busy.abort();
+  messages = []; save(); renderLog(); subtitle("");
+  settleTo("wave", 2200);
+  $("input").focus();
+};
 
 fetch("/v1/models").then((r) => r.json()).then((j) => { $("model").textContent = j.data[0].id; })
   .catch(() => { $("model").textContent = "server not reachable"; });
@@ -133,17 +528,14 @@ function inline(s) {
 }
 function markdown(src) {
   const out = [];
-  const parts = src.split(/```/);
-  parts.forEach((part, i) => {
+  src.split(/```/).forEach((part, i) => {
     if (i % 2 === 1) { // a code block (possibly still open while streaming)
       const nl = part.indexOf("\n");
-      const code = nl >= 0 ? part.slice(nl + 1) : "";
-      out.push("<pre><code>" + esc(code.replace(/\n$/, "")) + "</code></pre>");
+      out.push("<pre><code>" + esc((nl >= 0 ? part.slice(nl + 1) : "").replace(/\n$/, "")) + "</code></pre>");
       return;
     }
-    let list = null;
+    let list = null, para = [];
     const close = () => { if (list) { out.push("</" + list + ">"); list = null; } };
-    let para = [];
     const flush = () => { if (para.length) { out.push("<p>" + inline(esc(para.join("\n"))).replace(/\n/g, "<br>") + "</p>"); para = []; } };
     for (const line of part.split("\n")) {
       let m;
@@ -164,85 +556,111 @@ function markdown(src) {
   return out.join("");
 }
 
-// ---- the conversation
-function render() {
+// ---- the full conversation (drawer); drawn only while it is open
+function renderLog() {
+  if (!$("drawer").classList.contains("open")) return;
   const log = $("log");
   log.innerHTML = "";
-  if (!messages.length) { log.innerHTML = '<div class="empty">Ask anything. Replies run on your own GPU.</div>'; return; }
-  messages.forEach((m, i) => log.appendChild(view(m, i === messages.length - 1 && busy)));
-  $("scroller").scrollTop = $("scroller").scrollHeight;
-}
-
-function view(m, live) {
-  const div = document.createElement("div");
-  div.className = "msg " + m.role;
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-  if (m.role === "user") {
-    bubble.textContent = m.content;
-  } else {
-    if (m.think !== undefined && (m.think.trim() || live)) {
-      const d = document.createElement("details");
-      d.className = "think";
-      d.open = !!m.thinkOpen;
-      d.ontoggle = () => { m.thinkOpen = d.open; };
-      const s = document.createElement("summary");
-      s.textContent = m.thinkSecs === undefined ? "Thinking…" : `Thought for ${m.thinkSecs.toFixed(1)} s`;
-      const b = document.createElement("div");
-      b.className = "body";
-      b.textContent = m.think.trim();
-      d.append(s, b);
-      bubble.appendChild(d);
+  if (!messages.length) { log.innerHTML = '<p class="empty">Nothing yet. Say something to the ghost below.</p>'; return; }
+  for (const m of messages) {
+    const div = document.createElement("div");
+    div.className = "msg " + m.role;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    if (m.role === "user") bubble.textContent = m.content;
+    else {
+      if (m.think && m.think.trim()) {
+        const d = document.createElement("details");
+        d.className = "think";
+        const s = document.createElement("summary");
+        s.textContent = m.thinkSecs === undefined ? "Thinking…" : `Thought for ${m.thinkSecs.toFixed(1)} s`;
+        const b = document.createElement("div");
+        b.className = "body";
+        b.textContent = m.think.trim();
+        d.append(s, b);
+        bubble.appendChild(d);
+      }
+      const body = document.createElement("div");
+      body.innerHTML = markdown(m.content);
+      bubble.appendChild(body);
+      if (m.error) { const e = document.createElement("div"); e.className = "error"; e.textContent = m.error; bubble.appendChild(e); }
     }
-    const body = document.createElement("div");
-    body.innerHTML = markdown(m.content);
-    if (live && m.thinkSecs !== undefined) body.classList.add("cursor");
-    if (live && m.think === undefined) body.classList.add("cursor");
-    bubble.appendChild(body);
-    if (m.error) { const e = document.createElement("div"); e.className = "error"; e.textContent = m.error; bubble.appendChild(e); }
+    div.appendChild(bubble);
+    if (m.meta) { const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = m.meta; div.appendChild(meta); }
+    log.appendChild(div);
   }
-  div.appendChild(bubble);
-  if (m.meta) { const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = m.meta; div.appendChild(meta); }
-  return div;
+  log.scrollTop = log.scrollHeight;
 }
 
-// splits the raw reply into a <think> part and the answer
+// ---- subtitles: your line, then the reply's latest words as plain text
+function plain(s) {
+  return s.replace(/```[\s\S]*?(```|$)/g, " (code in the conversation) ").replace(/[*_`#>]+/g, "").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/\s+/g, " ").trim();
+}
+function subtitle(you, reply = "", extra = "") {
+  const el = $("subtitle");
+  if (!you && !reply && !extra) { el.innerHTML = ""; ghost?.room(null); return; }
+  let text = plain(reply), cut = false;
+  if (text.length > 260) { const at = text.indexOf(" ", text.length - 260); text = "…" + text.slice(at > 0 ? at : text.length - 260); cut = true; }
+  el.innerHTML = (you ? `<span class="you">${esc(you)}</span>` : "") + esc(text) + extra + (cut ? '<button class="more" type="button">Read the whole reply</button>' : "");
+  el.querySelector(".more")?.addEventListener("click", () => $("logBtn").click());
+  ghost?.room(el.getBoundingClientRect().top);
+}
+addEventListener("resize", () => { const el = $("subtitle"); ghost?.room(el.innerHTML ? el.getBoundingClientRect().top : null); });
+
+// ---- moods: the model starts its reply (or a sentence) with a hidden tag
+const MOOD_TAGS = ["happy", "neutral", "serious", "sorry", "surprised", "angry", "confused"];
+const MOOD_PROMPT = "You appear to the user as a small ghost whose face follows your mood. Start every reply with one mood tag in square brackets: " +
+  MOOD_TAGS.map((t) => `[${t}]`).join(", ") + ". You may put another tag before a sentence where your mood changes. The tags are hidden from the user; never mention them.";
+const TAG_RE = new RegExp(`\\[(${MOOD_TAGS.join("|")})\\]\\s*`, "gi");
+// the shown text without its tags (and without a tag still being typed at the very end), and the latest mood
+function moodOf(answer, streaming) {
+  let last = null;
+  let shown = answer.replace(TAG_RE, (_, t) => { last = t.toLowerCase(); return ""; });
+  if (streaming) shown = shown.replace(/\[[a-z]{0,9}$/i, "");
+  return { shown, last };
+}
+const TALKING_FACE = { happy: "cheerful", neutral: "talking", serious: "serious", sorry: "sorry", surprised: "surprised", angry: "angry", confused: "confused" };
+const AFTER_FACE = { happy: "happy", neutral: "happy", serious: "serious", sorry: "sorry", surprised: "surprised", angry: "angry", confused: "confused" };
+
+// splits the raw reply into its <think> part and the answer
 function split(raw, m, t0) {
   const open = raw.indexOf("<think>");
-  if (open < 0 || raw.slice(0, open).trim()) { m.content = raw; return; }
+  if (open < 0 || raw.slice(0, open).trim()) { m.answer = raw; return; }
   const close = raw.indexOf("</think>");
-  if (close < 0) { m.think = raw.slice(open + 7); m.content = ""; return; }
+  if (close < 0) { m.think = raw.slice(open + 7); m.answer = ""; return; }
   m.think = raw.slice(open + 7, close);
   if (m.thinkSecs === undefined) m.thinkSecs = (performance.now() - t0) / 1000;
-  m.content = raw.slice(close + 8).replace(/^\s+/, "");
+  m.answer = raw.slice(close + 8).replace(/^\s+/, "");
 }
 
 async function send(text) {
-  const think = $("think").checked;
+  clearTimeout(settle);
+  const thinking = think.getAttribute("aria-pressed") === "true";
   // `sent` is what the model reads; resending exactly that keeps the server's cache of the conversation valid
-  messages.push({ role: "user", content: text, sent: think ? text : text + " /no_think" });
+  messages.push({ role: "user", content: text, sent: thinking ? text : text + " /no_think" });
   const reply = { role: "assistant", content: "" };
   messages.push(reply);
   busy = new AbortController();
   setBusy(true);
-  render();
+  mood("thinking", "Waiting for the model");
+  subtitle(text);
+  renderLog();
 
-  // earlier replies go back without their thinking, as Qwen3 expects
+  // earlier replies go back without their thinking (as Qwen3 expects), with their mood tags
   const history = messages.slice(0, -1).map((m) => ({ role: m.role, content: m.sent ?? m.content }));
-  const sys = $("system").value.trim();
+  const sys = [$("system").value.trim(), $("moods").checked ? MOOD_PROMPT : ""].filter(Boolean).join("\n\n");
   if (sys) history.unshift({ role: "system", content: sys });
   const body = {
     messages: history, stream: true, stream_options: { include_usage: true },
-    chat_template_kwargs: { enable_thinking: think }, // explicit, so a server started with --no-think still follows the switch
+    chat_template_kwargs: { enable_thinking: thinking }, // explicit, so a server started with --no-think still follows the switch
     temperature: Number($("temp").value) || 0, max_tokens: Number($("maxTokens").value) || 2048,
   };
 
   const t0 = performance.now();
-  let raw = "", firstAt = null, usage = null, finish = null;
+  let raw = "", firstAt = null, usage = null, finish = null, lastMood = null, tool = null;
+  const stamps = []; // token arrival times, for the live speed
   try {
-    const r = await fetch("/v1/chat/completions", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: busy.signal,
-    });
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: busy.signal });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
@@ -262,52 +680,104 @@ async function send(text) {
         const ch = c.choices && c.choices[0];
         if (!ch) continue;
         if (ch.finish_reason) finish = ch.finish_reason;
-        if (ch.delta && ch.delta.content) {
-          if (firstAt === null) firstAt = performance.now();
-          raw += ch.delta.content;
-          split(raw, reply, t0);
-          render();
+        const delta = ch.delta || {};
+        if (delta.tool_calls) { // the model is calling a tool: hold up the magnifier while it does
+          tool = delta.tool_calls[0]?.function?.name || tool || "a tool";
+          mood("tool", `Using ${tool}`);
+          continue;
         }
+        if (!delta.content) continue;
+        const now = performance.now();
+        if (firstAt === null) firstAt = now;
+        stamps.push(now);
+        while (stamps.length && now - stamps[0] > 1000) stamps.shift();
+        const rate = stamps.length > 1 ? (stamps.length - 1) / ((now - stamps[0]) / 1000) : 0;
+        ghost?.rate(rate);
+        $("speed").textContent = rate ? `${rate.toFixed(0)} tok/s` : "";
+        raw += delta.content;
+        split(raw, reply, t0);
+        if (reply.think !== undefined && reply.thinkSecs === undefined) {
+          mood("thinking"); // reasoning before the answer
+          subtitle(text, "", '<span class="hint">Thinking…</span>');
+        } else {
+          const { shown, last } = moodOf(reply.answer || "", true);
+          if (last) lastMood = last;
+          reply.content = shown;
+          if (shown.trim()) {
+            ghost?.token();
+            mood(TALKING_FACE[lastMood] || "talking", "Talking");
+            subtitle(text, shown);
+          }
+        }
+        renderLog();
       }
     }
+    const { shown } = moodOf(reply.answer || "", false);
+    reply.content = shown;
+    reply.sent = reply.answer || ""; // with its tags, as the model wrote it
     const secs = (performance.now() - (firstAt ?? t0)) / 1000;
     if (usage) {
       const rate = usage.completion_tokens / Math.max(secs, 1e-3);
-      reply.meta = `${usage.completion_tokens} tokens · ${rate.toFixed(1)} tok/s · first token after ${((firstAt ?? t0) - t0).toFixed(0)} ms` + (finish === "length" ? " · stopped at the token limit" : "");
+      reply.meta = `${usage.completion_tokens} tokens in ${secs.toFixed(1)} s, ${rate.toFixed(1)} tok/s, first token after ${((firstAt ?? t0) - t0).toFixed(0)} ms` + (finish === "length" ? ", stopped at the length limit" : "");
     }
+    subtitle(text, shown);
+    if (finish === "tool_calls") settleTo("tool", 3000, `Asked to use ${tool}`);
+    else settleTo(AFTER_FACE[lastMood] || "happy", lastMood && !["happy", "neutral"].includes(lastMood) ? 5000 : 2200);
   } catch (e) {
-    if (e.name === "AbortError") reply.meta = "stopped";
-    else reply.error = String(e.message || e);
+    if (e.name === "AbortError") { reply.meta = "stopped"; subtitle(text, reply.content || ""); settleTo("idle", 10); }
+    else {
+      // a network failure (the browser only says "Failed to fetch"): say what it means
+      reply.error = e instanceof TypeError ? "Can't reach the server. Check that betterllama serve is still running, then send again." : String(e.message || e);
+      subtitle(text, reply.content || "", ` <span class="err">${esc(reply.error)}</span>`);
+      settleTo("confused", 5000, "Something went wrong", true);
+    }
   } finally {
     if (reply.think !== undefined && reply.thinkSecs === undefined) reply.thinkSecs = (performance.now() - t0) / 1000;
     busy = null;
+    ghost?.rate(0);
+    $("speed").textContent = "";
     setBusy(false);
     save();
-    render();
+    renderLog();
   }
 }
 
 function setBusy(on) {
   const b = $("sendBtn");
-  b.textContent = on ? "Stop" : "Send";
-  b.className = on ? "stop" : "primary";
+  b.classList.toggle("stop", on);
+  b.setAttribute("aria-label", on ? "Stop the reply" : "Send");
+  $("sendIcon").innerHTML = on ? '<rect x="4" y="4" width="10" height="10" rx="2" fill="currentColor"/>'
+                               : '<path d="M9 14V4M4.5 8.5 9 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>';
 }
 
+const input = $("input");
+const grow = () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight + 2, innerHeight * 0.3) + "px"; };
+input.addEventListener("input", () => {
+  grow();
+  if (busy) return;
+  clearTimeout(settle);
+  mood(input.value.trim() ? "listening" : "idle");
+});
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); } });
 $("form").onsubmit = (e) => {
   e.preventDefault();
   if (busy) { busy.abort(); return; }
-  const text = $("input").value.trim();
+  const text = input.value.trim();
   if (!text) return;
-  $("input").value = "";
+  input.value = "";
   grow();
   send(text);
 };
-const grow = () => { const t = $("input"); t.style.height = "auto"; t.style.height = t.scrollHeight + 2 + "px"; };
-$("input").addEventListener("input", grow);
-$("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
-});
-render();
+
+// without 3D (no WebGL), the conversation stays open instead
+if (!ghost) { $("stage").remove(); $("drawer").classList.add("open"); }
+// the last exchange as subtitles, and a wave hello
+const lastUser = [...messages].reverse().find((m) => m.role === "user");
+const lastReply = messages[messages.length - 1];
+if (lastUser && lastReply?.role === "assistant") subtitle(lastUser.content, lastReply.content);
+renderLog();
+settleTo("wave", 2400);
+input.focus();
 </script>
 </body>
 </html>
