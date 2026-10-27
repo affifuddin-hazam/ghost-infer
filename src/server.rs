@@ -57,6 +57,7 @@ struct Loaded {
     ctx: usize,
     chat_ok: bool,
     default_system: Option<String>,
+    thinking: bool, // the chat template has a thinking switch
 }
 
 #[derive(Default)]
@@ -163,7 +164,13 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
             eprintln!("[note: no ChatML template in this model, so /v1/chat/completions is off]");
         }
         *shared.status.lock().unwrap() = Status {
-            current: Some(Loaded { id: id.clone(), ctx: engine.backend.ctx(), chat_ok: fmt.is_some(), default_system: fmt.and_then(|f| f.default_system) }),
+            current: Some(Loaded {
+                id: id.clone(),
+                ctx: engine.backend.ctx(),
+                chat_ok: fmt.is_some(),
+                thinking: fmt.as_ref().is_some_and(|f| f.thinking),
+                default_system: fmt.and_then(|f| f.default_system),
+            }),
             loading: None,
         };
         if let Some((w, err)) = waiting.take() {
@@ -380,6 +387,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 ("current", opt(current.as_ref().map(|c| c.id.as_str()))),
                 ("loading", opt(loading.as_deref())),
                 ("context_length", current.as_ref().map(|c| num(c.ctx as f64)).unwrap_or(Json::Null)),
+                ("thinking", Json::Bool(current.as_ref().is_some_and(|c| c.thinking))),
                 ("models", Json::Arr(models)),
             ]);
             return respond(&mut conn, 200, &body);
@@ -411,7 +419,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         _ => {}
     }
     // everything else needs a running model
-    let Some(Loaded { id: model_id, ctx, chat_ok, default_system }) = current.filter(|_| loading.is_none()) else {
+    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking }) = current.filter(|_| loading.is_none()) else {
         if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
             let what = loading.as_deref().unwrap_or("the model");
             return respond(&mut conn, 503, &error_body(&format!("loading {what}; try again in a moment")));
@@ -451,7 +459,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         Ok(b) => b,
         Err(e) => return respond(&mut conn, 400, &error_body(&format!("request body: {e}"))),
     };
-    let prompt = if chat { chat_prompt(&body, default_system, think_default) } else { completion_prompt(&body) };
+    let prompt = if chat { chat_prompt(&body, default_system, think_default, thinking) } else { completion_prompt(&body) };
     let prompt = match prompt {
         Ok(p) => p,
         Err(e) => return respond(&mut conn, 400, &error_body(&e)),
@@ -649,7 +657,8 @@ fn request_tools(body: &Json) -> &[Json] {
 /// The messages in the ChatML template, ending with an open assistant turn. Tools, tool calls and
 /// tool results are written as Qwen's template writes them (`<tools>`, `<tool_call>`,
 /// `<tool_response>`), and the reasoning of turns before the latest user question is left out.
-fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool) -> Result<String, String> {
+/// `switch`: the model's template has a thinking switch; without one, thinking settings are ignored.
+fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, switch: bool) -> Result<String, String> {
     let messages = body.get("messages").and_then(Json::as_array).ok_or("messages must be a list")?;
     if messages.is_empty() {
         return Err("messages is empty".into());
@@ -740,7 +749,7 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool) -
     let thinking = body.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")).and_then(Json::as_bool).or_else(|| {
         body.get("reasoning_effort").and_then(Json::as_str).map(|e| !matches!(e.to_ascii_lowercase().as_str(), "none" | "minimal"))
     });
-    if !thinking.unwrap_or(think_default) {
+    if switch && !thinking.unwrap_or(think_default) {
         s.push_str("<think>\n\n</think>\n\n");
     }
     Ok(s)
@@ -859,7 +868,7 @@ mod tests {
     #[test]
     fn chat_template() {
         let body = Json::parse(r#"{"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]}"#).unwrap();
-        assert_eq!(chat_prompt(&body, Some("Be brief."), true).unwrap(), "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(chat_prompt(&body, Some("Be brief."), true, true).unwrap(), "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
     }
 
     #[test]
@@ -881,22 +890,25 @@ mod tests {
             "<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\nx\n</tool_response><|im_end|>\n",
             "<|im_start|>assistant\n",
         );
-        assert_eq!(chat_prompt(&body, None, true).unwrap(), want);
+        assert_eq!(chat_prompt(&body, None, true, true).unwrap(), want);
     }
 
     #[test]
     fn reasoning_effort_none_turns_thinking_off() {
         let off = Json::parse(r#"{"reasoning_effort":"none","messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&off, None, true).unwrap().ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(chat_prompt(&off, None, true, true).unwrap().ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
         let on = Json::parse(r#"{"reasoning_effort":"medium","messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&on, None, true).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&on, None, true, true).unwrap().ends_with("<|im_start|>assistant\n"));
         // an explicit chat_template_kwargs wins over reasoning_effort
         let kw = Json::parse(r#"{"reasoning_effort":"none","chat_template_kwargs":{"enable_thinking":true},"messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&kw, None, true).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&kw, None, true, true).unwrap().ends_with("<|im_start|>assistant\n"));
         // serve --no-think: off unless the request asks
         let plain = Json::parse(r#"{"messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&plain, None, false).unwrap().ends_with("<think>\n\n</think>\n\n"));
-        assert!(chat_prompt(&on, None, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&plain, None, false, true).unwrap().ends_with("<think>\n\n</think>\n\n"));
+        assert!(chat_prompt(&on, None, false, true).unwrap().ends_with("<|im_start|>assistant\n"));
+        // a model without a thinking switch (Qwen3-2507 Instruct, SmolLM2) never gets the empty block
+        assert!(chat_prompt(&off, None, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&plain, None, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]

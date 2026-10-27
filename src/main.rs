@@ -703,6 +703,9 @@ fn bench(o: &Opts) -> Result<(), String> {
 /// Chat formatting. Only ChatML (<|im_start|> ... <|im_end|>) for now, which covers SmolLM2 and Qwen.
 struct ChatFormat {
     default_system: Option<String>,
+    /// the template has Qwen3's thinking switch (enable_thinking); models without it never think, and
+    /// an empty <think></think> block where they do not expect one makes them stop after a few tokens
+    thinking: bool,
 }
 
 impl ChatFormat {
@@ -719,7 +722,7 @@ impl ChatFormat {
             let text = &after[..end];
             (!text.is_empty() && !text.contains("{{") && !text.contains("{%")).then(|| text.to_string())
         });
-        Ok(ChatFormat { default_system })
+        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking") })
     }
 
     fn first_turn(&self, system: Option<&str>, user: &str) -> String {

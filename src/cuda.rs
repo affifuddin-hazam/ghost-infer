@@ -2144,6 +2144,7 @@ mod os {
         fn SetDllDirectoryW(dir: *const u16) -> i32;
         fn GetCurrentProcess() -> *mut c_void;
         fn PrefetchVirtualMemory(process: *mut c_void, n: usize, ranges: *const Range, flags: u32) -> i32;
+        fn VirtualUnlock(addr: *mut c_void, bytes: usize) -> i32;
     }
     const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
 
@@ -2158,6 +2159,14 @@ mod os {
     pub fn prefetch(ranges: &[(usize, usize)]) {
         let r: Vec<Range> = ranges.iter().map(|&(a, n)| Range { addr: a as *mut c_void, bytes: n }).collect();
         unsafe { PrefetchVirtualMemory(GetCurrentProcess(), r.len(), r.as_ptr(), 0) };
+    }
+
+    /// Takes these ranges of mapped memory out of the working set (VirtualUnlock on pages that are not
+    /// locked does exactly that): they stay in the file cache, but are the first memory Windows reuses.
+    pub fn release(ranges: &[(usize, usize)]) {
+        for &(a, n) in ranges {
+            unsafe { VirtualUnlock(a as *mut c_void, n) };
+        }
     }
 
     pub fn open(path: &str) -> Option<*mut c_void> {
@@ -2188,6 +2197,7 @@ mod os {
         None
     }
     pub fn prefetch(_: &[(usize, usize)]) {}
+    pub fn release(_: &[(usize, usize)]) {}
 }
 
 macro_rules! api {
@@ -3103,6 +3113,13 @@ impl CpuMoe {
         Ok(CpuMoe { prefetch: Prefetcher::new(), mmap, n_experts: cfg.n_experts, routers, tensors })
     }
 
+    /// Lets Windows reuse the RAM holding expert e of layer l (now in GPU memory) before anything else.
+    fn release_expert(&self, l: usize, e: usize) {
+        let base = self.mmap.as_ptr() as usize;
+        let ranges: Vec<(usize, usize)> = self.tensors[l].iter().map(|t| (base + t.offset + e * t.stride, t.stride)).collect();
+        os::release(&ranges);
+    }
+
     /// Starts reading layer l's experts (those `cached` does not hold in GPU memory) off the disk, as
     /// runs of neighbouring experts in file order.
     fn prefetch_layer(&self, l: usize, cached: &[i32]) {
@@ -3314,6 +3331,8 @@ impl ExpertCache {
         self.owner[slot] = Some((l, e));
         self.slot_of[l][e] = slot as i32;
         self.uploads += 1;
+        // it runs from GPU memory from now on: its file pages need not hold RAM the CPU's experts could use
+        moe.release_expert(l, e);
         Ok(())
     }
 
@@ -3651,16 +3670,22 @@ impl GpuModel {
     }
 
     pub fn prefill(&self, tokens: &[u32], s: &mut GpuSession) -> Result<(), String> {
-        let chunks: Vec<&[u32]> = tokens.chunks(MAX_BATCH).collect();
+        // a mixture of experts takes short prompts a token at a time: one token runs the experts held in GPU
+        // memory there, while a small batch would run every expert on the CPU, reading even the GPU-held
+        // ones back from RAM (or, when RAM is short, from the disk)
+        let per_token = self.cfg.is_moe() && tokens.len() > 1 && tokens.len() < MOE_GPU_MIN_BATCH;
+        let chunks: Vec<&[u32]> = if per_token { tokens.chunks(1).collect() } else { tokens.chunks(MAX_BATCH).collect() };
         PROGRESS.start(tokens.len());
         let mut result = Ok(());
+        let mut done = 0;
         for (i, chunk) in chunks.iter().enumerate() {
-            PROGRESS.base.store(i * MAX_BATCH, Ordering::Relaxed);
+            PROGRESS.base.store(done, Ordering::Relaxed);
             result = self.forward_batch(chunk, s, i + 1 == chunks.len());
             if result.is_err() {
                 break;
             }
-            PROGRESS.done.store(i * MAX_BATCH + chunk.len(), Ordering::Relaxed);
+            done += chunk.len();
+            PROGRESS.done.store(done, Ordering::Relaxed);
         }
         PROGRESS.total.store(0, Ordering::Relaxed);
         result

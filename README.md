@@ -327,7 +327,9 @@ it. Remove that file to build a portable binary.
   tokens per expert and stream uncached experts through double-buffered pinned memory. When the model
   is bigger than the free RAM, a prefetch thread reads each layer's experts in as large sequential reads
   one layer ahead (a cold 1,000-token prompt from a USB hard drive: 151 s instead of 215 s), and the chat
-  page shows that it is loading weights from disk.
+  page shows that it is loading weights from disk. Experts copied into GPU memory give their RAM back, and
+  short prompts run a token at a time so the GPU-held experts are never read from RAM again: with 16 GB
+  of RAM, a new chat's first token came after 20 s instead of 56 s, and replies ran at 14 tokens/s instead of 3.
 - **Speculative decoding** checks all drafted tokens in one batched pass; a token's logits are
   bit-identical whether computed alone or inside a check batch, so the output equals plain greedy output.
 - **CPU backend**: AVX2 integer kernels for every format (with a scalar fallback), fused passes and

@@ -651,6 +651,7 @@ const pretty = (id) => {
 };
 const size = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.round(n / 1e6) + " MB";
 let model = null, loadingModel = null; // the server's model, and the one it is switching to
+let canThink = true; // the model has a thinking switch (Qwen3); others never think, so Think is hidden
 function showModel() {
   const b = $("modelBtn");
   b.classList.remove("down");
@@ -663,6 +664,8 @@ async function refreshModels() {
   try {
     const j = await (await fetch("/api/models")).json();
     model = j.current; loadingModel = j.loading;
+    canThink = j.thinking !== false;
+    think.hidden = !canThink;
     showModel();
     if (loadingModel) setTimeout(refreshModels, 1500); // a switch is under way (another tab, or the server starting): watch it finish
     return j;
@@ -894,7 +897,7 @@ function split(raw, m, t0) {
 function send(text) {
   const thinking = think.getAttribute("aria-pressed") === "true";
   // `sent` is what the model reads; resending exactly that keeps the server's cache of the conversation valid
-  chat.messages.push({ role: "user", content: text, sent: thinking ? text : text + " /no_think" });
+  chat.messages.push({ role: "user", content: text, sent: thinking || !canThink ? text : text + " /no_think" });
   if (!chats.includes(chat)) { chat.title = titleOf(chat.messages); chats.push(chat); }
   chat.at = Date.now();
   ask(thinking);
