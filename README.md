@@ -16,9 +16,20 @@ and cultural attractions. Paris is a major global city, and its population is ap
 - **GGUF v2/v3** reader over a memory map: the model loads in milliseconds and is never copied on the CPU.
 - **Byte-level BPE tokenizer** (`tokenizer.ggml.model = "gpt2"`): GPT-2 and Qwen2 splitting, isolated
   digits for SmolLM/StarCoder-style vocabularies, special tokens written literally in prompts.
-- **Transformers**: Llama (grouped-query attention, RoPE, SwiGLU, tied or separate output projection) and
-  Qwen3 (adds per-head RMSNorm on queries and keys, NEOX-style RoPE), with a KV cache.
-- **Weight formats**: Q8_0, Q4_K and Q6_K (so Q4_K_M files work), plus F16/F32 on the CPU.
+- **Transformers**: Llama (grouped-query attention, RoPE, SwiGLU, tied or separate output projection),
+  Qwen3 (adds per-head RMSNorm on queries and keys, NEOX-style RoPE) and Qwen3-MoE (mixture of experts:
+  128 experts per layer, 8 per token), with a KV cache.
+- **Weight formats**: Q8_0, Q3_K, Q4_K, Q5_K and Q6_K (so Q3_K_M and Q4_K_M files work), plus F16/F32 on
+  the CPU. Dequantisation matches gguf-py's reference bit for bit (`dequant` prints any row to check).
+- **Mixture of experts bigger than the GPU** (`--gpu`): attention and the router run on the GPU; the
+  experts live in RAM (the memory-mapped file) and the most-picked ones also in a VRAM cache, filled from
+  routing counts (halved every 1,024 tokens; a resident is replaced only by a clearly hotter expert).
+  Generating, a token's cached experts run on the GPU while the CPU computes the rest. Prompt batches
+  run every expert on the GPU: tokens grouped per expert, uncached experts streamed in through pinned
+  buffers while the previous one computes. Qwen3-30B-A3B Q3_K_M (13.7 GB) on an 8 GB RTX 2060 SUPER +
+  16 GB RAM: 2,350 experts (5 GB) cached, generation 34–44 tok/s, prompts 220 tok/s at 256 tokens and
+  660 at 1,024 — Ollama 0.22.1 on the same file and machine: 14–17 tok/s and 231 / 479 tok/s. Automatic
+  context for these models is 8,192 tokens (the memory is worth more as expert cache).
 - **CPU backend**: batched prompt processing, AVX2 integer kernels for every format (with a scalar
   fallback), fused Q/K/V and gate/up passes, context-split attention across cores.
 - **CUDA backend** (`--gpu`): loads the NVIDIA driver and NVRTC at runtime and compiles its kernels for the
@@ -78,6 +89,7 @@ betterllama serve Qwen3-8B-Q4_K_M.gguf --gpu --port 8080
 | `tokenize <model> <text>` | token ids and pieces, plus a round-trip check |
 | `inspect <model>` | metadata, tensor list and parameter counts |
 | `meta <model> <key>` | one metadata value in full (e.g. `tokenizer.chat_template`) |
+| `dequant <model> <tensor> <row>` | one row of a weight tensor as floats (for checking formats) |
 
 Options for `run`, `chat`, `serve` and `bench`:
 
@@ -249,6 +261,9 @@ Tools for checking this:
 | `BETTERLLAMA_NO_GRAPH=1` | GPU: plain kernel launches instead of CUDA-graph replay for one-token steps |
 | `BETTERLLAMA_NO_TC_ATT=1` | GPU prompts: f32 attention instead of f16 tensor cores (more exact, much slower on long prompts) |
 | `BETTERLLAMA_NO_Q8K=1` | K-quant GPU prompts: the older per-32 activation-scale kernel (more exact, ~1.7× slower) |
+| `BETTERLLAMA_EXPERT_CACHE_MB=n` | mixture of experts on the GPU: VRAM for the expert cache (default: what is free; 0 = every expert on the CPU) |
+| `BETTERLLAMA_MOE_CHECK=1` | mixture of experts on the GPU: also compute each GPU-resident expert on the CPU and print the difference |
+| `BETTERLLAMA_LOGITS_OUT=file` | `top`: write every next-token logit (f32, little-endian) for accuracy tooling |
 | `scripts\golden.ps1 [-Save]` | regression check against saved log-probabilities and a greedy reply |
 | `scripts\accuracy.ps1 [-Gpu]` | fast path vs exact maths at several prompt lengths |
 | `scripts\decode-accuracy.ps1` | GPU generation path vs exact maths at up to ~1,500 tokens |

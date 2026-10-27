@@ -26,9 +26,14 @@ pub struct Config {
     /// GGUF converters permute llama's Q/K for adjacent pairs but leave Qwen's as trained.
     pub rope_neox: bool,
     pub norm_eps: f32,
+    /// Mixture of experts (qwen3moe; 0 for dense models): experts per layer, experts each token
+    /// uses, and an expert's hidden size.
+    pub n_experts: usize,
+    pub n_experts_used: usize,
+    pub expert_ffn_dim: usize,
 }
 
-pub const SUPPORTED_ARCHS: [&str; 2] = ["llama", "qwen3"];
+pub const SUPPORTED_ARCHS: [&str; 3] = ["llama", "qwen3", "qwen3moe"];
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Config, String> {
@@ -55,9 +60,16 @@ impl Config {
             max_ctx: need("context_length")?,
             rope_dim: u("rope.dimension_count").unwrap_or(head_dim),
             rope_base: f("rope.freq_base").unwrap_or(10_000.0),
-            rope_neox: arch == "qwen3",
+            rope_neox: arch.starts_with("qwen3"),
             norm_eps: f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
+            n_experts: u("expert_count").unwrap_or(0),
+            n_experts_used: u("expert_used_count").unwrap_or(0),
+            expert_ffn_dim: u("expert_feed_forward_length").unwrap_or(0),
         })
+    }
+
+    pub fn is_moe(&self) -> bool {
+        self.n_experts > 0
     }
 
     fn kv_dim(&self) -> usize {
@@ -78,9 +90,21 @@ struct Layer<'a> {
     q_norm: Option<Vec<f32>>, // Qwen3: RMSNorm over each query head before RoPE
     k_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
-    w_gate: Matrix<'a>,
-    w_up: Matrix<'a>,
-    w_down: Matrix<'a>,
+    ffn: Ffn<'a>,
+}
+
+enum Ffn<'a> {
+    Dense { gate: Matrix<'a>, up: Matrix<'a>, down: Matrix<'a> },
+    /// router: n_experts rows of dim f32 logit weights
+    Moe { router: Vec<f32>, experts: Vec<Expert<'a>> },
+}
+
+/// One expert's SwiGLU feed-forward, inside the model file.
+#[derive(Clone, Copy)]
+pub struct Expert<'a> {
+    pub gate: Matrix<'a>,
+    pub up: Matrix<'a>,
+    pub down: Matrix<'a>,
 }
 
 pub struct Model<'a> {
@@ -106,6 +130,54 @@ fn matrix<'g>(g: &'g Gguf, name: &str) -> Result<Matrix<'g>, String> {
     Ok(Matrix { data: &g.mmap[t.offset..t.offset + t.n_bytes], ty: t.ty, cols: t.dims[0] as usize, rows: t.dims[1] as usize })
 }
 
+/// A 3-D expert tensor (cols x rows x experts, every expert's matrix stored whole) as one matrix per expert.
+fn expert_matrices<'g>(g: &'g Gguf, name: &str) -> Result<Vec<Matrix<'g>>, String> {
+    let t = tensor(g, name)?;
+    if t.ty.block().is_none() {
+        return Err(format!("tensor {name} uses {} which is not supported yet", t.ty.name()));
+    }
+    let [cols, rows, n] = t.dims[..] else { return Err(format!("tensor {name} is not 3-D")) };
+    let (cols, rows, n) = (cols as usize, rows as usize, n as usize);
+    let bytes = t.n_bytes / n;
+    Ok((0..n).map(|e| Matrix { data: &g.mmap[t.offset + e * bytes..t.offset + (e + 1) * bytes], ty: t.ty, rows, cols }).collect())
+}
+
+/// Every layer's experts (empty for a dense model), for the CPU expert path of the GPU backend too.
+pub fn load_experts<'g>(g: &'g Gguf, cfg: &Config) -> Result<Vec<Vec<Expert<'g>>>, String> {
+    if !cfg.is_moe() {
+        return Ok(Vec::new());
+    }
+    (0..cfg.n_layers)
+        .map(|i| {
+            let p = |s: &str| format!("blk.{i}.{s}.weight");
+            let (gate, up, down) = (expert_matrices(g, &p("ffn_gate_exps"))?, expert_matrices(g, &p("ffn_up_exps"))?, expert_matrices(g, &p("ffn_down_exps"))?);
+            if gate.len() != cfg.n_experts || up.len() != cfg.n_experts || down.len() != cfg.n_experts {
+                return Err(format!("layer {i}: expert tensors do not hold {} experts", cfg.n_experts));
+            }
+            if gate[0].rows != cfg.expert_ffn_dim || down[0].cols != cfg.expert_ffn_dim || gate[0].cols != cfg.dim {
+                return Err(format!("layer {i}: expert shapes do not match expert_feed_forward_length {}", cfg.expert_ffn_dim));
+            }
+            Ok(gate.into_iter().zip(up).zip(down).map(|((gate, up), down)| Expert { gate, up, down }).collect())
+        })
+        .collect()
+}
+
+/// Qwen3-MoE routing for one token: the `k` largest router logits, weighted by a softmax over
+/// just those k (the same as a softmax over all experts renormalised to the chosen ones).
+pub fn route(logits: &[f32], k: usize, out: &mut Vec<(usize, f32)>) {
+    out.clear();
+    out.extend(logits.iter().copied().enumerate());
+    // descending logit; ties to the lower expert index
+    out.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    out.truncate(k);
+    out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let max = out[0].1;
+    let total: f32 = out.iter().map(|&(_, l)| (l - max).exp()).sum();
+    for e in out.iter_mut() {
+        e.1 = (e.1 - max).exp() / total;
+    }
+}
+
 fn vector(g: &Gguf, name: &str) -> Result<Vec<f32>, String> {
     let t = tensor(g, name)?;
     if t.ty.block().is_none() {
@@ -122,9 +194,14 @@ impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> Result<Model<'a>, String> {
         let cfg = Config::from_gguf(g)?;
         let token_embd = matrix(g, "token_embd.weight")?;
+        let mut experts = load_experts(g, &cfg)?.into_iter();
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
+            let ffn = match experts.next() {
+                Some(experts) => Ffn::Moe { router: vector(g, &p("ffn_gate_inp"))?, experts },
+                None => Ffn::Dense { gate: matrix(g, &p("ffn_gate"))?, up: matrix(g, &p("ffn_up"))?, down: matrix(g, &p("ffn_down"))? },
+            };
             layers.push(Layer {
                 attn_norm: vector(g, &p("attn_norm"))?,
                 wq: matrix(g, &p("attn_q"))?,
@@ -134,9 +211,7 @@ impl<'a> Model<'a> {
                 q_norm: g.tensor(&p("attn_q_norm")).map(|_| vector(g, &p("attn_q_norm"))).transpose()?,
                 k_norm: g.tensor(&p("attn_k_norm")).map(|_| vector(g, &p("attn_k_norm"))).transpose()?,
                 ffn_norm: vector(g, &p("ffn_norm"))?,
-                w_gate: matrix(g, &p("ffn_gate"))?,
-                w_up: matrix(g, &p("ffn_up"))?,
-                w_down: matrix(g, &p("ffn_down"))?,
+                ffn,
             });
         }
         // small models tie the output projection to the embedding table
@@ -161,6 +236,8 @@ pub struct Session {
     att_partial: Vec<f32>,
     proj: Vec<f32>,
     gate: Vec<f32>,
+    picks: Vec<(usize, f32)>, // mixture of experts: (expert, weight) per token and pick
+    moe: MoeScratch,
     pub logits: Vec<f32>,
     rope_inv_freq: Vec<f32>,
 }
@@ -185,6 +262,8 @@ impl Session {
             att_partial: Vec::new(),
             proj: Vec::new(),
             gate: Vec::new(),
+            picks: Vec::new(),
+            moe: MoeScratch::default(),
             logits: vec![0.0; cfg.vocab],
             rope_inv_freq: (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.rope_dim as f32)).collect(),
         }
@@ -206,6 +285,61 @@ impl Session {
             (&mut self.gate, cfg.ffn_dim),
         ] {
             buf.resize(n * width, 0.0);
+        }
+    }
+}
+
+/// Scratch for the CPU expert path, reused between calls.
+#[derive(Default)]
+pub struct MoeScratch {
+    logits: Vec<f32>,
+    by_expert: Vec<Vec<(usize, f32)>>, // per expert: (token, weight)
+    xin: Vec<f32>,
+    xq: QuantizedBatch,
+    h: Vec<f32>,
+    out: Vec<f32>,
+}
+
+/// Routes each of the `xb.len() / dim` (normalised) rows: `picks` gets k (expert, weight) pairs per row.
+pub fn moe_route(router: &[f32], k: usize, xb: &[f32], dim: usize, picks: &mut Vec<(usize, f32)>, sc: &mut MoeScratch) {
+    let n_experts = router.len() / dim;
+    picks.clear();
+    let mut top = Vec::with_capacity(n_experts);
+    for row in xb.chunks_exact(dim) {
+        sc.logits.clear();
+        sc.logits.extend(router.chunks_exact(dim).map(|w| dot_f32(w, row)));
+        route(&sc.logits, k, &mut top);
+        picks.extend_from_slice(&top);
+    }
+}
+
+/// `acc[b] += Σ weight · expert(xb[b])` over the k experts `picks` gives row b (`expert(e)` hands out
+/// expert e of `n_experts`). Rows sharing an expert run through it together, so each expert's weights
+/// are read once per batch.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts<'e>(n_experts: usize, expert: impl Fn(usize) -> Expert<'e>, picks: &[(usize, f32)], k: usize, xb: &[f32], dim: usize, acc: &mut [f32], sc: &mut MoeScratch) {
+    sc.by_expert.resize_with(n_experts, Vec::new);
+    sc.by_expert.iter_mut().for_each(Vec::clear);
+    for (i, &(e, w)) in picks.iter().enumerate() {
+        sc.by_expert[e].push((i / k, w));
+    }
+    for (e, rows) in sc.by_expert.iter().enumerate().filter(|(_, r)| !r.is_empty()) {
+        let ex = &expert(e);
+        let (m, hidden) = (rows.len(), ex.gate.rows);
+        sc.xin.clear();
+        for &(b, _) in rows {
+            sc.xin.extend_from_slice(&xb[b * dim..(b + 1) * dim]);
+        }
+        sc.h.resize(m * hidden, 0.0);
+        sc.out.resize(m * dim, 0.0);
+        sc.xq.quantize(&sc.xin, dim);
+        gate_up_silu(&ex.gate, &ex.up, &sc.xin, &sc.xq, &mut sc.h);
+        sc.xq.quantize(&sc.h, hidden);
+        ex.down.matmul(&sc.h, &sc.xq, &mut sc.out);
+        for (&(b, w), o) in rows.iter().zip(sc.out.chunks_exact(dim)) {
+            for (a, v) in acc[b * dim..(b + 1) * dim].iter_mut().zip(o) {
+                *a += w * v;
+            }
         }
     }
 }
@@ -324,12 +458,18 @@ impl Model<'_> {
                 rms_norm_rows(&mut s.xb, &s.x, &layer.ffn_norm, c.norm_eps);
                 s.xq.quantize(&s.xb, dim);
             });
-            profile::time(6, || {
-                gate_up_silu(&layer.w_gate, &layer.w_up, &s.xb, &s.xq, &mut s.gate);
-                s.xq.quantize(&s.gate, c.ffn_dim);
-                layer.w_down.matmul(&s.gate, &s.xq, &mut s.proj);
-                for (x, f) in s.x.iter_mut().zip(&s.proj) {
-                    *x += f;
+            profile::time(6, || match &layer.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    gate_up_silu(gate, up, &s.xb, &s.xq, &mut s.gate);
+                    s.xq.quantize(&s.gate, c.ffn_dim);
+                    down.matmul(&s.gate, &s.xq, &mut s.proj);
+                    for (x, f) in s.x.iter_mut().zip(&s.proj) {
+                        *x += f;
+                    }
+                }
+                Ffn::Moe { router, experts } => {
+                    moe_route(router, c.n_experts_used, &s.xb, dim, &mut s.picks, &mut s.moe);
+                    moe_experts(experts.len(), |e| experts[e], &s.picks, c.n_experts_used, &s.xb, dim, &mut s.x, &mut s.moe);
                 }
             });
         }
@@ -445,6 +585,24 @@ impl Model<'_> {
                 let inv = 1.0 / total;
                 out.iter_mut().for_each(|o| *o *= inv);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route;
+
+    #[test]
+    fn route_keeps_top_k_with_softmax_over_them() {
+        let logits = [0.5f32, 2.0, -1.0, 2.0, 1.0];
+        let mut picks = Vec::new();
+        route(&logits, 3, &mut picks);
+        // ties go to the lower expert index
+        assert_eq!(picks.iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 3, 4]);
+        let z = 2.0f32.exp() * 2.0 + 1.0f32.exp();
+        for (p, want) in picks.iter().zip([2.0f32.exp() / z, 2.0f32.exp() / z, 1.0f32.exp() / z]) {
+            assert!((p.1 - want).abs() < 1e-6, "{p:?} vs {want}");
         }
     }
 }

@@ -5,7 +5,7 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, OnceLock};
 
-use crate::gguf::{GgmlType, Gguf};
+use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::model::Config;
 use crate::profile;
 use crate::quant::f16_to_f32;
@@ -640,6 +640,78 @@ __device__ __forceinline__ void q6k_dp4a(DP4A_PARAMS) {
             }
         }
 }
+// Q3_K, repacked at upload to 112-byte blocks: a 16-byte header (12 scale bytes, f16 d, 2 pad bytes),
+// 32 high-bit bytes, 64 bytes of 2-bit pairs. Per 128-value half, 4 lanes take 8 consecutive positions
+// each of all 4 groups (the groups share the bytes: group j is bits 2j of the pairs and bit 4*half + j of
+// the high bits), so a lane decodes 32 values from two 8-byte loads. 8 lanes cover a super-block; the warp
+// walks four super-blocks per step. Values are 2 low bits + 4 * high bit - 4, as signed bytes for dp4a.
+#define Q3K_GPU_BYTES 112
+// 6-bit scale i (0..15) from the 12 scale bytes as three words, centred to -32..31
+__device__ __forceinline__ int q3k_scale(int i, unsigned w0, unsigned w1, unsigned w2) {
+    unsigned lo = (((i & 7) < 4 ? w0 : w1) >> (8 * (i & 3) + (i < 8 ? 0 : 4))) & 0xF;
+    unsigned hi = (w2 >> (8 * (i & 3) + 2 * (i >> 2))) & 3;
+    return (int)(lo | (hi << 4)) - 32;
+}
+template <int NT, int R>
+__device__ __forceinline__ void q3k_dp4a(DP4A_PARAMS) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
+    int lane = threadIdx.x & 31;
+    if (row0 >= rows) return;
+    int nsb = cols >> 8;
+    int qsel = lane >> 3, l8 = lane & 7, half = l8 >> 2, l0 = 8 * (l8 & 3), sub = l0 >> 4;
+    size_t row_bytes = (size_t)nsb * Q3K_GPU_BYTES;
+    float acc[R][NT];
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) acc[r][j] = 0.f;
+    #pragma unroll 2 // more super-blocks' loads in flight before any is used
+    for (int sb = qsel; sb < nsb; sb += 4) {
+        int q[R][4][2], sc[R][4];
+        float d[R];
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            int row = min(row0 + r, rows - 1); // past the end: computed, never stored
+            const unsigned char* b = w + (size_t)row * row_bytes + (size_t)sb * Q3K_GPU_BYTES;
+            int4 hdr = *reinterpret_cast<const int4*>(b);
+            int2 hm = *reinterpret_cast<const int2*>(b + 16 + l0), qs = *reinterpret_cast<const int2*>(b + 48 + 32 * half + l0);
+            d[r] = h2f((unsigned)hdr.w & 0xFFFF);
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                int hs = 4 * half + g; // shifts below are safe: every byte is masked
+                q[r][g][0] = __vsub4(((qs.x >> (2 * g)) & 0x03030303) | (((hm.x >> hs) & 0x01010101) << 2), 0x04040404);
+                q[r][g][1] = __vsub4(((qs.y >> (2 * g)) & 0x03030303) | (((hm.y >> hs) & 0x01010101) << 2), 0x04040404);
+                sc[r][g] = q3k_scale(8 * half + 2 * g + sub, hdr.x, hdr.y, hdr.z);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            if (j < n) {
+                const signed char* x = xq + (size_t)j * cols;
+                const float* dx = xd + (size_t)j * (cols >> 5);
+                #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    int pos = sb * 256 + 128 * half + 32 * g + l0;
+                    int2 xv = *reinterpret_cast<const int2*>(x + pos);
+                    float dg = dx[pos >> 5];
+                    #pragma unroll
+                    for (int r = 0; r < R; r++) acc[r][j] += d[r] * (float)sc[r][g] * dg * (float)__dp4a(q[r][g][0], xv.x, __dp4a(q[r][g][1], xv.y, 0));
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            float v = warp_sum(acc[r][j]);
+            if (lane == 0 && j < n && row0 + r < rows) {
+                size_t idx = (size_t)j * out_stride + out_off + row0 + r;
+                out[idx] = accumulate ? out[idx] + v : v;
+            }
+        }
+}
+
 // Q8_0 (used for draft models): one row per warp, each lane 16 int8 weights and 16 activations per step.
 template <int NT>
 __device__ __forceinline__ void q8_dp4a(DP4A_PARAMS) {
@@ -684,6 +756,30 @@ __global__ void matmul_q6k_dp4a(DP4A_PARAMS) { q6k_dp4a<1, RPW>(DP4A_ARGS); }
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q6k_dp4a8(DP4A_PARAMS) { q6k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
 __global__ void matmul_q8_dp4a(DP4A_PARAMS) { q8_dp4a<1>(DP4A_ARGS); }
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q8_dp4a8(DP4A_PARAMS) { q8_dp4a<8>(DP4A_ARGS); }
+// Mixture of experts, one token, for the experts held in GPU memory. ptrs is a table of matrix
+// addresses: gate and up of expert k at 2k and 2k + 1, its down at 2 * nk + k; blockIdx.y picks the entry.
+// gate / up: row block y of out gets matrix y applied to the token's int8 activations.
+__global__ void moe_gate_up_q3k(const unsigned long long* __restrict__ ptrs, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                                const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    q3k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[blockIdx.y]), nullptr, xq, xd, xs, out + (size_t)blockIdx.y * rows, rows, cols, 1, 0, 0, 0);
+}
+// down: expert k reads its own activations (row k of xq / xd / xs, written by silu_q8)
+__global__ void moe_down_q4k(const unsigned long long* __restrict__ ptrs, int nk, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                             const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    int k = blockIdx.y;
+    q4k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
+                   xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
+}
+// x += cpu (the experts computed on the CPU; may be null) + sum over k of wts[k] * outs[k]
+__global__ void moe_combine(float* __restrict__ x, const float* __restrict__ outs, const float* __restrict__ wts, int nk,
+                            const float* __restrict__ cpu, int dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+    float v = cpu ? cpu[i] : 0.f;
+    for (int k = 0; k < nk; k++) v += wts[k] * outs[(size_t)k * dim + i];
+    x[i] += v;
+}
+
 #define KQ_ARGS const unsigned char* __restrict__ w, const float* __restrict__ wd, const float* __restrict__ x, \
                 float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off
 __global__ void matmul_q4k_1(KQ_ARGS) { q4k_matvec<1>(w, x, out, rows, cols, n, accumulate, out_stride, out_off); }
@@ -1951,6 +2047,84 @@ __global__ void silu_mul(const float* __restrict__ gu, float* __restrict__ h, in
     h[i] = g / (1.f + expf(-g)) * u;
 }
 
+// ---- mixture of experts, prompt batches ----
+
+// Router logits: out[t * ne + e] = dot(xb[t], R[e]), f32 throughout (the routing must not depend on
+// rounding). One block per token: its row goes to shared memory, each warp takes experts in turn.
+__global__ void router_logits(const float* __restrict__ xb, const float* __restrict__ R, float* __restrict__ out, int dim, int ne) {
+    extern __shared__ float row[];
+    const float* x = xb + (size_t)blockIdx.x * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) row[d] = x[d];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+    for (int e = warp; e < ne; e += nwarps) {
+        const float* r = R + (size_t)e * dim;
+        float acc = 0.f;
+        for (int d = lane; d < dim; d += 32) acc += row[d] * r[d];
+        acc = warp_sum(acc);
+        if (lane == 0) out[(size_t)blockIdx.x * ne + e] = acc;
+    }
+}
+
+// out[i] = xb[idx[i]] for the m rows an expert takes (one block per row)
+__global__ void moe_gather(const float* __restrict__ xb, const int* __restrict__ idx, float* __restrict__ out, int dim) {
+    const float4* s = reinterpret_cast<const float4*>(xb + (size_t)idx[blockIdx.x] * dim);
+    float4* o = reinterpret_cast<float4*>(out + (size_t)blockIdx.x * dim);
+    for (int d = threadIdx.x; d < dim / 4; d += blockDim.x) o[d] = s[d];
+}
+
+// x[idx[i]] += w[i] * y[i]; an expert takes each token at most once, so the rows never collide
+__global__ void moe_scatter(float* __restrict__ x, const float* __restrict__ y, const int* __restrict__ idx, const float* __restrict__ w, int dim) {
+    float* o = x + (size_t)idx[blockIdx.x] * dim;
+    const float* s = y + (size_t)blockIdx.x * dim;
+    float wi = w[blockIdx.x];
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) o[d] += wi * s[d];
+}
+
+// GPU Q3_K (112-byte blocks) to Q8: int8 per value and an f32 scale per 32 (requantised: a 32-value
+// block spans two of the 16-value scales). One warp per 32 values.
+__global__ void q3k_to_q8(const unsigned char* __restrict__ w, signed char* __restrict__ q, float* __restrict__ d, int blocks32) {
+    int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b >= blocks32) return;
+    int sb = b >> 3, k = b & 7, half = k >> 2, g = k & 3, l = lane; // value l of group g in half `half`
+    const unsigned char* blk = w + (size_t)sb * Q3K_GPU_BYTES;
+    const unsigned* hdr = reinterpret_cast<const unsigned*>(blk);
+    int qv = ((blk[48 + 32 * half + l] >> (2 * g)) & 3) - (((blk[16 + l] >> (4 * half + g)) & 1) ? 0 : 4);
+    float v = h2f(hdr[3] & 0xFFFF) * (float)q3k_scale(8 * half + 2 * g + (l >> 4), hdr[0], hdr[1], hdr[2]) * (float)qv;
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    float dd = amax / 127.f;
+    q[(size_t)b * 32 + l] = (signed char)__float2int_rn(dd != 0.f ? v / dd : 0.f);
+    if (lane == 0) d[b] = dd;
+}
+
+// GGUF Q5_K (176-byte blocks: f16 d, f16 dmin, 12 scale bytes, 32 high-bit bytes, 128 nibble bytes) to
+// Q8 as above. 32-value block k of a super-block is sub-block k (scale and min from the 12 bytes).
+__global__ void q5k_to_q8(const unsigned char* __restrict__ w, signed char* __restrict__ q, float* __restrict__ d, int blocks32) {
+    int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b >= blocks32) return;
+    int sb = b >> 3, k = b & 7, l = lane;
+    const unsigned char* blk = w + (size_t)sb * 176;
+    int sc, m;
+    q4k_scale_min(k, blk + 4, &sc, &m);
+    int lo = blk[48 + 32 * (k >> 1) + l];
+    lo = (k & 1) ? (lo >> 4) : (lo & 15);
+    int qv = lo | (((blk[16 + l] >> k) & 1) << 4);
+    unsigned dm = *reinterpret_cast<const unsigned*>(blk);
+    float v = h2f(dm & 0xFFFF) * sc * qv - h2f(dm >> 16) * m;
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    float dd = amax / 127.f;
+    q[(size_t)b * 32 + l] = (signed char)__float2int_rn(dd != 0.f ? v / dd : 0.f);
+    if (lane == 0) d[b] = dd;
+}
+
+// x[i] += y[i] (the residual add of a feed-forward computed elsewhere, e.g. experts on the CPU)
+__global__ void add_rows(float* __restrict__ x, const float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
 }
 "#;
 
@@ -2198,6 +2372,15 @@ struct Kernels {
     attention_prefill_tc: Option<[Ptr; 2]>, // f16 tensor cores (sm_75+), head size 64 / 128
     silu_mul: Ptr,
     silu_q8: Ptr,
+    add_rows: Ptr,
+    moe_gate_up_q3k: Ptr,
+    moe_down_q4k: Ptr,
+    moe_combine: Ptr,
+    router_logits: Ptr,
+    moe_gather: Ptr,
+    moe_scatter: Ptr,
+    q3k_to_q8: Ptr,
+    q5k_to_q8: Ptr,
     /// every launch goes here (a blocking stream: the synchronous copies still order against it); CUDA
     /// graphs need a stream other than the legacy default one
     stream: Ptr,
@@ -2323,6 +2506,15 @@ impl Kernels {
                 },
                 silu_mul: get("silu_mul")?,
                 silu_q8: get("silu_q8")?,
+                add_rows: get("add_rows")?,
+                moe_gate_up_q3k: get("moe_gate_up_q3k")?,
+                moe_down_q4k: get("moe_down_q4k")?,
+                moe_combine: get("moe_combine")?,
+                router_logits: get("router_logits")?,
+                moe_gather: get("moe_gather")?,
+                moe_scatter: get("moe_scatter")?,
+                q3k_to_q8: get("q3k_to_q8")?,
+                q5k_to_q8: get("q5k_to_q8")?,
                 stream: {
                     let mut st: Ptr = std::ptr::null_mut();
                     a.check((f.cuStreamCreate)(&mut st, 0), "stream")?;
@@ -2397,6 +2589,7 @@ fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> R
     Ok(())
 }
 const GPU_Q6K_BYTES: usize = 208; // a Q6_K block on the GPU, without its d (must match Q6K_BYTES in the kernels)
+const Q3K_GPU_BYTES: usize = 112; // a Q3_K block repacked for the GPU (must match Q3K_GPU_BYTES in the kernels)
 
 impl Uploader {
     fn new() -> Result<Uploader, String> {
@@ -2583,6 +2776,11 @@ impl GpuMatrix {
     fn d_ptr(&self) -> u64 {
         self.d.as_ref().map_or(0, |d| d.ptr)
     }
+
+    /// A matrix in memory owned elsewhere (an expert slot, a scratch buffer); never freed through this.
+    fn view(fmt: Fmt, q: u64, d: Option<u64>, rows: usize, cols: usize) -> std::mem::ManuallyDrop<GpuMatrix> {
+        std::mem::ManuallyDrop::new(GpuMatrix { fmt, q: DeviceBuf { ptr: q, bytes: 0 }, d: d.map(|ptr| DeviceBuf { ptr, bytes: 0 }), rows, cols })
+    }
 }
 
 /// Uploads tensors whose rows are concatenated in one output (e.g. Q, K and V). Neighbours of the same
@@ -2606,7 +2804,8 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
         let cols = run[0].dims[0] as usize;
         let rows: usize = run.iter().map(|t| t.dims[1] as usize).sum();
         let (fmt, gpu_bytes) = match ty {
-            GgmlType::Q8_0 => (Fmt::Q8, rows * cols),
+            // no 3- or 5-bit GPU kernels yet: requantised to int8 (about 2.4x / 1.5x the memory)
+            GgmlType::Q8_0 | GgmlType::Q3K | GgmlType::Q5K => (Fmt::Q8, rows * cols),
             GgmlType::Q4K => (Fmt::Q4K, run.iter().map(|t| t.n_bytes).sum()),
             GgmlType::Q6K => (Fmt::Q6K, rows * (cols / 256) * GPU_Q6K_BYTES),
             other => return Err(format!("GPU backend does not handle {} weights yet", other.name())),
@@ -2627,6 +2826,11 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
                     o.copy_from_slice(&i[..GPU_Q6K_BYTES]);
                     f16_to_f32(u16::from_le_bytes([i[GPU_Q6K_BYTES], i[GPU_Q6K_BYTES + 1]]))
                 })?,
+                Fmt::Q8 if t.ty != GgmlType::Q8_0 => {
+                    let (qb, ds) = requant_q8(g, t);
+                    up.put(dst, &qb)?;
+                    d.extend_from_slice(&ds);
+                }
                 // 34-byte blocks: f16 d, then 32 int8 values
                 Fmt::Q8 => up.put_repacked(dst, &g.path, t.offset as u64, t.n_bytes, (34, 32), &mut d, |i, o| {
                     o.copy_from_slice(&i[2..]);
@@ -2636,7 +2840,7 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
             off += match fmt {
                 Fmt::Q4K => t.n_bytes,
                 Fmt::Q6K => t.n_bytes / 210 * GPU_Q6K_BYTES,
-                Fmt::Q8 => t.n_bytes / 34 * 32,
+                Fmt::Q8 => t.n_elements() as usize,
             };
             up.file_secs += tf.elapsed().as_secs_f64();
         }
@@ -2645,6 +2849,32 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
         row_off += rows;
     }
     Ok(parts)
+}
+
+/// A 2-D tensor of another format (Q3_K, Q5_K) as GPU Q8: int8 values and an f32 scale per 32,
+/// requantised from the dequantised rows on every CPU thread.
+fn requant_q8(g: &Gguf, t: &TensorInfo) -> (Vec<u8>, Vec<f32>) {
+    use rayon::prelude::*;
+    let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
+    let m = crate::quant::Matrix { data: &g.mmap[t.offset..t.offset + t.n_bytes], ty: t.ty, rows, cols };
+    let mut q = vec![0u8; rows * cols];
+    let mut d = vec![0f32; rows * cols / 32];
+    q.par_chunks_mut(cols).zip(d.par_chunks_mut(cols / 32)).enumerate().for_each_init(
+        || vec![0f32; cols],
+        |row, (r, (qr, dr))| {
+            m.row_f32(r, row);
+            for ((blk, qb), dv) in row.chunks_exact(32).zip(qr.chunks_exact_mut(32)).zip(dr) {
+                let amax = blk.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let s = amax / 127.0;
+                let inv = if s != 0.0 { 1.0 / s } else { 0.0 };
+                for (o, v) in qb.iter_mut().zip(blk) {
+                    *o = (v * inv).round() as i8 as u8;
+                }
+                *dv = s;
+            }
+        },
+    );
+    (q, d)
 }
 
 fn upload_one(g: &Gguf, name: &str, up: &mut Uploader) -> Result<GpuMatrix, String> {
@@ -2668,8 +2898,298 @@ struct GpuLayer {
     k_norm: Option<DeviceBuf>,
     wo: GpuMatrix,
     ffn_norm: DeviceBuf,
-    gate_up: Vec<(GpuMatrix, usize)>, // [gate | up]
-    down: GpuMatrix,
+    ffn: GpuFfn,
+}
+
+enum GpuFfn {
+    Dense { gate_up: Vec<(GpuMatrix, usize)>, down: GpuMatrix }, // gate_up: [gate | up]
+    /// mixture of experts: routed and computed on the CPU (GpuModel::moe)
+    Moe,
+}
+
+/// The experts of a mixture-of-experts model, run on the CPU straight from the model file (its own
+/// mapping of it; the OS shares the pages with any other).
+struct CpuMoe {
+    mmap: memmap2::Mmap,
+    routers: Vec<Vec<f32>>,          // per layer: n_experts rows of dim logit weights
+    tensors: Vec<[ExpertTensor; 3]>, // per layer: gate, up, down
+}
+
+/// Where one 3-D expert tensor lies in the file: expert e's matrix starts at offset + e * stride.
+#[derive(Clone, Copy)]
+struct ExpertTensor {
+    offset: usize,
+    stride: usize,
+    ty: GgmlType,
+    rows: usize,
+    cols: usize,
+}
+
+impl CpuMoe {
+    fn load(g: &Gguf, cfg: &Config) -> Result<CpuMoe, String> {
+        let file = std::fs::File::open(&g.path).map_err(|e| format!("cannot open {}: {e}", g.path.display()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("cannot map {}: {e}", g.path.display()))?;
+        let mut routers = Vec::with_capacity(cfg.n_layers);
+        let mut tensors = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            let p = |s: &str| format!("blk.{i}.{s}.weight");
+            let r = g.tensor(&p("ffn_gate_inp")).ok_or_else(|| format!("missing tensor {}", p("ffn_gate_inp")))?;
+            if r.ty != GgmlType::F32 || r.n_elements() as usize != cfg.n_experts * cfg.dim {
+                return Err(format!("{}: expected an F32 router of {} x {}", r.name, cfg.n_experts, cfg.dim));
+            }
+            routers.push(g.mmap[r.offset..r.offset + r.n_bytes].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect());
+            let part = |name: &str, rows: usize, cols: usize| -> Result<ExpertTensor, String> {
+                let t = g.tensor(&p(name)).ok_or_else(|| format!("missing tensor {}", p(name)))?;
+                if t.ty.block().is_none() || t.dims[..] != [cols as u64, rows as u64, cfg.n_experts as u64] {
+                    return Err(format!("{}: unexpected {} tensor of shape {:?}", t.name, t.ty.name(), t.dims));
+                }
+                Ok(ExpertTensor { offset: t.offset, stride: t.n_bytes / cfg.n_experts, ty: t.ty, rows, cols })
+            };
+            let (dim, ffn) = (cfg.dim, cfg.expert_ffn_dim);
+            tensors.push([part("ffn_gate_exps", ffn, dim)?, part("ffn_up_exps", ffn, dim)?, part("ffn_down_exps", dim, ffn)?]);
+        }
+        Ok(CpuMoe { mmap, routers, tensors })
+    }
+
+    fn expert(&self, l: usize, e: usize) -> crate::model::Expert<'_> {
+        let m = |t: &ExpertTensor| {
+            let at = t.offset + e * t.stride;
+            crate::quant::Matrix { data: &self.mmap[at..at + t.stride], ty: t.ty, rows: t.rows, cols: t.cols }
+        };
+        let [gate, up, down] = &self.tensors[l];
+        crate::model::Expert { gate: m(gate), up: m(up), down: m(down) }
+    }
+}
+
+/// Host-side scratch of the CPU expert path.
+#[derive(Default)]
+struct MoeHost {
+    xb: Vec<f32>,
+    acc: Vec<f32>,
+    picks: Vec<(usize, f32)>,
+    cpu_picks: Vec<(usize, f32)>,
+    scratch: crate::model::MoeScratch,
+}
+
+/// Picks (routing decisions) after which every expert's heat is halved, so the cache follows the
+/// current work rather than freezing on what came first.
+const HEAT_HALF_LIFE: usize = 1024;
+/// Expert uploads per token at most: promotions never stall generation for long.
+const MAX_PROMOTIONS_PER_TOKEN: usize = 8;
+
+/// Experts of a mixture-of-experts model held in GPU memory: the ones the router picks most get a slot
+/// and run on the GPU; the rest run on the CPU. Only layers whose experts the GPU kernels handle (Q3_K
+/// gate and up, Q4_K down) are cached. Placement never changes which experts run, only where (and the
+/// rounding of their sums).
+struct ExpertCache {
+    buf: DeviceBuf,
+    slot_bytes: usize,
+    gate_bytes: usize,                  // repacked gate (= up) matrix; down follows both
+    slot_of: Vec<Vec<i32>>,             // [layer][expert] -> slot, or -1
+    owner: Vec<Option<(usize, usize)>>, // per slot: (layer, expert)
+    free: Vec<usize>,
+    heat: Vec<Vec<f32>>, // [layer][expert]: picks, halved every HEAT_HALF_LIFE tokens
+    cacheable: Vec<bool>,
+    tokens: usize,
+    promoted_this_token: usize,
+    staging: Vec<u8>,
+    pub uploads: usize,
+    // prompt batches: every expert runs on the GPU, the uncached ones staged through two pinned buffers
+    // into two scratch slots (double-buffered: the next expert's copy overlaps this one's maths)
+    routers: Vec<DeviceBuf>, // per layer, f32
+    pinned: [*mut u8; 2],
+    scratch: [DeviceBuf; 2],
+    scratch_bytes: usize,
+    events: [Ptr; 2],
+    next: usize,
+    conv_q: DeviceBuf, // an expert's [gate | up] (or a down) converted to Q8 for the batched kernels
+    conv_d: DeviceBuf,
+    idx: DeviceBuf, // per layer: the tokens of each expert in turn, and their weights
+    staged: usize,
+}
+
+impl Drop for ExpertCache {
+    fn drop(&mut self) {
+        if let Ok(a) = api() {
+            for p in self.pinned.iter().filter(|p| !p.is_null()) {
+                unsafe { (a.f.cuMemFreeHost)(*p as *mut c_void) };
+            }
+        }
+    }
+}
+
+impl ExpertCache {
+    /// As many slots as `budget` bytes hold after the prompt-batch buffers (none if no layer is cacheable).
+    fn new(moe: &CpuMoe, cfg: &Config, budget: usize) -> Result<ExpertCache, String> {
+        let a = api()?;
+        let cacheable: Vec<bool> = moe.tensors.iter().map(|[g, u, d]| g.ty == GgmlType::Q3K && u.ty == GgmlType::Q3K && d.ty == GgmlType::Q4K).collect();
+        let shape = moe.tensors.iter().zip(&cacheable).find(|(_, c)| **c).map(|(t, _)| *t);
+        let [g0, _, _] = moe.tensors[0];
+        let gate_bytes = g0.rows * (g0.cols / 256) * Q3K_GPU_BYTES;
+        let slot_bytes = match shape {
+            Some([_, _, d]) => 2 * gate_bytes + d.stride,
+            None => 1,
+        };
+        // a scratch slot holds any layer's expert (some downs are bigger formats than the cached ones)
+        let scratch_bytes = 2 * gate_bytes + moe.tensors.iter().map(|t| t[2].stride).max().unwrap_or(0);
+        let routers = moe.routers.iter().map(|r| DeviceBuf::alloc(r.len() * 4).and_then(|b| b.write(r).map(|_| b))).collect::<Result<Vec<_>, _>>()?;
+        let conv_elems = (2 * g0.rows * g0.cols).max(g0.rows * g0.cols);
+        let extras = routers.iter().map(|b| b.bytes).sum::<usize>() + 2 * scratch_bytes + conv_elems * 9 / 8 + 8 * MAX_BATCH * 8;
+        let slots = if shape.is_some() { (budget.saturating_sub(extras) / slot_bytes).min(cfg.n_layers * cfg.n_experts) } else { 0 };
+        let mut pinned = [std::ptr::null_mut(); 2];
+        let mut events = [std::ptr::null_mut(); 2];
+        for i in 0..2 {
+            let mut p: *mut c_void = std::ptr::null_mut();
+            a.check(unsafe { (a.f.cuMemAllocHost_v2)(&mut p, scratch_bytes) }, "pinned expert staging")?;
+            pinned[i] = p as *mut u8;
+            a.check(unsafe { (a.f.cuEventCreate)(&mut events[i], 0) }, "event")?;
+        }
+        Ok(ExpertCache {
+            buf: DeviceBuf::alloc(slots * slot_bytes)?,
+            slot_bytes,
+            gate_bytes,
+            slot_of: vec![vec![-1; cfg.n_experts]; cfg.n_layers],
+            owner: vec![None; slots],
+            free: (0..slots).rev().collect(),
+            heat: vec![vec![0.0; cfg.n_experts]; cfg.n_layers],
+            cacheable,
+            tokens: 0,
+            promoted_this_token: 0,
+            staging: vec![0u8; slot_bytes],
+            uploads: 0,
+            routers,
+            pinned,
+            scratch: [DeviceBuf::alloc(scratch_bytes)?, DeviceBuf::alloc(scratch_bytes)?],
+            scratch_bytes,
+            events,
+            next: 0,
+            conv_q: DeviceBuf::alloc(conv_elems)?,
+            conv_d: DeviceBuf::alloc(conv_elems / 32 * 4)?,
+            idx: DeviceBuf::alloc(8 * MAX_BATCH * 8)?,
+            staged: 0,
+        })
+    }
+
+    /// Gate and up as GPU Q3_K (112-byte blocks: the 16-byte header first) into `out`, then the down's
+    /// blocks as they are.
+    fn pack(moe: &CpuMoe, l: usize, e: usize, gate_bytes: usize, out: &mut [u8]) -> usize {
+        let ex = moe.expert(l, e);
+        for (m, dst) in [(ex.gate, 0), (ex.up, gate_bytes)] {
+            for (blk, o) in m.data.chunks_exact(110).zip(out[dst..dst + gate_bytes].chunks_exact_mut(Q3K_GPU_BYTES)) {
+                o[..12].copy_from_slice(&blk[96..108]); // scales
+                o[12..14].copy_from_slice(&blk[108..110]); // d
+                o[14..16].fill(0);
+                o[16..48].copy_from_slice(&blk[..32]); // high bits
+                o[48..112].copy_from_slice(&blk[32..96]); // 2-bit pairs
+            }
+        }
+        out[2 * gate_bytes..2 * gate_bytes + ex.down.data.len()].copy_from_slice(ex.down.data);
+        2 * gate_bytes + ex.down.data.len()
+    }
+
+    /// An uncached expert into the next scratch slot (asynchronously, on the launch stream): returns
+    /// its gate, up and down addresses and the scratch index to `release` after its kernels are queued.
+    fn stage(&mut self, moe: &CpuMoe, l: usize, e: usize, stream: Ptr) -> Result<([u64; 3], usize), String> {
+        let a = api()?;
+        let i = self.next;
+        self.next ^= 1;
+        // the GPU is done with this pinned buffer and scratch slot (copy and kernels of two experts ago)
+        a.check(unsafe { (a.f.cuEventSynchronize)(self.events[i]) }, "staging wait")?;
+        let buf = unsafe { std::slice::from_raw_parts_mut(self.pinned[i], self.scratch_bytes) };
+        let bytes = Self::pack(moe, l, e, self.gate_bytes, buf);
+        let dst = self.scratch[i].ptr;
+        a.check(unsafe { (a.f.cuMemcpyHtoDAsync_v2)(dst, self.pinned[i] as *const c_void, bytes, stream) }, "expert staging copy")?;
+        self.staged += 1;
+        let gb = self.gate_bytes as u64;
+        Ok(([dst, dst + gb, dst + 2 * gb], i))
+    }
+
+    fn release(&self, i: usize, stream: Ptr) -> Result<(), String> {
+        let a = api()?;
+        a.check(unsafe { (a.f.cuEventRecord)(self.events[i], stream) }, "event record")
+    }
+
+    fn slots(&self) -> usize {
+        self.owner.len()
+    }
+
+    /// Device addresses of a cached expert's gate, up and down.
+    fn ptrs(&self, slot: usize) -> [u64; 3] {
+        let base = self.buf.ptr + (slot * self.slot_bytes) as u64;
+        [base, base + self.gate_bytes as u64, base + 2 * self.gate_bytes as u64]
+    }
+
+    /// Copies expert e of layer l into `slot`: gate and up repacked to 112-byte Q3_K blocks (16-byte
+    /// header first), down as its Q4_K blocks.
+    fn upload(&mut self, moe: &CpuMoe, l: usize, e: usize, slot: usize) -> Result<(), String> {
+        Self::pack(moe, l, e, self.gate_bytes, &mut self.staging);
+        let a = api()?;
+        let dst = self.buf.ptr + (slot * self.slot_bytes) as u64;
+        a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(dst, self.staging.as_ptr() as *const c_void, self.slot_bytes) }, "expert upload")?;
+        if let Some((ol, oe)) = self.owner[slot] {
+            self.slot_of[ol][oe] = -1;
+        }
+        self.owner[slot] = Some((l, e));
+        self.slot_of[l][e] = slot as i32;
+        self.uploads += 1;
+        Ok(())
+    }
+
+    /// Records layer l's picks and promotes uncached ones: into a free slot, or over the coldest
+    /// resident when clearly hotter (25% + 4 picks, so the cache does not churn).
+    fn note(&mut self, moe: &CpuMoe, l: usize, picks: &[(usize, f32)]) -> Result<(), String> {
+        for &(e, _) in picks {
+            self.heat[l][e] += 1.0;
+        }
+        if !self.cacheable[l] || self.slots() == 0 {
+            return Ok(());
+        }
+        for &(e, _) in picks {
+            if self.slot_of[l][e] >= 0 {
+                continue;
+            }
+            // free slots fill without limit (the cache warms up during the first prompt); evictions are rationed
+            let slot = match self.free.pop() {
+                Some(s) => s,
+                None if self.promoted_this_token >= MAX_PROMOTIONS_PER_TOKEN => continue,
+                None => {
+                    let heat = &self.heat;
+                    let (slot, cold) = self
+                        .owner
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(s, o)| o.map(|(ol, oe)| (s, heat[ol][oe])))
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .unwrap();
+                    if self.heat[l][e] <= cold * 1.25 + 4.0 {
+                        continue;
+                    }
+                    slot
+                }
+            };
+            if self.owner[slot].is_some() {
+                self.promoted_this_token += 1;
+            }
+            self.upload(moe, l, e, slot)?;
+        }
+        Ok(())
+    }
+
+    /// Slots, how many hold an expert, and uploads so far (BETTERLLAMA_LOAD_TIMES reports them).
+    fn describe(&self) -> String {
+        let used = self.owner.iter().filter(|o| o.is_some()).count();
+        format!("{} slots ({} MB), {used} in use, {} uploads, {} staged for prompts", self.slots(), self.slots() * self.slot_bytes >> 20, self.uploads, self.staged)
+    }
+
+    /// Called once per generated (or prompt) token.
+    fn tick(&mut self, n: usize) {
+        self.promoted_this_token = 0;
+        let before = self.tokens / HEAT_HALF_LIFE;
+        self.tokens += n;
+        if self.tokens / HEAT_HALF_LIFE != before {
+            self.heat.iter_mut().flatten().for_each(|h| *h *= 0.5);
+        }
+    }
 }
 
 pub struct GpuModel {
@@ -2679,6 +3199,9 @@ pub struct GpuModel {
     output: Option<GpuMatrix>, // None = tied to the embedding
     output_norm: DeviceBuf,
     layers: Vec<GpuLayer>,
+    moe: Option<CpuMoe>,
+    /// the GPU-resident experts, made on the first forward pass from the memory left then
+    cache: std::cell::RefCell<Option<ExpertCache>>,
     prefill_shared: Option<usize>,
     pub device: String,
     /// Q8_0 weights decode with int8 activations too (for draft models; otherwise exact f32)
@@ -2706,10 +3229,14 @@ impl GpuModel {
             let k_norm = if g.tensor(&p("attn_k_norm")).is_some() { Some(upload_vec(g, &p("attn_k_norm"), up)?) } else { None };
             let wo = upload_one(g, &p("attn_output"), up)?;
             let ffn_norm = upload_vec(g, &p("ffn_norm"), up)?;
-            let gate_up = upload_parts(g, &[p("ffn_gate"), p("ffn_up")], up)?;
-            let down = upload_one(g, &p("ffn_down"), up)?;
-            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, wo, ffn_norm, gate_up, down });
+            let ffn = if cfg.is_moe() {
+                GpuFfn::Moe
+            } else {
+                GpuFfn::Dense { gate_up: upload_parts(g, &[p("ffn_gate"), p("ffn_up")], up)?, down: upload_one(g, &p("ffn_down"), up)? }
+            };
+            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, wo, ffn_norm, ffn });
         }
+        let moe = if cfg.is_moe() { Some(CpuMoe::load(g, &cfg)?) } else { None };
         let embd = upload_one(g, "token_embd.weight", up)?;
         let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight", up)?) } else { None };
 
@@ -2727,7 +3254,7 @@ impl GpuModel {
         }
         let output_norm = upload_vec(g, "output_norm.weight", up)?;
         up.finish()?;
-        let model = GpuModel { output_norm, cfg, k, embd, output, layers, prefill_shared, device, int8_q8: false };
+        let model = GpuModel { output_norm, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false };
         if std::env::var_os("BETTERLLAMA_LOAD_TIMES").is_some() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
@@ -2981,7 +3508,8 @@ impl GpuModel {
         s.tokens.write(&ids)?;
         // one-token steps replay a CUDA graph captured on the session's first one (BETTERLLAMA_NO_GRAPH=1:
         // plain launches); the kernels then read the position from s.pos_dev
-        if n == 1 && want != Out::None && graphs_enabled() {
+        // (not for a mixture of experts: its experts run on the CPU between the kernels)
+        if n == 1 && want != Out::None && graphs_enabled() && !self.cfg.is_moe() {
             s.pos_dev.write(&[s.pos as i32])?;
             let slot = (want == Out::Argmax) as usize;
             if s.graphs[slot].is_null() {
@@ -3011,7 +3539,181 @@ impl GpuModel {
             picks = ids.into_iter().map(|i| i as u32).collect();
         }
         s.pos += n;
+        if let Some(cache) = self.cache.borrow_mut().as_mut() {
+            cache.tick(n);
+        }
         Ok(picks)
+    }
+
+    /// Mixture-of-experts feed-forward of layer `l`. The normalised rows come down to the CPU, which
+    /// routes them. For one token, the experts held in GPU memory run there (queued first) while the CPU
+    /// computes the others; then both are added to s.x. Prompt batches run every expert on the CPU.
+    fn moe_ffn(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession) -> Result<(), String> {
+        let (c, k, a) = (&self.cfg, &self.k, api()?);
+        let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
+        let dim = c.dim;
+        let mut cache_ref = self.cache.borrow_mut();
+        if cache_ref.is_none() {
+            *cache_ref = Some(ExpertCache::new(moe, c, expert_cache_budget()?)?);
+        }
+        let cache = cache_ref.as_mut().unwrap();
+        if n >= MOE_GPU_MIN_BATCH {
+            return self.moe_ffn_batch(l, layer, n, s, cache, moe);
+        }
+        let on_gpu = n == 1 && cache.cacheable[l] && cache.slots() > 0;
+        k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+        if on_gpu {
+            k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+        }
+        let mut guard = s.moe.borrow_mut();
+        let h = &mut *guard;
+        let len = n * dim;
+        h.xb.resize(len, 0.0);
+        // synchronous copy: waits for the norm (the launch stream is a blocking one)
+        a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.xb.ptr, len * 4) }, "copy to host")?;
+        crate::model::moe_route(&moe.routers[l], c.n_experts_used, &h.xb, dim, &mut h.picks, &mut h.scratch);
+
+        // the token's GPU-resident experts: table of matrix addresses, then their weights
+        let mut ptrs: Vec<u64> = Vec::new();
+        let mut downs: Vec<u64> = Vec::new();
+        let mut wts: Vec<f32> = Vec::new();
+        h.cpu_picks.clear();
+        for &(e, w) in &h.picks {
+            match cache.slot_of[l][e] {
+                slot if on_gpu && slot >= 0 => {
+                    let [g, u, d] = cache.ptrs(slot as usize);
+                    ptrs.extend([g, u]);
+                    downs.push(d);
+                    wts.push(w);
+                }
+                _ => h.cpu_picks.push((e, w)),
+            }
+        }
+        let nk = wts.len();
+        if nk > 0 {
+            ptrs.extend(&downs);
+            let mut tab: Vec<u8> = ptrs.iter().flat_map(|p| p.to_le_bytes()).collect();
+            tab.extend(wts.iter().flat_map(|w| w.to_le_bytes()));
+            s.moe_tab.write(&tab)?;
+            let (ex, ffn) = (moe.tensors[l][0], c.expert_ffn_dim);
+            k.launch(k.moe_gate_up_q3k, (ex.rows.div_ceil(8) as u32, (2 * nk) as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
+            k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, nk as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(ffn as i32)])?;
+            k.launch(k.moe_down_q4k, (dim.div_ceil(8) as u32, nk as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::I(nk as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32)])?;
+        }
+        // the CPU's share, computed while the GPU works on its own
+        let cpu_k = if on_gpu { h.cpu_picks.len() } else { c.n_experts_used };
+        let cpu_picks = if on_gpu { &h.cpu_picks } else { &h.picks };
+        let cpu = if cpu_k > 0 {
+            h.acc.clear();
+            h.acc.resize(len, 0.0);
+            crate::model::moe_experts(c.n_experts, |e| moe.expert(l, e), cpu_picks, cpu_k, &h.xb, dim, &mut h.acc, &mut h.scratch);
+            s.att.write(&h.acc)?; // free here: the attention output was consumed by the output projection
+            s.att.ptr
+        } else {
+            0
+        };
+        // BETTERLLAMA_MOE_CHECK=1: the GPU-resident experts again on the CPU, largest difference printed
+        if nk > 0 && std::env::var_os("BETTERLLAMA_MOE_CHECK").is_some() {
+            let mut gpu = vec![0f32; nk * dim];
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(gpu.as_mut_ptr() as *mut c_void, s.h.ptr, nk * dim * 4) }, "copy to host")?;
+            let mut i = 0;
+            for &(e, _) in &h.picks {
+                if cache.slot_of[l][e] < 0 {
+                    continue;
+                }
+                let mut want = vec![0f32; dim];
+                crate::model::moe_experts(c.n_experts, |e| moe.expert(l, e), &[(e, 1.0)], 1, &h.xb, dim, &mut want, &mut h.scratch);
+                let got = &gpu[i * dim..(i + 1) * dim];
+                let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-20);
+                let err = got.iter().zip(&want).fold(0f32, |m, (g, w)| m.max((g - w).abs())) / scale;
+                eprintln!("[moe check layer {l} expert {e}: max |gpu - cpu| / max |cpu| = {err:.2e}]");
+                i += 1;
+            }
+        }
+        if nk > 0 {
+            let wts_ptr = s.moe_tab.ptr + (8 * 3 * nk) as u64;
+            k.launch(k.moe_combine, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(s.h.ptr), Arg::P(wts_ptr), Arg::I(nk as i32), Arg::P(cpu), Arg::I(dim as i32)])?;
+        } else {
+            k.launch(k.add_rows, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(cpu), Arg::I(len as i32)])?;
+        }
+        cache.note(moe, l, &h.picks)
+    }
+
+    /// Mixture of experts for a prompt batch, all on the GPU: routed there (f32), grouped by expert on the
+    /// host, then per expert: its tokens gathered, [gate | up] (converted to Q8) and down applied in
+    /// batched matmuls, and the weighted results added back to their tokens. Experts not in the cache
+    /// are staged through pinned memory, overlapping the previous expert's maths.
+    fn moe_ffn_batch(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession, cache: &mut ExpertCache, moe: &CpuMoe) -> Result<(), String> {
+        let (c, k, a) = (&self.cfg, &self.k, api()?);
+        let (dim, ne, top, ffn) = (c.dim, c.n_experts, c.n_experts_used, c.expert_ffn_dim);
+        k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+        k.launch(k.router_logits, (n as u32, 1), 256, (dim * 4) as u32, &[Arg::P(s.xb.ptr), Arg::P(cache.routers[l].ptr), Arg::P(s.gu.ptr), Arg::I(dim as i32), Arg::I(ne as i32)])?;
+        let mut guard = s.moe.borrow_mut();
+        let h = &mut *guard;
+        h.xb.resize(n * ne, 0.0); // the logits
+        a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.gu.ptr, n * ne * 4) }, "copy router logits")?;
+        h.picks.clear();
+        for row in h.xb.chunks_exact(ne) {
+            crate::model::route(row, top, &mut h.cpu_picks);
+            h.picks.extend_from_slice(&h.cpu_picks);
+        }
+        cache.note(moe, l, &h.picks)?;
+
+        // each expert's tokens, then all their weights, in one table
+        let mut lists: Vec<Vec<(i32, f32)>> = vec![Vec::new(); ne];
+        for (i, &(e, w)) in h.picks.iter().enumerate() {
+            lists[e].push(((i / top) as i32, w));
+        }
+        let mut tab: Vec<u8> = Vec::with_capacity(n * top * 8);
+        let mut offs = Vec::with_capacity(ne);
+        for list in &lists {
+            offs.push(tab.len() / 4);
+            tab.extend(list.iter().flat_map(|(t, _)| t.to_le_bytes()));
+        }
+        let w_base = tab.len() / 4;
+        for list in &lists {
+            tab.extend(list.iter().flat_map(|(_, w)| w.to_le_bytes()));
+        }
+        cache.idx.write(&tab)?;
+
+        let [g, _, d] = moe.tensors[l];
+        let gate_blocks = g.rows * g.cols / 32;
+        for (e, list) in lists.iter().enumerate().filter(|(_, list)| !list.is_empty()) {
+            let m = list.len();
+            let (ptrs, staged) = match cache.slot_of[l][e] {
+                slot if slot >= 0 => (cache.ptrs(slot as usize), None),
+                _ => {
+                    let (p, i) = cache.stage(moe, l, e, k.stream)?;
+                    (p, Some(i))
+                }
+            };
+            // gate and up to Q8, one after the other: a single [gate | up] matrix of 2 * ffn rows
+            for (j, &p) in ptrs[..2].iter().enumerate() {
+                let (q, dq) = (cache.conv_q.ptr + (j * gate_blocks * 32) as u64, cache.conv_d.ptr + (j * gate_blocks * 4) as u64);
+                k.launch(k.q3k_to_q8, (gate_blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(p), Arg::P(q), Arg::P(dq), Arg::I(gate_blocks as i32)])?;
+            }
+            let idx = cache.idx.ptr + (offs[e] * 4) as u64;
+            let wts = cache.idx.ptr + ((w_base + offs[e]) * 4) as u64;
+            k.launch(k.moe_gather, (m as u32, 1), 256, 0, &[Arg::P(s.xb.ptr), Arg::P(idx), Arg::P(s.att.ptr), Arg::I(dim as i32)])?;
+            let gate_up = GpuMatrix::view(Fmt::Q8, cache.conv_q.ptr, Some(cache.conv_d.ptr), 2 * ffn, dim);
+            self.matmul(&[(&gate_up, 0)], s.att.ptr, s.gu.ptr, 2 * ffn, m, false, s)?;
+            k.launch(k.silu_mul, ((m * ffn).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(ffn as i32), Arg::I(m as i32)])?;
+            let down = match d.ty {
+                GgmlType::Q4K => GpuMatrix::view(Fmt::Q4K, ptrs[2], None, dim, ffn),
+                GgmlType::Q5K => {
+                    let blocks = dim * ffn / 32;
+                    k.launch(k.q5k_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(ptrs[2]), Arg::P(cache.conv_q.ptr), Arg::P(cache.conv_d.ptr), Arg::I(blocks as i32)])?;
+                    GpuMatrix::view(Fmt::Q8, cache.conv_q.ptr, Some(cache.conv_d.ptr), dim, ffn)
+                }
+                other => return Err(format!("GPU experts: {} down projections are not supported yet", other.name())),
+            };
+            self.matmul(&[(&down, 0)], s.h.ptr, s.qkv.ptr, dim, m, false, s)?;
+            k.launch(k.moe_scatter, (m as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(s.qkv.ptr), Arg::P(idx), Arg::P(wts), Arg::I(dim as i32)])?;
+            if let Some(i) = staged {
+                cache.release(i, k.stream)?;
+            }
+        }
+        Ok(())
     }
 
     /// Every kernel of a forward pass over `n` tokens at `s.pos..` (`posp`: the position from device memory
@@ -3052,9 +3754,12 @@ impl GpuModel {
             self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
 
             self.timed(6, || {
-                let gate_up: Vec<(&GpuMatrix, usize)> = layer.gate_up.iter().map(|(m, off)| (m, *off)).collect();
+                let GpuFfn::Dense { gate_up, down } = &layer.ffn else {
+                    return self.moe_ffn(l, layer, n, s);
+                };
+                let gate_up: Vec<(&GpuMatrix, usize)> = gate_up.iter().map(|(m, off)| (m, *off)).collect();
                 self.norm_matmul(&layer.ffn_norm, &gate_up, s.gu.ptr, 2 * c.ffn_dim, n, s)?;
-                let down = [(&layer.down, 0)];
+                let down = [(down, 0)];
                 if self.dp4a_path(&down, n) {
                     // decoding: silu(gate) * up straight to int8 for the down projection
                     let nv = (c.ffn_dim / 4) as u32;
@@ -3063,7 +3768,7 @@ impl GpuModel {
                 }
                 let total = (n * c.ffn_dim) as u32;
                 k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(c.ffn_dim as i32), Arg::I(n as i32)])?;
-                self.matmul_one(&layer.down, s.h.ptr, s.x.ptr, n, true, s)
+                self.matmul_one(down[0].0, s.h.ptr, s.x.ptr, n, true, s)
             })?;
         }
 
@@ -3115,8 +3820,17 @@ pub struct GpuSession {
     logits_dev: DeviceBuf, // up to DECODE_MAX_BATCH rows
     picks: DeviceBuf,      // their argmax
     pos_dev: DeviceBuf,    // the position, for CUDA graphs
+    moe: std::cell::RefCell<MoeHost>, // host scratch of the CPU expert path
+    moe_tab: DeviceBuf,               // a token's GPU-resident experts: matrix addresses, then weights
     graphs: [Ptr; 2],      // captured one-token steps: Last, Argmax
     pub logits: Vec<f32>,
+}
+
+impl GpuModel {
+    /// The GPU expert cache's state, if this model has one yet.
+    pub fn expert_cache(&self) -> Option<String> {
+        self.cache.borrow().as_ref().map(ExpertCache::describe)
+    }
 }
 
 impl Drop for GpuSession {
@@ -3161,6 +3875,8 @@ impl GpuSession {
             logits_dev: logits_dev?,
             picks: picks?,
             pos_dev: pos_dev?,
+            moe: Default::default(),
+            moe_tab: DeviceBuf::alloc(4096)?,
             graphs: [std::ptr::null_mut(); 2],
             logits: vec![0.0; cfg.vocab],
         })
@@ -3201,6 +3917,25 @@ impl GpuSession {
 /// the driver's own allocations (CUDA graphs, launch buffers). On Windows going over does not fail:
 /// the driver quietly moves memory to the much slower system RAM.
 const FIT_RESERVE: usize = 384 << 20;
+
+/// GPU memory for the expert cache: what is free when it is made (after the weights and the session),
+/// less FIT_RESERVE. BETTERLLAMA_EXPERT_CACHE_MB sets it instead (0: every expert on the CPU).
+fn expert_cache_budget() -> Result<usize, String> {
+    if let Some(mb) = std::env::var("BETTERLLAMA_EXPERT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return Ok(mb << 20);
+    }
+    let a = api()?;
+    let (mut free, mut _total) = (0usize, 0usize);
+    a.check(unsafe { (a.f.cuMemGetInfo_v2)(&mut free, &mut _total) }, "memory info")?;
+    Ok(free.saturating_sub(FIT_RESERVE))
+}
+
+/// Prompt batches of at least this many tokens run every expert on the GPU (smaller ones on the CPU).
+const MOE_GPU_MIN_BATCH: usize = 32;
+
+/// Default context of a mixture-of-experts model on the GPU: the memory a longer one would take is
+/// worth more as expert cache.
+pub const MOE_DEFAULT_CTX: usize = 8192;
 
 /// The longest context (a multiple of 1024, at most every model's limit) for which a session of each
 /// of these models fits in the GPU memory now free.

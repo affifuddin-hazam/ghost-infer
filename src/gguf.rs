@@ -97,8 +97,12 @@ pub enum GgmlType {
     F32,
     F16,
     Q8_0,
+    /// 256-value super-blocks: 16 sub-blocks of 16 with 6-bit scale, 3-bit values
+    Q3K,
     /// 256-value super-blocks: 8 sub-blocks of 32 with 6-bit scale and min, 4-bit values
     Q4K,
+    /// 256-value super-blocks: 8 sub-blocks of 32 with 6-bit scale and min, 5-bit values
+    Q5K,
     /// 256-value super-blocks: 16 sub-blocks of 16 with 8-bit scale, 6-bit values
     Q6K,
     Other(u32),
@@ -110,7 +114,9 @@ impl GgmlType {
             0 => GgmlType::F32,
             1 => GgmlType::F16,
             8 => GgmlType::Q8_0,
+            11 => GgmlType::Q3K,
             12 => GgmlType::Q4K,
+            13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
             other => GgmlType::Other(other),
         }
@@ -122,7 +128,9 @@ impl GgmlType {
             GgmlType::F32 => Some((1, 4)),
             GgmlType::F16 => Some((1, 2)),
             GgmlType::Q8_0 => Some((32, 34)),
+            GgmlType::Q3K => Some((256, 110)),
             GgmlType::Q4K => Some((256, 144)),
+            GgmlType::Q5K => Some((256, 176)),
             GgmlType::Q6K => Some((256, 210)),
             GgmlType::Other(_) => None,
         }
@@ -133,10 +141,17 @@ impl GgmlType {
             GgmlType::F32 => "F32".into(),
             GgmlType::F16 => "F16".into(),
             GgmlType::Q8_0 => "Q8_0".into(),
+            GgmlType::Q3K => "Q3_K".into(),
             GgmlType::Q4K => "Q4_K".into(),
+            GgmlType::Q5K => "Q5_K".into(),
             GgmlType::Q6K => "Q6_K".into(),
             GgmlType::Other(id) => format!("type#{id}"),
         }
+    }
+
+    /// K-quant formats (256-value super-blocks dotted against per-32 int8 activations).
+    pub fn is_kquant(self) -> bool {
+        matches!(self, GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
     }
 }
 

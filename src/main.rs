@@ -24,6 +24,7 @@ const USAGE: &str = "betterllama - run GGUF language models on the CPU or an NVI
 USAGE:
     betterllama inspect  <model.gguf>
     betterllama meta     <model.gguf> <key>
+    betterllama dequant  <model.gguf> <tensor> <row>   (one row of a weight as floats, for checking formats)
     betterllama tokenize <model.gguf> <text>
     betterllama top      <model.gguf> <text> [--gpu]   (next-token probabilities after raw text)
     betterllama bench    <model.gguf> [-n <gen tokens>] [--prompt-len <n>] [--threads <n>] [--gpu] [--draft <gguf>]
@@ -144,6 +145,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("inspect") if rest.len() == 1 => inspect(&PathBuf::from(&rest[0])),
         Some("meta") if rest.len() == 2 => meta(&PathBuf::from(&rest[0]), &rest[1]),
+        Some("dequant") if rest.len() == 3 => dequant(&PathBuf::from(&rest[0]), &rest[1], &rest[2]),
         Some("tokenize") if rest.len() == 2 => tokenize(&PathBuf::from(&rest[0]), &rest[1]),
         Some("top") if rest.len() == 2 || (rest.len() == 3 && rest[2] == "--gpu") => top(&PathBuf::from(&rest[0]), &rest[1], rest.len() == 3),
         Some("bench") if !rest.is_empty() => parse_opts(rest).and_then(|o| bench(&o)),
@@ -194,6 +196,27 @@ fn meta(path: &PathBuf, key: &str) -> Result<(), String> {
         Value::Str(s) => println!("{s}"),
         other => println!("{other}"),
     }
+    Ok(())
+}
+
+/// Row `row` of tensor `name`, dequantised, one value per line (rows of every expert counted together).
+fn dequant(path: &PathBuf, name: &str, row: &str) -> Result<(), String> {
+    let g = Gguf::open(path)?;
+    let t = g.tensor(name).ok_or_else(|| format!("no tensor {name}"))?;
+    let cols = t.dims[0] as usize;
+    let rows = (t.n_elements() as usize) / cols;
+    let r: usize = row.parse().map_err(|_| format!("row \"{row}\" is not a number"))?;
+    if r >= rows || t.ty.block().is_none() {
+        return Err(format!("{name}: row {r} of {rows} ({})", t.ty.name()));
+    }
+    let m = quant::Matrix { data: &g.mmap[t.offset..t.offset + t.n_bytes], ty: t.ty, rows, cols };
+    let mut out = vec![0f32; cols];
+    m.row_f32(r, &mut out);
+    let mut text = String::with_capacity(cols * 12);
+    for v in out {
+        text.push_str(&format!("{v:e}\n"));
+    }
+    print!("{text}");
     Ok(())
 }
 
@@ -349,7 +372,10 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
         }
     };
     let ctx = match (ctx, &main) {
-        (0, Some(m)) => cuda::fit_ctx(&[Some(&m.cfg), draft_model.as_ref().map(|d| &d.cfg)].into_iter().flatten().collect::<Vec<_>>())?,
+        (0, Some(m)) => {
+            let fit = cuda::fit_ctx(&[Some(&m.cfg), draft_model.as_ref().map(|d| &d.cfg)].into_iter().flatten().collect::<Vec<_>>())?;
+            if m.cfg.is_moe() { fit.min(cuda::MOE_DEFAULT_CTX) } else { fit }
+        }
         (0, None) => 4096,
         (c, _) => c,
     };
@@ -589,6 +615,11 @@ fn top(path: &PathBuf, text: &str, gpu: bool) -> Result<(), String> {
     let ids = engine.tok.encode(text);
     engine.backend.prefill(&ids)?;
     let logits = engine.backend.logits();
+    // BETTERLLAMA_LOGITS_OUT=<file>: every logit as little-endian f32, for accuracy tooling
+    if let Some(out) = std::env::var_os("BETTERLLAMA_LOGITS_OUT") {
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&out, bytes).map_err(|e| format!("cannot write {}: {e}", PathBuf::from(&out).display()))?;
+    }
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let total: f64 = logits.iter().map(|&l| ((l - max) as f64).exp()).sum();
     let mut idx: Vec<usize> = (0..logits.len()).collect();
@@ -641,6 +672,11 @@ fn bench(o: &Opts) -> Result<(), String> {
         best_tg = best_tg.max(tg);
     }
     println!("prompt {} tok: {:>8.1} tok/s | generate {} tok: {:>7.1} tok/s | {}", ids.len(), best_pp, o.max_new, best_tg, engine.backend.describe());
+    if let Backend::Gpu(m, _) = &engine.backend {
+        if let Some(cache) = m.expert_cache() {
+            println!("expert cache: {cache}");
+        }
+    }
     // BETTERLLAMA_VERIFY_N=n: time one n-token decode batch (a speculative verify step) on its own
     if let (Some(n), Backend::Gpu(m, s)) = (std::env::var("BETTERLLAMA_VERIFY_N").ok().and_then(|v| v.parse::<usize>().ok()), &mut engine.backend) {
         let batch: Vec<u32> = ids[..n].to_vec();
