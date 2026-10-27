@@ -51,6 +51,7 @@ OPTIONS:
         --host <addr>     serve: address to listen on        [127.0.0.1]
         --port <n>        serve: port                        [8080]
         --no-think        serve: Qwen3 answers without thinking unless a request asks for it
+        --models <dir>    serve: another folder of GGUF files for the model picker (repeatable)
 ";
 
 struct Opts {
@@ -72,6 +73,7 @@ struct Opts {
     draft_k: usize,
     host: String,
     port: u16,
+    models: Vec<PathBuf>, // serve: more folders of GGUF files to switch to, besides the model's own
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -102,6 +104,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         draft_k: 3,
         host: "127.0.0.1".into(),
         port: 8080,
+        models: Vec::new(),
     };
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
@@ -128,6 +131,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--draft-k" => o.draft_k = num(val(a)?, a)? as usize,
             "--host" => o.host = val(a)?,
             "--port" => o.port = num(val(a)?, a)? as u16,
+            "--models" => o.models.push(PathBuf::from(val(a)?)),
             "--kv" => match val(a)?.as_str() {
                 "f16" => cuda::set_kv_int8(false),
                 "int8" => cuda::set_kv_int8(true),

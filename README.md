@@ -247,6 +247,7 @@ ghost-infer run   Qwen3-8B-Q4_K_M.gguf -p "Explain DNS." -t 0 --gpu --draft Qwen
 | `--special` | | print special tokens |
 | `--host <addr>` | 127.0.0.1 | `serve`: address to listen on (`0.0.0.0` for other machines on your network) |
 | `--port <n>` | 8080 | `serve`: port |
+| `--models <dir>` | | `serve`: another folder of GGUF files for the model picker, besides the model's own (repeatable) |
 
 </details>
 

@@ -69,7 +69,7 @@ struct Status {
 /// What the connection threads share: the model's status, and where the models are.
 struct Shared {
     status: Mutex<Status>,
-    dir: PathBuf,
+    dirs: Vec<PathBuf>, // the model's folder, then any --models folders
     defaults: (f32, usize, f32, usize),
     think_default: bool,
 }
@@ -78,25 +78,27 @@ fn model_id(path: &Path) -> String {
     path.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string()
 }
 
-/// The GGUF files in the models folder, by name.
-fn list_models(dir: &Path) -> Vec<(String, PathBuf, u64)> {
-    let mut found: Vec<_> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
+/// The GGUF files in the models folders, by name (a name found in an earlier folder wins).
+fn list_models(dirs: &[PathBuf]) -> Vec<(String, PathBuf, u64)> {
+    let mut found: Vec<_> = dirs
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")))
         .map(|p| (model_id(&p), std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0), p))
         .map(|(id, size, p)| (id, p, size))
         .collect();
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|m: &(String, PathBuf, u64)| seen.insert(m.0.clone()));
     found.sort_by_key(|m| m.0.to_lowercase());
     found
 }
 
 pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
-    let dir = o.model.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
-    let shared = Arc::new(Shared { status: Mutex::new(Status::default()), dir, defaults: (o.temp, o.top_k, o.top_p, o.max_new), think_default: !o.no_think });
+    let own = o.model.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+    let dirs = std::iter::once(own).chain(o.models.iter().cloned()).collect();
+    let shared = Arc::new(Shared { status: Mutex::new(Status::default()), dirs, defaults: (o.temp, o.top_k, o.top_p, o.max_new), think_default: !o.no_think });
     let (work, rx) = mpsc::channel::<Work>();
     let s = shared.clone();
     std::thread::spawn(move || {
@@ -378,7 +380,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     match (req.method.as_str(), req.path.trim_end_matches('/')) {
         // the models folder, for the chat page's model picker
         ("GET", "/api/models") => {
-            let models = list_models(&shared.dir)
+            let models = list_models(&shared.dirs)
                 .into_iter()
                 .map(|(id, _, size)| obj(vec![("id", str(&id)), ("size", num(size as f64))]))
                 .collect();
@@ -402,8 +404,9 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         ("POST", "/api/models/load") => {
             let id = std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse).ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from));
             let Some(id) = id else { return respond(&mut conn, 400, &error_body("send {\"id\": \"<model>\"}")) };
-            let Some((_, path, _)) = list_models(&shared.dir).into_iter().find(|m| m.0 == id) else {
-                return respond(&mut conn, 404, &error_body(&format!("no {id}.gguf in {}", shared.dir.display())));
+            let Some((_, path, _)) = list_models(&shared.dirs).into_iter().find(|m| m.0 == id) else {
+                let dirs: Vec<String> = shared.dirs.iter().map(|d| d.display().to_string()).collect();
+                return respond(&mut conn, 404, &error_body(&format!("no {id}.gguf in {}", dirs.join(" or "))));
             };
             if let Some(l) = &loading {
                 return respond(&mut conn, 409, &error_body(&format!("{l} is loading; wait for it")));
