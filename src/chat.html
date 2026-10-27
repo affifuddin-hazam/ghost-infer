@@ -931,6 +931,18 @@ async function ask(thinking) {
   let raw = "", firstAt = null, usage = null, finish = null, lastMood = null, tool = null;
   let tagChunks = 0, tagLoop = false; // small models can repeat the mood tags instead of answering
   const stamps = []; // token arrival times, for the live speed
+  // until the first token: how far the server is through the prompt, and whether it is waiting on the disk
+  // (a model bigger than the free RAM reads its weights from the disk as it goes)
+  const progress = setInterval(async () => {
+    if (firstAt !== null) return clearInterval(progress);
+    try {
+      const p = await (await fetch("/api/progress")).json();
+      if (firstAt !== null || !p.total) return;
+      const pct = `${Math.min(99, Math.floor((100 * p.done) / p.total))}%`;
+      if (p.disk) mood("thinking", `Loading weights from disk, ${pct}`);
+      else if (p.total >= 256) mood("thinking", `Reading your message, ${pct}`);
+    } catch {}
+  }, 600);
   try {
     const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: busy.signal });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
@@ -1001,6 +1013,7 @@ async function ask(thinking) {
       settleTo("confused", 5000, "Couldn't answer", true);
     }
   } finally {
+    clearInterval(progress);
     if (reply.think !== undefined && reply.thinkSecs === undefined) reply.thinkSecs = (performance.now() - t0) / 1000;
     busy = null;
     ghost?.rate(0);

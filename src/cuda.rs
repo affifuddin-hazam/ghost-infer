@@ -3,6 +3,7 @@
 //! dependency: without a GPU the binary still works on the CPU.
 
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
@@ -2141,8 +2142,23 @@ mod os {
         fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
         fn SetDllDirectoryW(dir: *const u16) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn PrefetchVirtualMemory(process: *mut c_void, n: usize, ranges: *const Range, flags: u32) -> i32;
     }
     const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+
+    #[repr(C)]
+    struct Range {
+        addr: *mut c_void,
+        bytes: usize,
+    }
+
+    /// Asks Windows to read these (address, length) ranges of mapped memory in now, as large concurrent
+    /// reads, instead of one 4 KB page fault at a time later. Only a hint: failure changes nothing.
+    pub fn prefetch(ranges: &[(usize, usize)]) {
+        let r: Vec<Range> = ranges.iter().map(|&(a, n)| Range { addr: a as *mut c_void, bytes: n }).collect();
+        unsafe { PrefetchVirtualMemory(GetCurrentProcess(), r.len(), r.as_ptr(), 0) };
+    }
 
     pub fn open(path: &str) -> Option<*mut c_void> {
         // nvrtc loads nvrtc-builtins*.dll lazily at compile time; make its folder searchable
@@ -2171,6 +2187,7 @@ mod os {
     pub fn symbol(_: *mut c_void, _: &str) -> Option<*mut c_void> {
         None
     }
+    pub fn prefetch(_: &[(usize, usize)]) {}
 }
 
 macro_rules! api {
@@ -2907,10 +2924,145 @@ enum GpuFfn {
     Moe,
 }
 
+/// What the current prompt pass is doing, for the server's /api/progress (the chat page shows it while it
+/// waits for the first token): prompt tokens read of the total, and time spent waiting for expert weights
+/// to come off the disk (a mixture of experts bigger than the free RAM).
+pub struct Progress {
+    done: AtomicUsize,
+    total: AtomicUsize, // 0: no prompt pass running
+    base: AtomicUsize,  // tokens of the earlier batches of this prompt
+    disk_ms: AtomicU64,
+    disk_at: AtomicU64,  // clock_ms() of the last wait
+    on_disk: AtomicBool, // waiting for the prefetch thread's read right now
+}
+
+pub static PROGRESS: Progress = Progress {
+    done: AtomicUsize::new(0),
+    total: AtomicUsize::new(0),
+    base: AtomicUsize::new(0),
+    disk_ms: AtomicU64::new(0),
+    disk_at: AtomicU64::new(0),
+    on_disk: AtomicBool::new(false),
+};
+
+fn clock_ms() -> u64 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+impl Progress {
+    /// (tokens read, prompt tokens (0: none running), ms waited on the disk in this prompt, waited in the last second)
+    pub fn get(&self) -> (usize, usize, u64, bool) {
+        let at = self.disk_at.load(Ordering::Relaxed);
+        let disk = self.on_disk.load(Ordering::Relaxed) || (at > 0 && clock_ms() - at < 1000);
+        (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed), self.disk_ms.load(Ordering::Relaxed), disk)
+    }
+    fn start(&self, total: usize) {
+        self.done.store(0, Ordering::Relaxed);
+        self.base.store(0, Ordering::Relaxed);
+        self.disk_ms.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+    /// Layer l of n_layers is done for the current batch of n tokens.
+    fn layer(&self, l: usize, n_layers: usize, n: usize) {
+        self.done.store(self.base.load(Ordering::Relaxed) + n * (l + 1) / n_layers, Ordering::Relaxed);
+    }
+    fn waited_on_disk(&self, ms: u64) {
+        self.disk_ms.fetch_add(ms, Ordering::Relaxed);
+        self.disk_at.store(clock_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Reads expert weights in ahead of use, on a thread of its own: Windows is asked for each request's ranges
+/// as large concurrent reads, then every page is touched so they are in memory when the experts run. On a
+/// hard disk this is several times faster than the 4 KB page faults the experts would otherwise take.
+struct Prefetcher {
+    tx: Option<std::sync::mpsc::Sender<Vec<(usize, usize)>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    sent: std::sync::Mutex<(u64, Vec<(usize, u64)>)>, // requests so far, and (layer, request number) not yet waited for
+    done: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>, // requests finished
+}
+
+impl Prefetcher {
+    fn new() -> Prefetcher {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, usize)>>();
+        let done = Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
+        let finished = done.clone();
+        let thread = std::thread::Builder::new()
+            .name("expert prefetch".into())
+            .spawn(move || {
+                let log = std::env::var_os("GHOST_INFER_LOAD_TIMES").is_some();
+                let mark = || {
+                    *finished.0.lock().unwrap() += 1;
+                    finished.1.notify_all();
+                };
+                for ranges in rx {
+                    let t = std::time::Instant::now();
+                    os::prefetch(&ranges);
+                    let asked = t.elapsed();
+                    for &(at, n) in &ranges {
+                        for p in (at..at + n).step_by(4096) {
+                            unsafe { std::ptr::read_volatile(p as *const u8) };
+                        }
+                    }
+                    mark();
+                    if log {
+                        let mb = ranges.iter().map(|r| r.1).sum::<usize>() as f64 / 1e6;
+                        eprintln!("[prefetch {mb:.0} MB: asked in {:.0} ms, in memory after {:.0} ms]", asked.as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+            })
+            .ok();
+        Prefetcher { tx: Some(tx), thread, sent: std::sync::Mutex::new((0, Vec::new())), done }
+    }
+
+    /// Queues the ranges of layer l.
+    fn request(&self, l: usize, ranges: Vec<(usize, usize)>) {
+        let (Some(tx), Some(_)) = (&self.tx, &self.thread) else { return };
+        let mut sent = self.sent.lock().unwrap();
+        if tx.send(ranges).is_ok() {
+            sent.0 += 1;
+            let n = sent.0;
+            sent.1.retain(|&(pl, _)| pl != l);
+            sent.1.push((l, n));
+        }
+    }
+
+    /// Waits until layer l's latest request is in memory (none queued: returns at once); the time waited.
+    fn wait(&self, l: usize) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        let ticket = {
+            let mut sent = self.sent.lock().unwrap();
+            let at = sent.1.iter().position(|&(pl, _)| pl == l);
+            at.map(|i| sent.1.remove(i).1)
+        };
+        if let Some(n) = ticket {
+            let mut done = self.done.0.lock().unwrap();
+            PROGRESS.on_disk.store(*done < n, Ordering::Relaxed);
+            while *done < n {
+                done = self.done.1.wait(done).unwrap();
+            }
+            PROGRESS.on_disk.store(false, Ordering::Relaxed);
+        }
+        t.elapsed()
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        self.tx.take(); // ends the thread's loop once it has finished its current request
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// The experts of a mixture-of-experts model, run on the CPU straight from the model file (its own
 /// mapping of it; the OS shares the pages with any other).
 struct CpuMoe {
+    prefetch: Prefetcher, // first, so its thread has stopped before the mapping it reads goes
     mmap: memmap2::Mmap,
+    n_experts: usize,
     routers: Vec<Vec<f32>>,          // per layer: n_experts rows of dim logit weights
     tensors: Vec<[ExpertTensor; 3]>, // per layer: gate, up, down
 }
@@ -2948,7 +3100,31 @@ impl CpuMoe {
             let (dim, ffn) = (cfg.dim, cfg.expert_ffn_dim);
             tensors.push([part("ffn_gate_exps", ffn, dim)?, part("ffn_up_exps", ffn, dim)?, part("ffn_down_exps", dim, ffn)?]);
         }
-        Ok(CpuMoe { mmap, routers, tensors })
+        Ok(CpuMoe { prefetch: Prefetcher::new(), mmap, n_experts: cfg.n_experts, routers, tensors })
+    }
+
+    /// Starts reading layer l's experts (those `cached` does not hold in GPU memory) off the disk, as
+    /// runs of neighbouring experts in file order.
+    fn prefetch_layer(&self, l: usize, cached: &[i32]) {
+        let base = self.mmap.as_ptr() as usize;
+        let mut ranges = Vec::new();
+        for t in &self.tensors[l] {
+            let mut e = 0;
+            while e < self.n_experts {
+                if cached[e] >= 0 {
+                    e += 1;
+                    continue;
+                }
+                let first = e;
+                while e < self.n_experts && cached[e] < 0 {
+                    e += 1;
+                }
+                ranges.push((base + t.offset + first * t.stride, (e - first) * t.stride));
+            }
+        }
+        if std::env::var_os("GHOST_INFER_NO_PREFETCH").is_none() {
+            self.prefetch.request(l, ranges);
+        }
     }
 
     fn expert(&self, l: usize, e: usize) -> crate::model::Expert<'_> {
@@ -3096,7 +3272,13 @@ impl ExpertCache {
         // the GPU is done with this pinned buffer and scratch slot (copy and kernels of two experts ago)
         a.check(unsafe { (a.f.cuEventSynchronize)(self.events[i]) }, "staging wait")?;
         let buf = unsafe { std::slice::from_raw_parts_mut(self.pinned[i], self.scratch_bytes) };
+        let t = std::time::Instant::now();
         let bytes = Self::pack(moe, l, e, self.gate_bytes, buf);
+        // a couple of MB from RAM take well under a millisecond; longer means the weights came off the disk
+        let ms = t.elapsed().as_millis() as u64;
+        if ms >= 3 {
+            PROGRESS.waited_on_disk(ms);
+        }
         let dst = self.scratch[i].ptr;
         a.check(unsafe { (a.f.cuMemcpyHtoDAsync_v2)(dst, self.pinned[i] as *const c_void, bytes, stream) }, "expert staging copy")?;
         self.staged += 1;
@@ -3470,10 +3652,18 @@ impl GpuModel {
 
     pub fn prefill(&self, tokens: &[u32], s: &mut GpuSession) -> Result<(), String> {
         let chunks: Vec<&[u32]> = tokens.chunks(MAX_BATCH).collect();
+        PROGRESS.start(tokens.len());
+        let mut result = Ok(());
         for (i, chunk) in chunks.iter().enumerate() {
-            self.forward_batch(chunk, s, i + 1 == chunks.len())?;
+            PROGRESS.base.store(i * MAX_BATCH, Ordering::Relaxed);
+            result = self.forward_batch(chunk, s, i + 1 == chunks.len());
+            if result.is_err() {
+                break;
+            }
+            PROGRESS.done.store(i * MAX_BATCH + chunk.len(), Ordering::Relaxed);
         }
-        Ok(())
+        PROGRESS.total.store(0, Ordering::Relaxed);
+        result
     }
 
     /// Runs `tokens` at positions `s.pos..`; copies next-token logits into `s.logits` if asked.
@@ -3646,6 +3836,20 @@ impl GpuModel {
     fn moe_ffn_batch(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession, cache: &mut ExpertCache, moe: &CpuMoe) -> Result<(), String> {
         let (c, k, a) = (&self.cfg, &self.k, api()?);
         let (dim, ne, top, ffn) = (c.dim, c.n_experts, c.n_experts_used, c.expert_ffn_dim);
+        // a batch uses nearly every expert of every layer: the prefetch thread reads the next layer's uncached
+        // ones in (and this one's, at the first layer) while this layer computes. This layer waits for its
+        // own read to finish first: faulting the same weights in at the same time would make a hard disk
+        // seek between the two and read both slowly.
+        if l == 0 {
+            moe.prefetch_layer(0, &cache.slot_of[0]);
+        }
+        if l + 1 < c.n_layers {
+            moe.prefetch_layer(l + 1, &cache.slot_of[l + 1]);
+        }
+        let waited = moe.prefetch.wait(l);
+        if waited.as_millis() >= 20 {
+            PROGRESS.waited_on_disk(waited.as_millis() as u64);
+        }
         k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
         k.launch(k.router_logits, (n as u32, 1), 256, (dim * 4) as u32, &[Arg::P(s.xb.ptr), Arg::P(cache.routers[l].ptr), Arg::P(s.gu.ptr), Arg::I(dim as i32), Arg::I(ne as i32)])?;
         let mut guard = s.moe.borrow_mut();
@@ -3713,6 +3917,7 @@ impl GpuModel {
                 cache.release(i, k.stream)?;
             }
         }
+        PROGRESS.layer(l, c.n_layers, n);
         Ok(())
     }
 

@@ -384,6 +384,12 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             ]);
             return respond(&mut conn, 200, &body);
         }
+        // the prompt being read: tokens done of the total (0: none), and whether it is waiting on the disk
+        ("GET", "/api/progress") => {
+            let (done, total, disk_ms, disk) = crate::cuda::PROGRESS.get();
+            let body = obj(vec![("done", num(done as f64)), ("total", num(total as f64)), ("disk_ms", num(disk_ms as f64)), ("disk", Json::Bool(disk))]);
+            return respond(&mut conn, 200, &body);
+        }
         // {"id": "<file name without .gguf>"}: answers once the switch is done (it can take a minute)
         ("POST", "/api/models/load") => {
             let id = std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse).ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from));
