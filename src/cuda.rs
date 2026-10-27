@@ -30,6 +30,20 @@ fn qch() -> usize {
     static QCH: OnceLock<usize> = OnceLock::new();
     *QCH.get_or_init(|| std::env::var("BETTERLLAMA_QCH").ok().and_then(|v| v.parse().ok()).filter(|&v| v == 128 || v == 256).unwrap_or(128))
 }
+/// KV cache in int8 with a scale per (position, kv head) instead of f16: about half the memory per
+/// token. Process-wide, because the kernels are compiled for one or the other (-DKV8); set it (--kv)
+/// before the first model loads. Default int8; BETTERLLAMA_KV=f16 changes the default.
+static KV_INT8: OnceLock<bool> = OnceLock::new();
+pub fn set_kv_int8(on: bool) {
+    let _ = KV_INT8.set(on);
+}
+fn kv_int8() -> bool {
+    *KV_INT8.get_or_init(|| std::env::var("BETTERLLAMA_KV").map_or(true, |v| v != "f16"))
+}
+/// Bytes per cached k or v value.
+fn kv_bytes() -> usize {
+    if kv_int8() { 1 } else { 2 }
+}
 const KQ_TB: usize = 4; // tokens per block row in the K-quant generation matmuls (must match TBK)
 const TILE: usize = 64; // must match TILE in the kernel source
 const TILED_MIN_BATCH: usize = 16; // from this many tokens, the int8 tiled matmul beats one-warp-per-row
@@ -99,7 +113,7 @@ __device__ __forceinline__ float h2f(unsigned int h) {
     asm("{.reg .b16 t; cvt.u16.u32 t, %1; cvt.f32.f16 %0, t;}" : "=f"(f) : "r"(h));
     return f;
 }
-// The KV cache holds f16 (half the memory of f32); attention arithmetic stays in f32.
+// f32 -> f16: the f16 KV cache and tensor-core operands; attention arithmetic stays in f32.
 __device__ __forceinline__ unsigned short f2h(float f) {
     unsigned short h;
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
@@ -109,6 +123,48 @@ __device__ __forceinline__ unsigned short f2h(float f) {
 __device__ __forceinline__ float4 h4f(const unsigned short* p) {
     uint2 w = *reinterpret_cast<const uint2*>(p);
     return make_float4(h2f(w.x & 0xFFFF), h2f(w.x >> 16), h2f(w.y & 0xFFFF), h2f(w.y >> 16));
+}
+
+// KV cache element. -DKV8: int8 with one f32 scale per (position, kv head) in ks / vs (symmetric,
+// quantised as each row is written, like LMDeploy's online int8 cache; a scale per 32 values, as
+// llama.cpp's q8_0 cache, measured no closer to f16 here and costs 9% more memory). Otherwise f16 and
+// ks / vs unused. The kv_load* helpers return the stored values; KV_SCALE gives the factor that turns
+// them into floats.
+#ifdef KV8
+typedef signed char kv_t;
+#define KV_SCALE(sc, pos, n_kv, kvh) ((sc)[(size_t)(pos) * (n_kv) + (kvh)])
+__device__ __forceinline__ float kv_load1(const kv_t* p) { return (float)*p; }
+__device__ __forceinline__ float2 kv_load2(const kv_t* p) {
+    int w = *reinterpret_cast<const short*>(p);
+    return make_float2((float)(signed char)w, (float)(w >> 8));
+}
+__device__ __forceinline__ float4 kv_load4(const kv_t* p) {
+    int w = *reinterpret_cast<const int*>(p);
+    return make_float4((float)(signed char)w, (float)(signed char)(w >> 8), (float)(signed char)(w >> 16), (float)(w >> 24));
+}
+#else
+typedef unsigned short kv_t;
+#define KV_SCALE(sc, pos, n_kv, kvh) 1.f
+__device__ __forceinline__ float kv_load1(const kv_t* p) { return h2f(*p); }
+__device__ __forceinline__ float2 kv_load2(const kv_t* p) {
+    unsigned w = *reinterpret_cast<const unsigned*>(p);
+    return make_float2(h2f(w & 0xFFFF), h2f(w >> 16));
+}
+__device__ __forceinline__ float4 kv_load4(const kv_t* p) { return h4f(p); }
+#endif
+
+// One head's row of hd floats into the cache; the whole block calls it (int8 reduces the row's max).
+__device__ __forceinline__ void kv_store(kv_t* __restrict__ dst, float* __restrict__ scale, const float* __restrict__ src, int hd, float* sh) {
+#ifdef KV8
+    float amax = 0.f;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) amax = fmaxf(amax, fabsf(src[d]));
+    amax = block_max(amax, sh);
+    float dd = amax / 127.f, inv = dd != 0.f ? 1.f / dd : 0.f;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) dst[d] = (signed char)__float2int_rn(src[d] * inv);
+    if (threadIdx.x == 0) *scale = dd;
+#else
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) dst[d] = f2h(src[d]);
+#endif
 }
 // d and dmin of a Q4_K block (one 32-bit load)
 __device__ __forceinline__ void q4k_dm(const unsigned char* b, float* d, float* dmin) {
@@ -177,7 +233,8 @@ __global__ void embed(int fmt, const unsigned char* __restrict__ w, const float*
 // q and k, and k, v copied into the cache. grid (tokens, n_heads + 2 * n_kv), block = 64.
 // neox: pairs (x[i], x[i + rope_dim/2]) (Qwen); otherwise adjacent pairs (x[2i], x[2i+1]) (GGUF llama).
 __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
-                             unsigned short* __restrict__ kc, unsigned short* __restrict__ vc, int pos0, const int* __restrict__ posp, int n_heads,
+                             kv_t* __restrict__ kc, kv_t* __restrict__ vc, float* __restrict__ ks, float* __restrict__ vs,
+                             int pos0, const int* __restrict__ posp, int n_heads,
                              int n_kv, int hd, int rope_dim, float base, int neox, float eps) {
     __shared__ float sh[32];
     if (posp) pos0 = *posp; // CUDA graphs: the position comes from device memory
@@ -186,7 +243,7 @@ __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ 
     float* row = qkv + (size_t)b * (q_dim + 2 * kv_dim);
     if (h >= n_heads + n_kv) { // a v head: straight into the cache (same for the whole block)
         int vh = h - n_heads - n_kv;
-        for (int d = threadIdx.x; d < hd; d += blockDim.x) vc[(size_t)pos * kv_dim + vh * hd + d] = f2h(row[q_dim + kv_dim + vh * hd + d]);
+        kv_store(vc + (size_t)pos * kv_dim + vh * hd, vs + (size_t)pos * n_kv + vh, row + q_dim + kv_dim + vh * hd, hd, sh);
         return;
     }
     float* vec = row + h * hd; // k heads directly follow the q heads
@@ -212,7 +269,7 @@ __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ 
     if (h >= n_heads) {
         __syncthreads();
         int kh = h - n_heads;
-        for (int d = threadIdx.x; d < hd; d += blockDim.x) kc[(size_t)pos * kv_dim + kh * hd + d] = f2h(vec[d]);
+        kv_store(kc + (size_t)pos * kv_dim + kh * hd, ks + (size_t)pos * n_kv + kh, vec, hd, sh);
     }
 }
 
@@ -652,7 +709,8 @@ __device__ __forceinline__ int att_chunk_for(int span, int want) {
 // floats of the key (one coalesced row read) and the dot products are reduced across the warp.
 // Writes each head's unnormalised output, max score and exp-sum to `part`, or (nsplit == 1) the final
 // normalised result to `out`. Needs hd a multiple of 32 (<= 128) and G <= ATT_MAX_G.
-__global__ void attention_partial_gqa(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
+__global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
+                                      const float* __restrict__ ks, const float* __restrict__ vs,
                                       float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp,
                                       int n_heads, int n_kv, int hd, float scale, int nsplit, int want) {
     if (posp) pos0 = *posp;
@@ -682,16 +740,17 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const unsig
         for (int e = 0; e < 4; e++) q[g][e] = (g < G && e < per) ? qrow[g * hd + e] * scale : 0.f;
 
     for (int t = warp; t < len; t += nwarps) {
-        const unsigned short* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd + lane * per;
+        const kv_t* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd + lane * per;
         float k4[4] = {0.f, 0.f, 0.f, 0.f};
-        if (per == 4) { float4 v = h4f(kt); k4[0] = v.x; k4[1] = v.y; k4[2] = v.z; k4[3] = v.w; }
-        else { unsigned w = *reinterpret_cast<const unsigned*>(kt); k4[0] = h2f(w & 0xFFFF); k4[1] = h2f(w >> 16); }
+        if (per == 4) { float4 v = kv_load4(kt); k4[0] = v.x; k4[1] = v.y; k4[2] = v.z; k4[3] = v.w; }
+        else { float2 v = kv_load2(kt); k4[0] = v.x; k4[1] = v.y; }
+        float kscale = KV_SCALE(ks, t0 + t, n_kv, kvh);
         #pragma unroll
         for (int g = 0; g < ATT_MAX_G; g++) {
             if (g < G) {
                 float d = q[g][0] * k4[0] + q[g][1] * k4[1] + q[g][2] * k4[2] + q[g][3] * k4[3];
                 for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffff, d, o);
-                if (lane == 0) sc[g][t] = d;
+                if (lane == 0) sc[g][t] = d * kscale;
             }
         }
     }
@@ -706,7 +765,7 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const unsig
             float se = 0.f;
             for (int t = tid; t < len; t += blockDim.x) {
                 float e = expf(sc[g][t] - m);
-                sc[g][t] = e;
+                sc[g][t] = e * KV_SCALE(vs, t0 + t, n_kv, kvh); // the value scale rides on the weight
                 se += e;
             }
             se = block_sum(se, red); // barrier: the probabilities are visible to every thread
@@ -718,9 +777,9 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const unsig
         float a[ATT_MAX_G];
         #pragma unroll
         for (int g = 0; g < ATT_MAX_G; g++) a[g] = 0.f;
-        const unsigned short* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + tid;
+        const kv_t* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + tid;
         for (int t = 0; t < len; t++) {
-            float v = h2f(vcol[(size_t)t * kv_dim]);
+            float v = kv_load1(vcol + (size_t)t * kv_dim);
             #pragma unroll
             for (int g = 0; g < ATT_MAX_G; g++) if (g < G) a[g] += sc[g][t] * v;
         }
@@ -744,8 +803,8 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const unsig
 // one block per (head, token, slice of `chunk` positions). Writes the slice's unnormalised output plus
 // its max score and exp-sum to `part` (hd + 2 floats).
 // With nsplit == 1 there is nothing to merge: the block writes the normalised result straight to `out`.
-__global__ void attention_partial(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
-                                  float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp, int n_heads, int n_kv, int hd,
+__global__ void attention_partial(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
+                                  const float* __restrict__ ks, const float* __restrict__ vs, float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp, int n_heads, int n_kv, int hd,
                                   float scale, int nsplit, int want) {
     if (posp) pos0 = *posp;
     __shared__ float sc[ATT_MAX_CHUNK];
@@ -770,13 +829,13 @@ __global__ void attention_partial(const float* __restrict__ qkv, const unsigned 
 
     float mx = NEG_INF;
     for (int t = threadIdx.x; t < len; t += blockDim.x) {
-        const unsigned short* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd;
+        const kv_t* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd;
         float acc = 0.f;
         for (int d = 0; d < hd / 4; d++) {
-            float4 k4 = h4f(kt + 4 * d);
+            float4 k4 = kv_load4(kt + 4 * d);
             acc += qs[4 * d] * k4.x + qs[4 * d + 1] * k4.y + qs[4 * d + 2] * k4.z + qs[4 * d + 3] * k4.w;
         }
-        acc *= scale;
+        acc *= scale * KV_SCALE(ks, t0 + t, n_kv, kvh);
         sc[t] = acc;
         mx = fmaxf(mx, acc);
     }
@@ -784,7 +843,7 @@ __global__ void attention_partial(const float* __restrict__ qkv, const unsigned 
     float se = 0.f;
     for (int t = threadIdx.x; t < len; t += blockDim.x) {
         float e = expf(sc[t] - mx);
-        sc[t] = e;
+        sc[t] = e * KV_SCALE(vs, t0 + t, n_kv, kvh); // the value scale rides on the weight
         se += e;
     }
     se = block_sum(se, red); // barrier: all scores visible
@@ -794,7 +853,7 @@ __global__ void attention_partial(const float* __restrict__ qkv, const unsigned 
     int g = threadIdx.x / hd, d = threadIdx.x % hd;
     if (g < groups) {
         float acc = 0.f;
-        for (int t = g; t < len; t += groups) acc += sc[t] * h2f(vc[(size_t)(t0 + t) * kv_dim + kvh * hd + d]);
+        for (int t = g; t < len; t += groups) acc += sc[t] * kv_load1(vc + (size_t)(t0 + t) * kv_dim + kvh * hd + d);
         accs[g][d] = acc;
     }
     __syncthreads();
@@ -813,7 +872,8 @@ __global__ void attention_partial(const float* __restrict__ qkv, const unsigned 
 // covers keys g, g+8, g+16, g+24 of the tile, for outputs the dims g, g+8, ... (interleaved: no bank conflicts).
 #define PQT 32
 #define PKT 32
-__global__ void attention_prefill(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
+__global__ void attention_prefill(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
+                                  const float* __restrict__ ks, const float* __restrict__ vs,
                                   float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, int hd, float scale) {
     extern __shared__ float smem[];
     int ld = hd + 1; // padded row stride: rows land on different banks
@@ -844,8 +904,8 @@ __global__ void attention_prefill(const float* __restrict__ qkv, const unsigned 
         for (int idx = tid; idx < PKT * hd; idx += blockDim.x) {
             int k = idx / hd, d = idx % hd, kp = t0 + k;
             bool ok = kp < kv_len;
-            Ks[k * ld + d] = ok ? h2f(kc[(size_t)kp * kv_dim + kvh * hd + d]) : 0.f;
-            Vs[k * ld + d] = ok ? h2f(vc[(size_t)kp * kv_dim + kvh * hd + d]) : 0.f;
+            Ks[k * ld + d] = ok ? kv_load1(kc + (size_t)kp * kv_dim + kvh * hd + d) * KV_SCALE(ks, kp, n_kv, kvh) : 0.f;
+            Vs[k * ld + d] = ok ? kv_load1(vc + (size_t)kp * kv_dim + kvh * hd + d) * KV_SCALE(vs, kp, n_kv, kvh) : 0.f;
         }
         __syncthreads();
 
@@ -921,6 +981,18 @@ __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     asm("{.reg .f16 l, h; cvt.rn.f16.f32 l, %1; cvt.rn.f16.f32 h, %2; mov.b32 %0, {l, h};}" : "=r"(r) : "f"(lo), "f"(hi));
     return r;
 }
+#ifdef KV8
+// 4 int8 values (one word) to 4 exact f16 (two f16x2 words): with the sign bit flipped each byte u is
+// 0..255, the f16 with bits 0x6400 | u is 1024 + u, and subtracting 1152 (0x6480) leaves the int8 value.
+__device__ __forceinline__ uint2 i8x4_to_h4(unsigned w) {
+    unsigned x = w ^ 0x80808080u, lo, hi;
+    asm("prmt.b32 %0, %1, %2, 0x4140;" : "=r"(lo) : "r"(x), "r"(0x64646464u));
+    asm("prmt.b32 %0, %1, %2, 0x4342;" : "=r"(hi) : "r"(x), "r"(0x64646464u));
+    asm("sub.f16x2 %0, %0, %1;" : "+r"(lo) : "r"(0x64806480u));
+    asm("sub.f16x2 %0, %0, %1;" : "+r"(hi) : "r"(0x64806480u));
+    return make_uint2(lo, hi);
+}
+#endif
 #define MMA_F16(c, a0, a1, b) \
     asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};" \
         : "+f"((c)[0]), "+f"((c)[1]), "+f"((c)[2]), "+f"((c)[3]) : "r"(a0), "r"(a1), "r"(b))
@@ -933,13 +1005,21 @@ __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
 // a warp keeps its Q rows as fragments in registers, S = Q K^T comes out in the accumulator layout,
 // which is also the A-fragment layout, so the probabilities feed O += P V without a trip through
 // shared memory. K/V tiles of 32 positions are copied (f16, as cached) into shared memory (rows padded by 16
-// bytes: ldmatrix rows hit different banks); the same buffer stages Q at the start. Online softmax in
+// bytes: ldmatrix rows hit different banks); the same buffer stages Q at the start. An int8 cache stages
+// K and V as their exact integer values (in f16) and applies the scales to the scores and probabilities. Online softmax in
 // base 2 (Q is pre-scaled by scale * log2 e). The row sums come from the tensor cores too (P x ones), so they\n// add up exactly the rounded probabilities that P V uses.
 template <int HD>
-__device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc,
+__device__ void attn_prefill_tc(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
+                                const float* __restrict__ ks, const float* __restrict__ vs,
                                 float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, float scale) {
     constexpr int BQ = 64, BK = 32, LDW = HD / 2 + 4; // row stride in f16x2 words
     __shared__ __align__(16) unsigned sm[2 * BK * LDW]; // Q staging (BQ rows), then K (BK rows) | V (BK rows)
+#ifdef KV8
+    // the tile's scales; the value scales go into the f16 probabilities times 2^10, so small products
+    // stay normal f16 (the output is divided by it again); |V| up to ~8000 fits
+    constexpr float VSCALE_BIAS = 1024.f;
+    __shared__ float kscale[BK], vscale[BK];
+#endif
     unsigned* Ks = sm;
     unsigned* Vs = sm + BK * LDW;
     int h = blockIdx.x;
@@ -983,6 +1063,37 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned sh
 
     for (int t0 = 0; t0 < kmax; t0 += BK) {
         __syncthreads(); // previous tile (or the Q staging) consumed
+#ifdef KV8
+        // int8 rows are HD bytes, so one 16-byte load brings 16 values: every load of the tile (and its
+        // scales) is issued before any is used, then converted to exact f16 integers. The scales go on
+        // the scores (K) and the probabilities (V). Past the end: zeros, so 0 x scale stays 0.
+        constexpr int C16 = HD / 16, NL = BK * C16 / 128; // 16-value groups per row, loads per thread
+        float sc_ld = 0.f;
+        if (tid < 2 * BK && t0 + (tid & (BK - 1)) < kv_len)
+            sc_ld = tid < BK ? KV_SCALE(ks, t0 + tid, n_kv, kvh) : KV_SCALE(vs, t0 + tid - BK, n_kv, kvh) * VSCALE_BIAS;
+        uint4 kw[NL], vw[NL];
+        #pragma unroll
+        for (int i = 0; i < NL; i++) {
+            int idx = tid + 128 * i, kp = t0 + idx / C16, off = 16 * (idx % C16);
+            kw[i] = vw[i] = make_uint4(0u, 0u, 0u, 0u);
+            if (kp < kv_len) {
+                kw[i] = *reinterpret_cast<const uint4*>(kc + (size_t)kp * kv_dim + kvh * HD + off);
+                vw[i] = *reinterpret_cast<const uint4*>(vc + (size_t)kp * kv_dim + kvh * HD + off);
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < NL; i++) {
+            int idx = tid + 128 * i, r = idx / C16, w = 8 * (idx % C16); // f16x2 word offset in the row
+            uint2 a = i8x4_to_h4(kw[i].x), b = i8x4_to_h4(kw[i].y), c = i8x4_to_h4(kw[i].z), d = i8x4_to_h4(kw[i].w);
+            *reinterpret_cast<uint4*>(Ks + r * LDW + w) = make_uint4(a.x, a.y, b.x, b.y);
+            *reinterpret_cast<uint4*>(Ks + r * LDW + w + 4) = make_uint4(c.x, c.y, d.x, d.y);
+            a = i8x4_to_h4(vw[i].x); b = i8x4_to_h4(vw[i].y); c = i8x4_to_h4(vw[i].z); d = i8x4_to_h4(vw[i].w);
+            *reinterpret_cast<uint4*>(Vs + r * LDW + w) = make_uint4(a.x, a.y, b.x, b.y);
+            *reinterpret_cast<uint4*>(Vs + r * LDW + w + 4) = make_uint4(c.x, c.y, d.x, d.y);
+        }
+        if (tid < BK) kscale[tid] = sc_ld;
+        else if (tid < 2 * BK) vscale[tid - BK] = sc_ld;
+#else
         for (int idx = tid; idx < BK * HD / 4; idx += 128) {
             int r = idx / (HD / 4), c4 = idx % (HD / 4), kp = t0 + r;
             uint2 k4 = make_uint2(0u, 0u), v4 = k4; // positions past the end must be finite (zeros): P = 0 there
@@ -993,6 +1104,7 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned sh
             *reinterpret_cast<uint2*>(Ks + r * LDW + 2 * c4) = k4;
             *reinterpret_cast<uint2*>(Vs + r * LDW + 2 * c4) = v4;
         }
+#endif
         __syncthreads();
         if (t0 > warp_last) continue; // causal: nothing of this tile is visible to the warp's rows
 
@@ -1016,6 +1128,11 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned sh
             #pragma unroll
             for (int e = 0; e < 2; e++) {
                 int kp = t0 + 8 * j + 2 * (lane & 3) + e;
+#ifdef KV8
+                float kd = kscale[8 * j + 2 * (lane & 3) + e];
+                s[j][e] *= kd;
+                s[j][2 + e] *= kd;
+#endif
                 if (kp > p_lo || kp >= kv_len) s[j][e] = NEG_INF;
                 if (kp > p_hi || kp >= kv_len) s[j][2 + e] = NEG_INF;
                 mx_lo = fmaxf(mx_lo, s[j][e]);
@@ -1031,12 +1148,22 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned sh
         float a_lo = exp2f(m_lo - mn_lo), a_hi = exp2f(m_hi - mn_hi);
         m_lo = mn_lo; m_hi = mn_hi;
         unsigned pf[BK / 8][2]; // probabilities as A fragments, one per k8 step of keys
+#ifdef KV8
+        unsigned pv[BK / 8][2]; // the same times the value scales, for P V
+#else
+        unsigned (&pv)[BK / 8][2] = pf;
+#endif
         #pragma unroll
         for (int j = 0; j < BK / 8; j++) {
             float p0 = exp2f(s[j][0] - mn_lo), p1 = exp2f(s[j][1] - mn_lo);
             float p2 = exp2f(s[j][2] - mn_hi), p3 = exp2f(s[j][3] - mn_hi);
             pf[j][0] = pack_h2(p0, p1);
             pf[j][1] = pack_h2(p2, p3);
+#ifdef KV8
+            float v0 = vscale[8 * j + 2 * (lane & 3)], v1 = vscale[8 * j + 2 * (lane & 3) + 1];
+            pv[j][0] = pack_h2(p0 * v0, p1 * v1);
+            pv[j][1] = pack_h2(p2 * v0, p3 * v1);
+#endif
         }
         // normalise by the sum of the rounded probabilities that P V actually uses
         l[0] *= a_lo; l[1] *= a_lo; l[2] *= a_hi; l[3] *= a_hi;
@@ -1049,11 +1176,15 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned sh
             unsigned b[4];
             LDSM_X4(b, vaddr + 16 * d, ".trans");
             #pragma unroll
-            for (int j = 0; j < BK / 8; j++) MMA_F16(o[d], pf[j][0], pf[j][1], b[j]);
+            for (int j = 0; j < BK / 8; j++) MMA_F16(o[d], pv[j][0], pv[j][1], b[j]);
         }
     }
     int r_lo = q0 + 16 * warp + (lane >> 2), r_hi = r_lo + 8;
+#ifdef KV8
+    float i_lo = (1.f / VSCALE_BIAS) / l[0], i_hi = (1.f / VSCALE_BIAS) / l[2];
+#else
     float i_lo = 1.f / l[0], i_hi = 1.f / l[2];
+#endif
     #pragma unroll
     for (int d = 0; d < HD / 8; d++) {
         int col = h * HD + 8 * d + 2 * (lane & 3);
@@ -1064,10 +1195,11 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const unsigned sh
 
 extern "C" {
 
-#define ATT_TC_ARGS const float* __restrict__ qkv, const unsigned short* __restrict__ kc, const unsigned short* __restrict__ vc, \
+#define ATT_TC_ARGS const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc, \
+                    const float* __restrict__ ks, const float* __restrict__ vs, \
                     float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, int hd, float scale
-__global__ void __launch_bounds__(128) attention_prefill_tc64(ATT_TC_ARGS) { attn_prefill_tc<64>(qkv, kc, vc, out, pos0, n, n_heads, n_kv, scale); }
-__global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { attn_prefill_tc<128>(qkv, kc, vc, out, pos0, n, n_heads, n_kv, scale); }
+__global__ void __launch_bounds__(128) attention_prefill_tc64(ATT_TC_ARGS) { attn_prefill_tc<64>(qkv, kc, vc, ks, vs, out, pos0, n, n_heads, n_kv, scale); }
+__global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { attn_prefill_tc<128>(qkv, kc, vc, ks, vs, out, pos0, n, n_heads, n_kv, scale); }
 
 // Flash-decoding attention, part 2: merge the slices of each (head, token) into the normalised output.
 __global__ void attention_combine(const float* __restrict__ part, float* __restrict__ out,
@@ -2079,7 +2211,7 @@ impl Kernels {
     /// options, NVRTC and GPU match a previous run, else compiled with NVRTC (seconds) and cached.
     /// BETTERLLAMA_NO_KERNEL_CACHE=1 always compiles.
     fn binary(a: &Api) -> Result<Vec<u8>, String> {
-        let opts = [
+        let mut opts = vec![
             format!("--gpu-architecture=sm_{}{}", a.compute.0, a.compute.1),
             "-std=c++14".into(),
             format!("-DRPW={}", kq_rpw()),
@@ -2087,6 +2219,9 @@ impl Kernels {
             format!("-DDP4A_BATCH_MINB={}", std::env::var("BETTERLLAMA_BATCH_MINB").unwrap_or("3".into())),
             format!("-DDP4A_BATCH_RPW={}", batch_rpw()),
         ];
+        if kv_int8() {
+            opts.push("-DKV8".into());
+        }
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2743,7 +2878,8 @@ impl GpuModel {
 
     /// posp: device pointer to the position (CUDA graphs), else 0 and s.pos is used. ixed_split:
     /// one-token steps use the session's widest split grid, so a captured graph fits every position.
-    fn attention(&self, s: &GpuSession, n: usize, kc: u64, vc: u64, posp: u64, fixed_split: bool) -> Result<(), String> {
+    /// kc, vc: the layer's cache; ks, vs: its int8 scales (unused with an f16 cache).
+    fn attention(&self, s: &GpuSession, n: usize, (kc, vc, ks, vs): (u64, u64, u64, u64), posp: u64, fixed_split: bool) -> Result<(), String> {
         let c = &self.cfg;
         let k = &self.k;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
@@ -2758,7 +2894,7 @@ impl GpuModel {
                 (c.n_heads as u32, n.div_ceil(PREFILL_TC_QT) as u32),
                 128,
                 0,
-                &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(n as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale)],
+                &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(n as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale)],
             );
         }
         if let (true, Some(shared)) = (n >= TILED_MIN_BATCH, self.prefill_shared) {
@@ -2767,7 +2903,7 @@ impl GpuModel {
                 (c.n_heads as u32, n.div_ceil(PREFILL_QT) as u32),
                 128,
                 shared as u32,
-                &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(n as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale)],
+                &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(n as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale)],
             );
         }
         // split-context path, a few tokens at a time so the partial-results buffer stays small
@@ -2790,7 +2926,7 @@ impl GpuModel {
                 (heads as u32, m as u32, nsplit as u32),
                 128,
                 0,
-                &[Arg::P(qkv), Arg::P(kc), Arg::P(vc), Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale), Arg::I(nsplit as i32), Arg::I(want as i32)],
+                &[Arg::P(qkv), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale), Arg::I(nsplit as i32), Arg::I(want as i32)],
             )?;
             if nsplit > 1 {
                 k.launch(
@@ -2891,10 +3027,12 @@ impl GpuModel {
         self.timed(0, || {
             k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(self.embd.fmt as i32), Arg::P(self.embd.q.ptr), Arg::P(self.embd.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)])
         })?;
-        let layer_kv = s.ctx * kv_dim * 2; // f16
+        let layer_kv = s.ctx * kv_dim * kv_bytes();
+        let layer_scales = s.ctx * c.n_kv_heads * 4;
         let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
         for (l, layer) in self.layers.iter().enumerate() {
             let (kc, vc) = (s.k_cache.at(l * layer_kv), s.v_cache.at(l * layer_kv));
+            let (ks, vs) = if kv_int8() { (s.k_scale.at(l * layer_scales), s.v_scale.at(l * layer_scales)) } else { (0, 0) };
             let qkv: Vec<(&GpuMatrix, usize)> = layer.qkv.iter().map(|(m, off)| (m, *off)).collect();
             self.timed(2, || self.norm_matmul(&layer.attn_norm, &qkv, s.qkv.ptr, qkv_rows, n, s))?;
             self.timed(3, || {
@@ -2907,10 +3045,10 @@ impl GpuModel {
                     (n as u32, (c.n_heads + 2 * c.n_kv_heads) as u32),
                     64,
                     0,
-                    &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
+                    &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
                 )
             })?;
-            self.timed(4, || self.attention(s, n, kc, vc, posp, fixed_split))?;
+            self.timed(4, || self.attention(s, n, (kc, vc, ks, vs), posp, fixed_split))?;
             self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
 
             self.timed(6, || {
@@ -2968,6 +3106,8 @@ pub struct GpuSession {
     h: DeviceBuf,
     k_cache: DeviceBuf,
     v_cache: DeviceBuf,
+    k_scale: DeviceBuf,  // int8 cache: f32 scale per (layer, position, kv head)
+    v_scale: DeviceBuf,
     xq: DeviceBuf,       // int8 activations for the tiled matmul
     xd: DeviceBuf,       // their per-32 scales
     xsum: DeviceBuf,     // and per-32 sums of the int8 values
@@ -2999,7 +3139,7 @@ fn graphs_enabled() -> bool {
 impl GpuSession {
     pub fn new(cfg: &Config, ctx: usize) -> Result<GpuSession, String> {
         let ctx = ctx.min(cfg.max_ctx);
-        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, k_cache, v_cache, logits_dev, picks, pos_dev] = Self::sizes(cfg, ctx).map(DeviceBuf::alloc);
+        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, k_cache, v_cache, k_scale, v_scale, logits_dev, picks, pos_dev] = Self::sizes(cfg, ctx).map(DeviceBuf::alloc);
         Ok(GpuSession {
             xq: xq?,
             xd: xd?,
@@ -3016,6 +3156,8 @@ impl GpuSession {
             h: h?,
             k_cache: k_cache?,
             v_cache: v_cache?,
+            k_scale: k_scale?,
+            v_scale: v_scale?,
             logits_dev: logits_dev?,
             picks: picks?,
             pos_dev: pos_dev?,
@@ -3025,12 +3167,13 @@ impl GpuSession {
     }
 
     /// Bytes of each device buffer, in the order `new` takes them.
-    fn sizes(cfg: &Config, ctx: usize) -> [usize; 16] {
+    fn sizes(cfg: &Config, ctx: usize) -> [usize; 18] {
         let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
         let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim);
         // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 32 positions
         let slices = SPLIT_MAX_BATCH * ctx.div_ceil(32);
-        let kv = cfg.n_layers * ctx * kv_dim * 2; // f16
+        let kv = cfg.n_layers * ctx * kv_dim * kv_bytes();
+        let scales = if kv_int8() { 4 * cfg.n_layers * ctx * cfg.n_kv_heads } else { 0 };
         [
             MAX_BATCH * widest,
             4 * MAX_BATCH * widest / 32,
@@ -3045,6 +3188,8 @@ impl GpuSession {
             4 * MAX_BATCH * cfg.ffn_dim,
             kv,
             kv,
+            scales,
+            scales,
             4 * DECODE_MAX_BATCH * cfg.vocab,
             4 * DECODE_MAX_BATCH,
             4,

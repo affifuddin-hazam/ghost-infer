@@ -31,8 +31,11 @@ and cultural attractions. Paris is a major global city, and its population is ap
   matrix-vector kernels for K-quants (16-byte loads, 84–97% of DRAM bandwidth on an 8B model), RMSNorm and
   SiLU kernels that write the int8 activations directly, and split-context ("flash-decoding") attention
   that reads each key/value row once per head group. One-token steps replay a CUDA graph. The KV cache is
-  f16 (half the memory of f32, same greedy output in tests), and `chat`/`serve` size the context to the
-  GPU memory the weights leave free.
+  int8 with one scale per position and kv head, quantised as each row is written (`--kv f16` for f16):
+  about half the memory of f16, so an 8B model on an 8 GB card gets a 19,456-token context instead of
+  10,240. Next-token log-probabilities stay within 0.11 of the f16 cache (same top token at every tested
+  length; int8 activations alone move them by ~0.1). `chat`/`serve` size the context to the GPU memory
+  the weights leave free.
 - **Speculative decoding** (`--draft small.gguf`, GPU, greedy): a small model with the same tokenizer
   guesses a few tokens ahead and the main model checks them all in one batched pass. The output is
   exactly the plain greedy output: a token's logits are bit-identical whether it is computed alone or
@@ -93,6 +96,7 @@ Options for `run`, `chat`, `serve` and `bench`:
 | `--special` | | print special tokens |
 | `--draft <gguf>` | | speculative decoding with this small model (`--gpu`, used for greedy replies; same tokenizer needed) |
 | `--draft-k <n>` | 3 | tokens the draft proposes per step (1-7) |
+| `--kv <f16\|int8>` | int8 (`BETTERLLAMA_KV`) | GPU KV cache format: int8 holds about twice the context of f16 |
 | `--host <addr>` | 127.0.0.1 | `serve`: address to listen on (`0.0.0.0` for other machines on your network) |
 | `--port <n>` | 8080 | `serve`: port |
 

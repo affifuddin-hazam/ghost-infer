@@ -44,6 +44,7 @@ OPTIONS:
         --gpu             run on the NVIDIA GPU (CUDA driver + NVRTC, loaded at runtime)
         --draft <gguf>    speculative decoding with this small model (GPU, greedy; same output, faster)
         --draft-k <n>     tokens the draft proposes per step  [3]
+        --kv <f16|int8>   GPU KV cache: int8 holds about twice the context  [int8, or BETTERLLAMA_KV]
         --threads <n>     CPU worker threads                 [physical cores]
         --special         print special tokens
         --host <addr>     serve: address to listen on        [127.0.0.1]
@@ -126,6 +127,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--draft-k" => o.draft_k = num(val(a)?, a)? as usize,
             "--host" => o.host = val(a)?,
             "--port" => o.port = num(val(a)?, a)? as u16,
+            "--kv" => match val(a)?.as_str() {
+                "f16" => cuda::set_kv_int8(false),
+                "int8" => cuda::set_kv_int8(true),
+                v => return Err(format!("--kv: \"{v}\" is not f16 or int8")),
+            },
             other => return Err(format!("unknown option {other}")),
         }
     }
