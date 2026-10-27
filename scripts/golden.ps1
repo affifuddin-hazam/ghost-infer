@@ -2,7 +2,7 @@
 # Usage: scripts\golden.ps1 [-Save]   (-Save writes the reference file, otherwise compares against it)
 param([switch]$Save)
 $root  = Split-Path $PSScriptRoot
-$exe   = Join-Path $root 'target\release\betterllama.exe'
+$exe   = Join-Path $root 'target\release\ghost-infer.exe'
 $model = Join-Path $root 'models\SmolLM2-135M-Instruct-Q8_0.gguf'
 $ref   = Join-Path $root 'scripts\golden.txt'
 

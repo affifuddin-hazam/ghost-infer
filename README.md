@@ -1,10 +1,10 @@
-# betterllama
+# ghost-infer
 
 A small LLM inference engine for GGUF models, written from scratch in Rust. It runs on the CPU, or on an
 NVIDIA GPU with `--gpu`, from a single executable with two dependencies (`memmap2`, `rayon`).
 
 ```text
-> betterllama run SmolLM2-135M-Instruct-Q8_0.gguf -p "What is the capital of France?" --gpu -t 0
+> ghost-infer run SmolLM2-135M-Instruct-Q8_0.gguf -p "What is the capital of France?" --gpu -t 0
 [loaded SmolLM2 135M Instruct on GPU NVIDIA GeForce RTX 2060 SUPER (sm_75, NVRTC nvrtc64_120_0.dll) in 0.74s]
 The capital of France is Paris. It is a city known for its historical landmarks, cultural institutions,
 and cultural attractions. Paris is a major global city, and its population is approximately 2.5 million people.
@@ -72,11 +72,11 @@ Remove that file to build a portable binary.
 ## Usage
 
 ```bash
-betterllama run   model.gguf -p "Write a haiku about the ocean."
-betterllama chat  model.gguf --gpu
-betterllama bench model.gguf --prompt-len 256 -n 128 --gpu
-betterllama run   Qwen3-8B-Q4_K_M.gguf -p "Explain DNS." -t 0 --gpu --draft Qwen3-0.6B-Q8_0.gguf
-betterllama serve Qwen3-8B-Q4_K_M.gguf --gpu --port 8080
+ghost-infer run   model.gguf -p "Write a haiku about the ocean."
+ghost-infer chat  model.gguf --gpu
+ghost-infer bench model.gguf --prompt-len 256 -n 128 --gpu
+ghost-infer run   Qwen3-8B-Q4_K_M.gguf -p "Explain DNS." -t 0 --gpu --draft Qwen3-0.6B-Q8_0.gguf
+ghost-infer serve Qwen3-8B-Q4_K_M.gguf --gpu --port 8080
 ```
 
 | Command | What it does |
@@ -108,13 +108,13 @@ Options for `run`, `chat`, `serve` and `bench`:
 | `--special` | | print special tokens |
 | `--draft <gguf>` | | speculative decoding with this small model (`--gpu`, used for greedy replies; same tokenizer needed) |
 | `--draft-k <n>` | 3 | tokens the draft proposes per step (1-7) |
-| `--kv <f16\|int8>` | int8 (`BETTERLLAMA_KV`) | GPU KV cache format: int8 holds about twice the context of f16 |
+| `--kv <f16\|int8>` | int8 (`GHOST_INFER_KV`) | GPU KV cache format: int8 holds about twice the context of f16 |
 | `--host <addr>` | 127.0.0.1 | `serve`: address to listen on (`0.0.0.0` for other machines on your network) |
 | `--port <n>` | 8080 | `serve`: port |
 
 ### Server
 
-`betterllama serve model.gguf --gpu` listens on `http://127.0.0.1:8080`. Open that address in a browser to chat:
+`ghost-infer serve model.gguf --gpu` listens on `http://127.0.0.1:8080`. Open that address in a browser to chat:
 replies stream in, the model's `<think>` reasoning folds into a "Thought for N s" line (with a switch to
 turn thinking off), the conversation is kept in the browser, and Settings has temperature, max tokens and
 a system prompt. The page is part of the program (`src/chat.html`); nothing else is installed.
@@ -149,9 +149,9 @@ context, so with a small context send only the tools a request needs.
 
 - An NVIDIA GPU with compute capability 6.1 or newer (needs `dp4a`; 7.5+ also uses int8 tensor cores),
   and a current driver (`nvcuda.dll`). The weights must fit in VRAM (an 8B Q4_K_M needs about 5.5 GB).
-- NVRTC 11.1 or newer from a CUDA toolkit. betterllama picks the newest `nvrtc64_*.dll` under
-  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin`, or the one named by `BETTERLLAMA_NVRTC`.
-  The compiled kernels are cached in `%LOCALAPPDATA%\betterllama\kernels` (about 0.6 MB), so only the
+- NVRTC 11.1 or newer from a CUDA toolkit. ghost-infer picks the newest `nvrtc64_*.dll` under
+  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin`, or the one named by `GHOST_INFER_NVRTC`.
+  The compiled kernels are cached in `%LOCALAPPDATA%\ghost-infer\kernels` (about 0.6 MB), so only the
   first start after an update or a GPU change compiles them (a few seconds).
 - Windows only for now (the libraries are loaded with `LoadLibraryExW`).
 
@@ -176,7 +176,7 @@ needs: about 30 s for the 8B from a USB hard disk, a few seconds from an SSD.
 **Qwen3 8B Q4_K_M, GPU** (both measured in the same session; GPU clocks vary between sessions, so
 compare rows only within one table)
 
-| | betterllama | Ollama |
+| | ghost-infer | Ollama |
 |---|---|---|
 | Prompt, ~33 tokens | 745 | **800** |
 | Prompt, ~260 tokens | **1,475** | 1,313 |
@@ -187,7 +187,7 @@ compare rows only within one table)
 **Speculative decoding**, the same 8B with `--draft JOSIEFIED-Qwen3-0.6B-Q8_0.gguf` (k = 3), same session as
 Ollama. The gain depends on how often the draft guesses right, so it is shown per text:
 
-| Greedy generation | betterllama | + draft | Ollama | guesses accepted |
+| Greedy generation | ghost-infer | + draft | Ollama | guesses accepted |
 |---|---|---|---|---|
 | bench text, ~32-token prompt (64 tokens) | 71.4 | **96.4** | 52.7 | |
 | bench text, ~256-token prompt | 70.1 | **119.4** | 52.5 | |
@@ -198,7 +198,7 @@ Ollama. The gain depends on how often the draft guesses right, so it is shown pe
 
 **Qwen3 8B Q4_K_M, CPU**
 
-| | betterllama | Ollama |
+| | ghost-infer | Ollama |
 |---|---|---|
 | Prompt, ~33 tokens | 10.3 | **18.7** |
 | Prompt, ~260 tokens | 9.4 | **18.2** |
@@ -206,7 +206,7 @@ Ollama. The gain depends on how often the draft guesses right, so it is shown pe
 
 **SmolLM2-135M-Instruct Q8_0, GPU**
 
-| | betterllama | Ollama |
+| | ghost-infer | Ollama |
 |---|---|---|
 | Prompt, 33 tokens | **5,311** | 2,788 |
 | Prompt, 253 tokens | **18,505** | 14,039 |
@@ -217,7 +217,7 @@ Ollama. The gain depends on how often the draft guesses right, so it is shown pe
 
 **SmolLM2-135M-Instruct Q8_0, CPU**
 
-| | betterllama | Ollama |
+| | ghost-infer | Ollama |
 |---|---|---|
 | Prompt, 33 tokens | 664 | **802** |
 | Prompt, 253 tokens | 692 | **713** |
@@ -226,7 +226,7 @@ Ollama. The gain depends on how often the draft guesses right, so it is shown pe
 | Generate at 253 context | 84 | **120** |
 | Generate at 1,013 context | 63 | **87** |
 
-On the small model per-token overhead dominates, which betterllama keeps low. On the 8B model the work is
+On the small model per-token overhead dominates, which ghost-infer keeps low. On the 8B model the work is
 in the matrix kernels, where llama.cpp (inside Ollama) is still ahead, most of all on long prompts.
 
 ## Accuracy
@@ -234,7 +234,7 @@ in the matrix kernels, where llama.cpp (inside Ollama) is still ahead, most of a
 Like llama.cpp, the fast paths quantise activations to int8: the CPU everywhere, the GPU for prompts, and
 the GPU for generation with K-quant weights. GPU prompt attention runs in f16 (as llama.cpp's does), with
 f32 accumulation and f32 key/value cache. GPU generation with Q8_0 weights, and every path under
-`BETTERLLAMA_EXACT=1`, uses f32 activations.
+`GHOST_INFER_EXACT=1`, uses f32 activations.
 
 | Path | Distance from exact f32 maths (log-probability) |
 |---|---|
@@ -251,19 +251,19 @@ Tools for checking this:
 
 | | |
 |---|---|
-| `BETTERLLAMA_EXACT=1` | reference mode: no activation quantisation, on the CPU and the GPU (slow) |
-| `BETTERLLAMA_STEPWISE=1` | feed prompts one token at a time, to test the generation path |
-| `BETTERLLAMA_PROFILE=1` | time per operation (CPU and GPU) in `bench` |
-| `BETTERLLAMA_QCH=256` | K-quant GPU prompts: one activation scale per 256 values (~1% faster, about twice the drift) |
-| `BETTERLLAMA_VERIFY_N=n` | `bench --gpu`: also time one n-token decode batch (a speculative check step) |
-| `BETTERLLAMA_LOAD_TIMES=1` | GPU: time each startup phase (driver, kernels, weights) |
-| `BETTERLLAMA_NO_KERNEL_CACHE=1` | GPU: compile the kernels instead of using (and filling) the on-disk cache |
-| `BETTERLLAMA_NO_GRAPH=1` | GPU: plain kernel launches instead of CUDA-graph replay for one-token steps |
-| `BETTERLLAMA_NO_TC_ATT=1` | GPU prompts: f32 attention instead of f16 tensor cores (more exact, much slower on long prompts) |
-| `BETTERLLAMA_NO_Q8K=1` | K-quant GPU prompts: the older per-32 activation-scale kernel (more exact, ~1.7× slower) |
-| `BETTERLLAMA_EXPERT_CACHE_MB=n` | mixture of experts on the GPU: VRAM for the expert cache (default: what is free; 0 = every expert on the CPU) |
-| `BETTERLLAMA_MOE_CHECK=1` | mixture of experts on the GPU: also compute each GPU-resident expert on the CPU and print the difference |
-| `BETTERLLAMA_LOGITS_OUT=file` | `top`: write every next-token logit (f32, little-endian) for accuracy tooling |
+| `GHOST_INFER_EXACT=1` | reference mode: no activation quantisation, on the CPU and the GPU (slow) |
+| `GHOST_INFER_STEPWISE=1` | feed prompts one token at a time, to test the generation path |
+| `GHOST_INFER_PROFILE=1` | time per operation (CPU and GPU) in `bench` |
+| `GHOST_INFER_QCH=256` | K-quant GPU prompts: one activation scale per 256 values (~1% faster, about twice the drift) |
+| `GHOST_INFER_VERIFY_N=n` | `bench --gpu`: also time one n-token decode batch (a speculative check step) |
+| `GHOST_INFER_LOAD_TIMES=1` | GPU: time each startup phase (driver, kernels, weights) |
+| `GHOST_INFER_NO_KERNEL_CACHE=1` | GPU: compile the kernels instead of using (and filling) the on-disk cache |
+| `GHOST_INFER_NO_GRAPH=1` | GPU: plain kernel launches instead of CUDA-graph replay for one-token steps |
+| `GHOST_INFER_NO_TC_ATT=1` | GPU prompts: f32 attention instead of f16 tensor cores (more exact, much slower on long prompts) |
+| `GHOST_INFER_NO_Q8K=1` | K-quant GPU prompts: the older per-32 activation-scale kernel (more exact, ~1.7× slower) |
+| `GHOST_INFER_EXPERT_CACHE_MB=n` | mixture of experts on the GPU: VRAM for the expert cache (default: what is free; 0 = every expert on the CPU) |
+| `GHOST_INFER_MOE_CHECK=1` | mixture of experts on the GPU: also compute each GPU-resident expert on the CPU and print the difference |
+| `GHOST_INFER_LOGITS_OUT=file` | `top`: write every next-token logit (f32, little-endian) for accuracy tooling |
 | `scripts\golden.ps1 [-Save]` | regression check against saved log-probabilities and a greedy reply |
 | `scripts\accuracy.ps1 [-Gpu]` | fast path vs exact maths at several prompt lengths |
 | `scripts\decode-accuracy.ps1` | GPU generation path vs exact maths at up to ~1,500 tokens |

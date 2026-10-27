@@ -1,4 +1,4 @@
-//! Opt-in per-operation timing (BETTERLLAMA_PROFILE=1), cheap enough to leave compiled in.
+//! Opt-in per-operation timing (GHOST_INFER_PROFILE=1), cheap enough to leave compiled in.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -11,7 +11,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn enabled() -> bool {
     static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| ENABLED.store(std::env::var_os("BETTERLLAMA_PROFILE").is_some(), Ordering::Relaxed));
+    INIT.get_or_init(|| ENABLED.store(std::env::var_os("GHOST_INFER_PROFILE").is_some(), Ordering::Relaxed));
     ENABLED.load(Ordering::Relaxed)
 }
 

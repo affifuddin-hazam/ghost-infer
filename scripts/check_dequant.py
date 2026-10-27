@@ -1,4 +1,4 @@
-"""Compare betterllama's dequantisation with gguf-py's reference for a few rows of every weight format."""
+"""Compare ghost-infer's dequantisation with gguf-py's reference for a few rows of every weight format."""
 import subprocess
 import sys
 

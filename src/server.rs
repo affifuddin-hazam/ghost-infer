@@ -431,7 +431,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         }
         ("GET", "/health") => return respond(&mut conn, 200, &obj(vec![("status", str("ok"))])),
         ("GET", "/v1/models") => {
-            let m = obj(vec![("id", str(model_id)), ("object", str("model")), ("created", num(created as f64)), ("owned_by", str("betterllama")), ("context_length", num(ctx as f64))]);
+            let m = obj(vec![("id", str(model_id)), ("object", str("model")), ("created", num(created as f64)), ("owned_by", str("ghost-infer")), ("context_length", num(ctx as f64))]);
             return respond(&mut conn, 200, &obj(vec![("object", str("list")), ("data", Json::Arr(vec![m]))]));
         }
         ("POST", "/v1/chat/completions") if chat_ok => {}

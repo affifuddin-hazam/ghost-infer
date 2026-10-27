@@ -626,10 +626,10 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + tail
 }
 
-/// BETTERLLAMA_EXACT=1: skip activation quantisation (slow; for checking accuracy).
+/// GHOST_INFER_EXACT=1: skip activation quantisation (slow; for checking accuracy).
 pub fn exact_mode() -> bool {
     static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EXACT.get_or_init(|| std::env::var_os("BETTERLLAMA_EXACT").is_some())
+    *EXACT.get_or_init(|| std::env::var_os("GHOST_INFER_EXACT").is_some())
 }
 
 fn has_avx2() -> bool {

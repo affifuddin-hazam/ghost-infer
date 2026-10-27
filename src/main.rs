@@ -19,18 +19,18 @@ use model::{Config, Model, Session};
 use sampler::Sampler;
 use tokenizer::{Tokenizer, Utf8Stream};
 
-const USAGE: &str = "betterllama - run GGUF language models on the CPU or an NVIDIA GPU
+const USAGE: &str = "ghost-infer - run GGUF language models on the CPU or an NVIDIA GPU
 
 USAGE:
-    betterllama inspect  <model.gguf>
-    betterllama meta     <model.gguf> <key>
-    betterllama dequant  <model.gguf> <tensor> <row>   (one row of a weight as floats, for checking formats)
-    betterllama tokenize <model.gguf> <text>
-    betterllama top      <model.gguf> <text> [--gpu]   (next-token probabilities after raw text)
-    betterllama bench    <model.gguf> [-n <gen tokens>] [--prompt-len <n>] [--threads <n>] [--gpu] [--draft <gguf>]
-    betterllama run      <model.gguf> -p <prompt> [options]
-    betterllama chat     <model.gguf> [options]
-    betterllama serve    <model.gguf> [--host <addr>] [--port <n>] [options]   (OpenAI-compatible HTTP API)
+    ghost-infer inspect  <model.gguf>
+    ghost-infer meta     <model.gguf> <key>
+    ghost-infer dequant  <model.gguf> <tensor> <row>   (one row of a weight as floats, for checking formats)
+    ghost-infer tokenize <model.gguf> <text>
+    ghost-infer top      <model.gguf> <text> [--gpu]   (next-token probabilities after raw text)
+    ghost-infer bench    <model.gguf> [-n <gen tokens>] [--prompt-len <n>] [--threads <n>] [--gpu] [--draft <gguf>]
+    ghost-infer run      <model.gguf> -p <prompt> [options]
+    ghost-infer chat     <model.gguf> [options]
+    ghost-infer serve    <model.gguf> [--host <addr>] [--port <n>] [options]   (OpenAI-compatible HTTP API)
 
 OPTIONS:
     -p, --prompt <text>   prompt (run)
@@ -45,7 +45,7 @@ OPTIONS:
         --gpu             run on the NVIDIA GPU (CUDA driver + NVRTC, loaded at runtime)
         --draft <gguf>    speculative decoding with this small model (GPU, greedy; same output, faster)
         --draft-k <n>     tokens the draft proposes per step  [3]
-        --kv <f16|int8>   GPU KV cache: int8 holds about twice the context  [int8, or BETTERLLAMA_KV]
+        --kv <f16|int8>   GPU KV cache: int8 holds about twice the context  [int8, or GHOST_INFER_KV]
         --threads <n>     CPU worker threads                 [physical cores]
         --special         print special tokens
         --host <addr>     serve: address to listen on        [127.0.0.1]
@@ -261,8 +261,8 @@ impl<'a> Backend<'a> {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<(), String> {
-        // BETTERLLAMA_STEPWISE=1: feed the prompt one token at a time, to test the generation path
-        if std::env::var_os("BETTERLLAMA_STEPWISE").is_some() {
+        // GHOST_INFER_STEPWISE=1: feed the prompt one token at a time, to test the generation path
+        if std::env::var_os("GHOST_INFER_STEPWISE").is_some() {
             return ids.iter().try_for_each(|&id| self.step(id));
         }
         match self {
@@ -615,8 +615,8 @@ fn top(path: &PathBuf, text: &str, gpu: bool) -> Result<(), String> {
     let ids = engine.tok.encode(text);
     engine.backend.prefill(&ids)?;
     let logits = engine.backend.logits();
-    // BETTERLLAMA_LOGITS_OUT=<file>: every logit as little-endian f32, for accuracy tooling
-    if let Some(out) = std::env::var_os("BETTERLLAMA_LOGITS_OUT") {
+    // GHOST_INFER_LOGITS_OUT=<file>: every logit as little-endian f32, for accuracy tooling
+    if let Some(out) = std::env::var_os("GHOST_INFER_LOGITS_OUT") {
         let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&out, bytes).map_err(|e| format!("cannot write {}: {e}", PathBuf::from(&out).display()))?;
     }
@@ -677,8 +677,8 @@ fn bench(o: &Opts) -> Result<(), String> {
             println!("expert cache: {cache}");
         }
     }
-    // BETTERLLAMA_VERIFY_N=n: time one n-token decode batch (a speculative verify step) on its own
-    if let (Some(n), Backend::Gpu(m, s)) = (std::env::var("BETTERLLAMA_VERIFY_N").ok().and_then(|v| v.parse::<usize>().ok()), &mut engine.backend) {
+    // GHOST_INFER_VERIFY_N=n: time one n-token decode batch (a speculative verify step) on its own
+    if let (Some(n), Backend::Gpu(m, s)) = (std::env::var("GHOST_INFER_VERIFY_N").ok().and_then(|v| v.parse::<usize>().ok()), &mut engine.backend) {
         let batch: Vec<u32> = ids[..n].to_vec();
         let pos = s.pos;
         profile::reset();

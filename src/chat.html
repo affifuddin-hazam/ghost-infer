@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>betterllama</title>
+<title>ghost-infer</title>
 <style>
   @font-face { font-family: "Instrument Sans"; src: url("/vendor/instrument-sans-5.3.0.woff2") format("woff2"); font-weight: 400 700; font-style: normal; font-display: swap; }
   @font-face { font-family: "Instrument Sans"; src: url("/vendor/instrument-sans-italic-5.3.0.woff2") format("woff2"); font-weight: 400 700; font-style: italic; font-display: swap; }
@@ -179,7 +179,7 @@
 <aside id="side" aria-label="Conversations">
   <div class="brand">
     <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><path d="M4 19V10a7 7 0 0 1 14 0v9l-2.3-1.6L13.3 19 11 17.4 8.7 19l-2.4-1.6Z" fill="currentColor"/><ellipse cx="8.6" cy="10.5" rx="1.1" ry="1.5" fill="#10141f"/><ellipse cx="13.4" cy="10.5" rx="1.1" ry="1.5" fill="#10141f"/></svg>
-    betterllama
+    ghost-infer
     <button class="ibtn" id="closeMenu" aria-label="Close the menu"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
   </div>
   <button class="new" id="newBtn"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>New chat</button>
@@ -515,9 +515,17 @@ const ghost = await (async () => {
 
 // ================================================================ conversations
 const store = {
-  get(k, d) { try { const v = localStorage.getItem("betterllama." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem("betterllama." + k, JSON.stringify(v)); } catch {} },
+  get(k, d) { try { const v = localStorage.getItem("ghost-infer." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("ghost-infer." + k, JSON.stringify(v)); } catch {} },
 };
+// the project was called betterllama: keep conversations and settings saved under that name
+try {
+  for (const k of Object.keys(localStorage).filter((k) => k.startsWith("betterllama."))) {
+    const to = "ghost-infer." + k.slice(12);
+    if (localStorage.getItem(to) === null) localStorage.setItem(to, localStorage.getItem(k));
+    localStorage.removeItem(k);
+  }
+} catch {}
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const blank = () => ({ id: uid(), title: "", messages: [], at: Date.now() });
 function titleOf(messages) {
@@ -808,7 +816,7 @@ const nearBottom = () => scroll.scrollHeight - scroll.scrollTop - scroll.clientH
 const toBottom = () => { scroll.scrollTop = scroll.scrollHeight; };
 function renderAll() {
   $("title").textContent = chat.title;
-  document.title = chat.title ? `${chat.title} - betterllama` : "betterllama";
+  document.title = chat.title ? `${chat.title} - ghost-infer` : "ghost-infer";
   if (!chat.messages.length) {
     log.innerHTML = '<div class="welcome"><h1>What are we working on?</h1><p>Ask a question, or paste code to explain, fix or review.</p><div class="starters"></div></div>';
     for (const [label, text] of STARTERS) {
@@ -989,7 +997,7 @@ async function ask(thinking) {
     } else if (e.name === "AbortError") { reply.meta = "stopped"; settleTo("idle", 10); }
     else {
       // a network failure (the browser only says "Failed to fetch"): say what it means
-      reply.error = e instanceof TypeError ? "Can't reach the server. Check that betterllama serve is still running, then try again." : String(e.message || e);
+      reply.error = e instanceof TypeError ? "Can't reach the server. Check that ghost-infer serve is still running, then try again." : String(e.message || e);
       settleTo("confused", 5000, "Couldn't answer", true);
     }
   } finally {

@@ -13,32 +13,32 @@ use crate::quant::f16_to_f32;
 const MAX_BATCH: usize = 1024; // prompt tokens per GPU pass: big batches keep the attention kernel busy
 const MATMUL_TB: usize = 8; // tokens per matmul block row (must match TB in the kernel source)
 /// Rows per warp in the K-quant generation matmuls (passed to the kernels as -DRPW).
-/// BETTERLLAMA_RPW overrides it for tuning.
+/// GHOST_INFER_RPW overrides it for tuning.
 fn kq_rpw() -> usize {
     static RPW: OnceLock<usize> = OnceLock::new();
-    *RPW.get_or_init(|| std::env::var("BETTERLLAMA_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=16).contains(&v)).unwrap_or(1))
+    *RPW.get_or_init(|| std::env::var("GHOST_INFER_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=16).contains(&v)).unwrap_or(1))
 }
 /// Rows per warp in the K-quant decode-batch matmuls (speculative verify; -DDP4A_BATCH_RPW).
 fn batch_rpw() -> usize {
     static R: OnceLock<usize> = OnceLock::new();
-    *R.get_or_init(|| std::env::var("BETTERLLAMA_BATCH_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=8).contains(&v)).unwrap_or(2))
+    *R.get_or_init(|| std::env::var("GHOST_INFER_BATCH_RPW").ok().and_then(|v| v.parse().ok()).filter(|&v| (1..=8).contains(&v)).unwrap_or(2))
 }
 
 /// Activation values per int8 scale in the K-quant prompt matmuls (passed as -DQCH): 128 or 256.
-/// 128 is ~1% slower than 256 and about halves the log-probability drift; BETTERLLAMA_QCH=256 overrides.
+/// 128 is ~1% slower than 256 and about halves the log-probability drift; GHOST_INFER_QCH=256 overrides.
 fn qch() -> usize {
     static QCH: OnceLock<usize> = OnceLock::new();
-    *QCH.get_or_init(|| std::env::var("BETTERLLAMA_QCH").ok().and_then(|v| v.parse().ok()).filter(|&v| v == 128 || v == 256).unwrap_or(128))
+    *QCH.get_or_init(|| std::env::var("GHOST_INFER_QCH").ok().and_then(|v| v.parse().ok()).filter(|&v| v == 128 || v == 256).unwrap_or(128))
 }
 /// KV cache in int8 with a scale per (position, kv head) instead of f16: about half the memory per
 /// token. Process-wide, because the kernels are compiled for one or the other (-DKV8); set it (--kv)
-/// before the first model loads. Default int8; BETTERLLAMA_KV=f16 changes the default.
+/// before the first model loads. Default int8; GHOST_INFER_KV=f16 changes the default.
 static KV_INT8: OnceLock<bool> = OnceLock::new();
 pub fn set_kv_int8(on: bool) {
     let _ = KV_INT8.set(on);
 }
 fn kv_int8() -> bool {
-    *KV_INT8.get_or_init(|| std::env::var("BETTERLLAMA_KV").map_or(true, |v| v != "f16"))
+    *KV_INT8.get_or_init(|| std::env::var("GHOST_INFER_KV").map_or(true, |v| v != "f16"))
 }
 /// Bytes per cached k or v value.
 fn kv_bytes() -> usize {
@@ -2253,9 +2253,9 @@ impl Api {
     }
 }
 
-/// Newest NVRTC under the CUDA toolkit folder, or BETTERLLAMA_NVRTC.
+/// Newest NVRTC under the CUDA toolkit folder, or GHOST_INFER_NVRTC.
 fn find_nvrtc() -> Option<String> {
-    if let Ok(p) = std::env::var("BETTERLLAMA_NVRTC") {
+    if let Ok(p) = std::env::var("GHOST_INFER_NVRTC") {
         return Some(p);
     }
     let mut roots = Vec::new();
@@ -2283,7 +2283,7 @@ fn api() -> Result<&'static Api, String> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| {
         let cuda = os::open("nvcuda.dll").ok_or("no NVIDIA driver (nvcuda.dll) found")?;
-        let nvrtc_path = find_nvrtc().ok_or("no NVRTC found (install the CUDA toolkit or set BETTERLLAMA_NVRTC)")?;
+        let nvrtc_path = find_nvrtc().ok_or("no NVRTC found (install the CUDA toolkit or set GHOST_INFER_NVRTC)")?;
         let nvrtc = os::open(&nvrtc_path).ok_or_else(|| format!("cannot load {nvrtc_path}"))?;
         let f = Fns::load(cuda, nvrtc)?;
         let mut api = Api { f, device_name: String::new(), compute: (0, 0), nvrtc_path };
@@ -2392,14 +2392,14 @@ unsafe impl Sync for Kernels {}
 impl Kernels {
     /// The kernels as a GPU binary (cubin) for the installed GPU: from the on-disk cache when the source,
     /// options, NVRTC and GPU match a previous run, else compiled with NVRTC (seconds) and cached.
-    /// BETTERLLAMA_NO_KERNEL_CACHE=1 always compiles.
+    /// GHOST_INFER_NO_KERNEL_CACHE=1 always compiles.
     fn binary(a: &Api) -> Result<Vec<u8>, String> {
         let mut opts = vec![
             format!("--gpu-architecture=sm_{}{}", a.compute.0, a.compute.1),
             "-std=c++14".into(),
             format!("-DRPW={}", kq_rpw()),
             format!("-DQCH={}", qch()),
-            format!("-DDP4A_BATCH_MINB={}", std::env::var("BETTERLLAMA_BATCH_MINB").unwrap_or("3".into())),
+            format!("-DDP4A_BATCH_MINB={}", std::env::var("GHOST_INFER_BATCH_MINB").unwrap_or("3".into())),
             format!("-DDP4A_BATCH_RPW={}", batch_rpw()),
         ];
         if kv_int8() {
@@ -2411,8 +2411,8 @@ impl Kernels {
             (KERNELS, &opts, &a.nvrtc_path, &a.device_name).hash(&mut h);
             format!("{:016x}", h.finish())
         };
-        let use_cache = std::env::var_os("BETTERLLAMA_NO_KERNEL_CACHE").is_none();
-        let dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("betterllama").join("kernels"));
+        let use_cache = std::env::var_os("GHOST_INFER_NO_KERNEL_CACHE").is_none();
+        let dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("ghost-infer").join("kernels"));
         let file = dir.as_ref().map(|d| d.join(format!("{key}.cubin")));
         if let (true, Some(file)) = (use_cache, &file) {
             if let Ok(bin) = std::fs::read(file) {
@@ -2422,7 +2422,7 @@ impl Kernels {
         let f = &a.f;
         let bin = unsafe {
             let src = CString::new(KERNELS).unwrap();
-            let name = CString::new("betterllama.cu").unwrap();
+            let name = CString::new("ghost-infer.cu").unwrap();
             let mut prog: Ptr = std::ptr::null_mut();
             if (f.nvrtcCreateProgram)(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) != 0 {
                 return Err("nvrtcCreateProgram failed".into());
@@ -2485,9 +2485,9 @@ impl Kernels {
                 ],
                 argmax_rows: get("argmax_rows")?,
                 matmul_tiled: get("matmul_tiled")?,
-                matmul_mma: if a.compute >= (7, 5) && std::env::var_os("BETTERLLAMA_NO_MMA").is_none() { Some(get("matmul_mma")?) } else { None },
-                // BETTERLLAMA_NO_Q8K=1 keeps K-quant prompts on matmul_mma (per-32 activation scales)
-                matmul_mma_k: if a.compute >= (7, 5) && std::env::var_os("BETTERLLAMA_NO_MMA").is_none() && std::env::var_os("BETTERLLAMA_NO_Q8K").is_none() {
+                matmul_mma: if a.compute >= (7, 5) && std::env::var_os("GHOST_INFER_NO_MMA").is_none() { Some(get("matmul_mma")?) } else { None },
+                // GHOST_INFER_NO_Q8K=1 keeps K-quant prompts on matmul_mma (per-32 activation scales)
+                matmul_mma_k: if a.compute >= (7, 5) && std::env::var_os("GHOST_INFER_NO_MMA").is_none() && std::env::var_os("GHOST_INFER_NO_Q8K").is_none() {
                     Some([get("matmul_mma_q4k")?, get("matmul_mma_q6k")?])
                 } else {
                     None
@@ -2498,8 +2498,8 @@ impl Kernels {
                 attention_partial_gqa: get("attention_partial_gqa")?,
                 attention_combine: get("attention_combine")?,
                 attention_prefill: get("attention_prefill")?,
-                // BETTERLLAMA_NO_TC_ATT=1 keeps prompts on the f32 attention kernel
-                attention_prefill_tc: if a.compute >= (7, 5) && std::env::var_os("BETTERLLAMA_NO_TC_ATT").is_none() {
+                // GHOST_INFER_NO_TC_ATT=1 keeps prompts on the f32 attention kernel
+                attention_prefill_tc: if a.compute >= (7, 5) && std::env::var_os("GHOST_INFER_NO_TC_ATT").is_none() {
                     Some([get("attention_prefill_tc64")?, get("attention_prefill_tc128")?])
                 } else {
                     None
@@ -2558,7 +2558,7 @@ struct Uploader {
     stream: Ptr,
     next: usize,
     files: Vec<std::fs::File>, // one read handle per worker thread
-    wait_secs: f64,            // BETTERLLAMA_LOAD_TIMES: time spent waiting for the GPU copies
+    wait_secs: f64,            // GHOST_INFER_LOAD_TIMES: time spent waiting for the GPU copies
     file_secs: f64,            // reading (and repacking) tensors
     alloc_secs: f64,
     bytes: usize,
@@ -2722,7 +2722,7 @@ impl Uploader {
         let tw = std::time::Instant::now();
         a.check(unsafe { (a.f.cuStreamSynchronize)(self.stream) }, "weight upload")?;
         self.wait_secs += tw.elapsed().as_secs_f64();
-        if std::env::var_os("BETTERLLAMA_LOAD_TIMES").is_some() {
+        if std::env::var_os("GHOST_INFER_LOAD_TIMES").is_some() {
             eprintln!(
                 "[upload: {:.0} MB; reading and repacking {:.0} ms, allocations {:.0} ms, waiting for GPU copies {:.0} ms]",
                 self.bytes as f64 / 1e6,
@@ -3175,7 +3175,7 @@ impl ExpertCache {
         Ok(())
     }
 
-    /// Slots, how many hold an expert, and uploads so far (BETTERLLAMA_LOAD_TIMES reports them).
+    /// Slots, how many hold an expert, and uploads so far (GHOST_INFER_LOAD_TIMES reports them).
     fn describe(&self) -> String {
         let used = self.owner.iter().filter(|o| o.is_some()).count();
         format!("{} slots ({} MB), {used} in use, {} uploads, {} staged for prompts", self.slots(), self.slots() * self.slot_bytes >> 20, self.uploads, self.staged)
@@ -3255,7 +3255,7 @@ impl GpuModel {
         let output_norm = upload_vec(g, "output_norm.weight", up)?;
         up.finish()?;
         let model = GpuModel { output_norm, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false };
-        if std::env::var_os("BETTERLLAMA_LOAD_TIMES").is_some() {
+        if std::env::var_os("GHOST_INFER_LOAD_TIMES").is_some() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
                 "[GPU load: driver {:.0} ms, kernels {:.0} ms, weights {:.0} ms]",
@@ -3267,7 +3267,7 @@ impl GpuModel {
         Ok(model)
     }
 
-    /// With BETTERLLAMA_PROFILE set, waits for the GPU after `f` so its time lands in bucket `op`.
+    /// With GHOST_INFER_PROFILE set, waits for the GPU after `f` so its time lands in bucket `op`.
     fn timed(&self, op: usize, f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         if !profile::enabled() {
             return f();
@@ -3317,7 +3317,7 @@ impl GpuModel {
             }
             return Ok(());
         }
-        // decoding (up to DECODE_MAX_BATCH tokens): int8 activations + dp4a (BETTERLLAMA_EXACT=1 keeps f32)
+        // decoding (up to DECODE_MAX_BATCH tokens): int8 activations + dp4a (GHOST_INFER_EXACT=1 keeps f32)
         if self.dp4a_path(parts, n) {
             let blocks = n * cols / 32;
             k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(blocks as i32)])?;
@@ -3506,7 +3506,7 @@ impl GpuModel {
         let a = api()?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         s.tokens.write(&ids)?;
-        // one-token steps replay a CUDA graph captured on the session's first one (BETTERLLAMA_NO_GRAPH=1:
+        // one-token steps replay a CUDA graph captured on the session's first one (GHOST_INFER_NO_GRAPH=1:
         // plain launches); the kernels then read the position from s.pos_dev
         // (not for a mixture of experts: its experts run on the CPU between the kernels)
         if n == 1 && want != Out::None && graphs_enabled() && !self.cfg.is_moe() {
@@ -3612,8 +3612,8 @@ impl GpuModel {
         } else {
             0
         };
-        // BETTERLLAMA_MOE_CHECK=1: the GPU-resident experts again on the CPU, largest difference printed
-        if nk > 0 && std::env::var_os("BETTERLLAMA_MOE_CHECK").is_some() {
+        // GHOST_INFER_MOE_CHECK=1: the GPU-resident experts again on the CPU, largest difference printed
+        if nk > 0 && std::env::var_os("GHOST_INFER_MOE_CHECK").is_some() {
             let mut gpu = vec![0f32; nk * dim];
             a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(gpu.as_mut_ptr() as *mut c_void, s.h.ptr, nk * dim * 4) }, "copy to host")?;
             let mut i = 0;
@@ -3843,11 +3843,11 @@ impl Drop for GpuSession {
     }
 }
 
-/// One-token steps replay CUDA graphs unless BETTERLLAMA_NO_GRAPH is set or the profiler (which
+/// One-token steps replay CUDA graphs unless GHOST_INFER_NO_GRAPH is set or the profiler (which
 /// synchronises after every operation) is on.
 fn graphs_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BETTERLLAMA_NO_GRAPH").is_none()) && !profile::enabled()
+    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_NO_GRAPH").is_none()) && !profile::enabled()
 }
 
 impl GpuSession {
@@ -3919,9 +3919,9 @@ impl GpuSession {
 const FIT_RESERVE: usize = 384 << 20;
 
 /// GPU memory for the expert cache: what is free when it is made (after the weights and the session),
-/// less FIT_RESERVE. BETTERLLAMA_EXPERT_CACHE_MB sets it instead (0: every expert on the CPU).
+/// less FIT_RESERVE. GHOST_INFER_EXPERT_CACHE_MB sets it instead (0: every expert on the CPU).
 fn expert_cache_budget() -> Result<usize, String> {
-    if let Some(mb) = std::env::var("BETTERLLAMA_EXPERT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(mb) = std::env::var("GHOST_INFER_EXPERT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return Ok(mb << 20);
     }
     let a = api()?;

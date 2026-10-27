@@ -1,5 +1,5 @@
 [package]
-name = "betterllama"
+name = "ghost-infer"
 version = "0.1.0"
 edition = "2024"
 description = "A small, dependency-light LLM inference engine for GGUF models"
