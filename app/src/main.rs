@@ -503,6 +503,7 @@ struct App {
     tasks: Vec<(String, String)>, // the model's task list for this chat: text, and pending / in_progress / done
     memory: Vec<String>,     // what the model remembers across chats
     memory_draft: String,    // a memory being typed in the rail
+    instructions: Vec<(String, bool, bool)>, // the GHOST.md files: path, whether it exists, whether it is the global one
     skills: Vec<(String, String)>, // installed skills: name, description
     skill_link: String,      // a skill link being pasted in the rail
     mcp: Vec<(String, String, usize)>, // MCP servers: name, state, how many tools
@@ -568,6 +569,8 @@ enum Message {
     Memory(Result<Json, String>),
     Forget(usize),
     MemoryDraft(String),
+    Instructions(Result<Json, String>),
+    EditInstructions(String),
     AddMemory,
     InstallSkill(bool), // from an archive (true) or a folder
     SkillPicked(Option<String>),
@@ -636,6 +639,7 @@ impl App {
             tasks: Vec::new(),
             memory: Vec::new(),
             memory_draft: String::new(),
+            instructions: Vec::new(),
             skills: Vec::new(),
             skill_link: String::new(),
             mcp: Vec::new(),
@@ -901,7 +905,10 @@ impl App {
                 }
                 return self.save_folders(folders);
             }
-            Message::Harness(Ok(j)) => self.set_harness(&j),
+            Message::Harness(Ok(j)) => {
+                self.set_harness(&j);
+                return self.refresh_instructions(); // a new folder may bring its own
+            }
             Message::Harness(Err(e)) => self.status = format!("Couldn't save the folders: {e}"),
             Message::Memory(Ok(j)) => self.memory = j.get("facts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
             Message::Memory(Err(e)) => self.status = format!("Couldn't read the memory: {e}"),
@@ -980,6 +987,25 @@ impl App {
                 return self.call(|api| { api.post("/api/mcp/import-claude", &Json::Null)?; std::thread::sleep(std::time::Duration::from_millis(500)); api.get("/api/mcp") }, Message::Mcp);
             }
             // mcp.json in Notepad; Reload picks the changes up
+            Message::Instructions(Ok(j)) => {
+                self.instructions = j.get("files").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|f| {
+                    Some((f.get("path")?.as_str()?.to_string(), f.get("exists").and_then(Json::as_bool).unwrap_or(false), f.get("scope").and_then(Json::as_str) == Some("global")))
+                }).collect();
+            }
+            Message::Instructions(Err(_)) => {}
+            // opened in Notepad, made first when missing (the model reads it at its next reply)
+            Message::EditInstructions(path) => {
+                let file = std::path::Path::new(&path);
+                if !file.exists() {
+                    let note = "<!-- ghost reads this file into its chats, like a CLAUDE.md: write your instructions for the model below. Comments like this one are left out. -->\n\n";
+                    if let Err(e) = std::fs::write(file, note) {
+                        self.status = format!("Couldn't make {path}: {e}");
+                        return Task::none();
+                    }
+                }
+                let _ = std::process::Command::new("notepad").arg(file).spawn();
+                return self.refresh_instructions();
+            }
             Message::McpEdit => {
                 if !self.mcp_config.is_empty() {
                     let _ = std::process::Command::new("notepad").arg(&self.mcp_config).spawn();
@@ -1070,12 +1096,16 @@ impl App {
         )
     }
 
-    /// What the model remembers (the rail shows it, with a remove button for each).
-    /// The installed skills and the MCP servers (the rail lists them).
+    /// The installed skills, the MCP servers and the GHOST.md files (the rail lists them).
     fn refresh_extras(&self) -> Task<Message> {
-        Task::batch([self.call(|api| api.get("/api/skills"), Message::Skills), self.call(|api| api.get("/api/mcp"), Message::Mcp)])
+        Task::batch([self.call(|api| api.get("/api/skills"), Message::Skills), self.call(|api| api.get("/api/mcp"), Message::Mcp), self.refresh_instructions()])
     }
 
+    fn refresh_instructions(&self) -> Task<Message> {
+        self.call(|api| api.get("/api/instructions"), Message::Instructions)
+    }
+
+    /// What the model remembers (the rail shows it, with a remove button for each).
     fn refresh_memory(&self) -> Task<Message> {
         self.call(|api| api.get("/api/memory"), Message::Memory)
     }

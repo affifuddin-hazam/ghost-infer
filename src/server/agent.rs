@@ -106,10 +106,15 @@ fn tool_prompt(folders: &[PathBuf]) -> String {
 
 // ---- memory: facts the model saved, kept in %LOCALAPPDATA%\ghost-infer\memory.json for every chat
 
-fn memory_file() -> Result<PathBuf, String> {
+/// %LOCALAPPDATA%\ghost-infer, made if missing.
+fn data_dir() -> Result<PathBuf, String> {
     let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer")).ok_or("LOCALAPPDATA is not set")?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
-    Ok(d.join("memory.json"))
+    Ok(d)
+}
+
+fn memory_file() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("memory.json"))
 }
 
 /// The remembered facts, oldest first.
@@ -271,6 +276,72 @@ fn memory_prompt() -> String {
     format!("What you remember from earlier chats:\n{}", facts.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"))
 }
 
+// ---- instructions: GHOST.md files, read into every reply's system prompt (as Claude Code reads CLAUDE.md)
+
+/// A folder's instructions are its GHOST.md, else a CLAUDE.md or AGENTS.md written for other agents.
+const INSTRUCTION_FILES: [&str; 3] = ["GHOST.md", "CLAUDE.md", "AGENTS.md"];
+const INSTRUCTIONS_MAX: usize = 12000; // characters, all the files together
+
+/// The instruction files, each with whether it exists: the global GHOST.md, then one per folder the model may
+/// use (the GHOST.md it would have when it has none of the three).
+pub fn instruction_files(folders: &[PathBuf]) -> Vec<(PathBuf, bool)> {
+    let mut files = Vec::new();
+    if let Ok(d) = data_dir() {
+        let p = d.join("GHOST.md");
+        files.push((p.clone(), p.is_file()));
+    }
+    for f in folders {
+        match INSTRUCTION_FILES.iter().map(|n| f.join(n)).find(|p| p.is_file()) {
+            Some(p) => files.push((p, true)),
+            None => files.push((f.join("GHOST.md"), false)),
+        }
+    }
+    files
+}
+
+pub fn instructions_json(folders: &[PathBuf]) -> Json {
+    Json::Arr(
+        instruction_files(folders)
+            .iter()
+            .enumerate()
+            .map(|(i, (p, exists))| obj(vec![("path", str(&p.display().to_string())), ("exists", Json::Bool(*exists)), ("scope", str(if i == 0 { "global" } else { "folder" }))]))
+            .collect(),
+    )
+}
+
+/// A file's text without its <!-- comments --> (notes for whoever edits it, not for the model).
+fn without_comments(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("<!--") {
+        out.push_str(&rest[..at]);
+        rest = rest[at..].find("-->").map_or("", |end| &rest[at + end + 3..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What the system prompt says from the instruction files, or nothing.
+fn instructions_prompt(folders: &[PathBuf]) -> String {
+    let mut parts = Vec::new();
+    let mut left = INSTRUCTIONS_MAX;
+    for (path, exists) in instruction_files(folders) {
+        let text = if exists { std::fs::read_to_string(&path).unwrap_or_default() } else { String::new() };
+        let text = without_comments(text.trim_start_matches('\u{feff}'));
+        let text = text.trim();
+        if text.is_empty() || left < 200 {
+            continue;
+        }
+        let text = crate::tools::clip(text, left);
+        left = left.saturating_sub(text.chars().count());
+        parts.push(format!("From {}:\n{text}", path.display()));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("The user's instructions, from their GHOST.md files. Follow them:\n\n{}", parts.join("\n\n"))
+}
+
 // ---- approvals: the run waits on a channel the approve endpoint answers
 
 fn pending() -> &'static Mutex<HashMap<String, mpsc::Sender<String>>> {
@@ -397,7 +468,8 @@ struct Request {
     temperature: f32,
     max_tokens: usize,
     groups: Vec<String>,
-    memory: String, // the remembered facts as the reply started
+    instructions: String, // the GHOST.md files as the reply started
+    memory: String, // the remembered facts, likewise
     skills: String, // the installed skills, likewise
 }
 
@@ -412,6 +484,7 @@ impl Request {
             temperature: f("temperature").map(|t| t as f32).unwrap_or(shared.defaults.0),
             max_tokens: f("max_tokens").map(|n| n.max(1.0) as usize).unwrap_or(shared.defaults.3),
             groups: b.get("tools").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect()).unwrap_or_default(),
+            instructions: instructions_prompt(&shared.harness.lock().unwrap().folders.clone()),
             memory: memory_prompt(),
             skills: super::skills::prompt(),
         }
@@ -486,7 +559,7 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
 /// The prompt for these messages: the client's system text plus where tools may work, then the chat.
 fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
     let folders = shared.harness.lock().unwrap().folders.clone();
-    let system = [req.system.trim().to_string(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let system = [req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut messages = Vec::new();
     if !system.is_empty() {
         messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));

@@ -457,7 +457,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let (defaults, think_default) = (shared.defaults, shared.think_default);
     // the agent tools and their settings: private to the chat page on this computer
     let path = req.path.trim_end_matches('/');
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp"].iter().any(|p| path.starts_with(p)) {
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
@@ -571,6 +571,11 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 }
                 Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
             },
+            // the GHOST.md files: the global one, and one per folder (whether each exists)
+            ("GET", "/api/instructions") => {
+                let folders = shared.harness.lock().unwrap().folders.clone();
+                respond_private(&mut conn, 200, &obj(vec![("files", agent::instructions_json(&folders))]))
+            }
             // what the model remembers, and the user's remove button: {"index": n}
             ("GET", "/api/memory") => respond_private(&mut conn, 200, &obj(vec![("facts", Json::Arr(agent::memory().iter().map(|f| str(f)).collect()))])),
             ("POST", "/api/memory/forget") => {

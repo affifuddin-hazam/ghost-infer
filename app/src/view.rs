@@ -438,6 +438,27 @@ impl App {
         let link = |label: &'static str, msg: Message| -> Element<'static, Message> {
             button(text(label).size(12.5).color(s.accent)).on_press(msg).padding(Padding { top: 4.0, right: 10.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }).into()
         };
+        // instructions: the global GHOST.md, and each folder's (GHOST.md, or a CLAUDE.md / AGENTS.md it has)
+        let mut instructions = column![].spacing(2);
+        for (path, exists, global) in &self.instructions {
+            let file = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+            let note = if *global { "Every chat".to_string() } else { path.rsplit(['\\', '/']).nth(1).unwrap_or("").to_string() };
+            instructions = instructions.push(
+                row![
+                    icon(ic::FILE, 11).color(s.faint).width(14),
+                    column![text(file).size(13).font(MEDIUM).color(if *exists { s.text } else { s.faint }), text(note).size(12).color(s.faint)].width(Fill),
+                    link(if *exists { "Edit" } else { "Add" }, Message::EditInstructions(path.clone())),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .padding([3, 0]),
+            );
+        }
+        let in_use = match self.instructions.iter().filter(|f| f.1).count() {
+            0 => String::new(),
+            n => format!("{n} in use"),
+        };
+
         let mut skills = column![].spacing(2);
         if self.skills.is_empty() {
             skills = skills.push(text("No skills installed").size(12.5).color(s.faint));
@@ -488,6 +509,8 @@ impl App {
         let body = body
             .push(head("Changes", files))
             .push(section(changes_body))
+            .push(head("Instructions", in_use))
+            .push(rail_section(s, instructions.into()))
             .push(head("Memory", facts))
             .push(memory)
             .push(head("Skills", if self.skills.is_empty() { String::new() } else { self.skills.len().to_string() }))
