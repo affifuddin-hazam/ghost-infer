@@ -1,0 +1,715 @@
+//! How the app looks: Claude Desktop's calm structure in ghost-infer's colours, as two skins: Graphite
+//! (dark, neutral greys) and Fog (light). Icons come from Segoe MDL2 Assets, the icon font every Windows 10
+//! and 11 has; text is Instrument Sans, the greeting Georgia.
+
+use iced::widget::{button, canvas, column, container, markdown, mouse_area, opaque, pick_list, rich_text, row, scrollable, stack, text, text_editor, text_input, Space};
+use iced::{border, keyboard, Alignment, Background, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Theme};
+
+use crate::ghost::{Ghost, Mood};
+use crate::{approval_text, group_name, tool_detail, tool_label, App, Menu, Message, Msg, Role};
+
+/// A skin: the colours every part of the app is drawn with.
+#[derive(Debug)]
+pub struct Skin {
+    pub bg: Color,
+    pub side: Color,
+    pub raise: Color,
+    pub raise2: Color,
+    pub hover: Color,
+    pub menu: Color,
+    pub line: Color,
+    pub line2: Color,
+    pub text: Color,
+    pub muted: Color,
+    pub faint: Color,
+    pub accent: Color,
+    pub ink: Color,
+    pub ok: Color,
+    pub bad: Color,
+    pub warn: Color,
+    pub bubble: Color,
+    pub dark: bool,
+}
+
+pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
+}
+const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
+    Color { a, ..rgb(r, g, b) }
+}
+
+pub static GRAPHITE: Skin = Skin {
+    bg: rgb(0x1d, 0x1d, 0x1f),
+    side: rgb(0x17, 0x17, 0x19),
+    raise: rgb(0x2a, 0x2a, 0x2d),
+    raise2: rgb(0x33, 0x33, 0x37),
+    hover: rgb(0x26, 0x26, 0x29),
+    menu: rgb(0x2b, 0x2b, 0x2f),
+    line: rgba(255, 255, 255, 0.06),
+    line2: rgba(255, 255, 255, 0.10),
+    text: rgb(0xec, 0xec, 0xee),
+    muted: rgb(0xa3, 0xa3, 0xaa),
+    faint: rgb(0x6f, 0x6f, 0x77),
+    accent: rgb(0xb9, 0xc7, 0xff),
+    ink: rgb(0x14, 0x17, 0x2a),
+    ok: rgb(0x8f, 0xd6, 0xa2),
+    bad: rgb(0xff, 0x8f, 0x80),
+    warn: rgb(0xf2, 0xc2, 0x7a),
+    bubble: rgb(0x2f, 0x2f, 0x33),
+    dark: true,
+};
+
+pub static FOG: Skin = Skin {
+    bg: rgb(0xf5, 0xf5, 0xf7),
+    side: rgb(0xec, 0xec, 0xef),
+    raise: rgb(0xff, 0xff, 0xff),
+    raise2: rgb(0xe9, 0xe9, 0xee),
+    hover: rgb(0xe4, 0xe4, 0xea),
+    menu: rgb(0xff, 0xff, 0xff),
+    line: rgba(20, 22, 30, 0.07),
+    line2: rgba(20, 22, 30, 0.12),
+    text: rgb(0x18, 0x19, 0x1f),
+    muted: rgb(0x5c, 0x5e, 0x6b),
+    faint: rgb(0x92, 0x94, 0x9f),
+    accent: rgb(0x3d, 0x4a, 0xa8),
+    ink: rgb(0xff, 0xff, 0xff),
+    ok: rgb(0x1f, 0x8a, 0x4c),
+    bad: rgb(0xc4, 0x45, 0x2f),
+    warn: rgb(0xa8, 0x6a, 0x12),
+    bubble: rgb(0xe6, 0xe8, 0xf2),
+    dark: false,
+};
+
+impl Skin {
+    pub fn theme(&self) -> Theme {
+        Theme::custom(
+            if self.dark { "Graphite" } else { "Fog" },
+            iced::theme::Palette { background: self.bg, text: self.text, primary: self.accent, success: self.ok, warning: self.warn, danger: self.bad },
+        )
+    }
+}
+
+pub const BODY: Font = Font::with_name("Instrument Sans");
+const MEDIUM: Font = Font { weight: iced::font::Weight::Medium, ..BODY };
+const SERIF: Font = Font::with_name("Georgia");
+const ICONS: Font = Font::with_name("Segoe MDL2 Assets");
+const MONO: Font = Font::with_name("Consolas");
+
+/// Segoe MDL2 Assets code points.
+mod ic {
+    pub const ADD: char = '\u{E710}';
+    pub const DELETE: char = '\u{E74D}';
+    pub const SETTINGS: char = '\u{E713}';
+    pub const CLOSE_PANE: char = '\u{E89F}';
+    pub const OPEN_PANE: char = '\u{E8A0}';
+    pub const UP: char = '\u{E74A}';
+    pub const STOP: char = '\u{E71A}';
+    pub const RIGHT: char = '\u{E76C}';
+    pub const DOWN: char = '\u{E70D}';
+    pub const COPY: char = '\u{E8C8}';
+    pub const RETRY: char = '\u{E72C}';
+    pub const FILE: char = '\u{E8A5}';
+    pub const FOLDER: char = '\u{E8B7}';
+    pub const SEARCH: char = '\u{E721}';
+    pub const EDIT: char = '\u{E70F}';
+    pub const TERMINAL: char = '\u{E756}';
+    pub const GLOBE: char = '\u{E774}';
+    pub const PC: char = '\u{E7F8}';
+    pub const BOLT: char = '\u{E945}';
+    pub const CHECK: char = '\u{E73E}';
+    pub const CANCEL: char = '\u{E711}';
+    pub const CHAT: char = '\u{E8BD}';
+    pub const SUN: char = '\u{E706}';
+    pub const MOON: char = '\u{E708}';
+    pub const CLOCK: char = '\u{E916}';
+    pub const UNDO: char = '\u{E7A7}';
+}
+
+fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
+    text(c.to_string()).font(ICONS).size(size).line_height(1.0)
+}
+
+/// The icon for a tool's call in the reply.
+fn tool_icon(name: &str) -> char {
+    match name {
+        "read_file" => ic::FILE,
+        "list_files" => ic::FOLDER,
+        "search_files" | "web_search" => ic::SEARCH,
+        "write_file" | "edit_file" => ic::EDIT,
+        "run_command" | "start_process" | "check_process" | "stop_process" => ic::TERMINAL,
+        "fetch_url" => ic::GLOBE,
+        _ => ic::PC,
+    }
+}
+
+/// The icon for a tool group in the + menu.
+fn group_icon(group: &str) -> char {
+    match group {
+        "files" => ic::FILE,
+        "edit" => ic::EDIT,
+        "cmd" => ic::TERMINAL,
+        _ => ic::GLOBE,
+    }
+}
+
+/// "Good morning" etc., from the computer's clock.
+fn greeting() -> &'static str {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        dow: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        ms: u16,
+    }
+    unsafe extern "system" {
+        fn GetLocalTime(t: *mut SystemTime);
+    }
+    let mut t = SystemTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    match t.hour {
+        5..=11 => "Good morning",
+        12..=17 => "Good afternoon",
+        _ => "Good evening",
+    }
+}
+
+/// How long ago a chat changed, roughly: Today, Yesterday, 3 days ago.
+fn ago(ms: f64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0);
+    match ((now - ms) / 86_400_000.0).floor() as i64 {
+        ..=0 => "Today".into(),
+        1 => "Yesterday".into(),
+        d => format!("{d} days ago"),
+    }
+}
+
+impl App {
+    pub fn view(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let body: Element<'_, Message> = if self.sidebar { row![self.sidebar(), self.main()].into() } else { self.main() };
+        let Some(menu) = self.menu else { return body };
+        // an open menu: a click anywhere else closes it
+        let shade = mouse_area(container(Space::new()).width(Fill).height(Fill)).on_press(Message::Menu(None));
+        // each item: icon, label, what it does, drawn in red, and for a switch whether it is on
+        let (items, pad): (Vec<(char, &str, Message, bool, Option<bool>)>, Padding) = match menu {
+            Menu::Chat => (
+                vec![(ic::COPY, "Copy as Markdown", Message::CopyChat, false, None), (ic::DELETE, "Delete", Message::DeleteCurrent, true, None)],
+                Padding { top: 44.0, left: if self.sidebar { 264.0 + 16.0 } else { 56.0 }, ..Padding::ZERO },
+            ),
+            Menu::Settings => (
+                vec![
+                    (if s.dark { ic::SUN } else { ic::MOON }, if s.dark { "Light theme (Fog)" } else { "Dark theme (Graphite)" }, Message::ToggleTheme, false, None),
+                    (ic::SETTINGS, "Follow Windows' theme", Message::SystemTheme, false, None),
+                ],
+                Padding { left: 12.0, bottom: 60.0, ..Padding::ZERO },
+            ),
+            Menu::Plus => {
+                let mut items: Vec<(char, &str, Message, bool, Option<bool>)> = crate::GROUPS.iter().map(|&(g, label)| (group_icon(g), label, Message::ToggleGroup(g), false, Some(self.tools.iter().any(|t| t == g)))).collect();
+                items.push((ic::FOLDER, "Add folder (soon)", Message::Menu(None), false, None));
+                (items, Padding { left: if self.sidebar { 264.0 + 60.0 } else { 60.0 }, bottom: 130.0, ..Padding::ZERO })
+            }
+        };
+        let list = column(items.into_iter().map(|(c, label, msg, danger, on)| {
+            let color = if danger { s.bad } else { s.text };
+            let mut line = row![icon(c, 13).color(if danger { s.bad } else { s.muted }), text(label).size(14).color(color).width(Fill)].spacing(12).align_y(Alignment::Center);
+            if let Some(on) = on {
+                line = line.push(icon(ic::CHECK, 12).color(if on { s.accent } else { Color::TRANSPARENT }));
+            }
+            button(line)
+                .on_press(msg)
+                .width(Fill)
+                .padding([7, 10])
+                .style(move |_, st| row_style(s, st, false))
+                .into()
+        }))
+        .spacing(1);
+        let card = container(list).padding(6).width(232).style(move |_| container::Style {
+            background: Some(Background::Color(s.menu)),
+            border: Border { radius: 12.0.into(), width: 1.0, color: s.line2 },
+            ..Default::default()
+        });
+        let placed = container(opaque(card))
+            .padding(pad)
+            .width(Fill)
+            .height(Fill)
+            .align_y(if matches!(menu, Menu::Chat) { Alignment::Start } else { Alignment::End });
+        stack![body, opaque(shade), placed].into()
+    }
+
+    fn sidebar(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let chrome = row![icon_button(s, ic::CLOSE_PANE, Message::ToggleSidebar)].padding(Padding { top: 6.0, bottom: 4.0, left: 0.0, right: 0.0 });
+        let nav = |c: char, label: &'static str, msg: Message| {
+            button(row![icon(c, 14).color(s.muted), text(label).size(14).color(s.text)].spacing(12).align_y(Alignment::Center))
+                .on_press(msg)
+                .width(Fill)
+                .padding([7, 10])
+                .style(move |_, st| row_style(s, st, false))
+        };
+        let mut col = column![chrome, nav(ic::ADD, "New chat", Message::NewChat), nav(ic::SEARCH, "Search", Message::ToggleSearch)].spacing(1);
+        if self.searching {
+            col = col.push(
+                text_input("Search chats", &self.filter)
+                    .on_input(Message::Filter)
+                    .size(13.5)
+                    .padding([7, 10])
+                    .style(move |t, st| input_style(s, t, st)),
+            );
+        }
+        let recents_head = button(row![text("Recents").size(12).color(s.faint), icon(if self.recents_open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint)].spacing(6).align_y(Alignment::Center))
+            .on_press(Message::ToggleRecents)
+            .padding(Padding { top: 14.0, right: 10.0, bottom: 4.0, left: 10.0 })
+            .style(move |_, _| button::Style { background: None, ..Default::default() });
+        col = col.push(recents_head);
+        let filter = self.filter.to_lowercase();
+        let rows = column(self.chats.iter().filter(|c| filter.is_empty() || c.title.to_lowercase().contains(&filter)).map(|c| {
+            let on = self.chat.as_deref() == Some(c.id.as_str());
+            let hover = self.hovered.as_deref() == Some(c.id.as_str());
+            let label = container(text(if c.title.is_empty() { "New chat" } else { c.title.as_str() }).size(14).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true);
+            let mut line = row![label].align_y(Alignment::Center).spacing(6);
+            if hover || on {
+                line = line.push(button(icon(ic::DELETE, 12).color(s.faint)).on_press(Message::DeleteChat(c.id.clone())).padding([3, 5]).style(move |_, st| bare(s, st)));
+            }
+            let b = button(line).on_press(Message::OpenChat(c.id.clone())).width(Fill).padding([7, 10]).style(move |_, st| row_style(s, st, on));
+            mouse_area(b).on_enter(Message::Hover(Some(c.id.clone()))).on_exit(Message::Hover(None)).into()
+        }))
+        .spacing(1);
+        let list: Element<'_, Message> = if self.recents_open { scrollable(rows).height(Fill).style(move |t, st| scroll_style(s, t, st)).into() } else { Space::new().height(Fill).into() };
+        col = col.push(list);
+        // you, at the bottom: this computer, the model, settings
+        let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "No model".into());
+        let me = button(
+            row![
+                canvas(Ghost::still(1.0, s.accent)).width(24).height(22),
+                column![text("This PC").size(13.5).color(s.text), text(model).size(12).color(s.faint).wrapping(text::Wrapping::None)].width(Fill),
+                icon(ic::SETTINGS, 13).color(s.muted),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::Menu(Some(Menu::Settings)))
+        .width(Fill)
+        .padding([8, 8])
+        .style(move |_, st| row_style(s, st, false));
+        container(column![container(col).height(Fill).padding([4, 10]), container(me).padding(Padding { top: 8.0, right: 10.0, bottom: 10.0, left: 10.0 }).style(move |_| container::Style { border: Border { width: 0.0, ..Default::default() }, ..Default::default() })])
+            .width(264)
+            .height(Fill)
+            .style(move |_| container::Style { background: Some(Background::Color(s.side)), ..Default::default() })
+            .into()
+    }
+
+    fn main(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let mut top = row![].spacing(8).align_y(Alignment::Center).padding(Padding { top: 6.0, right: 14.0, bottom: 6.0, left: 14.0 }).height(44);
+        if !self.sidebar {
+            top = top.push(icon_button(s, ic::OPEN_PANE, Message::ToggleSidebar));
+        }
+        if let (Some(title), false) = (&self.title, self.messages.is_empty()) {
+            top = top.push(
+                button(row![text(title.as_str()).size(14).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None), icon(ic::DOWN, 9).color(s.muted)].spacing(8).align_y(Alignment::Center))
+                    .on_press(Message::Menu(Some(Menu::Chat)))
+                    .padding([5, 8])
+                    .style(move |_, st| row_style(s, st, false)),
+            );
+        }
+        top = top.push(Space::new().width(Fill));
+        if self.context.1 > 0.0 && self.context.0 > 0.0 && !self.messages.is_empty() {
+            top = top.push(text(format!("{:.0}% of context", 100.0 * self.context.0 / self.context.1)).size(12).color(s.faint));
+        }
+
+        if self.messages.is_empty() {
+            // a new chat: the greeting, the ghost on the message box, recent chats
+            let hello = text(if self.api.is_some() { greeting() } else { "Connecting…" }).size(38).font(SERIF).color(s.text);
+            let mut center = column![Space::new().height(Fill), hello, Space::new().height(26), self.dock_parts()].align_x(Alignment::Center).max_width(760).width(Fill);
+            let recent: Vec<_> = self.chats.iter().take(3).collect();
+            if !recent.is_empty() {
+                let cards = row(recent.into_iter().map(|c| {
+                    button(column![icon(ic::CHAT, 14).color(s.accent), text(c.title.as_str()).size(14).font(MEDIUM).color(s.text), Space::new().height(Fill), text(ago(c.updated)).size(12).color(s.faint)].spacing(8))
+                        .on_press(Message::OpenChat(c.id.clone()))
+                        .width(Fill)
+                        .height(104)
+                        .padding([12, 14])
+                        .style(move |_, st| card_style(s, st))
+                        .into()
+                }))
+                .spacing(12);
+                center = center.push(Space::new().height(30)).push(row![text("Recent chats").size(13).color(s.muted)].padding([0, 2])).push(Space::new().height(10)).push(cards);
+            }
+            center = center.push(Space::new().height(Fill));
+            return container(column![top, container(center).center_x(Fill).height(Fill).padding([0, 24])]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into();
+        }
+
+        let first = self.messages.len().saturating_sub(self.shown);
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+        if first > 0 {
+            items.push(container(button(text(format!("Show {} earlier messages", first.min(crate::SHOWN))).size(13).color(s.muted)).on_press(Message::ShowEarlier).padding([6, 14]).style(move |_, st| pill(s, st, false))).center_x(Fill).into());
+        }
+        for (i, m) in self.messages.iter().enumerate().skip(first) {
+            items.push(self.message(i, m));
+        }
+        let transcript = scrollable(container(column(items).spacing(28).max_width(740)).center_x(Fill).padding(Padding { top: 18.0, right: 28.0, bottom: 28.0, left: 28.0 }))
+            .anchor_bottom()
+            .height(Fill)
+            .style(move |t, st| scroll_style(s, t, st));
+        let dock = container(column![self.dock_parts()].max_width(740)).center_x(Fill).padding(Padding { top: 0.0, right: 24.0, bottom: 12.0, left: 24.0 });
+        container(column![top, transcript, dock]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into()
+    }
+
+    /// The ghost perched on the message box, the box itself, and the pickers under it.
+    fn dock_parts(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let ghost = canvas(Ghost { pixel: 3.0, mood: self.mood(), t: self.clock, talk: self.talking(), accent: s.accent }).width(72).height(66);
+        let say = if self.status.is_empty() && self.messages.is_empty() && self.api.is_some() { "Hello".to_string() } else { self.status_text() };
+        // the ghost's hem tucks behind the box: the perch overlaps the card by a few pixels
+        let perch = row![Space::new().width(18), container(ghost).height(58).clip(true), container(text(say).size(13).color(s.muted)).padding(Padding { bottom: 22.0, left: 10.0, ..Padding::ZERO })]
+            .align_y(Alignment::End)
+            .height(58);
+        let editor = text_editor(&self.composer)
+            .placeholder(if self.messages.is_empty() { "How can I help you today?" } else { "Reply to ghost-infer" })
+            .on_action(Message::Edit)
+            .padding(Padding { top: 4.0, right: 6.0, bottom: 10.0, left: 6.0 })
+            .height(Length::Shrink)
+            .min_height(34)
+            .max_height(240)
+            .size(15)
+            .key_binding(|kp| {
+                // Enter sends; Shift+Enter starts a new line
+                if matches!(kp.key, keyboard::Key::Named(keyboard::key::Named::Enter)) && !kp.modifiers.shift() {
+                    return Some(text_editor::Binding::Custom(Message::Send));
+                }
+                text_editor::Binding::from_key_press(kp)
+            })
+            .style(move |t, st| editor_style(s, t, st));
+        let plus = button(container(icon(ic::ADD, 13).color(s.muted)).center(32)).on_press(Message::Menu(Some(Menu::Plus))).padding(0).style(move |_, st| round_style(s, st));
+        let busy = self.busy.is_some();
+        let send = button(container(icon(if busy { ic::STOP } else { ic::UP }, 13).color(s.ink)).center(32))
+            .on_press(if busy { Message::Stop } else { Message::Send })
+            .padding(0)
+            .style(move |_, st| send_style(s, st));
+        let card = container(column![editor, row![plus, Space::new().width(Fill), send].align_y(Alignment::Center)].spacing(4))
+            .padding(Padding { top: 12.0, right: 12.0, bottom: 10.0, left: 14.0 })
+            .style(move |_| container::Style {
+                background: Some(Background::Color(s.raise)),
+                // no soft shadow: tiny-skia repaints only the ghost's patch each tick and leaves holes in it
+                border: Border { radius: 18.0.into(), width: 1.0, color: s.line2 },
+                ..Default::default()
+            });
+        let think = button(row![icon(ic::BOLT, 11).color(if self.thinking { s.accent } else { s.faint }), text(if self.thinking { "Think" } else { "Quick" }).size(13).color(s.muted)].spacing(6).align_y(Alignment::Center))
+            .on_press(Message::ToggleThinking)
+            .padding([4, 8])
+            .style(move |_, st| row_style(s, st, false));
+        let model = pick_list(self.models.clone(), self.model.clone(), Message::PickModel)
+            .placeholder("Model")
+            .text_size(13)
+            .font(MEDIUM)
+            .padding([4, 8])
+            .style(move |t, st| pick_style(s, t, st))
+            .menu_style(move |t| menu_style(s, t));
+        let folder = row![icon(ic::FOLDER, 12).color(s.muted), text(self.folder_label()).size(13).color(s.muted)].spacing(7).align_y(Alignment::Center);
+        let under = row![container(folder).padding([4, 8]), Space::new().width(Fill), model, think].spacing(2).align_y(Alignment::Center).padding(Padding { top: 8.0, right: 4.0, bottom: 0.0, left: 4.0 });
+        column![perch, card, under].into()
+    }
+
+    fn status_text(&self) -> String {
+        let rate = match self.started {
+            Some(t) if self.chunks > 1 && self.status == "Writing" => format!(", {:.0} tok/s", self.chunks as f64 / t.elapsed().as_secs_f64().max(0.001)),
+            _ => String::new(),
+        };
+        format!("{}{rate}", self.status)
+    }
+
+    fn message<'a>(&'a self, i: usize, m: &'a Msg) -> Element<'a, Message> {
+        let s = self.skin();
+        if m.role == Role::User {
+            let bubble = container(text(m.raw.as_str()).size(15).line_height(1.5).color(s.text)).padding([10, 16]).max_width(560).style(move |_| container::Style {
+                background: Some(Background::Color(s.bubble)),
+                border: border::rounded(16),
+                ..Default::default()
+            });
+            return row![Space::new().width(Fill), bubble].into();
+        }
+        let live = self.busy.is_some() && i + 1 == self.messages.len();
+        // in the order it happened: each round's thinking and text, then the tools it called; tool calls of
+        // rounds with no text between them share one box
+        let settings = self.md_settings();
+        let mut parts: Vec<Element<'a, Message>> = Vec::new();
+        let mut group: Vec<usize> = Vec::new();
+        let flush = |group: &mut Vec<usize>, parts: &mut Vec<Element<'a, Message>>| {
+            if group.is_empty() {
+                return;
+            }
+            parts.push(self.tool_group(i, m, group));
+            // a call waiting for the user's OK: its card right under it
+            if let Some(t) = group.iter().map(|&j| &m.tools[j]).find(|t| t.ask.is_some()) {
+                parts.push(self.approval_card(t));
+            }
+            group.clear();
+        };
+        let last = m.rounds.len().saturating_sub(1);
+        for (k, r) in m.rounds.iter().enumerate() {
+            if !r.think.is_empty() {
+                flush(&mut group, &mut parts);
+                let thinking = live && k == last && r.answer.is_empty() && !m.tools.iter().any(|t| t.round == k);
+                let chevron = if m.think_open { ic::DOWN } else { ic::RIGHT };
+                parts.push(
+                    button(row![text(if thinking { "Thinking…" } else { "Thought" }).size(13.5).color(s.muted), icon(chevron, 9).color(s.faint)].spacing(7).align_y(Alignment::Center))
+                        .on_press(Message::ToggleThinkView(i))
+                        .padding([2, 0])
+                        .style(move |_, _| button::Style { background: None, ..Default::default() })
+                        .into(),
+                );
+                if m.think_open {
+                    parts.push(container(text(r.think.as_str()).size(13.5).color(s.muted).line_height(1.55)).padding(Padding { left: 14.0, ..Padding::ZERO }).into());
+                }
+            }
+            if !r.answer.is_empty() {
+                flush(&mut group, &mut parts);
+                parts.push(markdown::view_with(r.md.items(), settings, &Md(s)));
+            }
+            group.extend(m.tools.iter().enumerate().filter(|(_, t)| t.round == k).map(|(j, _)| j));
+        }
+        flush(&mut group, &mut parts);
+        if !live && (m.rounds.iter().any(|r| !r.answer.is_empty()) || m.changed) {
+            let mut foot = row![small_button(s, ic::COPY, Message::Copy(i))].spacing(2).align_y(Alignment::Center);
+            if i + 1 == self.messages.len() {
+                foot = foot.push(small_button(s, ic::RETRY, Message::Retry));
+            }
+            if m.changed && !m.undone && m.checkpoint.is_some() {
+                foot = foot.push(
+                    container(button(row![icon(ic::UNDO, 11).color(s.muted), text("Undo file changes").size(12.5).color(s.muted)].spacing(7).align_y(Alignment::Center)).on_press(Message::Undo(i)).padding([4, 10]).style(move |_, st| pill(s, st, false)))
+                        .padding(Padding { left: 6.0, ..Padding::ZERO }),
+                );
+            }
+            if !m.stats.is_empty() {
+                foot = foot.push(container(text(m.stats.as_str()).size(12).color(s.faint)).padding(Padding { left: 8.0, ..Padding::ZERO }));
+            }
+            parts.push(foot.into());
+        }
+        column(parts).spacing(12).into()
+    }
+
+    /// A box of tool calls (`which`: indexes into the reply's tools), each a line; a click shows what it was
+    /// given and what came back.
+    fn tool_group<'a>(&'a self, i: usize, m: &'a Msg, which: &[usize]) -> Element<'a, Message> {
+        let s = self.skin();
+        let lines = column(which.iter().map(|&j| {
+            let t = &m.tools[j];
+            let (mark, color) = match (&t.result, t.denied) {
+                (None, _) => (ic::CLOCK, s.warn),
+                (Some(_), true) => (ic::CANCEL, s.bad),
+                (Some(r), false) if r.starts_with("Error") => (ic::CANCEL, s.bad),
+                (Some(_), false) => (ic::CHECK, s.ok),
+            };
+            let head = row![
+                icon(tool_icon(&t.name), 12).color(s.muted),
+                container(text(tool_label(t)).size(13).color(s.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+                icon(mark, 11).color(color),
+                icon(if t.open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center);
+            let line = button(head).on_press(Message::ToggleTool(i, j)).width(Fill).padding([5, 8]).style(move |_, st| bare(s, st));
+            if !t.open {
+                return line.into();
+            }
+            let detail = container(scrollable(text(tool_detail(t)).size(12.5).font(MONO).color(s.muted).line_height(1.45)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
+                .max_height(260)
+                .width(Fill)
+                .padding([8, 10])
+                .style(move |_| container::Style { background: Some(Background::Color(s.bg)), border: border::rounded(8), ..Default::default() });
+            column![line, container(detail).padding(Padding { top: 2.0, right: 4.0, bottom: 6.0, left: 30.0 })].into()
+        }))
+        .spacing(1);
+        container(lines).padding([4, 4]).style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(12), ..Default::default() }).into()
+    }
+
+    /// The card for a call that needs the user's OK: what it would do, and Allow / Always allow / Deny.
+    fn approval_card<'a>(&'a self, t: &'a crate::ToolLine) -> Element<'a, Message> {
+        let s = self.skin();
+        let (what, preview) = approval_text(t);
+        let mut card = column![row![icon(tool_icon(&t.name), 13).color(s.accent), text(what).size(14).font(MEDIUM).color(s.text)].spacing(10).align_y(Alignment::Center)].spacing(10);
+        if !preview.is_empty() {
+            card = card.push(
+                container(scrollable(text(preview).size(12.5).font(MONO).color(s.text).line_height(1.45)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
+                    .max_height(240)
+                    .width(Fill)
+                    .padding([8, 10])
+                    .style(move |_| container::Style { background: Some(Background::Color(s.bg)), border: border::rounded(8), ..Default::default() }),
+            );
+        }
+        let group = t.ask.as_deref().unwrap_or("");
+        let answer = |label: String, decision: &'static str, main: bool| {
+            button(text(label).size(13.5).color(if main { s.ink } else { s.text }))
+                .on_press(Message::Approve(t.id.clone(), decision))
+                .padding([6, 14])
+                .style(move |_, st| answer_style(s, st, main))
+        };
+        card = card.push(row![answer("Allow".into(), "once", true), answer(format!("Always allow {}", group_name(group)), "always", false), answer("Deny".into(), "deny", false)].spacing(8));
+        container(card)
+            .padding([12, 14])
+            .width(Fill)
+            .style(move |_| container::Style { background: Some(Background::Color(s.raise)), border: Border { radius: 12.0.into(), width: 1.0, color: Color { a: 0.45, ..s.accent } }, ..Default::default() })
+            .into()
+    }
+
+    /// How a reply's Markdown is drawn: the body font, headings a step above the text (not twice its size).
+    fn md_settings(&self) -> markdown::Settings {
+        let s = self.skin();
+        let mut style = markdown::Style::from_palette(self.theme.palette());
+        style.font = BODY;
+        style.inline_code_font = MONO;
+        style.code_block_font = MONO;
+        style.inline_code_color = s.text;
+        style.inline_code_highlight.background = Background::Color(s.raise2);
+        style.inline_code_padding = Padding { top: 1.0, right: 4.0, bottom: 1.0, left: 4.0 };
+        style.link_color = s.accent;
+        let mut settings = markdown::Settings::with_text_size(15.5, style);
+        settings.code_size = 13.5.into();
+        settings.h1_size = 22.into();
+        settings.h2_size = 19.5.into();
+        settings.h3_size = 17.5.into();
+        settings.h4_size = 16.into();
+        settings.spacing = 12.into();
+        settings
+    }
+
+    /// The ghost's mood, from what is happening.
+    fn mood(&self) -> Mood {
+        match self.status.as_str() {
+            _ if self.api.is_none() && !self.status.starts_with("Connecting") => Mood::Sad,
+            "Thinking" | "Reading" | "Reading the results" => Mood::Thinking,
+            "Writing" => Mood::Talking,
+            "Using a tool" => Mood::Tool,
+            "Waiting for your OK" => Mood::Waiting,
+            _ if self.idle_secs() > 120.0 => Mood::Sleepy,
+            _ if self.messages.is_empty() && self.clock < 2600 => Mood::Wave,
+            _ if self.happy_until > self.clock => Mood::Happy,
+            _ => Mood::Idle,
+        }
+    }
+
+    fn talking(&self) -> bool {
+        self.last_chunk_at.is_some_and(|t| self.clock.saturating_sub(t) < 350)
+    }
+}
+
+/// Draws a reply's Markdown; code blocks in the skin's colours (iced's own are near-black in every theme).
+struct Md(&'static Skin);
+
+impl<'a> markdown::Viewer<'a, Message> for Md {
+    fn on_link_click(url: markdown::Uri) -> Message {
+        Message::Link(url)
+    }
+
+    fn code_block(&self, settings: markdown::Settings, _: Option<&'a str>, _: &'a str, lines: &'a [markdown::Text]) -> Element<'a, Message> {
+        let s = self.0;
+        let code = column(lines.iter().map(|line| rich_text(line.spans(settings.style)).on_link_click(Self::on_link_click).font(settings.style.code_block_font).size(settings.code_size).into()));
+        let bar = scrollable::Scrollbar::default().width(6).scroller_width(6);
+        container(scrollable(container(code).padding([12, 14])).direction(scrollable::Direction::Horizontal(bar)).style(move |t, st| scroll_style(s, t, st)))
+            .width(Fill)
+            .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(10), text_color: Some(s.text), ..Default::default() })
+            .into()
+    }
+}
+
+fn icon_button<'a>(s: &'static Skin, c: char, on_press: Message) -> Element<'a, Message> {
+    button(icon(c, 13).color(s.muted)).on_press(on_press).padding(8).style(move |_, st| row_style(s, st, false)).into()
+}
+
+fn small_button<'a>(s: &'static Skin, c: char, on_press: Message) -> Element<'a, Message> {
+    button(icon(c, 12).color(s.faint)).on_press(on_press).padding(7).style(move |_, st| bare(s, st)).into()
+}
+
+// ---- styles
+
+fn hovered(st: button::Status) -> bool {
+    matches!(st, button::Status::Hovered | button::Status::Pressed)
+}
+
+fn row_style(s: &Skin, st: button::Status, on: bool) -> button::Style {
+    button::Style { background: Some(Background::Color(if on { s.raise } else if hovered(st) { s.hover } else { Color::TRANSPARENT })), text_color: s.text, border: border::rounded(8), ..Default::default() }
+}
+
+fn bare(s: &Skin, st: button::Status) -> button::Style {
+    button::Style { background: Some(Background::Color(if hovered(st) { s.hover } else { Color::TRANSPARENT })), text_color: s.muted, border: border::rounded(7), ..Default::default() }
+}
+
+fn pill(s: &Skin, st: button::Status, on: bool) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(if on { Color { a: 0.14, ..s.accent } } else if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+        text_color: s.text,
+        border: Border { radius: 999.0.into(), width: 1.0, color: s.line2 },
+        ..Default::default()
+    }
+}
+
+/// An approval card's buttons: Allow filled with the accent, the others outlined.
+fn answer_style(s: &Skin, st: button::Status, main: bool) -> button::Style {
+    let bg = match (main, hovered(st)) {
+        (true, false) => s.accent,
+        (true, true) => Color { a: 0.85, ..s.accent },
+        (false, true) => s.hover,
+        (false, false) => Color::TRANSPARENT,
+    };
+    button::Style { background: Some(Background::Color(bg)), text_color: s.text, border: Border { radius: 8.0.into(), width: if main { 0.0 } else { 1.0 }, color: s.line2 }, ..Default::default() }
+}
+
+fn round_style(s: &Skin, st: button::Status) -> button::Style {
+    button::Style { background: Some(Background::Color(if hovered(st) { s.raise2 } else { Color::TRANSPARENT })), border: border::rounded(999), ..Default::default() }
+}
+
+fn send_style(s: &Skin, st: button::Status) -> button::Style {
+    let c = if hovered(st) { Color { a: 0.85, ..s.accent } } else { s.accent };
+    button::Style { background: Some(Background::Color(c)), border: border::rounded(999), ..Default::default() }
+}
+
+fn card_style(s: &Skin, st: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(if hovered(st) { s.raise } else { s.hover })),
+        text_color: s.text,
+        border: Border { radius: 12.0.into(), width: if s.dark { 0.0 } else { 1.0 }, color: s.line },
+        ..Default::default()
+    }
+}
+
+fn editor_style(s: &Skin, theme: &Theme, st: text_editor::Status) -> text_editor::Style {
+    let base = text_editor::default(theme, st);
+    text_editor::Style { background: Background::Color(Color::TRANSPARENT), border: Border { width: 0.0, ..base.border }, placeholder: s.faint, value: s.text, selection: Color { a: 0.3, ..s.accent }, ..base }
+}
+
+fn input_style(s: &Skin, _: &Theme, _: text_input::Status) -> text_input::Style {
+    text_input::Style { background: Background::Color(s.hover), border: Border { radius: 8.0.into(), width: 1.0, color: s.line2 }, placeholder: s.faint, value: s.text, selection: Color { a: 0.3, ..s.accent }, icon: s.faint }
+}
+
+fn pick_style(s: &Skin, _: &Theme, st: pick_list::Status) -> pick_list::Style {
+    let hover = matches!(st, pick_list::Status::Hovered | pick_list::Status::Opened { .. });
+    pick_list::Style { background: Background::Color(if hover { s.hover } else { Color::TRANSPARENT }), border: Border { radius: 8.0.into(), width: 0.0, color: Color::TRANSPARENT }, text_color: s.muted, placeholder_color: s.faint, handle_color: s.faint }
+}
+
+fn menu_style(s: &Skin, theme: &Theme) -> iced::overlay::menu::Style {
+    let base = iced::overlay::menu::default(theme);
+    iced::overlay::menu::Style {
+        background: Background::Color(s.menu),
+        border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
+        text_color: s.text,
+        selected_text_color: s.text,
+        selected_background: Background::Color(s.hover),
+        ..base
+    }
+}
+
+fn scroll_style(s: &Skin, theme: &Theme, st: scrollable::Status) -> scrollable::Style {
+    let mut out = scrollable::default(theme, st);
+    for rail in [&mut out.vertical_rail, &mut out.horizontal_rail] {
+        rail.background = None;
+        rail.border = Border::default();
+        rail.scroller.background = Background::Color(s.line2);
+        rail.scroller.border = border::rounded(4);
+    }
+    out
+}

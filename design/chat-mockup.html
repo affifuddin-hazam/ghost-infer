@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>betterllama chat (mockup)</title>
+<style>
+  :root {
+    --paper: #f2f4ef; --surface: #ffffff; --sunk: #e8ece5; --ink: #17211c; --muted: #5e6b64; --line: #d7ddd5;
+    --leaf: #1e5e47; --leaf-ink: #ffffff; --leaf-soft: #dcebe2; --fawn: #e7d5bf; --fawn-ink: #3a2a1a;
+    --signal: #2f9e6b; --code: #eef1ec; --danger: #b3402f;
+    --ui: Bahnschrift, "DIN Alternate", "Segoe UI", system-ui, sans-serif;
+    --text: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    --mono: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --paper: #0f1e18; --surface: #15271f; --sunk: #112219; --ink: #e4ece6; --muted: #8fa398; --line: #24382e;
+    --leaf: #6fcf9b; --leaf-ink: #0c1a14; --leaf-soft: #1c3529; --fawn: #3a2e23; --fawn-ink: #f2e4d2;
+    --signal: #7ee0a8; --code: #0c1913; --danger: #ec8a76;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--paper); color: var(--ink); font: 16px/1.6 var(--text); display: grid; grid-template-columns: 264px minmax(0, 1fr); }
+  button, input, textarea, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--leaf); outline-offset: 2px; }
+
+  /* ---- sidebar: past conversations */
+  aside { background: var(--sunk); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .brand { font: 600 19px/1 var(--ui); letter-spacing: 0.01em; padding: 20px 18px 14px; display: flex; align-items: center; gap: 10px; }
+  .brand svg { flex: none; }
+  .new { margin: 0 12px 14px; display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 12px;
+         border: 1px solid var(--line); background: var(--surface); font: 500 14px/1 var(--ui); }
+  .new:hover { border-color: var(--leaf); }
+  .group { font: 13px/1 var(--ui); color: var(--muted); padding: 14px 18px 6px; }
+  .chats { list-style: none; margin: 0; padding: 0 8px; overflow-y: auto; flex: 1; }
+  .chats a { display: block; padding: 8px 10px; border-radius: 8px; color: inherit; text-decoration: none; font-size: 14px;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chats a:hover { background: var(--paper); }
+  .chats a[aria-current] { background: var(--leaf-soft); color: var(--ink); font-weight: 600; }
+  .where { padding: 14px 18px 18px; font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line); }
+
+  /* ---- main column */
+  .main { display: grid; grid-template-rows: auto 1fr auto; grid-template-columns: minmax(0, 1fr); min-height: 0; min-width: 0; position: relative; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--paper); }
+  .icon.menu { display: none; }
+  .model { font: 500 15px/1.2 var(--ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .ctx { display: flex; align-items: center; gap: 8px; font: 13px/1 var(--ui); color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
+  .ctx .bar { width: 88px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .ctx .bar i { display: block; height: 100%; width: 15%; background: var(--leaf); border-radius: 3px; }
+  .icon { width: 36px; height: 36px; border-radius: 10px; border: 1px solid transparent; background: transparent; display: grid; place-items: center; color: var(--muted); }
+  .icon:hover { border-color: var(--line); color: var(--ink); background: var(--surface); }
+
+  /* settings panel */
+  .settings { position: absolute; right: 16px; top: 58px; width: min(360px, calc(100% - 32px)); background: var(--surface); border: 1px solid var(--line);
+              border-radius: 16px; padding: 18px; box-shadow: 0 18px 40px -18px rgba(15, 30, 24, 0.35); z-index: 5; display: none; }
+  .settings.open { display: block; }
+  .settings h2 { font: 600 16px/1 var(--ui); margin: 0 0 14px; }
+  .field { display: grid; gap: 6px; margin-bottom: 14px; font-size: 14px; }
+  .field .row { display: flex; justify-content: space-between; color: var(--muted); font: 14px/1 var(--ui); font-variant-numeric: tabular-nums; }
+  .field input[type=range] { accent-color: var(--leaf); width: 100%; }
+  .field textarea, .field input[type=number] { background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+  .field textarea { resize: vertical; min-height: 72px; }
+  .field small { color: var(--muted); font-size: 12.5px; }
+
+  /* ---- conversation */
+  .scroller { overflow-y: auto; min-height: 0; }
+  .log { max-width: 760px; margin: 0 auto; padding: 28px 24px 24px; }
+  .turn { margin-bottom: 30px; }
+  .you { display: flex; justify-content: flex-end; }
+  .you p { margin: 0; background: var(--fawn); color: var(--fawn-ink); padding: 10px 16px; border-radius: 18px 18px 6px 18px; max-width: 82%; white-space: pre-wrap; }
+  .reply { max-width: 68ch; min-width: 0; }
+  .reply p { margin: 0 0 12px; }
+  .reply h3 { font: 600 17px/1.3 var(--ui); margin: 18px 0 8px; }
+  .reply ul { margin: 4px 0 12px; padding-left: 22px; }
+  .reply code { font: 14px/1.5 var(--mono); background: var(--code); padding: 1px 5px; border-radius: 5px; }
+  .reply pre { background: var(--code); border: 1px solid var(--line); border-radius: 12px; margin: 8px 0 14px; overflow: hidden; }
+  .reply pre .bar { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px 6px 14px; font: 13px/1 var(--ui); color: var(--muted); border-bottom: 1px solid var(--line); }
+  .reply pre .bar button { border: 0; background: none; color: var(--muted); font: 13px/1 var(--ui); padding: 6px 8px; border-radius: 6px; }
+  .reply pre .bar button:hover { color: var(--ink); background: var(--surface); }
+  .reply pre code { display: block; padding: 12px 14px; background: none; overflow-x: auto; white-space: pre; }
+  .tok-k { color: var(--leaf); }
+  .tok-s { color: #8a5a33; }
+  :root[data-theme="dark"] .tok-s { color: #e2b98f; }
+
+  /* the thinking trail: a quiet, foldable side note */
+  details.think { margin: 0 0 14px; }
+  details.think summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; font: 14px/1 var(--ui); color: var(--muted);
+                          padding: 7px 12px; border-radius: 999px; border: 1px solid var(--line); }
+  details.think summary::-webkit-details-marker { display: none; }
+  details.think summary:hover { color: var(--ink); }
+  details.think summary svg { transition: transform 0.15s; }
+  details.think[open] summary svg { transform: rotate(90deg); }
+  details.think .body { margin: 10px 0 0 6px; padding-left: 14px; border-left: 2px solid var(--line); color: var(--muted); font-size: 14.5px; white-space: pre-wrap; }
+  .stats { font: 13px/1.4 var(--ui); color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 4px; }
+  .live::after { content: ""; display: inline-block; width: 8px; height: 1.05em; vertical-align: -0.15em; margin-left: 2px; background: var(--leaf); border-radius: 2px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ---- composer: the memorable part is the live speed meter */
+  footer { padding: 0 24px 20px; }
+  .composer { max-width: 760px; margin: 0 auto; background: var(--surface); border: 1px solid var(--line); border-radius: 22px; padding: 12px 12px 10px 18px;
+              box-shadow: 0 10px 30px -20px rgba(15, 30, 24, 0.45); }
+  .composer:focus-within { border-color: var(--leaf); }
+  .composer textarea { width: 100%; border: 0; background: transparent; resize: none; outline: none; min-height: 28px; max-height: 40vh; line-height: 1.5; padding: 4px 0; }
+  .tools { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .toggle { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--paper); border-radius: 999px; padding: 6px 12px 6px 8px; font: 14px/1 var(--ui); }
+  .toggle .knob { width: 28px; height: 16px; border-radius: 8px; background: var(--line); position: relative; transition: background 0.15s; }
+  .toggle .knob::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--surface); transition: transform 0.15s; }
+  .toggle[aria-pressed="true"] .knob { background: var(--leaf); }
+  .toggle[aria-pressed="true"] .knob::after { transform: translateX(12px); }
+  .meter { margin-left: auto; display: flex; align-items: center; gap: 10px; font: 500 15px/1 var(--ui); font-variant-numeric: tabular-nums; color: var(--ink); }
+  .meter .spark { display: flex; align-items: flex-end; gap: 2px; height: 22px; }
+  .meter .spark i { width: 4px; border-radius: 2px; background: var(--signal); opacity: 0.85; }
+  .meter small { font-size: 13px; color: var(--muted); font-weight: 400; }
+  .send { width: 40px; height: 40px; border-radius: 50%; border: 0; background: var(--leaf); color: var(--leaf-ink); display: grid; place-items: center; }
+  .send.stop { background: var(--ink); color: var(--paper); }
+  .hint { max-width: 760px; margin: 8px auto 0; font-size: 12.5px; color: var(--muted); text-align: center; }
+
+
+  @media (max-width: 820px) {
+    body { grid-template-columns: minmax(0, 1fr); }
+    aside { position: fixed; inset: 0 auto 0 0; width: 280px; z-index: 8; transform: translateX(-100%); transition: transform 0.2s; }
+    body.nav aside { transform: none; box-shadow: 0 0 0 100vmax rgba(10, 20, 15, 0.35); }
+    .icon.menu { display: grid; }
+    .ctx .label { display: none; }
+    header { padding: 10px 12px; gap: 8px; }
+    .log { padding: 20px 16px; }
+    footer { padding: 0 12px 12px; }
+    .meter .spark { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<aside aria-label="Conversations">
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><rect width="26" height="26" rx="8" fill="var(--leaf)"/><path d="M7 17.5 11 8l3 6 2-3.5 3 7" fill="none" stroke="var(--leaf-ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    betterllama
+  </div>
+  <button class="new"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>New chat</button>
+  <div class="group">Today</div>
+  <ul class="chats">
+    <li><a href="#" aria-current="page">Palindrome check in Python</a></li>
+    <li><a href="#">How DNS finds a website</a></li>
+    <li class="group" style="padding-left:10px">Earlier</li>
+    <li><a href="#">Two days in Penang on a budget</a></li>
+    <li><a href="#">Tool calling test with the weather API</a></li>
+    <li><a href="#">Rewrite my cover letter</a></li>
+  </ul>
+  <div class="where">Conversations stay in this browser. Replies run on this computer's GPU.</div>
+</aside>
+
+<div class="main">
+  <header>
+    <button class="icon menu" aria-label="Show conversations" onclick="document.body.classList.toggle('nav')">
+      <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+    <span class="model" title="Model on the server">Qwen3-30B-A3B-Instruct-2507-Q3_K_M</span>
+    <span class="ctx" title="How much of the context window this conversation uses"><span class="bar"><i></i></span><span class="label">1,240 of 8,192 tokens</span></span>
+    <button class="icon" id="theme" aria-label="Theme: auto" title="Theme: auto (follows the system)">
+      <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 3.5a6.5 6.5 0 0 1 0 13z" fill="currentColor"/></svg>
+    </button>
+    <button class="icon" aria-label="Settings" onclick="document.querySelector('.settings').classList.toggle('open')">
+      <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M15 6h1M4 14h1M8 14h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="13.5" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="6.5" cy="14" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+    </button>
+  </header>
+
+  <section class="settings" aria-label="Settings">
+    <h2>Reply settings</h2>
+    <label class="field"><span class="row"><span>Temperature</span><span>0.0</span></span><input type="range" min="0" max="2" step="0.1" value="0"><small>0 gives the same answer every time and is fastest.</small></label>
+    <label class="field"><span class="row"><span>Longest reply</span><span>2,048 tokens</span></span><input type="range" min="64" max="8192" step="64" value="2048"></label>
+    <label class="field"><span class="row"><span>System prompt</span></span><textarea placeholder="Leave empty to use the model's default"></textarea></label>
+  </section>
+
+  <div class="scroller">
+    <div class="log">
+      <div class="turn you"><p>Write a Python function that checks whether a string is a palindrome, ignoring spaces and punctuation.</p></div>
+      <div class="turn">
+        <div class="reply">
+          <details class="think">
+            <summary><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1.5 6.5 5 3 8.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Thought for 2.4 s</summary>
+            <div class="body">The user wants letters and digits only, compared case-insensitively. Filter with str.isalnum, lower-case, then compare with the reverse. Mention that it handles an empty string.</div>
+          </details>
+          <p>Keep only letters and digits, ignore case, then compare the cleaned string with its reverse:</p>
+          <pre><div class="bar"><span>Python</span><button>Copy</button></div><code><span class="tok-k">def</span> is_palindrome(text: str) -> bool:
+    cleaned = [c.lower() <span class="tok-k">for</span> c <span class="tok-k">in</span> text <span class="tok-k">if</span> c.isalnum()]
+    <span class="tok-k">return</span> cleaned == cleaned[::-1]
+
+print(is_palindrome(<span class="tok-s">"A man, a plan, a canal: Panama"</span>))  <span style="color:var(--muted)"># True</span></code></pre>
+          <p>An empty string counts as a palindrome, since it reads the same both ways. If you only want letters, swap <code>isalnum()</code> for <code>isalpha()</code>.</p>
+        </div>
+        <div class="stats">412 tokens in 12.1 s, 34 tok/s, first token after 180 ms</div>
+      </div>
+
+      <div class="turn you"><p>Now make it work for a whole sentence list and show which ones pass.</p></div>
+      <div class="turn">
+        <div class="reply">
+          <p>Run each sentence through the same function and print the result next to it:</p>
+          <pre><div class="bar"><span>Python</span><button>Copy</button></div><code>sentences = [<span class="tok-s">"Was it a car or a cat I saw?"</span>, <span class="tok-s">"Hello, world"</span>]
+<span class="tok-k">for</span> s <span class="tok-k">in</span> sentences:
+    print(is_palindrome(s), s)</code></pre>
+          <p class="live">This prints <code>True</code> for the first sentence and</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <form class="composer" onsubmit="return false">
+      <textarea rows="1" placeholder="Message" aria-label="Message"></textarea>
+      <div class="tools">
+        <button type="button" class="toggle" aria-pressed="true" onclick="this.setAttribute('aria-pressed', this.getAttribute('aria-pressed') !== 'true')"><span class="knob"></span>Thinking</button>
+        <div class="meter" aria-live="off" title="Generation speed, live">
+          <span class="spark" id="spark"></span>
+          <span><span id="rate">41.2</span> <small>tok/s</small></span>
+        </div>
+        <button type="button" class="send stop" aria-label="Stop the reply">
+          <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><rect x="2" y="2" width="10" height="10" rx="2" fill="currentColor"/></svg>
+        </button>
+      </div>
+    </form>
+    <div class="hint">Enter sends, Shift+Enter adds a line.</div>
+  </footer>
+</div>
+
+
+<script>
+  // theme: auto (the system's) -> light -> dark
+  const themes = ["auto", "light", "dark"];
+  let theme = "auto";
+  const applyTheme = () => {
+    const dark = theme === "dark" || (theme === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    const b = document.getElementById("theme");
+    b.setAttribute("aria-label", "Theme: " + theme);
+    b.title = theme === "auto" ? "Theme: auto (follows the system)" : "Theme: " + theme;
+  };
+  document.getElementById("theme").onclick = () => { theme = themes[(themes.indexOf(theme) + 1) % 3]; applyTheme(); };
+  applyTheme();
+
+  // mockup only: animate the speed meter as a reply would
+  const spark = document.getElementById("spark"), rate = document.getElementById("rate");
+  const vals = Array.from({ length: 24 }, () => 36 + Math.random() * 8);
+  function draw() {
+    spark.innerHTML = vals.map((v) => `<i style="height:${Math.round(4 + (v - 28) / 22 * 18)}px"></i>`).join("");
+    rate.textContent = vals[vals.length - 1].toFixed(1);
+  }
+  draw();
+  if (!matchMedia("(prefers-reduced-motion: reduce)").matches)
+    setInterval(() => { vals.shift(); vals.push(Math.max(30, Math.min(48, vals[vals.length - 1] + (Math.random() - 0.5) * 4))); draw(); }, 250);
+</script>
+</body>
+</html>

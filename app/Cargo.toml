@@ -1,0 +1,15 @@
+[package]
+name = "ghost-app"
+version = "0.1.0"
+edition = "2024"
+description = "ghost-infer's native desktop app: a light window onto the local ghost-infer server"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/affifuddin-hazam/ghost-infer"
+
+[[bin]]
+name = "ghost-app"
+path = "src/main.rs"
+
+[dependencies]
+# drawn on the CPU (tiny-skia): no GPU memory taken from the model, about 16 MB idle
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "thread-pool", "markdown", "highlighter", "canvas"] }

@@ -6,6 +6,10 @@ description = "Fast local LLM inference for consumer GPUs: GGUF models, an OpenA
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/affifuddin-hazam/ghost-infer"
 
+[workspace]
+# the engine and server stay at the root; the native desktop app is its own crate (it brings the GUI crates)
+members = [".", "app"]
+
 [dependencies]
 memmap2 = "0.9"
 rayon = "1.10"

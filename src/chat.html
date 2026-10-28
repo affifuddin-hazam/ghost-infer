@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ghost-infer</title>
+<meta name="ghost-token" content="__GHOST_TOKEN__">
 <style>
   @font-face { font-family: "Instrument Sans"; src: url("/vendor/instrument-sans-5.3.0.woff2") format("woff2"); font-weight: 400 700; font-style: normal; font-display: swap; }
   @font-face { font-family: "Instrument Sans"; src: url("/vendor/instrument-sans-italic-5.3.0.woff2") format("woff2"); font-weight: 400 700; font-style: italic; font-display: swap; }
@@ -96,6 +97,24 @@
   details.think summary::after { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(-45deg); margin-left: 2px; transition: transform 0.15s; }
   details.think[open] summary::after { transform: rotate(45deg) translate(-2px, -1px); }
   details.think summary:hover { color: var(--text); }
+  /* the agent tools: each call in the reply's tool note, and the approval card before a change */
+  .toolnote .body { white-space: normal !important; }
+  .toolnote .call { margin: 4px 0; }
+  .toolnote .call summary { list-style: none; cursor: pointer; font-size: 13.5px; color: var(--muted); }
+  .toolnote .call summary::-webkit-details-marker { display: none; }
+  .toolnote .call summary:hover { color: var(--text); }
+  .toolnote .call.denied summary { text-decoration: line-through; }
+  .toolnote .call pre { margin: 6px 0 8px; padding: 8px 10px; border-radius: 8px; background: var(--code); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
+  .approve { margin: 10px 0 14px; padding: 12px 14px; border-radius: 12px; background: var(--raise); border: 1px solid rgba(185, 199, 255, 0.35); font-size: 14px; }
+  .approve .what { margin-bottom: 8px; }
+  .approve pre { margin: 0 0 10px; padding: 8px 10px; border-radius: 8px; background: var(--code); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; }
+  .approve .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .approve button { border: 1px solid var(--line-2); background: none; color: var(--text); border-radius: 8px; padding: 5px 12px; font-size: 13.5px; }
+  .approve button.ok { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  .undo { font-size: 12.5px; color: var(--muted); background: none; border: 1px solid var(--line-2); border-radius: 8px; padding: 3px 10px; margin-left: 6px; }
+  .undo:hover { color: var(--text); }
+  .toolgroups { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; margin: 10px 0 12px 26px; }
+  .linkbtn { background: none; border: 0; padding: 0; color: var(--muted); font-size: 12.5px; text-decoration: underline; }
   details.think .body { white-space: pre-wrap; margin-top: 8px; padding-left: 14px; border-left: 2px solid var(--line-2); color: var(--muted); font-size: 14px; }
   .error { margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 14px; border-radius: 10px; background: rgba(255, 155, 138, 0.08); border: 1px solid rgba(255, 155, 138, 0.25); color: var(--danger); font-size: 14.5px; }
   .error button { border: 1px solid rgba(255, 155, 138, 0.4); background: none; color: var(--danger); border-radius: 8px; padding: 4px 12px; font-size: 13.5px; }
@@ -146,7 +165,7 @@
   .note { text-align: center; font-size: 12px; color: var(--faint); padding-top: 8px; }
 
   /* ---- settings */
-  .settings { position: fixed; left: 12px; bottom: 70px; z-index: 8; width: min(340px, calc(100vw - 24px)); padding: 18px; border-radius: 14px; display: none;
+  .settings { position: fixed; left: 12px; bottom: 70px; z-index: 8; width: min(360px, calc(100vw - 24px)); max-height: calc(100vh - 90px); overflow-y: auto; padding: 18px; border-radius: 14px; display: none;
               background: var(--raise); border: 1px solid var(--line-2); box-shadow: 0 24px 50px -20px rgba(0, 0, 0, 0.8); }
   .settings.open { display: block; }
   .settings h2 { font-size: 15px; font-weight: 600; margin: 0 0 16px; }
@@ -201,7 +220,15 @@
   <label class="field"><span class="row"><span>Longest reply</span><span id="maxVal"></span></span><input type="range" id="maxTokens" min="64" max="8192" step="64" value="2048"></label>
   <label class="field"><span class="row"><span>System prompt</span></span><textarea id="system" placeholder="Leave empty to use the model's default"></textarea></label>
   <label class="check"><input type="checkbox" id="moods" checked><span>Let the model set the ghost's mood<br><small>It starts replies with a hidden tag such as [happy]. Turn off for models that don't follow it.</small></span></label>
-  <label class="check" style="margin-top: 12px"><input type="checkbox" id="tools" checked><span>Let the model check this computer<br><small>A tool it can call for the CPU, memory, GPU, drives and what is running. It is only read, never changed.</small></span></label>
+  <label class="check" style="margin-top: 12px"><input type="checkbox" id="tools" checked><span>Let the model use tools<br><small>It asks you first before it changes a file, runs a command or goes online.</small></span></label>
+  <div class="toolgroups">
+    <label class="check"><input type="checkbox" id="tg_files" checked><span>Read files</span></label>
+    <label class="check"><input type="checkbox" id="tg_edit" checked><span>Change files</span></label>
+    <label class="check"><input type="checkbox" id="tg_cmd" checked><span>Run commands</span></label>
+    <label class="check"><input type="checkbox" id="tg_web" checked><span>Search the web</span></label>
+  </div>
+  <label class="field"><span class="row"><span>Folders the model may use</span></span><textarea id="folders" placeholder="One folder per line, for example&#10;E:\Projects\notes"></textarea><small id="foldersNote">Files outside these folders are refused. Relative paths start in the first one.</small></label>
+  <button type="button" class="linkbtn" id="resetAllow">Ask again before every change</button>
 </section>
 
 <div class="main">
@@ -605,7 +632,8 @@ for (const ev of ["pointermove", "keydown", "pointerdown", "wheel"]) addEventLis
 
 // ---- settings, kept in this browser
 const think = $("think");
-const prefs = { temp: ["temp", 0], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true], tools: ["tools", true] };
+const prefs = { temp: ["temp", 0], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true], tools: ["tools", true],
+  tg_files: ["tg_files", true], tg_edit: ["tg_edit", true], tg_cmd: ["tg_cmd", true], tg_web: ["tg_web", true] };
 for (const [id, [key, d]] of Object.entries(prefs)) {
   const el = $(id), v = store.get(key, d);
   el.type === "checkbox" ? (el.checked = v) : (el.value = v);
@@ -826,7 +854,7 @@ function view(m) {
     '<details class="think toolnote" hidden><summary></summary><div class="body"></div></details><div class="answer"></div>' +
     '<div class="error" hidden><span></span><button type="button" class="retry">Try again</button></div>' +
     `<div class="actions"><button type="button" class="ibtn copyall" title="Copy" aria-label="Copy the reply">${ICON.copy}</button>` +
-    `<button type="button" class="ibtn retry" title="Write it again" aria-label="Write the reply again">${ICON.retry}</button><span class="stat"></span></div>`;
+    `<button type="button" class="ibtn retry" title="Write it again" aria-label="Write the reply again">${ICON.retry}</button><button type="button" class="undo" hidden>Undo file changes</button><span class="stat"></span></div>`;
   div.reply = m;
   fill(div, m);
   return div;
@@ -835,9 +863,19 @@ function fill(div, m) {
   const calls = (m.steps || []).flatMap((st) => st.calls), tn = div.querySelector(".toolnote");
   tn.hidden = !calls.length;
   if (calls.length) {
-    tn.querySelector("summary").textContent = [...new Set(calls.map((cl) => TOOL_LABEL[cl.name] || `Used ${cl.name}`))].join(", ");
-    tn.querySelector(".body").textContent = calls.map((cl) => cl.result).join("\n\n");
+    tn.querySelector("summary").textContent = calls.length === 1 ? callLabel(calls[0]) : `Used ${calls.length} tools`;
+    const body = tn.querySelector(".body");
+    body.replaceChildren(...calls.map((cl) => {
+      const d = document.createElement("details"), sm = document.createElement("summary"), pre = document.createElement("pre");
+      d.className = "call" + (cl.denied ? " denied" : "");
+      sm.textContent = callLabel(cl);
+      pre.textContent = cl.result ?? "";
+      d.append(sm, pre);
+      return d;
+    }));
   }
+  const undo = div.querySelector(".undo");
+  undo.hidden = !m.changed || m.undone;
   const th = div.querySelector(".think"), hasThink = !!(m.think && m.think.trim());
   th.hidden = !hasThink;
   if (hasThink) {
@@ -905,26 +943,147 @@ log.addEventListener("click", async (e) => {
     b.innerHTML = ICON.done;
     setTimeout(() => (b.innerHTML = ICON.copy), 1500);
   } else if (b.classList.contains("retry")) retry();
+  else if (b.classList.contains("undo")) {
+    const m = b.closest(".msg").reply;
+    b.disabled = true;
+    try {
+      const j = await harness("/api/tools/undo", { checkpoint: m.cp });
+      m.undone = true;
+      b.hidden = true;
+      settleTo("happy", 2500, j.undone.length ? `Undone: ${j.undone.length} file${j.undone.length === 1 ? "" : "s"} put back` : "Nothing to undo");
+      save();
+    } catch (e) {
+      b.disabled = false;
+      settleTo("confused", 4000, `Couldn't undo: ${e.message || e}`, true);
+    }
+  }
 });
 
-// ---- tools the model may call; the page runs them and hands the answers back
-const TOOLS = [{
-  type: "function",
-  function: {
-    name: "get_system_info",
-    description: "Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.",
-    parameters: { type: "object", properties: {}, required: [] },
-  },
-}];
-const TOOL_LABEL = { get_system_info: "Checked this computer's specs" };
-const TOOL_STATUS = { get_system_info: "Checking this computer's specs" };
-async function runTool(name) {
+// ---- tools the model may call. The server runs the file, command and web tools (only for this page: it
+// carries the server's token); the page asks the user before anything that changes something or goes online.
+const TOKEN = document.querySelector('meta[name="ghost-token"]')?.content || "";
+async function harness(path, body) {
+  const r = await fetch(path, { method: body ? "POST" : "GET", headers: { "X-Ghost-Token": TOKEN, "Content-Type": "application/json" }, body: body && JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+  return j;
+}
+const T = (name, description, properties = {}, required = []) => ({ type: "function", function: { name, description, parameters: { type: "object", properties, required } } });
+const S = (d) => ({ type: "string", description: d }), N = (d) => ({ type: "integer", description: d }), B = (d) => ({ type: "boolean", description: d });
+const TOOL_GROUPS = {
+  files: [
+    T("read_file", "Read a text file, with line numbers. For a big file, read part of it with offset and limit.", { path: S("File path"), offset: N("First line to read, from 1"), limit: N("How many lines (default 300)") }, ["path"]),
+    T("list_files", "List a folder, or with pattern every file under it matching a glob such as **/*.py.", { path: S("Folder (default: the first allowed folder)"), pattern: S("Glob, e.g. *.md or src/**/*.rs") }),
+    T("search_files", "Search inside files for a regular expression. Returns path:line:text.", { pattern: S("Regular expression"), path: S("Folder or file to search"), glob: S("Only files matching this, e.g. *.rs"), ignore_case: B("Ignore upper/lower case") }, ["pattern"]),
+  ],
+  edit: [
+    T("write_file", "Create a file, or replace a file's whole content.", { path: S("File path"), content: S("The complete content") }, ["path", "content"]),
+    T("edit_file", "Replace exact text in a file. Read the file first; old_string must match exactly once, so include enough surrounding lines.", { path: S("File path"), old_string: S("The exact text to replace"), new_string: S("The text to put in its place"), replace_all: B("Replace every match") }, ["path", "old_string", "new_string"]),
+  ],
+  cmd: [
+    T("run_command", "Run a Windows PowerShell command and get its output (stops after 60 s unless timeout is set).", { command: S("PowerShell command"), cwd: S("Folder to run it in"), timeout: N("Seconds, up to 600") }, ["command"]),
+    T("start_process", "Start a long-running PowerShell command (a server, a build) in the background. Returns its id.", { command: S("PowerShell command"), cwd: S("Folder to run it in") }, ["command"]),
+    T("check_process", "A background process's state and the output it printed since the last check.", { id: N("Process id") }, ["id"]),
+    T("stop_process", "Stop a background process.", { id: N("Process id") }, ["id"]),
+  ],
+  web: [
+    T("web_search", "Search the web. Returns titles, addresses and snippets.", { query: S("What to search for") }, ["query"]),
+    T("fetch_url", "Read a web page as text.", { url: S("http(s) address") }, ["url"]),
+  ],
+};
+const SYSTEM_TOOL = T("get_system_info", "Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.");
+function toolList() {
+  return [SYSTEM_TOOL, ...Object.entries(TOOL_GROUPS).filter(([g]) => $("tg_" + g).checked).flatMap(([, list]) => list)];
+}
+// tools that need the user's OK, by group; "always allow" is kept per group in this browser
+const NEEDS_OK = { write_file: "edit", edit_file: "edit", run_command: "cmd", start_process: "cmd", web_search: "web", fetch_url: "web" };
+const GROUP_NAME = { edit: "file changes", cmd: "commands", web: "web access" };
+let allowed = store.get("allow", {});
+$("resetAllow").onclick = () => { allowed = {}; store.set("allow", allowed); $("resetAllow").textContent = "Done: it will ask again"; };
+
+const short = (t, n = 60) => { t = String(t ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
+const argsOf = (cl) => { try { return JSON.parse(cl.arguments || "{}") || {}; } catch { return {}; } };
+// what a call did, for the tool note under the reply
+function callLabel(cl) {
+  const a = argsOf(cl), p = short(a.path || a.cwd || "", 70);
+  const label = {
+    get_system_info: "Checked this computer's specs", read_file: `Read ${p}`, list_files: `Listed ${p || "the folder"}${a.pattern ? " (" + a.pattern + ")" : ""}`,
+    search_files: `Searched for ${short(a.pattern, 40)}${a.path ? " in " + short(a.path, 40) : ""}`, write_file: `Wrote ${p}`, edit_file: `Edited ${p}`,
+    run_command: `Ran ${short(a.command)}`, start_process: `Started ${short(a.command)}`, check_process: `Checked process ${a.id}`, stop_process: `Stopped process ${a.id}`,
+    web_search: `Searched the web for "${short(a.query, 50)}"`, fetch_url: `Read ${short(a.url, 70)}`,
+  }[cl.name] || `Used ${cl.name}`;
+  return cl.denied ? label + " (you said no)" : label;
+}
+const TOOL_STATUS = { get_system_info: "Checking this computer's specs", read_file: "Reading a file", list_files: "Looking through files", search_files: "Searching files",
+  write_file: "Writing a file", edit_file: "Editing a file", run_command: "Running a command", start_process: "Starting a process", check_process: "Checking a process",
+  stop_process: "Stopping a process", web_search: "Searching the web", fetch_url: "Reading a web page" };
+
+// the approval card: what the call would do, and Allow / Always allow / Deny; resolves to "once", "always" or "deny"
+function approve(el, cl, group) {
+  return new Promise((resolve) => {
+    const a = argsOf(cl), box = document.createElement("div");
+    box.className = "approve";
+    const what = document.createElement("div");
+    what.className = "what";
+    const detail = {
+      write_file: [`Write ${a.path} (${String(a.content ?? "").split("\n").length} lines)?`, a.content],
+      edit_file: [`Change ${a.path}?`, `- ${String(a.old_string ?? "").split("\n").join("\n- ")}\n+ ${String(a.new_string ?? "").split("\n").join("\n+ ")}`],
+      run_command: [`Run this in PowerShell${a.cwd ? " in " + a.cwd : ""}?`, a.command],
+      start_process: [`Start this in the background${a.cwd ? " in " + a.cwd : ""}?`, a.command],
+      web_search: [`Search the web for "${a.query}"?`, ""],
+      fetch_url: [`Open ${a.url}?`, ""],
+    }[cl.name] || [`Use ${cl.name}?`, cl.arguments];
+    what.textContent = detail[0];
+    box.append(what);
+    if (detail[1]) { const pre = document.createElement("pre"); pre.textContent = detail[1]; box.append(pre); }
+    const btns = document.createElement("div");
+    btns.className = "btns";
+    const done = (v) => { box.remove(); resolve(v); };
+    for (const [label, cls, v] of [["Allow", "ok", "once"], [`Always allow ${GROUP_NAME[group]}`, "", "always"], ["Deny", "", "deny"]]) {
+      const b = document.createElement("button");
+      b.type = "button"; b.textContent = label; b.className = cls; b.onclick = () => done(v);
+      btns.append(b);
+    }
+    box.append(btns);
+    el.querySelector(".actions").before(box);
+    box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    busy?.signal.addEventListener("abort", () => done("deny"), { once: true });
+  });
+}
+
+async function runTool(name, argsText, checkpoint) {
   try {
     if (name === "get_system_info") return JSON.stringify(await (await fetch("/api/system")).json(), null, 1);
-    return JSON.stringify({ error: `no tool named ${name}` });
+    const j = await harness("/api/tools/run", { name, arguments: argsText || "{}", checkpoint });
+    return j.error ? `Error: ${j.error}` : j.result;
   } catch (e) {
-    return JSON.stringify({ error: String(e.message || e) });
+    return `Error: ${e.message || e}`;
   }
+}
+
+// the allowed folders, kept by the server; the textarea saves them when it loses focus
+let folders = [];
+async function loadHarness() {
+  try {
+    folders = (await harness("/api/harness")).folders || [];
+    $("folders").value = folders.join("\n");
+  } catch (e) {
+    $("foldersNote").textContent = `Tools are unavailable: ${e.message || e}`;
+  }
+}
+$("folders").addEventListener("change", async () => {
+  try {
+    folders = (await harness("/api/harness", { folders: $("folders").value.split("\n").map((f) => f.trim()).filter(Boolean) })).folders;
+    $("foldersNote").textContent = folders.length ? `Saved. Relative paths start in ${folders[0]}.` : "Saved: no folders, so file tools are refused.";
+  } catch (e) {
+    $("foldersNote").textContent = String(e.message || e);
+  }
+});
+loadHarness();
+// told to the model when tools are on: where it may work, and how this computer runs commands
+function toolPrompt() {
+  const where = folders.length ? `You may use files in ${folders.join(", ")} (relative paths start in ${folders[0]}).` : "No folders are allowed yet, so file tools will fail; if you need files, ask the user to add a folder in Settings.";
+  return `You can use tools to do things on the user's computer. ${where} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. Use tools until the task is done, then answer briefly.`;
 }
 // a reply that used tools, as the messages the model wrote and read: each round's call and the results, then the answer
 function expand(m) {
@@ -1014,9 +1173,11 @@ async function ask(thinking) {
 
   // earlier replies go back without their thinking (as Qwen3 expects), with their mood tags and any tool rounds
   const history = c.messages.slice(0, -1).flatMap((m) => [...expand(m), { role: m.role, content: m.sent ?? m.content }]);
-  const sys = [$("system").value.trim(), $("moods").checked ? MOOD_PROMPT : ""].filter(Boolean).join("\n\n");
-  if (sys) history.unshift({ role: "system", content: sys });
   const useTools = $("tools").checked;
+  const sys = [$("system").value.trim(), useTools ? toolPrompt() : "", $("moods").checked ? MOOD_PROMPT : ""].filter(Boolean).join("\n\n");
+  if (sys) history.unshift({ role: "system", content: sys });
+  const tools = useTools ? toolList() : [];
+  reply.cp = `${c.id}-${Date.now()}`; // groups this reply's file changes for undo
 
   const t0 = performance.now();
   let raw = "", firstAt = null, usage = null, finish = null, lastMood = null, calls = [];
@@ -1043,7 +1204,7 @@ async function ask(thinking) {
         messages: [...history, ...expand(reply)], stream: true, stream_options: { include_usage: true },
         chat_template_kwargs: { enable_thinking: thinking }, // explicit, so a server started with --no-think still follows the switch
         temperature: Number($("temp").value) || 0, max_tokens: Number($("maxTokens").value) || 2048,
-        ...(useTools && round < 4 ? { tools: TOOLS } : {}),
+        ...(useTools && round < 40 ? { tools } : {}),
       };
       raw = ""; finish = null; calls = [];
       const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: busy.signal });
@@ -1104,8 +1265,26 @@ async function ask(thinking) {
       if (finish !== "tool_calls" || !calls.length) break;
       // run the calls, keep the round (what the model wrote, what it asked, what came back), and go again
       for (const cl of calls) {
+        // the same call a third time in one reply: a small model going round in circles
+        const same = (reply.steps || []).flatMap((st) => st.calls).filter((p) => p.name === cl.name && p.arguments === cl.arguments).length;
+        if (same >= 2) {
+          cl.result = "You already made this exact call twice; its result is above. Do something different, or answer with what you have.";
+          continue;
+        }
+        const group = NEEDS_OK[cl.name];
+        if (group && !allowed[group]) {
+          mood("curious", "Waiting for your OK");
+          const v = await approve(el, cl, group);
+          if (v === "deny") {
+            cl.denied = true;
+            cl.result = "The user declined this action. Do not try it again. If there is no other way to proceed, explain the situation clearly and stop.";
+            continue;
+          }
+          if (v === "always") { allowed[group] = true; store.set("allow", allowed); }
+        }
         mood("tool", TOOL_STATUS[cl.name] || `Using ${cl.name}`);
-        cl.result = await runTool(cl.name, cl.arguments);
+        cl.result = await runTool(cl.name, cl.arguments, reply.cp);
+        if (group === "edit" && !cl.result.startsWith("Error")) reply.changed = true;
       }
       const { shown } = moodOf(reply.answer || "", false);
       (reply.steps ||= []).push({ sent: reply.answer || "", shown, calls });

@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost chat (mockup)</title>
+<style>
+  :root {
+    --night: #161c2c; --night-2: #1d2539; --glass: rgba(255, 255, 255, 0.06); --glass-line: rgba(255, 255, 255, 0.11);
+    --ink: #eef1f8; --muted: #9aa3bb; --accent: #b9c7ff; --accent-ink: #141a2a;
+    --ui: Bahnschrift, "DIN Alternate", "Segoe UI", system-ui, sans-serif;
+    --text: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  body { background: radial-gradient(120% 90% at 50% 38%, #26304a 0%, var(--night) 62%, #0f1320 100%); color: var(--ink); font: 16px/1.55 var(--text); }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  canvas#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* top bar */
+  header { position: fixed; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 12px; padding: 14px 18px; z-index: 3; }
+  .model { font: 500 14px/1.2 var(--ui); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .status { font: 14px/1 var(--ui); color: var(--ink); display: inline-flex; align-items: center; gap: 8px; margin-left: auto; white-space: nowrap; }
+  .status i { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  .icon { width: 38px; height: 38px; border-radius: 12px; border: 1px solid var(--glass-line); background: var(--glass); display: grid; place-items: center; color: var(--ink); backdrop-filter: blur(8px); }
+
+  /* subtitles: the reply being spoken */
+  .subtitle { position: fixed; left: 50%; transform: translateX(-50%); bottom: 150px; width: min(680px, calc(100% - 32px)); text-align: center; z-index: 2;
+              font: 19px/1.5 var(--text); color: var(--ink); text-shadow: 0 2px 14px rgba(0, 0, 0, 0.55); min-height: 2em; pointer-events: none; }
+  .subtitle .you { display: block; font: 14px/1.4 var(--ui); color: var(--muted); margin-bottom: 6px; }
+
+  /* composer */
+  .composer { position: fixed; left: 50%; transform: translateX(-50%); bottom: 26px; width: min(680px, calc(100% - 24px)); z-index: 3;
+              display: flex; align-items: flex-end; gap: 10px; padding: 10px 10px 10px 18px; border-radius: 24px;
+              background: rgba(29, 37, 57, 0.72); border: 1px solid var(--glass-line); backdrop-filter: blur(14px); }
+  .composer:focus-within { border-color: rgba(185, 199, 255, 0.5); }
+  .composer textarea { flex: 1; border: 0; outline: none; resize: none; background: transparent; min-height: 28px; max-height: 30vh; padding: 7px 0; line-height: 1.5; }
+  .composer textarea::placeholder { color: var(--muted); }
+  .send { width: 42px; height: 42px; border-radius: 50%; border: 0; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; flex: none; }
+  .speed { font: 500 14px/1 var(--ui); color: var(--muted); font-variant-numeric: tabular-nums; align-self: center; white-space: nowrap; }
+
+  /* transcript drawer */
+  .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(400px, 92vw); z-index: 4; background: rgba(20, 26, 42, 0.92); border-left: 1px solid var(--glass-line);
+            backdrop-filter: blur(16px); transform: translateX(100%); transition: transform 0.25s ease; display: flex; flex-direction: column; }
+  .drawer.open { transform: none; }
+  .drawer h2 { font: 600 16px/1 var(--ui); margin: 0; padding: 20px 20px 14px; display: flex; justify-content: space-between; align-items: center; }
+  .drawer .log { overflow-y: auto; padding: 0 20px 20px; font-size: 15px; }
+  .drawer .msg { margin-bottom: 16px; }
+  .drawer .msg.user { text-align: right; }
+  .drawer .msg.user span { display: inline-block; background: rgba(185, 199, 255, 0.16); padding: 8px 13px; border-radius: 16px 16px 5px 16px; }
+  .drawer .stats { font: 12.5px/1.4 var(--ui); color: var(--muted); margin-top: 4px; }
+
+  /* demo bar (mockup only) */
+  .demo { position: fixed; left: 18px; top: 64px; z-index: 3; display: flex; flex-direction: column; gap: 6px; font: 13px/1 var(--ui); }
+  .demo span { color: var(--muted); margin-bottom: 2px; }
+  .demo button { text-align: left; border: 1px solid var(--glass-line); background: var(--glass); border-radius: 10px; padding: 7px 11px; backdrop-filter: blur(8px); }
+  .demo button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+  @media (max-width: 700px) {
+    .demo { top: auto; bottom: 96px; left: 12px; right: 12px; flex-direction: row; flex-wrap: wrap; }
+    .demo span { display: none; }
+    .subtitle { bottom: 200px; font-size: 17px; }
+  }
+</style>
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js" } }</script>
+</head>
+<body>
+<canvas id="stage" aria-label="The assistant, a small ghost, reacting to the conversation"></canvas>
+
+<header>
+  <span class="model">Qwen3-30B-A3B-Instruct-2507-Q3_K_M</span>
+  <span class="status" id="status"><i></i><span id="statusText">Here</span></span>
+  <button class="icon" aria-label="Show the conversation" onclick="document.querySelector('.drawer').classList.toggle('open')">
+    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M4 10h12M4 15h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+  </button>
+</header>
+
+<div class="demo" role="group" aria-label="Mockup: try each state">
+  <span>Mockup: try a state</span>
+  <button data-state="idle">Idle</button>
+  <button data-state="listening">Listening</button>
+  <button data-state="thinking">Thinking</button>
+  <button data-state="talking">Talking</button>
+  <button data-state="tool">Using a tool</button>
+  <button data-state="happy">Happy</button>
+  <button data-state="sorry">Sorry</button>
+  <button data-state="surprised">Surprised</button>
+  <button data-state="angry">Angry</button>
+  <button data-state="serious">Serious</button>
+  <button data-state="confused">Error</button>
+  <button data-state="sleepy">Sleepy</button>
+  <button data-state="wave">Hello</button>
+</div>
+
+<div class="subtitle" id="subtitle" aria-live="polite"></div>
+
+<form class="composer" id="form">
+  <textarea id="input" rows="1" placeholder="Say something" aria-label="Message"></textarea>
+  <span class="speed" id="speed"></span>
+  <button class="send" type="submit" aria-label="Send">
+    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 14V4M4.5 8.5 9 4l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+</form>
+
+<aside class="drawer" aria-label="Conversation">
+  <h2>Conversation <button class="icon" aria-label="Close" onclick="document.querySelector('.drawer').classList.remove('open')">
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button></h2>
+  <div class="log" id="log">
+    <div class="msg user"><span>Can you find me a good laksa place in Penang?</span></div>
+    <div class="msg">Searching gave three that locals keep naming: Air Itam Laksa by the market, Penang Road Famous Laksa, and Kim Laksa in Balik Pulau. Go early: Air Itam sells out by mid-afternoon.<div class="stats">96 tokens in 2.6 s, 37 tok/s</div></div>
+  </div>
+</aside>
+
+<script type="module">
+import * as THREE from "three";
+
+// ---------------------------------------------------------------- scene
+const canvas = document.getElementById("stage");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
+camera.position.set(0, 0.35, 9);
+scene.add(new THREE.HemisphereLight(0xf2f5ff, 0x3a4566, 1.7));
+const key = new THREE.DirectionalLight(0xffffff, 2.0);
+key.position.set(-3, 5, 6);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x9fb2ff, 1.2);
+rim.position.set(4, 2, -5);
+scene.add(rim);
+
+const ghost = new THREE.Group(); // floats and leans
+const body = new THREE.Group();  // squash and stretch
+ghost.add(body);
+ghost.scale.setScalar(0.72);
+const HOME_Y = 0.55;             // above the subtitles and the message box
+scene.add(ghost);
+
+// body: a lathe dome with straight sides; the hem is waved per frame
+const R = 1.25, H = 1.55;
+const prof = [];
+for (let i = 0; i <= 24; i++) { const a = (i / 24) * Math.PI / 2; prof.push(new THREE.Vector2(Math.sin(a) * R + 1e-4, Math.cos(a) * R)); }
+for (let i = 1; i <= 12; i++) prof.push(new THREE.Vector2(R * (1 + 0.05 * i / 12), -H * (i / 12)));
+prof.reverse(); // hem to top: the lathe's faces then point outward
+const geo = new THREE.LatheGeometry(prof, 96);
+const base = geo.attributes.position.array.slice();
+// a soft self-glow keeps it ghostly white under the blue light; working states add to it
+const white = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85, metalness: 0, emissive: 0xdfe5ff, emissiveIntensity: 0.12, transparent: true, opacity: 1 });
+const inner = new THREE.MeshStandardMaterial({ color: 0x8e99b8, roughness: 0.9, side: THREE.BackSide, transparent: true, opacity: 1 });
+body.add(new THREE.Mesh(geo, white), new THREE.Mesh(geo, inner));
+
+// face: eyes (oval, happy arc, closed line), mouth, blush
+const dark = new THREE.MeshBasicMaterial({ color: 0x1a2030 });
+const shine = new THREE.MeshBasicMaterial({ color: 0xffffff });
+const face = new THREE.Group();
+face.position.set(0, 0.28, 0);
+body.add(face);
+function makeEye(x) {
+  const g = new THREE.Group();
+  g.position.set(x, 0, R * 0.985);
+  const oval = new THREE.Mesh(new THREE.SphereGeometry(0.15, 32, 16), dark);
+  oval.scale.set(1, 1.42, 0.2);
+  const hi = new THREE.Mesh(new THREE.CircleGeometry(0.042, 16), shine);
+  hi.position.set(0.045, 0.07, 0.16);
+  oval.add(hi);
+  const arc = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.032, 10, 32, Math.PI), dark); // ^ shape
+  arc.visible = false;
+  const line = new THREE.Mesh(new THREE.CapsuleGeometry(0.03, 0.2, 4, 12), dark);
+  line.rotation.z = Math.PI / 2;
+  line.visible = false;
+  // a brow, shown only for angry, serious and worried faces
+  const brow = new THREE.Mesh(new THREE.CapsuleGeometry(0.032, 0.2, 4, 12), dark);
+  brow.rotation.z = Math.PI / 2;
+  brow.position.set(0, 0.29, 0.02);
+  brow.scale.setScalar(0.001);
+  g.add(oval, arc, line, brow);
+  return { g, oval, arc, line, brow, side: Math.sign(x) };
+}
+const eyes = [makeEye(-0.36), makeEye(0.36)];
+eyes.forEach((e) => face.add(e.g));
+const mouth = new THREE.Mesh(new THREE.SphereGeometry(0.09, 24, 12), dark);
+mouth.position.set(0, -0.36, R * 0.94);
+mouth.scale.set(1, 0.05, 0.4);
+face.add(mouth);
+const blushMat = new THREE.MeshBasicMaterial({ color: 0xff9db5, transparent: true, opacity: 0, depthWrite: false });
+const blush = [-0.68, 0.68].map((x) => { const m = new THREE.Mesh(new THREE.CircleGeometry(0.13, 24), blushMat); m.position.set(x, -0.18, R * 0.9); m.rotation.y = x * 0.55; face.add(m); return m; });
+
+// arms: small rounded nubs that slide out of the sides when there is something to do
+function makeArm(side) {
+  const pivot = new THREE.Group();
+  pivot.position.set(side * (R * 0.92), -0.45, 0.05);
+  const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.15, 0.42, 6, 16), white);
+  arm.position.set(side * 0.28, 0, 0);
+  arm.rotation.z = side * Math.PI / 2;
+  pivot.add(arm);
+  pivot.scale.setScalar(0.001);
+  body.add(pivot);
+  return pivot;
+}
+const arms = { left: makeArm(-1), right: makeArm(1) };
+
+// a prop for tool use: a magnifying glass gripped by its handle at the tip of the right arm.
+// Its group's origin is the grip; the handle runs up from it to the lens.
+const prop = new THREE.Group();
+const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.055, 0.46, 14), new THREE.MeshStandardMaterial({ color: 0x5a648a, roughness: 0.6 }));
+handle.position.set(0, 0.12, 0);
+const lens = new THREE.Mesh(new THREE.TorusGeometry(0.24, 0.05, 12, 36), new THREE.MeshStandardMaterial({ color: 0xb9c7ff, roughness: 0.3, metalness: 0.4 }));
+lens.position.set(0, 0.6, 0);
+const glass = new THREE.Mesh(new THREE.CircleGeometry(0.22, 32), new THREE.MeshStandardMaterial({ color: 0xd8e2ff, transparent: true, opacity: 0.35, depthWrite: false }));
+glass.position.copy(lens.position);
+prop.add(handle, lens, glass);
+prop.position.set(0.6, 0, 0.22); // the arm's tip (pivot space: the arm runs along +x to about 0.6), a little forward
+prop.scale.setScalar(0.001);
+arms.right.add(prop);
+
+// steam puffs for an angry face
+const puffTex = orbTexture(0.9);
+
+// soft shadow under the ghost
+const shadow = new THREE.Mesh(new THREE.CircleGeometry(1, 48), new THREE.MeshBasicMaterial({ color: 0x05070e, transparent: true, opacity: 0.45, depthWrite: false }));
+shadow.rotation.x = -Math.PI / 2;
+shadow.position.y = -1.0;
+scene.add(shadow);
+
+// background orbs (bokeh) and small effects (z, ?)
+function orbTexture(alpha) {
+  const c = document.createElement("canvas"); c.width = c.height = 64; const x = c.getContext("2d"); const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, `rgba(255,255,255,${alpha})`); g.addColorStop(0.6, `rgba(220,228,255,${alpha / 3})`); g.addColorStop(1, "rgba(220,228,255,0)");
+  x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
+}
+const orbTex = orbTexture(0.55);
+const orbs = [];
+for (let i = 0; i < 28; i++) {
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: orbTex, transparent: true, depthWrite: false, opacity: 0.25 + Math.random() * 0.45 }));
+  const size = 0.15 + Math.random() * 0.65;
+  s.scale.setScalar(size);
+  s.position.set((Math.random() - 0.5) * 12, (Math.random() - 0.5) * 7, -2 - Math.random() * 4);
+  s.userData = { vy: 0.05 + Math.random() * 0.12, phase: Math.random() * 6.28, size };
+  scene.add(s); orbs.push(s);
+}
+function glyph(text) {
+  const c = document.createElement("canvas"); c.width = c.height = 128; const x = c.getContext("2d");
+  x.font = "600 84px Bahnschrift, Segoe UI, sans-serif"; x.fillStyle = "#dfe6ff"; x.textAlign = "center"; x.textBaseline = "middle"; x.fillText(text, 64, 70);
+  return new THREE.CanvasTexture(c);
+}
+const fx = { z: glyph("z"), q: glyph("?"), puff: puffTex };
+const floaters = [];
+function emit(kind) {
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: fx[kind], transparent: true, depthWrite: false }));
+  s.scale.setScalar(kind === "z" ? 0.38 : kind === "puff" ? 0.3 + Math.random() * 0.15 : 0.55);
+  const side = Math.random() < 0.5 ? -1 : 1;
+  if (kind === "puff") s.position.set(ghost.position.x + side * (0.35 + Math.random() * 0.25), ghost.position.y + 0.95, 0.3);
+  else s.position.set(ghost.position.x + 0.9 + Math.random() * 0.2, ghost.position.y + 1.2, 0.5);
+  s.userData = { age: 0 };
+  scene.add(s); floaters.push(s);
+}
+
+// ---------------------------------------------------------------- state -> target pose
+// every state is a set of targets the animation eases toward, so changes always blend.
+// brow: [shown 0..1, angle (+ = inner ends down, angry; - = inner ends up, worried), height];
+// front: an arm brought round to the front of the body (the chin hand, crossed arms); bob: how much it floats;
+// heat: 0 cool white glow .. 1 red (angry)
+const rest = { eye: "oval", eyeOpen: 1, lookX: 0, lookY: 0, lean: 0, tilt: 0, glow: 0, blush: 0, height: 0, arms: [0, 0], armLift: [0, 0], front: [0, 0],
+               prop: 0, hem: 1, opacity: 1, brow: [0, 0, 0], bob: 1, heat: 0, label: "Here" };
+const pose = (p) => ({ ...rest, ...p });
+const poses = {
+  idle:      pose({}),
+  listening: pose({ eyeOpen: 1.12, lookY: -0.6, lean: 0.16, glow: 0.05, height: -0.05, label: "Listening" }),
+  thinking:  pose({ eyeOpen: 0.55, lookX: 0.55, lookY: 0.65, lean: -0.04, tilt: 0.12, glow: 0.35, height: 0.08, arms: [0, 1], armLift: [0, 1.1], front: [0, 1], hem: 0.6, label: "Thinking" }),
+  talking:   pose({ lean: 0.04, glow: 0.1, height: 0.05, hem: 1.6, label: "Talking" }),
+  tool:      pose({ eyeOpen: 0.8, lookX: 0.75, lookY: 0.35, lean: 0.04, tilt: -0.06, glow: 0.25, height: 0.02, arms: [0.7, 1], armLift: [0.3, 0.75], front: [0, 0.35], prop: 1, hem: 1.2, label: "Searching the web" }),
+  happy:     pose({ eye: "arc", glow: 0.15, blush: 0.75, height: 0.3, arms: [1, 1], armLift: [1.2, 1.2], hem: 1.3, label: "Done" }),
+  sorry:     pose({ eyeOpen: 0.6, lookY: -0.55, lean: 0.05, tilt: -0.08, height: -0.35, hem: 0.4, opacity: 0.85, brow: [1, -0.4, 0.02], label: "Sorry" }),
+  surprised: pose({ eyeOpen: 1.45, lookY: 0.1, lean: -0.08, glow: 0.2, height: 0.25, arms: [1, 1], armLift: [0.9, 0.9], hem: 1.8, label: "Oh!" }),
+  angry:     pose({ eyeOpen: 0.62, lookY: -0.05, lean: 0.14, glow: 0.3, height: -0.08, arms: [1, 1], armLift: [-0.35, -0.35], hem: 0.55, brow: [1, 0.5, -0.07], bob: 0.35, heat: 1, label: "Not happy" }),
+  serious:   pose({ eyeOpen: 0.78, lean: 0.03, height: -0.02, arms: [1, 1], armLift: [0.28, 0.28], front: [1, 1], hem: 0.5, brow: [1, 0.06, -0.05], bob: 0.2, label: "Serious" }),
+  confused:  pose({ eye: "squint", eyeOpen: 0.75, lookX: -0.3, lookY: 0.2, tilt: 0.22, arms: [0, 1], armLift: [0, 1.5], hem: 0.8, brow: [0.8, -0.25, 0.03], label: "Something went wrong" }),
+  sleepy:    pose({ eye: "line", lookY: -0.2, lean: 0.02, tilt: 0.05, height: -0.45, hem: 0.3, opacity: 0.8, bob: 0.6, label: "Dozing" }),
+  wave:      pose({ eye: "arc", tilt: 0.06, glow: 0.1, blush: 0.4, height: 0.15, arms: [0, 1], armLift: [0, 2.3], hem: 1.2, label: "Hello" }),
+};
+let state = "idle", target = poses.idle;
+const cur = { ...rest, arms: [0, 0], armLift: [0, 0], front: [0, 0], brow: [0, 0, 0], talk: 0 };
+const coolGlow = new THREE.Color(0xdfe5ff), hotGlow = new THREE.Color(0xff6a5c);
+let rate = 0, mouthTarget = 0, lastInput = performance.now(), blinkAt = 2, blinkT = -1, glanceAt = 4, glance = [0, 0];
+let lastTokenAt = -1, syllable = 0, openness = 0.7; // talking rhythm
+function setState(s) {
+  state = s; target = poses[s];
+  document.getElementById("statusText").textContent = target.label;
+  document.querySelectorAll(".demo button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.state === s)));
+  if (s === "confused") emit("q");
+}
+window.setState = setState;
+window.ghostDebug = () => ({ mouth: cur.talk, state }); // mockup: for measuring the talking rhythm
+
+// pointer: the eyes and body follow it a little
+const pointer = new THREE.Vector2();
+addEventListener("pointermove", (e) => { pointer.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight * 2 - 1)); lastInput = performance.now(); if (state === "sleepy") setState("idle"); });
+
+// ---------------------------------------------------------------- animation
+const ease = (a, b, k) => a + (b - a) * k;
+const clock = new THREE.Clock();
+let zTimer = 0;
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime, k = 1 - Math.pow(0.0015, dt);
+  for (const key of ["eyeOpen", "lookX", "lookY", "lean", "tilt", "glow", "blush", "height", "prop", "hem", "opacity", "bob", "heat"]) cur[key] = ease(cur[key], target[key], k);
+  for (const key of ["arms", "armLift", "front", "brow"]) cur[key].forEach((v, i) => (cur[key][i] = ease(v, target[key][i], k)));
+
+  // nobody around for 2 minutes: doze off
+  if (state === "idle" && performance.now() - lastInput > 120000) setState("sleepy");
+
+  // float: bob faster and higher when lively; streaming speed adds energy
+  const energy = state === "talking" ? 1 + Math.min(rate, 60) / 200 : state === "sleepy" ? 0.4 : 1;
+  const shake = state === "angry" ? Math.sin(t * 38) * 0.012 : 0; // a small tremble
+  ghost.position.x = shake;
+  ghost.position.y = HOME_Y + cur.height + Math.sin(t * 1.6 * energy) * 0.12 * cur.bob + (state === "happy" ? Math.abs(Math.sin(t * 6)) * 0.12 : 0);
+  ghost.rotation.x = cur.lean + pointer.y * -0.06;
+  ghost.rotation.y = pointer.x * 0.25 + Math.sin(t * 0.7) * 0.04;
+  ghost.rotation.z = cur.tilt + Math.sin(t * 1.1) * 0.025;
+  const breathe = 1 + Math.sin(t * 1.6 * energy + 1) * 0.015;
+  body.scale.set(1 / Math.sqrt(breathe), breathe, 1 / Math.sqrt(breathe));
+  const lift = ghost.position.y - HOME_Y;
+  shadow.scale.setScalar(0.78 - lift * 0.15);
+  shadow.material.opacity = 0.4 - lift * 0.12;
+
+  // the hem ripples; faster with the reply's speed
+  const pos = geo.attributes.position;
+  const amp = 0.11 * cur.hem, speed = 2.2 * (state === "talking" ? 1 + Math.min(rate, 60) / 120 : 1) * Math.min(cur.hem, 1.3);
+  for (let i = 0; i < pos.count; i++) {
+    const y0 = base[3 * i + 1];
+    if (y0 > -H * 0.45) continue;
+    const x0 = base[3 * i], z0 = base[3 * i + 2], a = Math.atan2(z0, x0);
+    const w = (-y0 - H * 0.45) / (H * 0.55); // 0 where the waves start, 1 at the hem
+    pos.array[3 * i + 1] = y0 + Math.sin(a * 6 + t * speed) * amp * w * w;
+    const r = 1 + Math.sin(a * 6 + t * speed + 1.4) * 0.025 * w;
+    pos.array[3 * i] = x0 * r; pos.array[3 * i + 2] = z0 * r;
+  }
+  pos.needsUpdate = true;
+
+  // glow and presence
+  white.emissiveIntensity = 0.12 + cur.glow * (0.75 + 0.25 * Math.sin(t * 3));
+  white.emissive.copy(coolGlow).lerp(hotGlow, cur.heat);
+  white.opacity = inner.opacity = cur.opacity;
+  blushMat.opacity = cur.blush * 0.7;
+
+  // eyes: look target = state + pointer + idle glances; blink every few seconds
+  if (t > glanceAt) { glance = [(Math.random() - 0.5) * 0.8, (Math.random() - 0.5) * 0.4]; glanceAt = t + 2.5 + Math.random() * 4; setTimeout(() => (glance = [0, 0]), 700); }
+  const lx = cur.lookX + pointer.x * 0.35 + (state === "idle" ? glance[0] : 0), ly = cur.lookY + pointer.y * 0.25 + (state === "idle" ? glance[1] : 0);
+  face.position.x = ease(face.position.x, lx * 0.14, k); face.position.y = ease(face.position.y, 0.28 + ly * 0.1, k);
+  if (t > blinkAt && blinkT < 0) blinkT = 0;
+  let lid = 1;
+  if (blinkT >= 0) { blinkT += dt; lid = Math.abs(Math.cos(Math.min(blinkT / 0.16, 1) * Math.PI)); if (blinkT > 0.16) { blinkT = -1; blinkAt = t + 2.5 + Math.random() * 4; } }
+  eyes.forEach((e, i) => {
+    const shape = target.eye;
+    e.oval.visible = shape === "oval" || shape === "squint";
+    e.arc.visible = shape === "arc";
+    e.line.visible = shape === "line";
+    const open = cur.eyeOpen * lid * (shape === "squint" && i === 0 ? 0.35 : 1);
+    e.oval.scale.set(1 * (0.9 + 0.1 * cur.eyeOpen), 1.42 * Math.max(open, 0.06), 0.2);
+    e.arc.position.y = 0.02;
+    // brows: the inner end is the one toward the middle of the face
+    const [shown, angle, by] = cur.brow;
+    e.brow.scale.setScalar(Math.max(shown, 0.001));
+    e.brow.rotation.z = Math.PI / 2 + e.side * angle;
+    e.brow.position.y = 0.27 + by - (1 - cur.eyeOpen) * 0.08;
+  });
+
+  // mouth: a speaking rhythm of its own (about 4.5 syllables a second, each opening a little different)
+  // while tokens keep arriving; tokens come far faster than speech, so they only keep it going
+  const speaking = state === "talking" && t - lastTokenAt < 0.35;
+  if (speaking) {
+    syllable += dt * 4.5 * (0.92 + Math.min(rate, 60) / 400);
+    if (syllable >= 1) { syllable -= 1; openness = 0.45 + Math.random() * 0.55; }
+    mouthTarget = openness * Math.pow(Math.sin(syllable * Math.PI), 0.8);
+  } else mouthTarget = 0;
+  cur.talk = ease(cur.talk, mouthTarget, 1 - Math.pow(0.0001, dt));
+  mouth.scale.set(1 + cur.talk * 0.2, 0.05 + cur.talk * 0.75, 0.4);
+  mouth.visible = cur.talk > 0.03 || state === "surprised";
+  if (state === "surprised") mouth.scale.set(0.8, 0.7, 0.4);
+
+  // arms: out (scale) and raised (rotation); the thinking hand goes to the chin
+  [arms.left, arms.right].forEach((a, i) => {
+    a.scale.setScalar(Math.max(cur.arms[i], 0.001));
+    const side = i ? 1 : -1;
+    let lift = cur.armLift[i];
+    if (state === "wave" && i === 1) lift += Math.sin(t * 9) * 0.35;
+    if (state === "talking") lift += Math.max(0, Math.sin(t * 1.3 + i * 2)) * 0.18 * Math.min(1, cur.talk * 2); // easy gestures
+    a.rotation.z = side * lift;
+  });
+  // arms brought round to the front: the thinking hand under the chin, crossed arms when serious
+  [arms.left, arms.right].forEach((a, i) => {
+    // fully crossed (serious): both arms reach across the middle, the right one over the left
+    const side = i ? 1 : -1, f = cur.front[i], cross = state === "serious" ? f : 0;
+    a.rotation.y = side * -(1.25 + 1.1 * cross) * f;
+    a.position.x = side * R * (0.92 - 0.37 * f - 0.25 * cross);
+    a.position.z = 0.05 + (R * 0.95 + (i ? 0.09 : 0)) * f;
+    a.position.y = -0.45 - 0.1 * f - (i ? 0.02 : 0.08) * cross;
+  });
+  // the magnifier stays upright in the hand whatever the arm's angle, tipped a little toward the face
+  prop.scale.setScalar(Math.max(cur.prop, 0.001));
+  prop.rotation.z = -arms.right.rotation.z - 0.25 + Math.sin(t * 2) * 0.06; // leaning outward, clear of the body
+  prop.rotation.y = -arms.right.rotation.y - 0.3;                           // the lens faces the viewer
+
+  // orbs drift up; the reply's speed makes them flow
+  const flow = state === "talking" ? 1 + Math.min(rate, 60) / 50 : state === "thinking" ? 1.6 : state === "sleepy" ? 0.4 : 1;
+  for (const o of orbs) {
+    o.position.y += o.userData.vy * dt * flow;
+    o.position.x += Math.sin(t * 0.5 + o.userData.phase) * 0.002 * flow;
+    if (o.position.y > 4) o.position.y = -4;
+    if (state === "thinking") { const ang = 0.15 * dt; const x = o.position.x, z = o.position.z + 4; o.position.x = x * Math.cos(ang) - z * Math.sin(ang); o.position.z = x * Math.sin(ang) + z * Math.cos(ang) - 4; }
+  }
+  // z's while asleep, steam while angry
+  if (state === "sleepy" && (zTimer -= dt) < 0) { emit("z"); zTimer = 1.6; }
+  if (state === "angry" && (zTimer -= dt) < 0) { emit("puff"); zTimer = 0.35; }
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i]; f.userData.age += dt; f.position.y += dt * 0.45; f.position.x += dt * 0.15; f.material.opacity = Math.max(0, 1 - f.userData.age / 2.4);
+    if (f.userData.age > 2.4) { scene.remove(f); floaters.splice(i, 1); }
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.position.z = w < 700 ? 12 : 9; // smaller screens: a little further away
+  camera.updateProjectionMatrix();
+  ghost.position.x = 0;
+}
+addEventListener("resize", resize);
+resize();
+frame();
+
+// ---------------------------------------------------------------- demo conversation (mockup)
+document.querySelectorAll(".demo button").forEach((b) => (b.onclick = () => { stopDemo(); setState(b.dataset.state); if (b.dataset.state === "talking") speak(sample, () => {}); }));
+const input = document.getElementById("input"), subtitle = document.getElementById("subtitle"), speedEl = document.getElementById("speed");
+input.addEventListener("input", () => {
+  lastInput = performance.now();
+  if (!["thinking", "talking", "tool"].includes(state)) setState(input.value ? "listening" : "idle");
+  ghost.rotation.x += 0.03; // a small nod per keystroke
+});
+const sample = "Sure. Keep only letters and digits, ignore case, then compare the cleaned text with its reverse. An empty string counts as a palindrome too.";
+let timers = [];
+function stopDemo() { timers.forEach(clearTimeout); timers = []; rate = 0; speedEl.textContent = ""; }
+function later(ms, f) { timers.push(setTimeout(f, ms)); }
+// streams `text` word by word at a varying speed; each word opens the mouth
+function speak(text, done) {
+  const words = text.split(" ");
+  let i = 0, shown = "";
+  const step = () => {
+    if (i >= words.length) { rate = 0; speedEl.textContent = ""; done(); return; }
+    shown += (i ? " " : "") + words[i];
+    lastTokenAt = clock.elapsedTime;
+    rate = 30 + Math.sin(i / 3) * 9 + Math.random() * 4;
+    speedEl.textContent = rate.toFixed(0) + " tok/s";
+    subtitle.innerHTML = (pending ? `<span class="you">${pending}</span>` : "") + shown;
+    i++;
+    later(1000 / (rate / 1.4), step);
+  };
+  step();
+}
+let pending = "";
+document.getElementById("form").onsubmit = (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  stopDemo();
+  input.value = "";
+  pending = text.replace(/[<>&]/g, "");
+  subtitle.innerHTML = `<span class="you">${pending}</span>`;
+  setState("thinking");
+  const search = /find|search|where|look up/i.test(text);
+  later(1600, () => {
+    if (search) { setState("tool"); later(2200, () => { setState("talking"); speak("I found three places locals keep naming. Air Itam Laksa by the market is the classic; go early, it sells out.", finish); }); }
+    else { setState("talking"); speak(sample, finish); }
+  });
+};
+function finish() { setState("happy"); later(2200, () => { setState("idle"); pending = ""; }); }
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.getElementById("form").requestSubmit(); } });
+setState("wave");
+later(2600, () => setState("idle"));
+</script>
+</body>
+</html>

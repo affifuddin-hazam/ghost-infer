@@ -16,6 +16,8 @@ use crate::sampler::Sampler;
 use crate::tokenizer::Utf8Stream;
 use crate::{ChatFormat, Engine, Opts};
 
+mod agent;
+
 const MAX_BODY: usize = 32 << 20;
 
 enum Kind {
@@ -77,6 +79,9 @@ struct Shared {
     dirs: Vec<PathBuf>, // the model's folder, then any --models folders
     defaults: (f32, usize, f32, usize),
     think_default: bool,
+    harness: Mutex<crate::tools::Settings>,
+    /// made at startup and written into the chat page: the agent tools answer only requests carrying it
+    token: String,
 }
 
 fn model_id(path: &Path) -> String {
@@ -103,7 +108,14 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
     let own = o.model.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
     let dirs = std::iter::once(own).chain(o.models.iter().cloned()).collect();
-    let shared = Arc::new(Shared { status: Mutex::new(Status::default()), dirs, defaults: (o.temp, o.top_k, o.top_p, o.max_new), think_default: !o.no_think });
+    let shared = Arc::new(Shared {
+        status: Mutex::new(Status::default()),
+        dirs,
+        defaults: (o.temp, o.top_k, o.top_p, o.max_new),
+        think_default: !o.no_think,
+        harness: Mutex::new(crate::tools::Settings::load()),
+        token: new_token(),
+    });
     let (work, rx) = mpsc::channel::<Work>();
     let s = shared.clone();
     std::thread::spawn(move || {
@@ -291,6 +303,9 @@ struct Request {
     method: String,
     path: String,
     body: Vec<u8>,
+    host: String,   // the Host header
+    origin: String, // the Origin header (empty if none)
+    token: String,  // the X-Ghost-Token header (empty if none)
 }
 
 fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
@@ -301,6 +316,7 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
     let method = parts.next().ok_or("empty request")?.to_string();
     let path = parts.next().ok_or("no path")?.split('?').next().unwrap_or("").to_string();
     let (mut len, mut expect_continue) = (0usize, false);
+    let (mut host, mut origin, mut token) = (String::new(), String::new(), String::new());
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).map_err(|e| e.to_string())? == 0 || h.trim().is_empty() {
@@ -310,6 +326,9 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
             match k.trim().to_ascii_lowercase().as_str() {
                 "content-length" => len = v.trim().parse().map_err(|_| "bad Content-Length")?,
                 "expect" => expect_continue = v.trim().eq_ignore_ascii_case("100-continue"),
+                "host" => host = v.trim().to_string(),
+                "origin" => origin = v.trim().to_string(),
+                "x-ghost-token" => token = v.trim().to_string(),
                 _ => {}
             }
         }
@@ -322,7 +341,7 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
     }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).map_err(|e| e.to_string())?;
-    Ok(Request { method, path, body })
+    Ok(Request { method, path, body, host, origin, token })
 }
 
 const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
@@ -333,6 +352,7 @@ fn status_text(code: u16) -> &'static str {
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
+        403 => "Forbidden",
         405 => "Method Not Allowed",
         _ => "Internal Server Error",
     }
@@ -348,9 +368,56 @@ fn respond(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
     conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(text.as_bytes())).map_err(|e| e.to_string())
 }
 
-/// The built-in chat page (src/chat.html, compiled into the program).
-fn respond_page(conn: &mut TcpStream) -> Result<(), String> {
-    respond_file(conn, include_bytes!("chat.html"), "text/html; charset=utf-8", "no-cache")
+/// The built-in chat page (src/chat.html, compiled into the program), with this run's tool token written
+/// in. It is sent without CORS headers, so another website cannot read the token out of it.
+fn respond_page(conn: &mut TcpStream, token: &str) -> Result<(), String> {
+    let page = include_str!("chat.html").replace("__GHOST_TOKEN__", token);
+    respond_file(conn, page.as_bytes(), "text/html; charset=utf-8", "no-store")
+}
+
+/// A random hex token (the standard library's hasher keys come from the operating system's randomness).
+fn new_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    (0..2u64)
+        .map(|i| {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u64(i);
+            h.write_u128(nanos);
+            h.write_u32(std::process::id());
+            format!("{:016x}", h.finish())
+        })
+        .collect()
+}
+
+/// A request the agent tools may answer: from this computer, addressed to localhost (so a website that
+/// points its own name at 127.0.0.1 cannot reach them), from the chat page or no page, carrying the token.
+fn tools_allowed(req: &Request, conn: &TcpStream, token: &str) -> Result<(), &'static str> {
+    if !conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
+        return Err("the agent tools only answer requests from this computer");
+    }
+    let host = req.host.rsplit_once(':').map_or(req.host.as_str(), |(h, _)| h);
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err("the agent tools only answer requests addressed to localhost or 127.0.0.1");
+    }
+    if !req.origin.is_empty() && !req.origin.ends_with(&format!("//{}", req.host)) {
+        return Err("the agent tools do not answer other websites");
+    }
+    if req.token != token {
+        return Err("missing or wrong tool token: reload the chat page");
+    }
+    Ok(())
+}
+
+/// `respond` without CORS headers: for the agent tools, which other websites must not reach.
+fn respond_private(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
+    let text = body.to_string();
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        status_text(code),
+        text.len()
+    );
+    conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(text.as_bytes())).map_err(|e| e.to_string())
 }
 
 /// The chat page's 3D library (three.js, MIT) and typeface (Instrument Sans, OFL), from src/vendor, compiled in
@@ -385,6 +452,95 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         (s.current.clone(), s.loading.clone())
     };
     let (defaults, think_default) = (shared.defaults, shared.think_default);
+    // the agent tools and their settings: private to the chat page on this computer
+    let path = req.path.trim_end_matches('/');
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent"].iter().any(|p| path.starts_with(p)) {
+        if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
+            return respond_private(&mut conn, 403, &error_body(e));
+        }
+        let body = || std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse);
+        return match (req.method.as_str(), path) {
+            ("GET", "/api/harness") => respond_private(&mut conn, 200, &crate::tools::status(&shared.harness.lock().unwrap())),
+            ("POST", "/api/harness") => match body().and_then(|b| {
+                let old = shared.harness.lock().unwrap().clone(); // released before the new settings go in
+                crate::tools::Settings::from_json(&b, &old)
+            }) {
+                Ok(s) => {
+                    s.save()?;
+                    let reply = crate::tools::status(&s);
+                    *shared.harness.lock().unwrap() = s;
+                    respond_private(&mut conn, 200, &reply)
+                }
+                Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+            },
+            // {"name": ..., "arguments": {...} or "<json>"}: {"result": "..."} or {"error": "..."} for the model
+            ("POST", "/api/tools/run") => {
+                let b = match body() {
+                    Ok(b) => b,
+                    Err(e) => return respond_private(&mut conn, 400, &error_body(&e)),
+                };
+                let name = b.get("name").and_then(Json::as_str).unwrap_or("");
+                let args = match b.get("arguments") {
+                    Some(Json::Str(a)) if a.trim().is_empty() => Json::Obj(Vec::new()),
+                    Some(Json::Str(a)) => Json::parse(a).unwrap_or(Json::Null),
+                    Some(a) => a.clone(),
+                    None => Json::Obj(Vec::new()),
+                };
+                let checkpoint = b.get("checkpoint").and_then(Json::as_str).unwrap_or("");
+                let settings = shared.harness.lock().unwrap();
+                let reply = match (args, crate::tools::run) {
+                    (Json::Null, _) => {
+                        let given = b.get("arguments").and_then(Json::as_str).unwrap_or("");
+                        obj(vec![("error", str(&format!("invalid arguments for {name}: not valid JSON. Arguments given: {}. Fix them and call the tool again.", crate::tools::clip(given, 300))))])
+                    }
+                    (args, run) => match run(name, &args, &settings, checkpoint) {
+                        Ok(r) => obj(vec![("result", str(&r))]),
+                        Err(e) => obj(vec![("error", str(&e))]),
+                    },
+                };
+                respond_private(&mut conn, 200, &reply)
+            }
+            // the saved chats, shared by every client
+            ("GET", "/api/chats") => match agent::list_chats() {
+                Ok(list) => respond_private(&mut conn, 200, &obj(vec![("chats", list)])),
+                Err(e) => respond_private(&mut conn, 500, &error_body(&e)),
+            },
+            ("GET", p) if p.starts_with("/api/chats/") => match agent::load_chat(&p["/api/chats/".len()..]) {
+                Ok(chat) => respond_private(&mut conn, 200, &chat),
+                Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
+            },
+            ("DELETE", p) if p.starts_with("/api/chats/") => match agent::delete_chat(&p["/api/chats/".len()..]) {
+                Ok(()) => respond_private(&mut conn, 200, &obj(vec![("deleted", Json::Bool(true))])),
+                Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
+            },
+            // one reply of the agent, streamed as events (see agent.rs)
+            ("POST", "/api/agent") => {
+                let Some(l) = current.clone().filter(|_| loading.is_none()) else {
+                    return respond_private(&mut conn, 503, &error_body("no model is running yet; try again in a moment"));
+                };
+                match body() {
+                    Ok(b) => agent::run(&mut conn, &b, work, shared, &l),
+                    Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+                }
+            }
+            // {"id": ..., "decision": "once" | "always" | "deny"}: the user's answer to an approval event
+            ("POST", "/api/agent/approve") => {
+                let b = body().unwrap_or(Json::Null);
+                let (id, decision) = (b.get("id").and_then(Json::as_str).unwrap_or(""), b.get("decision").and_then(Json::as_str).unwrap_or("deny"));
+                let ok = agent::answer(id, decision);
+                respond_private(&mut conn, if ok { 200 } else { 404 }, &obj(vec![("answered", Json::Bool(ok))]))
+            }
+            // {"checkpoint": ...}: every file change made under it, put back
+            ("POST", "/api/tools/undo") => {
+                let cp = body().ok().and_then(|b| b.get("checkpoint").and_then(Json::as_str).map(String::from)).unwrap_or_default();
+                match crate::tools::undo(&cp) {
+                    Ok(done) => respond_private(&mut conn, 200, &obj(vec![("undone", Json::Arr(done.iter().map(|d| str(d)).collect()))])),
+                    Err(e) => respond_private(&mut conn, 500, &error_body(&e)),
+                }
+            }
+            _ => respond_private(&mut conn, 404, &error_body("not found")),
+        };
+    }
     match (req.method.as_str(), req.path.trim_end_matches('/')) {
         // the models folder, for the chat page's model picker
         ("GET", "/api/models") => {
@@ -448,7 +604,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             return respond(&mut conn, 503, &error_body(&format!("loading {what}; try again in a moment")));
         }
         if let ("GET", "" | "/index.html") = (req.method.as_str(), req.path.trim_end_matches('/')) {
-            return respond_page(&mut conn);
+            return respond_page(&mut conn, &shared.token);
         }
         if let Some((_, body, content_type)) = VENDOR.iter().find(|v| v.0 == req.path) {
             return respond_file(&mut conn, body, content_type, "public, max-age=31536000, immutable");
@@ -461,7 +617,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
             return conn.write_all(head.as_bytes()).map_err(|e| e.to_string());
         }
-        ("GET", "" | "/index.html") => return respond_page(&mut conn),
+        ("GET", "" | "/index.html") => return respond_page(&mut conn, &shared.token),
         ("GET", p) if VENDOR.iter().any(|v| v.0 == p) => {
             let (_, body, content_type) = VENDOR.iter().find(|v| v.0 == p).unwrap();
             return respond_file(&mut conn, body, content_type, "public, max-age=31536000, immutable");

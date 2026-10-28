@@ -8,6 +8,7 @@ mod sampler;
 mod server;
 mod sysinfo;
 mod tokenizer;
+mod tools;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;

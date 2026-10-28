@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ghost-infer app (mockups)</title>
+<style>
+  @font-face { font-family: "Instrument Sans"; src: url("../src/vendor/instrument-sans.woff2") format("woff2"); font-weight: 400 700; }
+  /* One structure, four skins. Everything here is flat colour, radii, soft shadows, the Windows icon font,
+     Instrument Sans and Georgia: all things the native app (iced, drawn on the CPU) can draw the same way. */
+  :root, [data-dir="graphite"] {
+    --bg: #1d1d1f; --side: #171719; --raise: #2a2a2d; --raise2: #333337; --hover: #262629; --menu: #2b2b2f;
+    --line: rgba(255,255,255,.06); --line2: rgba(255,255,255,.10);
+    --text: #ececee; --muted: #a3a3aa; --faint: #6f6f77; --accent: #b9c7ff; --ink: #14172a; --ok: #8fd6a2; --bad: #ff8f80; --warn: #f2c27a;
+    --r-card: 18px; --r-row: 8px; --r-bubble: 16px; --r-chip: 999px; --r-menu: 12px; --shadow: 0 12px 34px rgba(0,0,0,.4);
+    --bubble: #2f2f33; --code: #141416; --side-border: transparent; --greet: Georgia, "Times New Roman", serif;
+  }
+  [data-dir="midnight"] {
+    --bg: #131722; --side: #0e111a; --raise: #1b202d; --raise2: #242a3a; --hover: #191e2a; --menu: #1f2433;
+    --line: rgba(255,255,255,.07); --line2: rgba(255,255,255,.12);
+    --text: #e6e9f0; --muted: #8b93a7; --faint: #5d6578; --accent: #b9c7ff; --ink: #11162a; --ok: #8fe3a8; --bad: #ff9b8a; --warn: #ffc98a;
+    --r-card: 24px; --r-row: 9px; --r-bubble: 18px; --r-chip: 999px; --r-menu: 12px; --shadow: 0 10px 30px rgba(0,0,0,.45);
+    --bubble: #242a3a; --code: #0d1018; --side-border: rgba(255,255,255,.05); --greet: "Instrument Sans", sans-serif;
+  }
+  [data-dir="fog"] {
+    --bg: #f5f5f7; --side: #ececef; --raise: #ffffff; --raise2: #e9e9ee; --hover: #e4e4ea; --menu: #ffffff;
+    --line: rgba(20,22,30,.07); --line2: rgba(20,22,30,.12);
+    --text: #18191f; --muted: #5c5e6b; --faint: #92949f; --accent: #3d4aa8; --ink: #ffffff; --ok: #1f8a4c; --bad: #c4452f; --warn: #a86a12;
+    --r-card: 18px; --r-row: 8px; --r-bubble: 16px; --r-chip: 999px; --r-menu: 12px; --shadow: 0 10px 30px rgba(20,22,40,.10);
+    --bubble: #e6e8f2; --code: #f0f1f5; --side-border: transparent; --greet: Georgia, serif;
+  }
+  [data-dir="seance"] {
+    --bg: #15121c; --side: #100d16; --raise: #1d1926; --raise2: #282233; --hover: #1b1724; --menu: #1f1a29;
+    --line: rgba(214,200,255,.09); --line2: rgba(214,200,255,.18);
+    --text: #ece8f4; --muted: #9c94ad; --faint: #6c6480; --accent: #c8b6ff; --mint: #9ff0c9; --ink: #16111f; --ok: #9ff0c9; --bad: #ff9fb0; --warn: #ffd59a;
+    --r-card: 6px; --r-row: 4px; --r-bubble: 6px; --r-chip: 4px; --r-menu: 6px; --shadow: 6px 6px 0 #0a0810;
+    --bubble: #2a2238; --code: #0e0b14; --side-border: rgba(214,200,255,.08); --greet: "Instrument Sans", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: #08090c; font: 15px/1.6 "Instrument Sans", "Segoe UI", system-ui, sans-serif; color: var(--text); overflow: hidden; }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
+  .ic { font-family: "Segoe MDL2 Assets"; font-style: normal; line-height: 1; display: inline-block; }
+
+  /* mockup-only controls */
+  .picker { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 50; display: flex; gap: 12px; align-items: center; padding: 6px 8px; background: rgba(8,9,12,.94); border: 1px dashed rgba(255,255,255,.2); border-radius: 12px; font-size: 12.5px; color: #c8ccd8; white-space: nowrap; }
+  .picker .grp { display: flex; gap: 2px; }
+  .picker button { padding: 4px 9px; border-radius: 8px; color: #9aa1b4; }
+  .picker button.on { background: rgba(185,199,255,.16); color: #dfe5ff; }
+  .picker .lbl { color: #6b7286; }
+
+  .win { position: fixed; inset: 50px 20px 20px; display: grid; grid-template-columns: 268px 1fr auto; background: var(--bg); border-radius: 10px; overflow: hidden; box-shadow: 0 30px 80px rgba(0,0,0,.6); }
+
+  /* ---- sidebar */
+  .side { background: var(--side); border-right: 1px solid var(--side-border); display: flex; flex-direction: column; min-width: 0; }
+  .chrome { height: 44px; display: flex; align-items: center; gap: 2px; padding: 0 10px; color: var(--muted); }
+  .chrome .ib { width: 30px; height: 30px; border-radius: var(--r-row); display: grid; place-items: center; font-size: 13px; }
+  .chrome .ib:hover { background: var(--hover); color: var(--text); }
+  .nav { padding: 4px 10px 6px; display: flex; flex-direction: column; gap: 1px; }
+  .navrow { display: flex; align-items: center; gap: 12px; padding: 7px 10px; border-radius: var(--r-row); font-size: 14px; color: var(--text); }
+  .navrow .ic { font-size: 14px; width: 16px; color: var(--muted); }
+  .navrow:hover { background: var(--hover); }
+  .navrow .tag { margin-left: auto; font-size: 11px; color: var(--faint); }
+  .sect { display: flex; align-items: center; gap: 6px; padding: 14px 20px 4px; font-size: 12px; color: var(--faint); }
+  .sect .ic { font-size: 8px; }
+  [data-dir="seance"] .sect { color: var(--mint); }
+  .list { padding: 0 10px; display: flex; flex-direction: column; gap: 1px; }
+  .item { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: var(--r-row); font-size: 14px; color: var(--text); white-space: nowrap; }
+  .item span { flex: 1; overflow: hidden; }
+  .item .ic { font-size: 12px; color: var(--faint); }
+  .item .more { opacity: 0; font-size: 12px; }
+  .item:hover { background: var(--hover); }
+  .item:hover .more, .item.on .more { opacity: 1; }
+  .item.on { background: var(--raise); }
+  [data-dir="seance"] .item.on { box-shadow: inset 3px 0 0 var(--accent); }
+  .grow { flex: 1; overflow: hidden; }
+  .me { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--line); font-size: 13.5px; }
+  .me canvas { width: 24px; height: 22px; image-rendering: pixelated; }
+  .me .sub { color: var(--faint); font-size: 12px; }
+  .me .sp { flex: 1; }
+  .me .ic { color: var(--muted); font-size: 13px; }
+
+  /* ---- main */
+  .main { display: flex; flex-direction: column; min-width: 0; position: relative; }
+  .top { height: 44px; display: flex; align-items: center; gap: 8px; padding: 0 14px 0 18px; }
+  .title { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500; padding: 4px 8px; border-radius: var(--r-row); }
+  .title .ic { font-size: 9px; color: var(--muted); }
+  .title:hover { background: var(--hover); }
+  .top .sp { flex: 1; }
+  .top .ctx { color: var(--faint); font-size: 12px; margin-right: 6px; }
+  .top .ib { width: 30px; height: 30px; border-radius: var(--r-row); display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+  .top .ib:hover, .top .ib.on { background: var(--hover); color: var(--text); }
+
+  .menu { position: absolute; z-index: 30; min-width: 210px; background: var(--menu); border: 1px solid var(--line2); border-radius: var(--r-menu); box-shadow: var(--shadow); padding: 6px; display: none; }
+  .menu.open { display: block; }
+  .mi { display: flex; align-items: center; gap: 12px; padding: 7px 10px; border-radius: 8px; font-size: 14px; }
+  .mi:hover { background: var(--hover); }
+  .mi .ic { font-size: 13px; width: 16px; color: var(--muted); }
+  .mi .key { margin-left: auto; font-size: 12px; color: var(--faint); }
+  .mi .chev { margin-left: auto; font-size: 9px; color: var(--faint); }
+  .mi.danger { color: var(--bad); }
+  .mi.danger .ic { color: var(--bad); }
+  .sep { height: 1px; background: var(--line2); margin: 5px 4px; }
+  #titleMenu { top: 40px; left: 18px; }
+  #plusMenu { bottom: 122px; left: calc(50% - 370px + 8px); }
+  .win.isempty #plusMenu { bottom: auto; top: calc(50% + 34px); }
+
+  .scroll { flex: 1; overflow-y: auto; padding: 18px 28px 28px; }
+  .col { max-width: 740px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+  .user { align-self: flex-end; max-width: 560px; background: var(--bubble); padding: 10px 16px; border-radius: var(--r-bubble); }
+  [data-dir="seance"] .user { border: 1px solid var(--line2); }
+  .reply { display: flex; flex-direction: column; gap: 12px; }
+  .thought { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13.5px; align-self: flex-start; }
+  .thought .ic { font-size: 9px; color: var(--faint); }
+  .tools { padding: 9px 12px; border-radius: 12px; background: var(--hover); display: flex; flex-direction: column; gap: 7px; font-size: 13px; color: var(--muted); }
+  [data-dir="midnight"] .tools { border: 1px solid var(--line); }
+  [data-dir="seance"] .tools { border-radius: 4px; border: 1px dashed var(--line2); background: transparent; }
+  .tool { display: flex; align-items: center; gap: 10px; }
+  .tool .ic { font-size: 12px; }
+  .tool .name { flex: 1; white-space: nowrap; overflow: hidden; }
+  .tool .ok { color: var(--ok); font-size: 11px; }
+  .tool .wait { color: var(--warn); font-size: 11px; }
+  .answer p { margin: 0; }
+  .answer code { font-family: Consolas, monospace; font-size: 13.5px; color: var(--accent); background: var(--raise2); padding: 1px 5px; border-radius: 5px; }
+  [data-dir="graphite"] .answer code { color: var(--text); }
+  [data-dir="seance"] .answer code { color: var(--mint); border-radius: 3px; }
+  .code { background: var(--code); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  [data-dir="seance"] .code { border-radius: 4px; }
+  .code .head { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; font-size: 12px; color: var(--faint); border-bottom: 1px solid var(--line); }
+  .code pre { margin: 0; padding: 12px 14px; font: 13.5px/1.55 Consolas, monospace; color: var(--text); }
+  .code .k { color: var(--accent); } .code .s { color: var(--ok); }
+  .foot { display: flex; align-items: center; gap: 2px; color: var(--faint); font-size: 12px; }
+  .foot button { width: 28px; height: 28px; border-radius: 7px; color: var(--faint); font-size: 12px; display: grid; place-items: center; }
+  .foot button:hover { background: var(--hover); color: var(--text); }
+  .foot .undo { width: auto; padding: 0 10px; font-family: inherit; font-size: 12.5px; color: var(--muted); border-radius: var(--r-chip); background: var(--hover); margin-left: 6px; }
+  .foot .t { margin-left: 8px; }
+
+  .approve { background: var(--raise); border-radius: 14px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+  [data-dir="seance"] .approve { border-radius: 4px; box-shadow: inset 0 0 0 1px var(--line2), var(--shadow); }
+  .approve .what { font-size: 14px; display: flex; align-items: center; gap: 9px; }
+  .approve .what .ic { color: var(--accent); font-size: 13px; }
+  .diff { font: 13px/1.6 Consolas, monospace; background: var(--code); border-radius: 8px; padding: 8px 10px; }
+  .diff .del { color: var(--bad); } .diff .add { color: var(--ok); }
+  .btns { display: flex; gap: 8px; }
+  .btns button { padding: 5px 13px; border-radius: var(--r-chip); background: var(--raise2); font-size: 13.5px; }
+  .btns .ok { background: var(--accent); color: var(--ink); }
+
+  /* ---- composer: the card, then the folder and model pickers under it */
+  .dock { padding: 0 24px 12px; }
+  .composer { max-width: 740px; margin: 0 auto; background: var(--raise); border-radius: var(--r-card); box-shadow: var(--shadow); padding: 12px 12px 10px 14px; }
+  [data-dir="midnight"] .composer, [data-dir="seance"] .composer { border: 1px solid var(--line2); }
+  [data-dir="fog"] .composer { border: 1px solid var(--line); }
+  .composer .box { min-height: 28px; color: var(--faint); font-size: 15px; padding: 2px 4px 14px; }
+  .composer .bar { display: flex; align-items: center; gap: 6px; }
+  .round { width: 32px; height: 32px; border-radius: var(--r-chip); display: grid; place-items: center; font-size: 13px; color: var(--muted); }
+  .round:hover, .round.on { background: var(--raise2); color: var(--text); }
+  .bar .sp { flex: 1; }
+  .send { width: 32px; height: 32px; border-radius: var(--r-chip); background: var(--accent); color: var(--ink); display: grid; place-items: center; font-size: 13px; }
+  [data-dir="seance"] .send { border-radius: 4px; }
+  .under { max-width: 740px; margin: 8px auto 0; display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); padding: 0 6px; }
+  .under .pk { display: inline-flex; align-items: center; gap: 7px; padding: 4px 8px; border-radius: var(--r-row); }
+  .under .pk:hover { background: var(--hover); color: var(--text); }
+  .under .pk .ic { font-size: 12px; } .under .pk .ch { font-size: 8px; color: var(--faint); }
+  .under .sp { flex: 1; }
+  .under .pk b { color: var(--text); font-weight: 500; }
+  .under .status { color: var(--faint); font-size: 12.5px; }
+
+  /* ---- the ghost, perched on the message box on every screen, its status beside it */
+  .perch { max-width: 740px; margin: 0 auto; height: 50px; position: relative; }
+  .perch canvas { position: absolute; left: 18px; bottom: -12px; width: 72px; height: 66px; image-rendering: pixelated; z-index: 2; }
+  .perch .say { position: absolute; left: 100px; bottom: 10px; font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 8px; }
+  .perch .say i.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  [data-dir="seance"] .perch .say i.dot { border-radius: 0; background: var(--mint); box-shadow: none; }
+  .perch .say b { color: var(--text); font-weight: 500; }
+  .composer { position: relative; z-index: 3; }
+
+  /* ---- new chat */
+  .empty { flex: 1; display: none; flex-direction: column; align-items: center; padding: 0 24px 30px; overflow-y: auto; }
+  .empty .spacer { flex: 1; min-height: 40px; }
+  .greet { display: flex; align-items: center; gap: 16px; margin-bottom: 22px; }
+  .greet canvas { image-rendering: pixelated; width: 48px; height: 44px; }
+  .greet h1 { margin: 0; font: 400 38px/1.15 var(--greet); letter-spacing: -.01em; }
+  [data-dir="midnight"] .greet h1, [data-dir="seance"] .greet h1 { font-weight: 600; font-size: 32px; }
+  .empty .composer { width: 100%; }
+  .empty .under { width: 100%; }
+  .recent { width: 100%; max-width: 740px; margin-top: 30px; }
+  .recent .head { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 10px; padding: 0 2px; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .card { background: var(--hover); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; min-height: 96px; }
+  [data-dir="midnight"] .card, [data-dir="seance"] .card { border: 1px solid var(--line); }
+  [data-dir="seance"] .card { border-radius: 4px; }
+  .card .ic { font-size: 14px; color: var(--accent); }
+  .card b { font-weight: 500; font-size: 14px; }
+  .card span { font-size: 12px; color: var(--faint); margin-top: auto; }
+  .win.isempty .scroll, .win.isempty .dock, .win.isempty .top .ctx, .win.isempty .title { display: none; }
+  .win.isempty .empty { display: flex; }
+
+  /* ---- session rail */
+  .rail { width: 0; overflow: hidden; background: var(--side); border-left: 1px solid var(--side-border); transition: width .2s ease; }
+  .win.rail-on .rail { width: 292px; }
+  .rail-in { width: 292px; padding: 8px 14px 14px; height: 100%; overflow-y: auto; }
+  .rh { display: flex; align-items: center; justify-content: space-between; padding: 12px 4px 6px; font-size: 13px; font-weight: 600; }
+  .rh .r { font-weight: 400; color: var(--faint); font-size: 12px; display: inline-flex; gap: 8px; align-items: center; }
+  .rh .ic { font-size: 8px; color: var(--faint); }
+  .sec { background: var(--hover); border-radius: 12px; padding: 8px 12px; }
+  [data-dir="midnight"] .sec, [data-dir="seance"] .sec { border: 1px solid var(--line); }
+  [data-dir="seance"] .sec { border-radius: 4px; }
+  .kv { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); padding: 4px 0; }
+  .kv .ic { font-size: 13px; width: 16px; color: var(--faint); }
+  .kv b { color: var(--text); font-weight: 500; }
+  .meter { height: 6px; border-radius: 99px; background: var(--raise2); overflow: hidden; margin: 6px 0 6px; }
+  .meter i { display: block; height: 100%; width: 12%; background: var(--accent); border-radius: 99px; }
+  [data-dir="seance"] .meter { border-radius: 0; height: 8px; background: repeating-linear-gradient(90deg, var(--raise2) 0 6px, transparent 6px 8px); }
+  [data-dir="seance"] .meter i { border-radius: 0; background: repeating-linear-gradient(90deg, var(--mint) 0 6px, transparent 6px 8px); }
+  .small { font-size: 12px; color: var(--faint); }
+  .task { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; color: var(--muted); padding: 3px 0; }
+  .task .ic { font-size: 11px; margin-top: 4px; width: 12px; }
+  .task.done { color: var(--faint); text-decoration: line-through; }
+  .task.done .ic { color: var(--ok); }
+  .task.now { color: var(--text); }
+  .task.now .ic { color: var(--accent); }
+  .change { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); padding: 3px 0; }
+  .change .n { font-family: Consolas, monospace; font-size: 12px; } .add { color: var(--ok); } .del { color: var(--bad); }
+  .linkbtn { color: var(--accent); font-size: 12.5px; padding-top: 4px; }
+</style>
+</head>
+<body data-dir="graphite">
+<nav class="picker" aria-label="Mockup controls">
+  <span class="lbl">Skin</span>
+  <div class="grp" id="dirs"><button data-v="graphite" class="on">Graphite</button><button data-v="midnight">Midnight</button><button data-v="fog">Fog</button><button data-v="seance">Séance</button></div>
+  <span class="lbl">Screen</span>
+  <div class="grp" id="screens"><button data-v="chat" class="on">Conversation</button><button data-v="empty">New chat</button></div>
+  <span class="lbl">Rail</span>
+  <div class="grp" id="rails"><button data-v="on" class="on">On</button><button data-v="off">Off</button></div>
+  <span class="lbl">Menus</span>
+  <div class="grp" id="menus"><button data-v="none" class="on">None</button><button data-v="title">Chat</button><button data-v="plus">+</button></div>
+</nav>
+
+<div class="win rail-on" id="win">
+  <aside class="side">
+    <div class="chrome"><button class="ib" title="Hide the sidebar"><i class="ic">&#xE89F;</i></button><button class="ib"><i class="ic">&#xE72B;</i></button><button class="ib"><i class="ic">&#xE72A;</i></button></div>
+    <div class="nav">
+      <button class="navrow"><i class="ic">&#xE710;</i>New chat</button>
+      <button class="navrow"><i class="ic">&#xE721;</i>Search</button>
+      <button class="navrow"><i class="ic">&#xE8B7;</i>Folders</button>
+      <button class="navrow"><i class="ic">&#xE945;</i>Models</button>
+    </div>
+    <div class="sect">Pinned <i class="ic">&#xE70D;</i></div>
+    <div class="list">
+      <div class="item"><i class="ic">&#xE840;</i><span>ghost-infer roadmap</span><i class="ic more">&#xE712;</i></div>
+    </div>
+    <div class="sect">Recents <i class="ic">&#xE70D;</i></div>
+    <div class="list grow">
+      <div class="item on"><span>stats.py gives the wrong average</span><i class="ic more">&#xE712;</i></div>
+      <div class="item"><span>Explain the MLA attention kernel</span><i class="ic more">&#xE712;</i></div>
+      <div class="item"><span>Summarise the printing press notes</span><i class="ic more">&#xE712;</i></div>
+      <div class="item"><span>Check my PC specs</span><i class="ic more">&#xE712;</i></div>
+      <div class="item"><span>Rust lifetimes, simply</span><i class="ic more">&#xE712;</i></div>
+      <div class="item"><span>Malay summary of the meeting</span><i class="ic more">&#xE712;</i></div>
+    </div>
+    <div class="me"><canvas class="g" data-px="1"></canvas><div><div>This PC</div><div class="sub">GLM-4.7-Flash on the GPU</div></div><span class="sp"></span><i class="ic">&#xE713;</i></div>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <button class="title" id="titleBtn">stats.py gives the wrong average <i class="ic">&#xE70D;</i></button>
+      <span class="sp"></span><span class="ctx">12% of context</span>
+      <button class="ib on" title="Session"><i class="ic">&#xE8A0;</i></button>
+    </div>
+    <div class="menu" id="titleMenu">
+      <div class="mi"><i class="ic">&#xE8AC;</i>Rename<span class="key">R</span></div>
+      <div class="mi"><i class="ic">&#xE840;</i>Pin<span class="key">P</span></div>
+      <div class="mi"><i class="ic">&#xE8C8;</i>Copy as Markdown</div>
+      <div class="mi"><i class="ic">&#xE8B7;</i>Open the folder</div>
+      <div class="sep"></div>
+      <div class="mi danger"><i class="ic">&#xE74D;</i>Delete<span class="key">D</span></div>
+    </div>
+
+    <div class="scroll"><div class="col">
+      <div class="user">stats.py gives the wrong average. Find the bug, fix it, then run it to check.</div>
+      <div class="reply">
+        <button class="thought">Thought for 6.2 s <i class="ic">&#xE76C;</i></button>
+        <div class="tools">
+          <div class="tool"><i class="ic">&#xE8A5;</i><span class="name">Read harness_test\stats.py</span><i class="ic ok">&#xE73E;</i></div>
+          <div class="tool"><i class="ic">&#xE70F;</i><span class="name">Edited harness_test\stats.py</span><i class="ic ok">&#xE73E;</i></div>
+          <div class="tool"><i class="ic">&#xE756;</i><span class="name">Ran py stats.py</span><i class="ic ok">&#xE73E;</i></div>
+        </div>
+        <div class="answer"><p>Found it: line 5 added <code>+ 1</code> after dividing, so every average came out one too high. The fixed function:</p></div>
+        <div class="code"><div class="head"><span>python</span><span><i class="ic">&#xE8C8;</i>&nbsp; Copy</span></div>
+<pre><span class="k">def</span> average(numbers):
+    total = <span class="s">0</span>
+    <span class="k">for</span> n <span class="k">in</span> numbers:
+        total += n
+    <span class="k">return</span> total / len(numbers)</pre></div>
+        <div class="answer"><p>Running it now prints <code>average of 2, 4, 6 is 4.0</code>, which is right.</p></div>
+        <div class="foot"><button title="Copy"><i class="ic">&#xE8C8;</i></button><button title="Retry"><i class="ic">&#xE72C;</i></button><button class="undo">Undo file changes</button><span class="t">19.5 s</span></div>
+      </div>
+      <div class="user">Also make it handle an empty list.</div>
+      <div class="reply">
+        <button class="thought">Thought for 2.8 s <i class="ic">&#xE76C;</i></button>
+        <div class="tools">
+          <div class="tool"><i class="ic">&#xE8A5;</i><span class="name">Read harness_test\stats.py</span><i class="ic ok">&#xE73E;</i></div>
+          <div class="tool"><i class="ic">&#xE70F;</i><span class="name">Edit harness_test\stats.py</span><i class="ic wait">&#xE916;</i></div>
+        </div>
+        <div class="approve">
+          <div class="what"><i class="ic">&#xE70F;</i>Change stats.py?</div>
+          <div class="diff"><div class="del">-     total = 0</div><div class="add">+     if not numbers:</div><div class="add">+         return 0.0</div><div class="add">+     total = 0</div></div>
+          <div class="btns"><button class="ok">Allow</button><button>Always allow file changes</button><button>Deny</button></div>
+        </div>
+      </div>
+    </div></div>
+
+    <div class="empty">
+      <div class="spacer"></div>
+      <div class="greet"><h1 id="greet">Good afternoon, Apiz</h1></div>
+      <div class="perch" style="width:100%"><canvas class="live" data-mood="wave"></canvas><span class="say">Hello</span></div>
+      <div class="composer"><div class="box">How can I help you today?</div><div class="bar"><button class="round plus"><i class="ic">&#xE710;</i></button><span class="sp"></span><button class="send"><i class="ic">&#xE74A;</i></button></div></div>
+      <div class="under"><button class="pk"><i class="ic">&#xE8B7;</i>Folder<i class="ic ch">&#xE70D;</i></button><span class="sp"></span><button class="pk"><b>GLM-4.7-Flash</b> Think<i class="ic ch">&#xE70D;</i></button></div>
+      <div class="recent">
+        <div class="head"><span>Recent chats</span><span>View all</span></div>
+        <div class="cards">
+          <div class="card"><i class="ic">&#xE943;</i><b>Explain the MLA attention kernel</b><span>Today</span></div>
+          <div class="card"><i class="ic">&#xE8A5;</i><b>Summarise the printing press notes</b><span>Yesterday</span></div>
+          <div class="card"><i class="ic">&#xE7F8;</i><b>Check my PC specs</b><span>Oct 27</span></div>
+        </div>
+      </div>
+      <div class="spacer"></div>
+    </div>
+
+    <div class="menu" id="plusMenu">
+      <div class="mi"><i class="ic">&#xE723;</i>Add files<span class="key">Ctrl+U</span></div>
+      <div class="mi"><i class="ic">&#xE8B7;</i>Add folder</div>
+      <div class="mi"><i class="ic">&#xE7B3;</i>Tools<i class="ic chev">&#xE76C;</i></div>
+      <div class="mi"><i class="ic">&#xE734;</i>Skills<i class="ic chev">&#xE76C;</i></div>
+      <div class="mi"><i class="ic">&#xE71B;</i>Connectors<i class="ic chev">&#xE76C;</i></div>
+    </div>
+
+    <div class="dock">
+      <div class="perch"><canvas class="live" data-mood="curious"></canvas><span class="say"><i class="dot"></i><b>Waiting for your OK</b> to change stats.py</span></div>
+      <div class="composer"><div class="box">Reply to ghost-infer</div><div class="bar"><button class="round plus"><i class="ic">&#xE710;</i></button><span class="sp"></span><button class="send"><i class="ic">&#xE71A;</i></button></div></div>
+      <div class="under"><button class="pk"><i class="ic">&#xE8B7;</i>harness_test<i class="ic ch">&#xE70D;</i></button><span class="sp"></span><button class="pk"><b>GLM-4.7-Flash</b> Think<i class="ic ch">&#xE70D;</i></button></div>
+    </div>
+  </main>
+
+  <aside class="rail"><div class="rail-in">
+    <div class="rh">Environment <i class="ic">&#xE70D;</i></div>
+    <div class="sec">
+      <div class="kv"><i class="ic">&#xE7F8;</i><span>This PC, <b>RTX 2060 SUPER</b>, 16 GB</span></div>
+      <div class="kv"><i class="ic">&#xE945;</i><span><b>GLM-4.7-Flash</b> on the GPU</span></div>
+      <div class="kv"><i class="ic">&#xE8B7;</i><span><b>harness_test</b></span></div>
+    </div>
+    <div class="rh">Context <span class="r">12%</span></div>
+    <div class="sec"><div class="meter"><i></i></div><div class="small">1,960 of 16,384 tokens</div></div>
+    <div class="rh">Tasks <span class="r">2 of 3 <i class="ic">&#xE70D;</i></span></div>
+    <div class="sec">
+      <div class="task done"><i class="ic">&#xE73E;</i>Find the bug</div>
+      <div class="task done"><i class="ic">&#xE73E;</i>Fix and run stats.py</div>
+      <div class="task now"><i class="ic">&#xE91F;</i>Handle an empty list</div>
+    </div>
+    <div class="rh">Changes <span class="r">1 file</span></div>
+    <div class="sec"><div class="change"><span>stats.py</span><span class="n"><span class="add">+1</span> <span class="del">-1</span></span></div><button class="linkbtn">Undo all</button></div>
+    <div class="rh">Memory <span class="r">2 facts</span></div>
+    <div class="sec">
+      <div class="task"><i class="ic">&#xE734;</i>Python runs as <code style="font-family:Consolas">py</code> on this PC</div>
+      <div class="task"><i class="ic">&#xE734;</i>Projects live in E:\AI</div>
+    </div>
+  </div></aside>
+</div>
+
+<script>
+// the pixel ghost (the chat page's sprite), resting
+const TOP = ["....wwwwww....","..wwwwwwwwww..",".wwwwwwwwwwww.",".wwwwwwwwwwww.", ...Array(8).fill("wwwwwwwwwwwwww")];
+const HEM = ["wwww..wwww..ww", ".ww....ww....w"];
+function ghost(cv) {
+  const px = +cv.dataset.px, W = 24, H = 22, OX = 3, OY = 6;
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d"), rows = [...TOP, ...HEM], g = Array.from({ length: H }, () => Array(W).fill(0));
+  const body = (x, y) => rows[y] && rows[y][x] === "w";
+  rows.forEach((r, y) => [...r].forEach((c, x) => { if (c === "w") g[OY + y][OX + x] = !body(x + 1, y) || !body(x, y + 1) ? "s" : "w"; }));
+  const put = (x, y, c) => (g[OY + y][OX + x] = c);
+  put(3, 1, "h"); put(2, 2, "h");
+  [[3,4],[4,4],[3,5],[4,5],[9,4],[10,4],[9,5],[10,5]].forEach(([x, y]) => put(x, y, "e"));
+  put(3, 4, "h"); put(9, 4, "h"); put(1, 7, "b"); put(12, 7, "b");
+  const solid = (x, y) => g[y] && g[y][x] && g[y][x] !== "o";
+  const out = g.map((r) => r.slice());
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (!g[y][x] && (solid(x-1,y) || solid(x+1,y) || solid(x,y-1) || solid(x,y+1))) out[y][x] = "o";
+  const C = { o: "#0b0e17", w: "#e8ebf3", s: "#aeb6cc", h: "#ffffff", e: "#121726", b: "#ff9db5" };
+  out.forEach((r, y) => r.forEach((c, x) => { if (c) { ctx.fillStyle = C[c]; ctx.fillRect(x, y, 1, 1); } }));
+  cv.style.width = W * px + "px"; cv.style.height = H * px + "px";
+}
+document.querySelectorAll("canvas.g").forEach(ghost);
+
+// the perched ghost, alive: a one-pixel bob, the hem wiggling, a blink now and then; its face follows its mood
+function live(cv, t) {
+  const W = 24, H = 22, OX = 3, OY = 6, mood = cv.dataset.mood;
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d"), step = Math.floor(t / 420), bob = step % 2;
+  const hem = step % 2 ? ["ww..wwww..wwww", "w....ww....ww."] : HEM;
+  const rows = [...TOP, ...hem], g = Array.from({ length: H }, () => Array(W).fill(0));
+  const body = (x, y) => rows[y] && rows[y][x] === "w";
+  rows.forEach((r, y) => [...r].forEach((c, x) => { if (c === "w") g[OY + y + bob][OX + x] = !body(x + 1, y) || !body(x, y + 1) ? "s" : "w"; }));
+  const put = (x, y, c) => { if (g[OY + y + bob]) g[OY + y + bob][OX + x] = c; };
+  const putAbs = (x, y, c) => { if (g[y] && x < W) g[y][x] = c; };
+  put(3, 1, "h"); put(2, 2, "h");
+  const blink = step % 9 === 0;
+  if (mood === "wave") {
+    [[2,5],[3,4],[4,5],[8,5],[9,4],[10,5],[5,7],[6,8],[7,8],[8,7]].forEach(([x, y]) => put(x, y, "e"));
+    put(1, 7, "b"); put(12, 7, "b");
+    (Math.floor(t / 180) % 2 ? [[14,6],[15,5],[16,4],[16,3]] : [[14,6],[15,5],[16,5],[17,4]]).forEach(([x, y]) => put(x, y, "w"));
+  } else if (mood === "curious") {
+    [[4,4],[5,4],[4,5],[5,5],[10,3],[11,3],[10,4],[11,4],[10,5],[11,5],[10,1],[11,1]].forEach(([x, y]) => put(x, y, "e"));
+    [[15,3],[16,2],[17,2],[18,3],[18,4],[17,5],[16,5],[15,4]].forEach(([x, y]) => put(x, y, "a"));
+    put(14, 6, "A"); put(13, 7, "A");
+    if (step % 3) put(16, 3, "h");
+  } else {
+    blink ? [3,4,9,10].forEach((x) => put(x, 5, "e")) : [[3,4],[4,4],[3,5],[4,5],[9,4],[10,4],[9,5],[10,5]].forEach(([x, y]) => put(x, y, "e"));
+  }
+  const solid = (x, y) => g[y] && ["w","s","h","b","e"].includes(g[y][x]);
+  const out = g.map((r) => r.slice());
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (!g[y][x] && (solid(x-1,y) || solid(x+1,y) || solid(x,y-1) || solid(x,y+1))) out[y][x] = "o";
+  const C = { o: "#0b0e17", w: "#e8ebf3", s: "#aeb6cc", h: "#ffffff", e: "#121726", b: "#ff9db5", a: getComputedStyle(document.body).getPropertyValue("--accent").trim() || "#b9c7ff", A: "#7f8cc4" };
+  out.forEach((r, y) => r.forEach((c, x) => { if (c) { ctx.fillStyle = C[c]; ctx.fillRect(x, y, 1, 1); } }));
+}
+(function tick(t) { document.querySelectorAll("canvas.live").forEach((cv) => live(cv, t)); requestAnimationFrame(tick); })(0);
+const h = new Date().getHours();
+document.getElementById("greet").textContent = (h < 5 ? "Good evening" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening") + ", Apiz";
+
+const win = document.getElementById("win");
+function group(id, fn) {
+  const g = document.getElementById(id);
+  g.addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    g.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+    fn(b.dataset.v);
+  });
+}
+group("dirs", (v) => (document.body.dataset.dir = v));
+group("screens", (v) => win.classList.toggle("isempty", v === "empty"));
+group("rails", (v) => win.classList.toggle("rail-on", v === "on"));
+group("menus", (v) => {
+  document.getElementById("titleMenu").classList.toggle("open", v === "title");
+  document.getElementById("plusMenu").classList.toggle("open", v === "plus");
+});
+const q = new URLSearchParams(location.search);
+for (const [k, id] of [["dir", "dirs"], ["screen", "screens"], ["rail", "rails"], ["menu", "menus"]]) if (q.get(k)) document.querySelector(`#${id} [data-v="${q.get(k)}"]`)?.click();
+</script>
+</body>
+</html>
