@@ -454,7 +454,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let (defaults, think_default) = (shared.defaults, shared.think_default);
     // the agent tools and their settings: private to the chat page on this computer
     let path = req.path.trim_end_matches('/');
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory"].iter().any(|p| path.starts_with(p)) {
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
@@ -529,6 +529,12 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 let (id, decision) = (b.get("id").and_then(Json::as_str).unwrap_or(""), b.get("decision").and_then(Json::as_str).unwrap_or("deny"));
                 let ok = agent::answer(id, decision);
                 respond_private(&mut conn, if ok { 200 } else { 404 }, &obj(vec![("answered", Json::Bool(ok))]))
+            }
+            // the app's "Quit and stop the model" (the launcher runs the server without a window): answers, then
+            // ends the server, which frees the GPU
+            ("POST", "/api/quit") => {
+                respond_private(&mut conn, 200, &obj(vec![("quitting", Json::Bool(true))]))?;
+                std::process::exit(0)
             }
             // what the model remembers, and the user's remove button: {"index": n}
             ("GET", "/api/memory") => respond_private(&mut conn, 200, &obj(vec![("facts", Json::Arr(agent::memory().iter().map(|f| str(f)).collect()))])),

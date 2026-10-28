@@ -383,8 +383,16 @@ fn app_file() -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("ghost-infer").join("app.json"))
 }
 
-/// The app's own settings: the theme, the tool groups that are on, and whether the rail is shown.
-fn load_settings() -> (ThemeMode, Vec<String>, bool) {
+/// The app's own settings, kept in app.json (start-ghost-app reads load_last and last_model from it too).
+struct Saved {
+    mode: ThemeMode,
+    tools: Vec<String>,         // the tool groups that are on
+    rail: bool,                 // the rail is shown
+    load_last: bool,            // the launcher starts the server with the last picked model
+    last_model: Option<String>, // the model last picked in the app
+}
+
+fn load_settings() -> Saved {
     let j = app_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| Json::parse(&t).ok()).unwrap_or(Json::Null);
     let mode = match j.get("theme").and_then(Json::as_str) {
         Some("dark") => ThemeMode::Dark,
@@ -395,20 +403,13 @@ fn load_settings() -> (ThemeMode, Vec<String>, bool) {
         Some(a) => a.iter().filter_map(Json::as_str).filter(|g| GROUPS.iter().any(|(k, _)| k == g)).map(String::from).collect(),
         None => vec!["files".to_string()],
     };
-    (mode, tools, j.get("rail").and_then(Json::as_bool).unwrap_or(false))
-}
-
-fn save_settings(mode: ThemeMode, tools: &[String], rail: bool) {
-    let Some(p) = app_file() else { return };
-    let v = match mode {
-        ThemeMode::System => "system",
-        ThemeMode::Dark => "dark",
-        ThemeMode::Light => "light",
-    };
-    if let Some(d) = p.parent() {
-        let _ = std::fs::create_dir_all(d);
+    Saved {
+        mode,
+        tools,
+        rail: j.get("rail").and_then(Json::as_bool).unwrap_or(false),
+        load_last: j.get("load_last").and_then(Json::as_bool).unwrap_or(false),
+        last_model: j.get("last_model").and_then(Json::as_str).map(String::from),
     }
-    let _ = std::fs::write(p, obj(vec![("theme", str(v)), ("tools", Json::Arr(tools.iter().map(|g| str(g)).collect())), ("rail", Json::Bool(rail))]).to_string());
 }
 
 /// Whether Windows is set to dark mode for apps (HKCU\...\Personalize\AppsUseLightTheme = 0).
@@ -463,6 +464,8 @@ struct App {
     repaint: bool,           // flipped on every change but the ghost's tick: the whole window is drawn again
     maximized: bool,         // the window fills the screen (no resize edges; the button shows "restore")
     rail: bool,              // the session rail on the right is shown
+    load_last: bool,         // start with the last picked model (the launcher reads it)
+    last_model: Option<String>, // the model last picked here
     system: Json,            // this computer, as /api/system reports it (for the rail)
     tasks: Vec<(String, String)>, // the model's task list for this chat: text, and pending / in_progress / done
     memory: Vec<String>,     // what the model remembers across chats
@@ -514,6 +517,8 @@ enum Message {
     WindowResized,
     Maximized(bool),
     ToggleRail,
+    ToggleLoadLast,
+    Quit,
     System(Result<Json, String>),
     UndoAll,
     AddFolder,
@@ -527,7 +532,7 @@ enum Message {
 impl App {
     fn new(args: Args) -> (App, Task<Message>) {
         let addr = args.addr.clone();
-        let (mode, tools, rail) = load_settings();
+        let Saved { mode, tools, rail, load_last, last_model } = load_settings();
         let dark = match mode {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
@@ -570,6 +575,8 @@ impl App {
             repaint: false,
             maximized: false,
             rail,
+            load_last,
+            last_model,
             system: Json::Null,
             tasks: Vec::new(),
             memory: Vec::new(),
@@ -656,6 +663,8 @@ impl App {
             }
             Message::PickModel(choice) => {
                 let id = choice.id;
+                self.last_model = Some(id.clone());
+                self.save_settings();
                 self.status = format!("Loading {}…", choice.label);
                 let body = obj(vec![("id", str(&id))]);
                 return self.call(
@@ -694,13 +703,13 @@ impl App {
             Message::ToggleTheme => {
                 self.set_dark(!self.dark);
                 self.mode = if self.dark { ThemeMode::Dark } else { ThemeMode::Light };
-                save_settings(self.mode, &self.tools, self.rail);
+                self.save_settings();
                 self.menu = None;
             }
             Message::SystemTheme => {
                 self.mode = ThemeMode::System;
                 self.set_dark(windows_dark());
-                save_settings(self.mode, &self.tools, self.rail);
+                self.save_settings();
                 self.menu = None;
             }
             Message::ToggleTool(i, j) => {
@@ -716,7 +725,7 @@ impl App {
                     }
                     None => self.tools.push(g.to_string()),
                 }
-                save_settings(self.mode, &self.tools, self.rail);
+                self.save_settings();
             }
             Message::Approve(id, decision) => {
                 if let Some(t) = self.messages.last_mut().and_then(|m| m.tools.iter_mut().find(|t| t.id == id)) {
@@ -775,9 +784,22 @@ impl App {
             // maximized by the button, a double click, snapping or Win+Up: the size changes every time
             Message::WindowResized => return iced::window::latest().and_then(iced::window::is_maximized).map(Message::Maximized),
             Message::Maximized(m) => self.maximized = m,
+            Message::ToggleLoadLast => {
+                self.load_last = !self.load_last;
+                // on with nothing picked yet: the model running now is the one to start with
+                if self.last_model.is_none() {
+                    self.last_model = self.model.as_ref().map(|m| m.id.clone());
+                }
+                self.save_settings();
+            }
+            // the server runs without a window, so the app stops it: the model leaves the GPU, then the app closes
+            Message::Quit => {
+                let Some(api) = self.api.clone() else { return iced::exit() };
+                return Task::perform(blocking(move || api.post("/api/quit", &Json::Null)), |_| ()).discard().chain(iced::exit());
+            }
             Message::ToggleRail => {
                 self.rail = !self.rail;
-                save_settings(self.mode, &self.tools, self.rail);
+                self.save_settings();
                 if self.rail {
                     return self.refresh_system();
                 }
@@ -845,6 +867,28 @@ impl App {
     }
 
     /// This computer's GPU, memory and model, for the rail (only fetched while it is shown).
+    fn save_settings(&self) {
+        let Some(p) = app_file() else { return };
+        let v = match self.mode {
+            ThemeMode::System => "system",
+            ThemeMode::Dark => "dark",
+            ThemeMode::Light => "light",
+        };
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let mut fields = vec![
+            ("theme", str(v)),
+            ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())),
+            ("rail", Json::Bool(self.rail)),
+            ("load_last", Json::Bool(self.load_last)),
+        ];
+        if let Some(m) = &self.last_model {
+            fields.push(("last_model", str(m)));
+        }
+        let _ = std::fs::write(p, obj(fields).to_string());
+    }
+
     /// The server's harness settings: the folders file tools may use.
     fn set_harness(&mut self, j: &Json) {
         self.folders = j.get("folders").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();

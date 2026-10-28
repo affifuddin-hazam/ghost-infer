@@ -108,6 +108,7 @@ mod ic {
     pub const CLOSE: char = '\u{E8BB}';
     pub const DOCK_RIGHT: char = '\u{E90D}';
     pub const CHIP: char = '\u{E950}';
+    pub const POWER: char = '\u{E7E8}';
     pub const TASKS: char = '\u{E9D5}';
     pub const MEMORY: char = '\u{E734}';
     pub const NOW: char = '\u{E91F}';
@@ -226,6 +227,8 @@ impl App {
                 vec![
                     (if s.dark { ic::SUN } else { ic::MOON }, if s.dark { "Light theme (Fog)" } else { "Dark theme (Graphite)" }, Message::ToggleTheme, false, None),
                     (ic::SETTINGS, "Follow Windows' theme", Message::SystemTheme, false, None),
+                    (ic::BOLT, "Start with the last model", Message::ToggleLoadLast, false, Some(self.load_last)),
+                    (ic::POWER, "Quit and stop the model", Message::Quit, false, None),
                 ],
                 Padding { left: 12.0, bottom: 60.0, ..Padding::ZERO },
             ),
