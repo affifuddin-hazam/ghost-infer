@@ -109,6 +109,8 @@ mod ic {
     pub const DOCK_RIGHT: char = '\u{E90D}';
     pub const CHIP: char = '\u{E950}';
     pub const POWER: char = '\u{E7E8}';
+    pub const SKILL: char = '\u{E8F1}';
+    pub const PLUG: char = '\u{E71B}';
     pub const TASKS: char = '\u{E9D5}';
     pub const MEMORY: char = '\u{E734}';
     pub const NOW: char = '\u{E91F}';
@@ -135,6 +137,7 @@ mod ic {
     pub const MOON: char = '\u{E708}';
     pub const CLOCK: char = '\u{E916}';
     pub const UNDO: char = '\u{E7A7}';
+    pub const DOWNLOAD: char = '\u{E896}';
 }
 
 fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
@@ -152,6 +155,10 @@ fn tool_icon(name: &str) -> char {
         "fetch_url" => ic::GLOBE,
         "update_tasks" => ic::TASKS,
         "remember" | "forget" => ic::MEMORY,
+        "use_skill" => ic::SKILL,
+        "search_chats" => ic::SEARCH,
+        "read_chat" => ic::CHAT,
+        n if n.starts_with("mcp__") => ic::PLUG,
         _ => ic::PC,
     }
 }
@@ -160,6 +167,7 @@ fn tool_icon(name: &str) -> char {
 fn group_icon(group: &str) -> char {
     match group {
         "files" => ic::FILE,
+        "mcp" => ic::PLUG,
         "edit" => ic::EDIT,
         "cmd" => ic::TERMINAL,
         _ => ic::GLOBE,
@@ -235,7 +243,14 @@ impl App {
             Menu::Plus => {
                 let mut items: Vec<(char, &str, Message, bool, Option<bool>)> = crate::GROUPS.iter().map(|&(g, label)| (group_icon(g), label, Message::ToggleGroup(g), false, Some(self.tools.iter().any(|t| t == g)))).collect();
                 items.push((ic::FOLDER, "Add folder…", Message::AddFolder, false, None));
-                (items, Padding { left: if self.sidebar { 264.0 + 60.0 } else { 60.0 }, bottom: 130.0, ..Padding::ZERO })
+                items.push((ic::SKILL, "Install skill…", Message::InstallSkill(false), false, None));
+                items.push((ic::DOWNLOAD, "Install skill from a link…", Message::OpenSkillLink, false, None));
+                // just above the + button, its left edge with the button's
+                let pad = match self.plus_at {
+                    Some(at) => Padding { left: at.x, bottom: (self.window.height - at.y + 6.0).max(0.0), ..Padding::ZERO },
+                    None => Padding { left: if self.sidebar { 264.0 + 60.0 } else { 60.0 }, bottom: 130.0, ..Padding::ZERO },
+                };
+                (items, pad)
             }
         };
         let list = column(items.into_iter().map(|(c, label, msg, danger, on)| {
@@ -415,9 +430,72 @@ impl App {
         if !self.tasks.is_empty() {
             body = body.push(head("Tasks", format!("{done} of {}", self.tasks.len()))).push(section(tasks.into()));
         }
-        let body = body.push(head("Changes", files)).push(section(changes_body)).push(head("Memory", facts)).push(section(memory));
+        // memory: the facts, and a field to add one
+        let add_memory = text_input("Add a memory", &self.memory_draft).on_input(Message::MemoryDraft).on_submit(Message::AddMemory).size(13).padding([6, 8]).style(move |t, st| input_style(s, t, st));
+        let memory = rail_section(s, column![memory, add_memory].spacing(8).into());
+
+        // skills: installed ones with remove, and installing
+        let link = |label: &'static str, msg: Message| -> Element<'static, Message> {
+            button(text(label).size(12.5).color(s.accent)).on_press(msg).padding(Padding { top: 4.0, right: 10.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }).into()
+        };
+        let mut skills = column![].spacing(2);
+        if self.skills.is_empty() {
+            skills = skills.push(text("No skills installed").size(12.5).color(s.faint));
+        }
+        for (name, desc) in &self.skills {
+            skills = skills.push(
+                row![
+                    icon(ic::SKILL, 11).color(s.faint).width(14),
+                    column![text(name.clone()).size(13).font(MEDIUM).color(s.text), text(crate::clip_line(desc, 90)).size(12).color(s.faint)].width(Fill),
+                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::RemoveSkill(name.clone())).padding([4, 5]).style(move |_, st| bare(s, st)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .padding([3, 0]),
+            );
+        }
+        skills = skills.push(row![link("Install from folder", Message::InstallSkill(false)), link("From .zip", Message::InstallSkill(true))]);
+        let skill_link = text_input("Paste a skill link (GitHub or .zip)", &self.skill_link).id("skill-link").on_input(Message::SkillLink).on_submit(Message::InstallLink).size(13).padding([6, 8]).style(move |t, st| input_style(s, t, st));
+        skills = skills.push(container(skill_link).padding(Padding { top: 6.0, ..Padding::ZERO }));
+
+        // MCP servers: each with its state, and editing the list
+        let mut mcp = column![].spacing(2);
+        if self.mcp.is_empty() {
+            mcp = mcp.push(text("No MCP servers yet").size(12.5).color(s.faint));
+        }
+        for (name, state, tools) in &self.mcp {
+            let (dot, note) = match state.as_str() {
+                "ready" => (s.ok, format!("{tools} tools")),
+                "starting" => (s.warn, "starting".to_string()),
+                other => (s.bad, crate::clip_line(other, 80)),
+            };
+            mcp = mcp.push(
+                row![
+                    container(Space::new().width(7).height(7)).style(move |_| container::Style { background: Some(Background::Color(dot)), border: border::rounded(99), ..Default::default() }).padding(0),
+                    column![text(name.clone()).size(13).font(MEDIUM).color(s.text), text(note).size(12).color(s.faint)].width(Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .padding([3, 0]),
+            );
+        }
+        mcp = mcp.push(row![link("Edit servers", Message::McpEdit), link("Reload", Message::McpReload), link("From Claude", Message::McpImport)]);
+        let servers = match self.mcp.iter().filter(|m| m.1 == "ready").count() {
+            0 => String::new(),
+            n => format!("{n} ready"),
+        };
+
+        let body = body
+            .push(head("Changes", files))
+            .push(section(changes_body))
+            .push(head("Memory", facts))
+            .push(memory)
+            .push(head("Skills", if self.skills.is_empty() { String::new() } else { self.skills.len().to_string() }))
+            .push(rail_section(s, skills.into()))
+            .push(head("MCP servers", servers))
+            .push(rail_section(s, mcp.into()));
         let top = row![drag_area(container(Space::new()).width(Fill).height(32)), self.window_controls()];
-        container(column![top, scrollable(container(body).padding(Padding { top: 0.0, right: 14.0, bottom: 14.0, left: 14.0 })).height(Fill).style(move |t, st| scroll_style(s, t, st))])
+        container(column![top, scrollable(container(body).padding(Padding { top: 0.0, right: 14.0, bottom: 14.0, left: 14.0 })).id("rail").height(Fill).style(move |t, st| scroll_style(s, t, st))])
             .width(292)
             .height(Fill)
             .style(move |_| container::Style { background: Some(Background::Color(s.side)), border: Border { width: 0.0, ..Default::default() }, ..Default::default() })
@@ -605,7 +683,7 @@ impl App {
                 text_editor::Binding::from_key_press(kp)
             })
             .style(move |t, st| editor_style(s, t, st));
-        let plus = button(container(icon(ic::ADD, 13).color(s.muted)).center(32)).on_press(Message::Menu(Some(Menu::Plus))).padding(0).style(move |_, st| round_style(s, st));
+        let plus = container(button(container(icon(ic::ADD, 13).color(s.muted)).center(32)).on_press(Message::OpenPlus).padding(0).style(move |_, st| round_style(s, st))).id("plus");
         let busy = self.busy.is_some();
         let send = button(container(icon(if busy { ic::STOP } else { ic::UP }, 13).color(s.ink)).center(32))
             .on_press(if busy { Message::Stop } else { Message::Send })
@@ -836,6 +914,11 @@ impl<'a> markdown::Viewer<'a, Message> for Md {
             .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(10), text_color: Some(s.text), ..Default::default() })
             .into()
     }
+}
+
+/// A box in the rail.
+fn rail_section<'a>(s: &'static Skin, content: Element<'a, Message>) -> Element<'a, Message> {
+    container(content).width(Fill).padding([8, 12]).style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(12), ..Default::default() }).into()
 }
 
 /// A count with thousands separators: 16384 -> "16,384".

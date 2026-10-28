@@ -9,7 +9,7 @@ use std::process::Command;
 use crate::json::{num, obj, str, Json};
 
 /// Characters a tool result may hand the model; longer ones keep their start and end.
-const MAX_RESULT: usize = 16_000;
+pub const MAX_RESULT: usize = 16_000;
 /// Lines read_file returns when the model does not say, and the longest line it shows whole.
 const READ_LINES: usize = 300;
 const MAX_LINE: usize = 400;
@@ -25,6 +25,12 @@ pub struct Settings {
     pub folders: Vec<PathBuf>,
     /// tool groups the user said to always allow (edit, cmd, web), for clients that run the agent here
     pub always: Vec<String>,
+}
+
+/// Where installed skills live (%LOCALAPPDATA%\ghost-infer\skills): the file tools may read there, and
+/// commands may run there (for a skill's scripts), but nothing is written there except by installing.
+pub fn skills_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("skills"))
 }
 
 fn settings_file() -> Option<PathBuf> {
@@ -77,7 +83,7 @@ impl Settings {
             }
         }
         let always = match j.get("always").and_then(Json::as_array) {
-            Some(a) => a.iter().filter_map(Json::as_str).filter(|g| matches!(*g, "edit" | "cmd" | "web")).map(String::from).collect(),
+            Some(a) => a.iter().filter_map(Json::as_str).filter(|g| matches!(*g, "edit" | "cmd" | "web" | "mcp")).map(String::from).collect(),
             None => old.always.clone(),
         };
         Ok(Settings { folders, always })
@@ -114,6 +120,24 @@ impl Settings {
         Err(format!("{path} is outside the allowed folders ({})", self.folder_list()))
     }
 
+    /// `resolve`, or else an absolute path inside the skills folder: for reading and for a command's folder,
+    /// never for writing (the write tools use `resolve`).
+    pub fn resolve_read(&self, path: &str) -> Result<PathBuf, String> {
+        let err = match self.resolve(path) {
+            Ok(p) => return Ok(p),
+            Err(e) => e,
+        };
+        let p = Path::new(path.trim());
+        if let (true, Some(root)) = (p.is_absolute(), skills_dir()) {
+            if let (Ok(real), Ok(r)) = (std::fs::canonicalize(p), std::fs::canonicalize(root)) {
+                if real.starts_with(&r) {
+                    return Ok(real);
+                }
+            }
+        }
+        Err(err)
+    }
+
     fn folder_list(&self) -> String {
         self.folders.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ")
     }
@@ -143,16 +167,16 @@ pub fn run(name: &str, args: &Json, s: &Settings, checkpoint: &str) -> Result<St
     let need = |k: &str| text(k).ok_or_else(|| format!("{name} needs \"{k}\""));
     let count = |k: &str| args.get(k).and_then(Json::as_f64).filter(|v| *v >= 1.0).map(|v| v as usize);
     let out = match name {
-        "read_file" => read_file(&s.resolve(need("path")?)?, count("offset").unwrap_or(1), count("limit").unwrap_or(READ_LINES))?,
-        "list_files" => list_files(s, &s.resolve(text("path").unwrap_or("."))?, text("pattern"))?,
-        "search_files" => search_files(s, need("pattern")?, &s.resolve(text("path").unwrap_or("."))?, text("glob"), args.get("ignore_case").and_then(Json::as_bool).unwrap_or(false))?,
+        "read_file" => read_file(&s.resolve_read(need("path")?)?, count("offset").unwrap_or(1), count("limit").unwrap_or(READ_LINES))?,
+        "list_files" => list_files(s, &s.resolve_read(text("path").unwrap_or("."))?, text("pattern"))?,
+        "search_files" => search_files(s, need("pattern")?, &s.resolve_read(text("path").unwrap_or("."))?, text("glob"), args.get("ignore_case").and_then(Json::as_bool).unwrap_or(false))?,
         "write_file" => write_file(s, &writable(s.resolve(need("path")?)?)?, need("content")?, checkpoint)?,
         "edit_file" => edit_file(s, &writable(s.resolve(need("path")?)?)?, need("old_string")?, text("new_string").unwrap_or(""), args.get("replace_all").and_then(Json::as_bool).unwrap_or(false), checkpoint)?,
         "run_command" => {
             let secs = count("timeout").unwrap_or(COMMAND_SECS).min(MAX_COMMAND_SECS);
-            run_command(need("command")?, &s.resolve(text("cwd").unwrap_or("."))?, secs)?
+            run_command(need("command")?, &s.resolve_read(text("cwd").unwrap_or("."))?, secs)?
         }
-        "start_process" => start_process(need("command")?, &s.resolve(text("cwd").unwrap_or("."))?)?,
+        "start_process" => start_process(need("command")?, &s.resolve_read(text("cwd").unwrap_or("."))?)?,
         "check_process" => check_process(count("id").ok_or("check_process needs \"id\"")?)?,
         "stop_process" => stop_process(count("id").ok_or("stop_process needs \"id\"")?)?,
         "web_search" => web_search(need("query")?)?,

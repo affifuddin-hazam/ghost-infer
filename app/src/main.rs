@@ -23,7 +23,7 @@ use json::{num, obj, str, Json};
 /// app's main memory cost, so it stays bounded however long a chat gets).
 pub const SHOWN: usize = 30;
 
-/// Command line: `ghost-app [host:port] [--open <chat id>] [--send <message>] [--menu plus|chat|settings]` (the last three
+/// Command line: `ghost-app [host:port] [--open <chat id>] [--send <message>] [--menu plus|chat|settings|skill-link]` (the last three
 /// for testing).
 #[derive(Debug, Clone, Default)]
 struct Args {
@@ -118,13 +118,14 @@ impl ToolLine {
 }
 
 /// The tool groups the app can turn on, with their menu labels; "files" (reading) is on by default.
-pub const GROUPS: [(&str, &str); 4] = [("files", "Read files"), ("edit", "Change files"), ("cmd", "Run commands"), ("web", "Use the web")];
+pub const GROUPS: [(&str, &str); 5] = [("files", "Read files"), ("edit", "Change files"), ("cmd", "Run commands"), ("web", "Use the web"), ("mcp", "Use MCP tools")];
 
 /// What "Always allow" covers, by approval group.
 fn group_name(group: &str) -> &'static str {
     match group {
         "edit" => "file changes",
         "cmd" => "commands",
+        "mcp" => "MCP tools",
         _ => "web access",
     }
 }
@@ -233,6 +234,21 @@ fn tasks_of(j: Option<&Json>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Text on one line, cut to `max` characters.
+pub fn clip_line(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() > max { format!("{}…", s.chars().take(max - 1).collect::<String>()) } else { s }
+}
+
+/// An MCP tool's server and tool, from its name mcp__<server>__<tool>.
+fn mcp_parts(name: &str) -> (String, String) {
+    let rest = name.trim_start_matches("mcp__");
+    match rest.split_once("__") {
+        Some((s, t)) => (s.to_string(), t.to_string()),
+        None => (rest.to_string(), String::new()),
+    }
+}
+
 /// A short label for a tool call, like the chat page's.
 fn tool_label(t: &ToolLine) -> String {
     let a = Json::parse(&t.arguments).unwrap_or(Json::Null);
@@ -253,6 +269,13 @@ fn tool_label(t: &ToolLine) -> String {
         "update_tasks" => "Updated the task list".into(),
         "remember" => format!("Remembered: {}", s("fact")),
         "forget" => format!("Forgot: {}", s("fact")),
+        "use_skill" => format!("Used the {} skill", s("name")),
+        "search_chats" => format!("Searched earlier chats for \"{}\"", s("query")),
+        "read_chat" => "Read an earlier chat".into(),
+        n if n.starts_with("mcp__") => {
+            let (server, tool) = mcp_parts(n);
+            format!("Used {tool} ({server} MCP)")
+        }
         other => format!("Used {other}"),
     };
     if t.result.is_some() && !t.denied {
@@ -287,6 +310,14 @@ fn approval_text(t: &ToolLine) -> (String, String) {
         "start_process" => (format!("Start this in the background{cwd}?"), s("command")),
         "web_search" => (format!("Search the web for \"{}\"?", s("query")), String::new()),
         "fetch_url" => (format!("Open {}?", s("url")), String::new()),
+        n if n.starts_with("mcp__") => {
+            let (server, tool) = mcp_parts(n);
+            let args = match Json::parse(&t.arguments) {
+                Ok(Json::Obj(f)) => f.iter().map(|(k, v)| format!("{k}: {}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect::<Vec<_>>().join("\n"),
+                _ => t.arguments.clone(),
+            };
+            (format!("Use {tool} from the {server} MCP server?"), args)
+        }
         other => (format!("Use {other}?"), t.arguments.clone()),
     }
 }
@@ -463,12 +494,19 @@ struct App {
     tools: Vec<String>,      // the tool groups that are on
     repaint: bool,           // flipped on every change but the ghost's tick: the whole window is drawn again
     maximized: bool,         // the window fills the screen (no resize edges; the button shows "restore")
+    window: iced::Size,      // the window's size, to place menus
+    plus_at: Option<iced::Rectangle>, // where the + button is (the + menu opens above it)
     rail: bool,              // the session rail on the right is shown
     load_last: bool,         // start with the last picked model (the launcher reads it)
     last_model: Option<String>, // the model last picked here
     system: Json,            // this computer, as /api/system reports it (for the rail)
     tasks: Vec<(String, String)>, // the model's task list for this chat: text, and pending / in_progress / done
     memory: Vec<String>,     // what the model remembers across chats
+    memory_draft: String,    // a memory being typed in the rail
+    skills: Vec<(String, String)>, // installed skills: name, description
+    skill_link: String,      // a skill link being pasted in the rail
+    mcp: Vec<(String, String, usize)>, // MCP servers: name, state, how many tools
+    mcp_config: String,      // where mcp.json is
 }
 
 #[derive(Debug, Clone)]
@@ -514,7 +552,9 @@ enum Message {
     Minimize,
     CloseWindow,
     ResizeWindow(iced::window::Direction),
-    WindowResized,
+    WindowResized(iced::Size),
+    OpenPlus,
+    PlusAt(Option<iced::Rectangle>),
     Maximized(bool),
     ToggleRail,
     ToggleLoadLast,
@@ -527,6 +567,19 @@ enum Message {
     Harness(Result<Json, String>),
     Memory(Result<Json, String>),
     Forget(usize),
+    MemoryDraft(String),
+    AddMemory,
+    InstallSkill(bool), // from an archive (true) or a folder
+    SkillPicked(Option<String>),
+    SkillLink(String),
+    InstallLink,
+    OpenSkillLink, // the + menu: the rail, with its link field focused
+    Skills(Result<Json, String>),
+    RemoveSkill(String),
+    Mcp(Result<Json, String>),
+    McpReload,
+    McpImport,
+    McpEdit,
 }
 
 impl App {
@@ -574,12 +627,19 @@ impl App {
             tools,
             repaint: false,
             maximized: false,
+            window: iced::Size::new(1180.0, 780.0),
+            plus_at: None,
             rail,
             load_last,
             last_model,
             system: Json::Null,
             tasks: Vec::new(),
             memory: Vec::new(),
+            memory_draft: String::new(),
+            skills: Vec::new(),
+            skill_link: String::new(),
+            mcp: Vec::new(),
+            mcp_config: String::new(),
         };
         (app, Task::perform(blocking(move || connect(&addr)), Message::Connected))
     }
@@ -598,8 +658,8 @@ impl App {
                 self.set_models(&models);
                 self.set_chats(&chats);
                 self.status = String::new();
-                self.menu = match self.start.menu.take().as_deref() {
-                    Some("plus") => Some(Menu::Plus),
+                let menu = self.start.menu.take();
+                self.menu = match menu.as_deref() {
                     Some("chat") => Some(Menu::Chat),
                     Some("settings") => Some(Menu::Settings),
                     _ => None,
@@ -607,7 +667,13 @@ impl App {
                 if self.model.is_none() {
                     self.status = "Loading the model…".into();
                 }
-                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.wait_for_model()]);
+                // the + menu opens as a click opens it: once the button is on screen
+                let plus = match menu.as_deref() {
+                    Some("plus") => Task::done(Message::OpenPlus),
+                    Some("skill-link") => Task::done(Message::OpenSkillLink),
+                    _ => Task::none(),
+                };
+                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras(), self.wait_for_model(), plus]);
                 if let Some(id) = self.start.open.take() {
                     return Task::batch([system, self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded)]);
                 }
@@ -782,7 +848,16 @@ impl App {
             Message::CloseWindow => return iced::exit(),
             Message::ResizeWindow(d) => return iced::window::latest().and_then(move |id| iced::window::drag_resize(id, d)),
             // maximized by the button, a double click, snapping or Win+Up: the size changes every time
-            Message::WindowResized => return iced::window::latest().and_then(iced::window::is_maximized).map(Message::Maximized),
+            Message::WindowResized(size) => {
+                self.window = size;
+                return iced::window::latest().and_then(iced::window::is_maximized).map(Message::Maximized);
+            }
+            // the + menu: find the button on screen first, then open the menu above it
+            Message::OpenPlus => return iced::widget::selector::find(iced::widget::selector::id("plus")).map(|t| Message::PlusAt(t.map(|t| t.bounds()))),
+            Message::PlusAt(at) => {
+                self.plus_at = at;
+                self.menu = Some(Menu::Plus);
+            }
             Message::Maximized(m) => self.maximized = m,
             Message::ToggleLoadLast => {
                 self.load_last = !self.load_last;
@@ -830,6 +905,86 @@ impl App {
             Message::Harness(Err(e)) => self.status = format!("Couldn't save the folders: {e}"),
             Message::Memory(Ok(j)) => self.memory = j.get("facts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
             Message::Memory(Err(e)) => self.status = format!("Couldn't read the memory: {e}"),
+            Message::MemoryDraft(d) => self.memory_draft = d,
+            Message::AddMemory => {
+                let fact = std::mem::take(&mut self.memory_draft);
+                if !fact.trim().is_empty() {
+                    let body = obj(vec![("fact", str(fact.trim()))]);
+                    return self.call(move |api| api.post("/api/memory/add", &body), Message::Memory);
+                }
+            }
+            Message::InstallSkill(archive) => {
+                self.menu = None;
+                return Task::perform(
+                    blocking(move || {
+                        let d = rfd::FileDialog::new();
+                        let picked = if archive { d.set_title("Choose a skill archive").add_filter("Skill", &["zip", "skill"]).pick_file() } else { d.set_title("Choose a skill's folder (it has a SKILL.md)").pick_folder() };
+                        picked.map(|p| p.display().to_string())
+                    }),
+                    Message::SkillPicked,
+                );
+            }
+            Message::SkillPicked(None) => {}
+            Message::SkillLink(l) => self.skill_link = l,
+            Message::InstallLink => {
+                let link = std::mem::take(&mut self.skill_link);
+                if !link.trim().is_empty() {
+                    self.status = "Downloading the skill…".into();
+                    let body = obj(vec![("path", str(link.trim()))]);
+                    return self.call(move |api| api.post("/api/skills/install", &body), Message::Skills);
+                }
+            }
+            Message::OpenSkillLink => {
+                self.menu = None;
+                // the field sits low in the rail: scrolled to, then focused
+                let focus = iced::widget::operation::snap_to_end("rail").chain(iced::widget::operation::focus("skill-link"));
+                if !self.rail {
+                    self.rail = true;
+                    self.save_settings();
+                    return Task::batch([self.refresh_system(), focus]);
+                }
+                return focus;
+            }
+            Message::SkillPicked(Some(path)) => {
+                let body = obj(vec![("path", str(&path))]);
+                return self.call(move |api| api.post("/api/skills/install", &body), Message::Skills);
+            }
+            Message::Skills(Ok(j)) => {
+                self.skills = j.get("skills").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("description").and_then(Json::as_str).unwrap_or("").to_string()))).collect();
+                if let Some(name) = j.get("installed").and_then(Json::as_str) {
+                    self.status = format!("Installed the {name} skill");
+                }
+            }
+            Message::Skills(Err(e)) => self.status = format!("Couldn't install the skill: {e}"),
+            Message::RemoveSkill(name) => {
+                let body = obj(vec![("name", str(&name))]);
+                return self.call(move |api| api.post("/api/skills/remove", &body), Message::Skills);
+            }
+            Message::Mcp(Ok(j)) => {
+                self.mcp = j.get("servers").and_then(Json::as_array).unwrap_or(&[]).iter().filter(|s| s.get("name").and_then(Json::as_str).is_some_and(|n| !n.is_empty())).filter_map(|s| {
+                    Some((s.get("name")?.as_str()?.to_string(), s.get("status").and_then(Json::as_str).unwrap_or("").to_string(), s.get("tools").and_then(Json::as_array).map_or(0, |t| t.len())))
+                }).collect();
+                if let Some(c) = j.get("config").and_then(Json::as_str) {
+                    self.mcp_config = c.to_string();
+                }
+                // servers still starting: look again in a moment
+                if self.mcp.iter().any(|m| m.1 == "starting") {
+                    return self.call(|api| { std::thread::sleep(std::time::Duration::from_secs(3)); api.get("/api/mcp") }, Message::Mcp);
+                }
+            }
+            Message::Mcp(Err(_)) => {}
+            Message::McpReload => {
+                return self.call(|api| { api.post("/api/mcp/reload", &Json::Null)?; std::thread::sleep(std::time::Duration::from_millis(500)); api.get("/api/mcp") }, Message::Mcp);
+            }
+            Message::McpImport => {
+                return self.call(|api| { api.post("/api/mcp/import-claude", &Json::Null)?; std::thread::sleep(std::time::Duration::from_millis(500)); api.get("/api/mcp") }, Message::Mcp);
+            }
+            // mcp.json in Notepad; Reload picks the changes up
+            Message::McpEdit => {
+                if !self.mcp_config.is_empty() {
+                    let _ = std::process::Command::new("notepad").arg(&self.mcp_config).spawn();
+                }
+            }
             Message::Forget(i) => {
                 let body = obj(vec![("index", num(i as f64))]);
                 return self.call(move |api| api.post("/api/memory/forget", &body), Message::Memory);
@@ -916,6 +1071,11 @@ impl App {
     }
 
     /// What the model remembers (the rail shows it, with a remove button for each).
+    /// The installed skills and the MCP servers (the rail lists them).
+    fn refresh_extras(&self) -> Task<Message> {
+        Task::batch([self.call(|api| api.get("/api/skills"), Message::Skills), self.call(|api| api.get("/api/mcp"), Message::Mcp)])
+    }
+
     fn refresh_memory(&self) -> Task<Message> {
         self.call(|api| api.get("/api/memory"), Message::Memory)
     }
@@ -989,7 +1149,7 @@ impl App {
 
     /// The ghost's clock: a tick a few times a second (the sprite moves in steps, so no more is needed).
     fn subscription(&self) -> iced::Subscription<Message> {
-        let resized = iced::window::resize_events().map(|_| Message::WindowResized);
+        let resized = iced::window::resize_events().map(|(_, size)| Message::WindowResized(size));
         let tick = iced::Subscription::run(|| {
             use iced::futures::StreamExt;
             let (tx, rx) = mpsc::unbounded::<()>();
@@ -1159,7 +1319,7 @@ impl App {
             }
             "done" => {
                 self.finish(&s("finish"));
-                return Task::batch([self.refresh_system(), self.refresh_memory()]); // the reply may have changed what the GPU holds
+                return Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras()]); // the reply may have changed what the GPU holds
             }
             "error" => {
                 self.status = s("message");

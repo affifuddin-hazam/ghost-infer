@@ -37,7 +37,9 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"get_system_info","description":"Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.","parameters":{"type":"object","properties":{},"required":[]}}},
   {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for a job of several steps; the user sees it beside the chat. Send the whole list every time. Mark one task in_progress while you work on it, and done as soon as it is finished.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
   {"type":"function","function":{"name":"remember","description":"Save a lasting fact about the user or this computer for future chats: a preference, where their projects live, how a program runs here. Not for details of one task.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
-  {"type":"function","function":{"name":"forget","description":"Forget a remembered fact that is wrong or no longer true.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact as it was saved"}},"required":["fact"]}}}
+  {"type":"function","function":{"name":"forget","description":"Forget a remembered fact that is wrong or no longer true.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact as it was saved"}},"required":["fact"]}}},
+  {"type":"function","function":{"name":"search_chats","description":"Search the user's earlier chats with you, for when they refer to something you talked about before. Returns matching chats with their id, title, date and the lines that match.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Words to look for"}},"required":["query"]}}},
+  {"type":"function","function":{"name":"read_chat","description":"Read an earlier chat found with search_chats.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The chat's id"}},"required":["id"]}}}
  ],
  "files": [
   {"type":"function","function":{"name":"read_file","description":"Read a text file, with line numbers. For a big file, read part of it with offset and limit.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"offset":{"type":"integer","description":"First line to read, from 1"},"limit":{"type":"integer","description":"How many lines (default 300)"}},"required":["path"]}}},
@@ -65,15 +67,19 @@ fn tool_groups() -> &'static Json {
     T.get_or_init(|| Json::parse(TOOLS).expect("the built-in tool list is valid JSON"))
 }
 
-/// The tools of these groups (and the system one), as the chat template's "tools".
+/// The tools of these groups (and the system one), as the chat template's "tools": use_skill when skills are
+/// installed, and the MCP servers' tools when the mcp group is on.
 fn tools_for(groups: &[String]) -> Vec<Json> {
     let all = tool_groups();
-    std::iter::once("system")
-        .chain(groups.iter().map(String::as_str))
-        .filter_map(|g| all.get(g).and_then(Json::as_array))
-        .flatten()
-        .cloned()
-        .collect()
+    let mut tools: Vec<Json> = std::iter::once("system").chain(groups.iter().map(String::as_str)).filter_map(|g| all.get(g).and_then(Json::as_array)).flatten().cloned().collect();
+    if !super::skills::list().is_empty() {
+        let t = r#"{"type":"function","function":{"name":"use_skill","description":"Load a skill's instructions (the skills are listed in the system prompt). Call it before a task one of them is for.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The skill's name"}},"required":["name"]}}}"#;
+        tools.push(Json::parse(t).expect("valid tool"));
+    }
+    if groups.iter().any(|g| g == "mcp") {
+        tools.extend(super::mcp::tools());
+    }
+    tools
 }
 
 /// The group whose calls need the user's OK, if any.
@@ -82,6 +88,7 @@ fn approval_group(name: &str) -> Option<&'static str> {
         "write_file" | "edit_file" => Some("edit"),
         "run_command" | "start_process" => Some("cmd"),
         "web_search" | "fetch_url" => Some("web"),
+        n if n.starts_with("mcp__") => Some("mcp"),
         _ => None,
     }
 }
@@ -94,7 +101,7 @@ fn tool_prompt(folders: &[PathBuf]) -> String {
     } else {
         format!("You may use files in {} (relative paths start in {}).", list.join(", "), list[0])
     };
-    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. For a job of several steps, keep a task list with update_tasks. Save lasting facts with remember. Use tools until the task is done, then answer briefly.")
+    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. For a job of several steps, keep a task list with update_tasks. Save lasting facts with remember. When the user refers to an earlier conversation, look it up with search_chats. Use tools until the task is done, then answer briefly.")
 }
 
 // ---- memory: facts the model saved, kept in %LOCALAPPDATA%\ghost-infer\memory.json for every chat
@@ -126,6 +133,105 @@ pub fn forget_at(index: usize) -> Result<Vec<String>, String> {
     facts.remove(index);
     save_memory(&facts)?;
     Ok(facts)
+}
+
+/// A fact the user adds by hand (the rail's field); the facts.
+pub fn add_fact(fact: &str) -> Result<Vec<String>, String> {
+    let fact = fact.trim();
+    if fact.is_empty() {
+        return Err("the fact is empty".into());
+    }
+    let mut facts = memory();
+    if !facts.iter().any(|f| f.trim().eq_ignore_ascii_case(fact)) {
+        facts.push(fact.to_string());
+        save_memory(&facts)?;
+    }
+    Ok(facts)
+}
+
+// ---- earlier chats: search_chats and read_chat
+
+/// A chat's text as the model reads it: what the user and the assistant said, without tool calls or thinking.
+fn chat_text(c: &Json) -> Vec<(String, String)> {
+    c.get("messages")
+        .and_then(Json::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|m| {
+            let who = match m.get("role").and_then(Json::as_str)? {
+                "user" => "User",
+                "assistant" => "Assistant",
+                _ => return None,
+            };
+            let text = m.get("content").and_then(Json::as_str)?;
+            let text = text.rsplit("</think>").next().unwrap_or(text).trim();
+            (!text.is_empty()).then(|| (who.to_string(), text.to_string()))
+        })
+        .collect()
+}
+
+/// The search_chats tool: chats whose title or text has the query's words, best first, with matching lines.
+fn search_chats(query: &str, current: &str) -> String {
+    let words: Vec<String> = query.to_lowercase().split_whitespace().filter(|w| w.len() > 1).map(String::from).collect();
+    if words.is_empty() {
+        return "Error: give some words to look for".into();
+    }
+    let Ok(dir) = chats_dir() else { return "Error: the chats cannot be read".into() };
+    let mut hits: Vec<(usize, f64, String)> = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some(c) = std::fs::read_to_string(e.path()).ok().and_then(|t| Json::parse(&t).ok()) else { continue };
+        let id = c.get("id").and_then(Json::as_str).unwrap_or("").to_string();
+        if id == current || id.is_empty() {
+            continue;
+        }
+        let title = c.get("title").and_then(Json::as_str).unwrap_or("").to_string();
+        let lines = chat_text(&c);
+        let score_of = |t: &str| {
+            let t = t.to_lowercase();
+            words.iter().filter(|w| t.contains(w.as_str())).count()
+        };
+        let mut score = 3 * score_of(&title);
+        let mut matched = Vec::new();
+        for (who, text) in &lines {
+            for line in text.lines() {
+                let n = score_of(line);
+                if n > 0 {
+                    score += n;
+                    if matched.len() < 3 {
+                        matched.push(format!("  {who}: {}", crate::tools::clip(line.trim(), 200)));
+                    }
+                }
+            }
+        }
+        if score > 0 {
+            let at = c.get("updated").and_then(Json::as_f64).unwrap_or(0.0);
+            let days = ((now_ms() - at) / 86_400_000.0).floor() as i64;
+            let when = match days {
+                ..=0 => "today".to_string(),
+                1 => "yesterday".to_string(),
+                d => format!("{d} days ago"),
+            };
+            hits.push((score, at, format!("- id {id}: \"{title}\" ({when})\n{}", matched.join("\n"))));
+        }
+    }
+    if hits.is_empty() {
+        return format!("No earlier chat mentions {query}.");
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+    let list: Vec<String> = hits.into_iter().take(5).map(|h| h.2).collect();
+    format!("{}\n\nRead one with read_chat and its id.", list.join("\n"))
+}
+
+/// The read_chat tool: an earlier chat's conversation (its end, when long).
+fn read_chat(id: &str) -> String {
+    match load_chat(id.trim()) {
+        Ok(c) => {
+            let title = c.get("title").and_then(Json::as_str).unwrap_or("");
+            let text: Vec<String> = chat_text(&c).into_iter().map(|(who, t)| format!("{who}: {t}")).collect();
+            crate::tools::clip(&format!("Chat \"{title}\":\n\n{}", text.join("\n\n")), 12000)
+        }
+        Err(_) => format!("Error: no chat with id {id}"),
+    }
 }
 
 /// The remember and forget tools; their result for the model.
@@ -292,6 +398,7 @@ struct Request {
     max_tokens: usize,
     groups: Vec<String>,
     memory: String, // the remembered facts as the reply started
+    skills: String, // the installed skills, likewise
 }
 
 impl Request {
@@ -306,6 +413,7 @@ impl Request {
             max_tokens: f("max_tokens").map(|n| n.max(1.0) as usize).unwrap_or(shared.defaults.3),
             groups: b.get("tools").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect()).unwrap_or_default(),
             memory: memory_prompt(),
+            skills: super::skills::prompt(),
         }
     }
 }
@@ -378,7 +486,7 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
 /// The prompt for these messages: the client's system text plus where tools may work, then the chat.
 fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
     let folders = shared.harness.lock().unwrap().folders.clone();
-    let system = [req.system.trim().to_string(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders) }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let system = [req.system.trim().to_string(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut messages = Vec::new();
     if !system.is_empty() {
         messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));
@@ -599,6 +707,19 @@ fn call(conn: &mut TcpStream, id: &str, name: &str, arguments: &str, chat: &Chat
                 _ => return Ok(("The user declined this action. Do not try it again. If there is no other way to proceed, explain the situation clearly and stop.".into(), true)),
             }
         }
+    }
+    if name == "use_skill" {
+        let args = Json::parse(arguments).unwrap_or(Json::Null);
+        return Ok((super::skills::use_skill(args.get("name").and_then(Json::as_str).unwrap_or("")), false));
+    }
+    if name == "search_chats" || name == "read_chat" {
+        let args = Json::parse(arguments).unwrap_or(Json::Null);
+        let s = |k: &str| args.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+        return Ok((if name == "search_chats" { search_chats(&s("query"), &chat.id) } else { read_chat(&s("id")) }, false));
+    }
+    if name.starts_with("mcp__") {
+        let args = if arguments.trim().is_empty() { Json::Obj(Vec::new()) } else { Json::parse(arguments).unwrap_or(Json::Null) };
+        return Ok((super::mcp::call(name, &args), false));
     }
     if name == "remember" || name == "forget" {
         return Ok((memory_tool(name, &Json::parse(arguments).unwrap_or(Json::Null)), false));

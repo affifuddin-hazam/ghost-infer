@@ -17,6 +17,8 @@ use crate::tokenizer::Utf8Stream;
 use crate::{ChatFormat, Engine, Opts};
 
 mod agent;
+mod mcp;
+mod skills;
 
 const MAX_BODY: usize = 32 << 20;
 
@@ -116,6 +118,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         harness: Mutex::new(crate::tools::Settings::load()),
         token: new_token(),
     });
+    std::thread::spawn(mcp::start_all); // the MCP servers in mcp.json, while the model loads
     let (work, rx) = mpsc::channel::<Work>();
     let s = shared.clone();
     std::thread::spawn(move || {
@@ -454,7 +457,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let (defaults, think_default) = (shared.defaults, shared.think_default);
     // the agent tools and their settings: private to the chat page on this computer
     let path = req.path.trim_end_matches('/');
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit"].iter().any(|p| path.starts_with(p)) {
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
@@ -534,8 +537,40 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             // ends the server, which frees the GPU
             ("POST", "/api/quit") => {
                 respond_private(&mut conn, 200, &obj(vec![("quitting", Json::Bool(true))]))?;
+                mcp::stop_all();
                 std::process::exit(0)
             }
+            // a fact the user adds: {"fact": "..."}
+            ("POST", "/api/memory/add") => match agent::add_fact(body().ok().and_then(|b| b.get("fact").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
+                Ok(facts) => respond_private(&mut conn, 200, &obj(vec![("facts", Json::Arr(facts.iter().map(|f| str(f)).collect()))])),
+                Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+            },
+            // skills: the installed ones, install from a folder, archive or link {"path"}, remove {"name"}
+            ("GET", "/api/skills") => respond_private(&mut conn, 200, &obj(vec![("skills", skills::list_json())])),
+            ("POST", "/api/skills/install") => match skills::install(body().ok().and_then(|b| b.get("path").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
+                Ok(name) => respond_private(&mut conn, 200, &obj(vec![("installed", str(&name)), ("skills", skills::list_json())])),
+                Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+            },
+            ("POST", "/api/skills/remove") => match skills::remove(body().ok().and_then(|b| b.get("name").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
+                Ok(()) => respond_private(&mut conn, 200, &obj(vec![("skills", skills::list_json())])),
+                Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
+            },
+            // MCP servers: their state; reload after editing mcp.json; import Claude Desktop's
+            ("GET", "/api/mcp") => {
+                let config = mcp::ensure_config().unwrap_or_default();
+                respond_private(&mut conn, 200, &obj(vec![("servers", mcp::status()), ("config", str(&config))]))
+            }
+            ("POST", "/api/mcp/reload") => {
+                std::thread::spawn(mcp::start_all);
+                respond_private(&mut conn, 200, &obj(vec![("reloading", Json::Bool(true))]))
+            }
+            ("POST", "/api/mcp/import-claude") => match mcp::import_claude() {
+                Ok(added) => {
+                    std::thread::spawn(mcp::start_all);
+                    respond_private(&mut conn, 200, &obj(vec![("added", Json::Arr(added.iter().map(|n| str(n)).collect()))]))
+                }
+                Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
+            },
             // what the model remembers, and the user's remove button: {"index": n}
             ("GET", "/api/memory") => respond_private(&mut conn, 200, &obj(vec![("facts", Json::Arr(agent::memory().iter().map(|f| str(f)).collect()))])),
             ("POST", "/api/memory/forget") => {

@@ -1,0 +1,307 @@
+//! Skills, in the Agent Skills format Claude uses (agentskills.io): a folder with a SKILL.md, YAML front matter
+//! with a name and a description, then instructions, plus any files those refer to. They are installed into
+//! %LOCALAPPDATA%\ghost-infer\skills\<name>. The model sees every skill's name and description; use_skill
+//! gives it a skill's instructions when a task fits, and its other files stay readable for when they are needed.
+
+use std::path::{Path, PathBuf};
+
+use crate::json::{obj, str, Json};
+
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub dir: PathBuf,
+}
+
+fn root() -> Result<PathBuf, String> {
+    let d = crate::tools::skills_dir().ok_or("LOCALAPPDATA is not set")?;
+    std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
+    Ok(d)
+}
+
+/// A SKILL.md's front matter fields and its body. Only what skills use: `key: value` lines, quoted or not,
+/// and `key: >` or `key: |` followed by indented lines.
+fn parse(text: &str) -> (Vec<(String, String)>, String) {
+    let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    let Some(rest) = text.strip_prefix("---\n") else { return (Vec::new(), text) };
+    let Some(end) = rest.find("\n---") else { return (Vec::new(), text.clone()) };
+    let (head, body) = (&rest[..end], rest[end + 4..].trim_start_matches(['-', '\n']));
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut block: Option<usize> = None; // the field a `>` or `|` block belongs to
+    for line in head.lines() {
+        if let (Some(i), true) = (block, line.starts_with([' ', '\t'])) {
+            let v = &mut fields[i].1;
+            if !v.is_empty() {
+                v.push(' ');
+            }
+            v.push_str(line.trim());
+            continue;
+        }
+        block = None;
+        let Some((k, v)) = line.split_once(':') else { continue };
+        if k.starts_with([' ', '\t']) {
+            continue; // a nested map (metadata): not needed
+        }
+        let v = v.trim();
+        if matches!(v, ">" | "|" | ">-" | "|-") {
+            fields.push((k.trim().to_string(), String::new()));
+            block = Some(fields.len() - 1);
+        } else {
+            fields.push((k.trim().to_string(), v.trim_matches(|c| c == '"' || c == '\'').to_string()));
+        }
+    }
+    (fields, body.to_string())
+}
+
+fn read(dir: &Path) -> Option<Skill> {
+    let text = std::fs::read_to_string(dir.join("SKILL.md")).ok()?;
+    let (fields, _) = parse(&text);
+    let get = |k: &str| fields.iter().find(|(f, _)| f == k).map(|(_, v)| v.clone()).filter(|v| !v.is_empty());
+    let folder = dir.file_name()?.to_string_lossy().to_string();
+    Some(Skill { name: get("name").unwrap_or(folder), description: get("description").unwrap_or_default(), dir: dir.to_path_buf() })
+}
+
+/// The installed skills, by name.
+pub fn list() -> Vec<Skill> {
+    let Ok(root) = root() else { return Vec::new() };
+    let mut skills: Vec<Skill> = std::fs::read_dir(root).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).filter_map(|e| read(&e.path())).collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+pub fn list_json() -> Json {
+    Json::Arr(list().iter().map(|s| obj(vec![("name", str(&s.name)), ("description", str(&s.description))])).collect())
+}
+
+/// What the system prompt says about the skills, or nothing when none are installed.
+pub fn prompt() -> String {
+    let skills = list();
+    if skills.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = skills.iter().map(|s| format!("- {}: {}", s.name, crate::tools::clip(&s.description, 400))).collect();
+    format!("Skills you can use. When a task matches one, call use_skill with its name before you start, then follow its instructions:\n{}", lines.join("\n"))
+}
+
+/// The use_skill tool: a skill's instructions, and where its other files are.
+pub fn use_skill(name: &str) -> String {
+    let skills = list();
+    let Some(s) = skills.iter().find(|s| s.name.eq_ignore_ascii_case(name.trim())) else {
+        return format!("Error: no skill named {name}. The skills are: {}", skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
+    };
+    let text = std::fs::read_to_string(s.dir.join("SKILL.md")).unwrap_or_default();
+    let (_, body) = parse(&text);
+    let dir = s.dir.display().to_string();
+    format!(
+        "{}\n\n(This skill's folder is {dir}. Read the files it mentions with read_file, using full paths in that folder; run its scripts with run_command and cwd set to that folder.)",
+        crate::tools::clip(body.trim(), 24000)
+    )
+}
+
+/// A skill name as the format allows: lowercase letters, digits and single hyphens.
+fn clean_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().to_lowercase().chars() {
+        let c = if c.is_ascii_alphanumeric() { c } else { '-' };
+        if !(c == '-' && (out.is_empty() || out.ends_with('-'))) {
+            out.push(c);
+        }
+    }
+    out.trim_end_matches('-').chars().take(64).collect()
+}
+
+/// Every folder with a SKILL.md under `dir`, a few levels down (a repository can hold many skills).
+fn skill_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 5 {
+        return;
+    }
+    let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.ends_with(".git")).collect();
+    subs.sort();
+    for p in subs {
+        if p.join("SKILL.md").is_file() {
+            out.push(p);
+        } else {
+            skill_dirs(&p, depth + 1, out);
+        }
+    }
+}
+
+/// The one skill in `dir`: itself, or the only one below it. With several, which they are.
+fn locate(dir: &Path) -> Result<PathBuf, String> {
+    if dir.join("SKILL.md").is_file() {
+        return Ok(dir.to_path_buf());
+    }
+    let mut found = Vec::new();
+    skill_dirs(dir, 0, &mut found);
+    match found.len() {
+        0 => Err("there is no SKILL.md in it".into()),
+        1 => Ok(found.remove(0)),
+        n => {
+            let names: Vec<String> = found.iter().take(8).map(|p| p.strip_prefix(dir).unwrap_or(p).display().to_string().replace('\\', "/")).collect();
+            let more = if n > 8 { ", …" } else { "" };
+            Err(format!("it has {n} skills ({}{more}). Install them one at a time, from the link or folder of each", names.join(", ")))
+        }
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)?.flatten() {
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if e.file_name() == ".git" {
+            continue;
+        }
+        if src.is_dir() {
+            copy_dir(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Unpacks a .zip / .skill archive into `into` (Windows' own tar reads zip archives).
+fn unpack(file: &Path, into: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(into).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("tar").arg("-xf").arg(file).arg("-C").arg(into).output().map_err(|e| format!("cannot unpack it: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("cannot unpack it: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+/// A GitHub link as what to download and, for a repository's zip, the folder in it to install from:
+/// github.com/<o>/<r>, …/tree/<ref>/<folder>, …/blob/<ref>/<folder>/SKILL.md, raw.githubusercontent.com/<o>/<r>/<ref>/<folder>/SKILL.md.
+/// A link to an archive in a repository downloads just that file.
+fn github(url: &str) -> Option<(String, Option<String>)> {
+    let rest = url.split_once("://")?.1.split(['?', '#']).next()?.trim_end_matches('/');
+    let (host, path) = rest.split_once('/')?;
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let (owner, repo, reference, mut sub) = match (host.trim_start_matches("www."), parts.as_slice()) {
+        ("github.com", [o, r]) => (*o, r.trim_end_matches(".git"), "HEAD", Vec::new()),
+        ("github.com", [o, r, "tree" | "blob", reference, sub @ ..]) => (*o, *r, *reference, sub.to_vec()),
+        ("raw.githubusercontent.com", [o, r, reference, sub @ ..]) => (*o, *r, *reference, sub.to_vec()),
+        _ => return None,
+    };
+    let last = sub.last().map(|l| l.to_lowercase()).unwrap_or_default();
+    if last.ends_with(".zip") || last.ends_with(".skill") {
+        return Some((format!("https://raw.githubusercontent.com/{owner}/{repo}/{reference}/{}", sub.join("/")), None));
+    }
+    if last.ends_with(".md") {
+        sub.pop();
+    }
+    Some((format!("https://codeload.github.com/{owner}/{repo}/zip/{reference}"), Some(sub.join("/"))))
+}
+
+/// Downloads a skill into `tmp`; the folder holding it.
+fn download(url: &str, tmp: &Path) -> Result<PathBuf, String> {
+    let (fetch, sub) = github(url).unwrap_or((url.to_string(), None));
+    let file = tmp.join("download");
+    std::fs::create_dir_all(tmp).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "--max-time", "300", "--max-filesize", "500000000", "-A", "ghost-infer", "-o"])
+        .arg(&file)
+        .arg(&fetch)
+        .output()
+        .map_err(|e| format!("cannot download it: {e}"))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim().trim_start_matches("curl: ");
+        let why = why.split_once(") ").map_or(why, |(_, w)| w);
+        if why.ends_with("error: 404") {
+            return Err("nothing is at that link (404)".into());
+        }
+        return Err(format!("cannot download it: {why}"));
+    }
+    let dir = tmp.join("files");
+    let head = std::fs::read(&file).map_err(|e| e.to_string())?;
+    if head.starts_with(b"PK") {
+        unpack(&file, &dir)?;
+    } else if String::from_utf8_lossy(&head[..head.len().min(64)]).trim_start_matches('\u{feff}').trim_start().starts_with("---") {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::rename(&file, dir.join("SKILL.md")).map_err(|e| e.to_string())?;
+    } else {
+        return Err("that link gives neither a skill archive nor a SKILL.md".into());
+    }
+    let Some(sub) = sub else { return locate(&dir) };
+    // a repository's zip holds one folder, <repo>-<ref>
+    let top = std::fs::read_dir(&dir).ok().and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.is_dir())).ok_or("the repository's download is empty")?;
+    let base = if sub.is_empty() { top } else { top.join(&sub) };
+    if !base.is_dir() {
+        return Err(format!("the repository has no folder {sub}"));
+    }
+    locate(&base)
+}
+
+/// Installs a skill from a folder or a .zip / .skill archive (with SKILL.md in it, or as the only skill
+/// below it), or from a link: GitHub (a repository, a folder in one, or its SKILL.md) or a direct
+/// link to an archive or a SKILL.md. A skill of the same name is replaced. Its name.
+pub fn install(source: &str) -> Result<String, String> {
+    let root = root()?;
+    let source = source.trim().trim_matches('"');
+    let tmp = root.join(format!(".install-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let result = (|| {
+        let src = PathBuf::from(source);
+        let dir = if source.starts_with("https://") || source.starts_with("http://") {
+            download(source, &tmp)?
+        } else if src.is_dir() {
+            locate(&src).map_err(|e| format!("that folder has no skill: {e}"))?
+        } else if src.is_file() {
+            unpack(&src, &tmp)?;
+            locate(&tmp)?
+        } else {
+            return Err(format!("{source} is not a folder, a file or a link"));
+        };
+        let skill = read(&dir).ok_or("its SKILL.md cannot be read")?;
+        let name = clean_name(&skill.name);
+        if name.is_empty() {
+            return Err("its SKILL.md has no usable name".to_string());
+        }
+        let target = root.join(&name);
+        if target.exists() {
+            std::fs::remove_dir_all(&target).map_err(|e| format!("cannot replace the installed {name}: {e}"))?;
+        }
+        copy_dir(&dir, &target).map_err(|e| format!("cannot copy it: {e}"))?;
+        Ok(name)
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Removes an installed skill.
+pub fn remove(name: &str) -> Result<(), String> {
+    let name = clean_name(name);
+    let dir = root()?.join(&name);
+    if name.is_empty() || !dir.join("SKILL.md").is_file() {
+        return Err("no such skill".into());
+    }
+    std::fs::remove_dir_all(dir).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn front_matter() {
+        let (f, body) = parse("---\nname: pdf-tools\ndescription: >\n  Fill PDF forms.\n  Use for PDFs.\nmetadata:\n  author: x\n---\n# Steps\nDo it.");
+        assert_eq!(f[0], ("name".into(), "pdf-tools".into()));
+        assert_eq!(f[1], ("description".into(), "Fill PDF forms. Use for PDFs.".into()));
+        assert!(body.starts_with("# Steps"));
+        assert_eq!(clean_name("My Skill__v2"), "my-skill-v2");
+    }
+
+    #[test]
+    fn github_links() {
+        let zip = |r: &str| format!("https://codeload.github.com/a/b/zip/{r}");
+        assert_eq!(github("https://github.com/a/b"), Some((zip("HEAD"), Some(String::new()))));
+        assert_eq!(github("https://github.com/a/b.git/"), Some((zip("HEAD"), Some(String::new()))));
+        assert_eq!(github("https://github.com/a/b/tree/main/skills/pdf"), Some((zip("main"), Some("skills/pdf".into()))));
+        assert_eq!(github("https://github.com/a/b/blob/main/skills/pdf/SKILL.md"), Some((zip("main"), Some("skills/pdf".into()))));
+        assert_eq!(github("https://raw.githubusercontent.com/a/b/main/x/SKILL.md"), Some((zip("main"), Some("x".into()))));
+        assert_eq!(github("https://github.com/a/b/blob/main/dist/x.zip"), Some(("https://raw.githubusercontent.com/a/b/main/dist/x.zip".into(), None)));
+        assert_eq!(github("https://github.com/a/b/releases/download/v1/x.zip"), None);
+        assert_eq!(github("https://example.com/x.zip"), None);
+    }
+}
