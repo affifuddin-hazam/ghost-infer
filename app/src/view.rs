@@ -117,6 +117,7 @@ mod ic {
     pub const TODO: char = '\u{EA3A}';
     pub const OPEN_PANE: char = '\u{E8A0}';
     pub const UP: char = '\u{E74A}';
+    pub const CHEVRON_UP: char = '\u{E70E}';
     pub const STOP: char = '\u{E71A}';
     pub const RIGHT: char = '\u{E76C}';
     pub const DOWN: char = '\u{E70D}';
@@ -158,6 +159,7 @@ fn tool_icon(name: &str) -> char {
         "use_skill" => ic::SKILL,
         "search_chats" => ic::SEARCH,
         "read_chat" => ic::CHAT,
+        "check_work" => ic::RETRY,
         n if n.starts_with("mcp__") => ic::PLUG,
         _ => ic::PC,
     }
@@ -733,7 +735,56 @@ impl App {
             .menu_style(move |t| menu_style(s, t));
         let folder = row![icon(ic::FOLDER, 12).color(s.muted), text(self.folder_label()).size(13).color(s.muted)].spacing(7).align_y(Alignment::Center);
         let under = row![container(folder).padding([4, 8]), Space::new().width(Fill), model, think].spacing(2).align_y(Alignment::Center).padding(Padding { top: 8.0, right: 4.0, bottom: 0.0, left: 4.0 });
-        column![perch, card, under].into()
+        match self.plan() {
+            Some(plan) => column![plan, perch, card, under].into(),
+            None => column![perch, card, under].into(),
+        }
+    }
+
+    /// The model's task list pinned above the message box: the step it is on and how far along it is, and the
+    /// steps themselves when open (until all are done, unless opened or closed by hand).
+    fn plan(&self) -> Option<Element<'_, Message>> {
+        if self.tasks.is_empty() {
+            return None;
+        }
+        let s = self.skin();
+        let done = self.tasks.iter().filter(|t| t.1 == "done").count();
+        let total = self.tasks.len();
+        let open = self.plan_shown();
+        let now = self.tasks.iter().find(|t| t.1 == "in_progress").or_else(|| self.tasks.iter().find(|t| t.1 != "done"));
+        let title = match now {
+            Some((task, _)) => task.clone(),
+            None if total == 1 => "The task is done".to_string(),
+            None => format!("All {total} tasks done"),
+        };
+        let head = row![
+            icon(if done == total { ic::CHECK } else { ic::TASKS }, 12).color(if done == total { s.ok } else { s.accent }),
+            container(text(title).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+            text(format!("{done} of {total}")).size(12.5).color(s.faint),
+            icon(if open { ic::DOWN } else { ic::CHEVRON_UP }, 8).color(s.faint),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        let head = button(head).on_press(Message::TogglePlan).width(Fill).padding([7, 10]).style(move |_, st| bare(s, st));
+        let mut body = column![head];
+        if open {
+            let steps = column(self.tasks.iter().map(|(task, status)| {
+                let (mark, mc, tc) = match status.as_str() {
+                    "done" => (ic::CHECK, s.ok, s.faint),
+                    "in_progress" => (ic::NOW, s.accent, s.text),
+                    _ => (ic::TODO, s.faint, s.muted),
+                };
+                row![icon(mark, 10).color(mc).width(14), text(task.clone()).size(13).color(tc).width(Fill)].spacing(10).align_y(Alignment::Center).padding([4, 0]).into()
+            }));
+            let steps = scrollable(container(steps).padding(Padding { top: 0.0, right: 12.0, bottom: 8.0, left: 10.0 })).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st));
+            body = body.push(container(steps).max_height(190));
+        }
+        let card = container(body).padding(2).width(Fill).style(move |_| container::Style {
+            background: Some(Background::Color(s.raise)),
+            border: Border { radius: 14.0.into(), width: 1.0, color: s.line2 },
+            ..Default::default()
+        });
+        Some(container(card).padding(Padding { bottom: 6.0, ..Padding::ZERO }).into())
     }
 
     fn status_text(&self) -> String {

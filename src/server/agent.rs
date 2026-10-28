@@ -35,7 +35,7 @@ const MAX_ROUNDS: usize = 40;
 const TOOLS: &str = r#"{
  "system": [
   {"type":"function","function":{"name":"get_system_info","description":"Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.","parameters":{"type":"object","properties":{},"required":[]}}},
-  {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for a job of several steps; the user sees it beside the chat. Send the whole list every time. Mark one task in_progress while you work on it, and done as soon as it is finished.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
+  {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for any job of more than one step; the user sees it pinned above the message box. Send the whole list every time. Mark one task in_progress while you work on it, and done as soon as it is finished.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
   {"type":"function","function":{"name":"remember","description":"Save a lasting fact about the user or this computer for future chats: a preference, where their projects live, how a program runs here. Not for details of one task.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"forget","description":"Forget a remembered fact that is wrong or no longer true.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact as it was saved"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"search_chats","description":"Search the user's earlier chats with you, for when they refer to something you talked about before. Returns matching chats with their id, title, date and the lines that match.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Words to look for"}},"required":["query"]}}},
@@ -93,15 +93,51 @@ fn approval_group(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Told to the model when tools are on: where it may work, and how this computer runs commands.
-fn tool_prompt(folders: &[PathBuf]) -> String {
+/// Told to the model when tools are on: where it may work, how this computer runs commands, and (when it may
+/// run them) to check what it changes.
+fn tool_prompt(folders: &[PathBuf], can_run: bool) -> String {
     let list: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
     let where_ = if list.is_empty() {
         "No folders are allowed yet, so file tools will fail; if you need files, ask the user to add a folder in Settings.".to_string()
     } else {
         format!("You may use files in {} (relative paths start in {}).", list.join(", "), list[0])
     };
-    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. For a job of several steps, keep a task list with update_tasks. Save lasting facts with remember. When the user refers to an earlier conversation, look it up with search_chats. Use tools until the task is done, then answer briefly.")
+    let check = if can_run { " After you change code, check it: run it or its tests with run_command. If something fails, fix it and run it again. Say it is done only once it works, and say how you checked." } else { "" };
+    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. Unless the task is one quick step, start by writing a short plan with update_tasks (2 to 6 steps), mark the step you start in_progress and each finished one done, and change the plan when the work shows it should change. Save lasting facts with remember. When the user refers to an earlier conversation, look it up with search_chats.{check} Use tools until the task is done, then answer briefly.")
+}
+
+/// Files whose changes can be checked by running something (a notes file is not).
+const CODE: [&str; 31] = [
+    "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "c", "h", "cc", "cpp", "hpp", "cs", "rb", "php", "swift", "lua", "sh", "ps1", "bat", "cmd", "html", "css", "vue", "svelte", "sql", "dart",
+];
+
+fn is_code(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, ext)| CODE.iter().any(|c| c.eq_ignore_ascii_case(ext)))
+}
+
+/// What the harness says when a reply would end with changed code that nothing has run since.
+const NUDGE: &str = "(Automatic check) You changed code in this reply and have not run anything since. Check your work now: run the code or its tests with run_command. If something fails, fix it and run it again. If it cannot be run here, or the user asked you not to run it, say so in one line.";
+
+/// Put after the user's message while tools are on: told only in the system prompt, a small model often
+/// starts working without a plan.
+const PLAN_REMINDER: &str = "(Reminder from ghost: unless this takes one quick step, first call update_tasks with a short plan, then keep it up to date as you work.)";
+
+/// The chat as the model reads it for this reply: the user's message with the plan reminder after it. The
+/// chat keeps the message as written, so the reminder is never shown or saved.
+fn with_reminder(messages: &[Json], at: usize) -> Vec<Json> {
+    let mut out = messages.to_vec();
+    if let Some(Json::Obj(fields)) = out.get_mut(at) {
+        if let Some((_, Json::Str(text))) = fields.iter_mut().find(|(k, _)| k == "content") {
+            text.push_str("\n\n");
+            text.push_str(PLAN_REMINDER);
+        }
+    }
+    out
+}
+
+/// The harness's own messages in a chat (the nudge): not the user's, so retrying and searching pass them by.
+fn is_auto(m: &Json) -> bool {
+    m.get("auto").and_then(Json::as_bool).unwrap_or(false)
 }
 
 // ---- memory: facts the model saved, kept in %LOCALAPPDATA%\ghost-infer\memory.json for every chat
@@ -164,6 +200,7 @@ fn chat_text(c: &Json) -> Vec<(String, String)> {
         .iter()
         .filter_map(|m| {
             let who = match m.get("role").and_then(Json::as_str)? {
+                "user" if is_auto(m) => return None,
                 "user" => "User",
                 "assistant" => "Assistant",
                 _ => return None,
@@ -519,7 +556,7 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
         }
         // answer again: drop the reply after the last user message
         None => {
-            let last_user = chat.messages.iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user")).ok_or("this chat has no message to answer")?;
+            let last_user = chat.messages.iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m)).ok_or("this chat has no message to answer")?;
             chat.messages.truncate(last_user + 1);
         }
     }
@@ -559,7 +596,7 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
 /// The prompt for these messages: the client's system text plus where tools may work, then the chat.
 fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
     let folders = shared.harness.lock().unwrap().folders.clone();
-    let system = [req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let system = [req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders, tools.iter().any(|t| tool_name(t) == "run_command")) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut messages = Vec::new();
     if !system.is_empty() {
         messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));
@@ -604,13 +641,25 @@ fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sha
     Some(title.chars().take(80).collect())
 }
 
+fn tool_name(t: &Json) -> &str {
+    t.get("function").and_then(|f| f.get("name")).and_then(Json::as_str).unwrap_or("")
+}
+
 /// The model's rounds for one reply; Ok is how it finished ("stop", "length", or "rounds" at MAX_ROUNDS).
+/// A reply about to end with code it changed and nothing run since is sent back, once, to check it.
 fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<&'static str, String> {
     let reply_start = chat.messages.len();
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
     let mut changed = false;
+    let can_run = tools.iter().any(|t| tool_name(t) == "run_command");
+    let (mut unchecked, mut nudged) = (false, false); // code changed and nothing run since; the nudge sent
+    let plans = tools.iter().any(|t| tool_name(t) == "update_tasks");
+    let asked = chat.messages[..reply_start].iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m));
     for round in 0..MAX_ROUNDS {
-        let prompt = prompt_for(req, &chat.messages, &tools, req.thinking, shared, loaded)?;
+        let prompt = match asked.filter(|_| plans) {
+            Some(at) => prompt_for(req, &with_reminder(&chat.messages, at), &tools, req.thinking, shared, loaded)?,
+            None => prompt_for(req, &chat.messages, &tools, req.thinking, shared, loaded)?,
+        };
         let lead = if loaded.glm && prompt.ends_with("<think>") { "<think>" } else { "" };
 
         let (tx, events) = mpsc::channel();
@@ -662,6 +711,14 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
             msg.push(("tool_calls", Json::Arr(tc)));
         }
         chat.messages.push(obj(msg));
+        if calls.is_empty() && unchecked && can_run && !nudged && round + 1 < MAX_ROUNDS {
+            nudged = true;
+            chat.messages.push(obj(vec![("role", str("user")), ("content", str(NUDGE)), ("auto", Json::Bool(true))]));
+            emit(conn, obj(vec![("type", str("nudge")), ("text", str(NUDGE))]))?;
+            mark_changed(chat, reply_start, changed);
+            chat.save()?;
+            continue;
+        }
         if calls.is_empty() {
             mark_changed(chat, reply_start, changed);
             return Ok(if finish == "length" { "length" } else { "stop" });
@@ -671,6 +728,10 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
             let (result, denied) = if name == "update_tasks" { (update_tasks(conn, chat, &arguments)?, false) } else { call(conn, &id, &name, &arguments, chat, reply_start, checkpoint, shared, loaded)? };
             if !denied && approval_group(&name) == Some("edit") && !result.starts_with("Error") {
                 changed = true;
+                unchecked |= Json::parse(&arguments).ok().and_then(|a| a.get("path").and_then(Json::as_str).map(is_code)).unwrap_or(false);
+            }
+            if !denied && approval_group(&name) == Some("cmd") {
+                unchecked = false;
             }
             emit(conn, obj(vec![("type", str("tool_result")), ("id", str(&id)), ("name", str(&name)), ("result", str(&result)), ("denied", Json::Bool(denied))]))?;
             let mut m = vec![("role", str("tool")), ("tool_call_id", str(&id)), ("name", str(&name)), ("content", str(&result))];

@@ -111,6 +111,11 @@ impl ToolLine {
         ToolLine { id: id.to_string(), name: name.to_string(), arguments: arguments.to_string(), result: None, denied: false, open: false, ask: None, round: 0 }
     }
 
+    /// The harness sending the reply back to check the code it changed, shown as a step (its words inside).
+    fn nudge(text: &str) -> ToolLine {
+        ToolLine { result: Some(text.to_string()), ..ToolLine::new("nudge", "check_work", "{}") }
+    }
+
     /// Whether it changed a file (so the reply can be undone).
     fn changed_files(&self) -> bool {
         matches!(self.name.as_str(), "write_file" | "edit_file") && !self.denied && self.result.as_deref().is_some_and(|r| !r.starts_with("Error"))
@@ -272,6 +277,7 @@ fn tool_label(t: &ToolLine) -> String {
         "use_skill" => format!("Used the {} skill", s("name")),
         "search_chats" => format!("Searched earlier chats for \"{}\"", s("query")),
         "read_chat" => "Read an earlier chat".into(),
+        "check_work" => "Asked to check its work".into(),
         n if n.starts_with("mcp__") => {
             let (server, tool) = mcp_parts(n);
             format!("Used {tool} ({server} MCP)")
@@ -501,6 +507,7 @@ struct App {
     last_model: Option<String>, // the model last picked here
     system: Json,            // this computer, as /api/system reports it (for the rail)
     tasks: Vec<(String, String)>, // the model's task list for this chat: text, and pending / in_progress / done
+    plan_open: Option<bool>, // the plan above the message box opened or closed by hand (None: open until it is all done)
     memory: Vec<String>,     // what the model remembers across chats
     memory_draft: String,    // a memory being typed in the rail
     instructions: Vec<(String, bool, bool)>, // the GHOST.md files: path, whether it exists, whether it is the global one
@@ -558,6 +565,7 @@ enum Message {
     PlusAt(Option<iced::Rectangle>),
     Maximized(bool),
     ToggleRail,
+    TogglePlan,
     ToggleLoadLast,
     Quit,
     System(Result<Json, String>),
@@ -637,6 +645,7 @@ impl App {
             last_model,
             system: Json::Null,
             tasks: Vec::new(),
+            plan_open: None,
             memory: Vec::new(),
             memory_draft: String::new(),
             instructions: Vec::new(),
@@ -715,6 +724,7 @@ impl App {
                     self.shown = window();
                     self.context.0 = 0.0;
                     self.tasks.clear();
+                    self.plan_open = None;
                 }
             }
             Message::DeleteChat(id) => {
@@ -876,6 +886,7 @@ impl App {
                 let Some(api) = self.api.clone() else { return iced::exit() };
                 return Task::perform(blocking(move || api.post("/api/quit", &Json::Null)), |_| ()).discard().chain(iced::exit());
             }
+            Message::TogglePlan => self.plan_open = Some(!self.plan_shown()),
             Message::ToggleRail => {
                 self.rail = !self.rail;
                 self.save_settings();
@@ -1101,6 +1112,11 @@ impl App {
         Task::batch([self.call(|api| api.get("/api/skills"), Message::Skills), self.call(|api| api.get("/api/mcp"), Message::Mcp), self.refresh_instructions()])
     }
 
+    /// Whether the plan above the message box shows its steps: as set by hand, else until every step is done.
+    pub fn plan_shown(&self) -> bool {
+        self.plan_open.unwrap_or_else(|| self.tasks.iter().any(|t| t.1 != "done"))
+    }
+
     fn refresh_instructions(&self) -> Task<Message> {
         self.call(|api| api.get("/api/instructions"), Message::Instructions)
     }
@@ -1199,11 +1215,18 @@ impl App {
         self.title = chat.get("title").and_then(Json::as_str).map(String::from);
         self.context.0 = chat.get("tokens").and_then(Json::as_f64).unwrap_or(0.0); // chats saved before this have none
         self.tasks = tasks_of(chat.get("tasks"));
+        self.plan_open = None;
         self.messages.clear();
         self.shown = window();
         for m in chat.get("messages").and_then(Json::as_array).unwrap_or(&[]) {
             let content = m.get("content").and_then(Json::as_str).unwrap_or("");
             match m.get("role").and_then(Json::as_str) {
+                // the harness check-your-work nudge: a step in the reply, not a message of the user
+                Some("user") if m.get("auto").and_then(Json::as_bool).unwrap_or(false) => {
+                    if let Some(reply) = self.messages.last_mut().filter(|r| r.role == Role::Assistant) {
+                        reply.add_tool(ToolLine::nudge(content));
+                    }
+                }
                 Some("user") => self.messages.push(Msg::user(content)),
                 Some("assistant") => {
                     if self.messages.last().is_none_or(|l| l.role != Role::Assistant) {
@@ -1312,6 +1335,12 @@ impl App {
                 self.status = "Using a tool".into();
             }
             "tasks" => self.tasks = tasks_of(ev.get("tasks")),
+            "nudge" => {
+                if let Some(m) = self.messages.last_mut() {
+                    m.add_tool(ToolLine::nudge(&s("text")));
+                }
+                self.status = "Checking its work".into();
+            }
             "tool_result" => {
                 let id = s("id");
                 if let Some(m) = self.messages.last_mut() {
