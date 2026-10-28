@@ -58,6 +58,7 @@ struct Loaded {
     chat_ok: bool,
     default_system: Option<String>,
     thinking: bool, // the chat template has a thinking switch
+    backend: String, // where it runs, e.g. "GPU NVIDIA GeForce RTX 2060 SUPER (sm_75, ...)"
 }
 
 #[derive(Default)]
@@ -171,6 +172,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
                 ctx: engine.backend.ctx(),
                 chat_ok: fmt.is_some(),
                 thinking: fmt.as_ref().is_some_and(|f| f.thinking),
+                backend: engine.backend.describe(),
                 default_system: fmt.and_then(|f| f.default_system),
             }),
             loading: None,
@@ -395,6 +397,16 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             return respond(&mut conn, 200, &body);
         }
         // the prompt being read: tokens done of the total (0: none), and whether it is waiting on the disk
+        // this computer and what runs on it, for the chat page's get_system_info tool
+        ("GET", "/api/system") => {
+            let mut first = vec![("inference_engine", str(concat!("ghost-infer ", env!("CARGO_PKG_VERSION"), ", running locally on this computer")))];
+            if let Some(c) = &current {
+                first.push(("model_loaded", str(&c.id)));
+                first.push(("model_runs_on", str(&c.backend)));
+                first.push(("context_length", num(c.ctx as f64)));
+            }
+            return respond(&mut conn, 200, &crate::sysinfo::report(first));
+        }
         ("GET", "/api/progress") => {
             let (done, total, disk_ms, disk) = crate::cuda::PROGRESS.get();
             let body = obj(vec![("done", num(done as f64)), ("total", num(total as f64)), ("disk_ms", num(disk_ms as f64)), ("disk", Json::Bool(disk))]);
@@ -422,7 +434,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         _ => {}
     }
     // everything else needs a running model
-    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking }) = current.filter(|_| loading.is_none()) else {
+    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, .. }) = current.filter(|_| loading.is_none()) else {
         if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
             let what = loading.as_deref().unwrap_or("the model");
             return respond(&mut conn, 503, &error_body(&format!("loading {what}; try again in a moment")));

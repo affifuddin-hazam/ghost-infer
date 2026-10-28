@@ -201,6 +201,7 @@
   <label class="field"><span class="row"><span>Longest reply</span><span id="maxVal"></span></span><input type="range" id="maxTokens" min="64" max="8192" step="64" value="2048"></label>
   <label class="field"><span class="row"><span>System prompt</span></span><textarea id="system" placeholder="Leave empty to use the model's default"></textarea></label>
   <label class="check"><input type="checkbox" id="moods" checked><span>Let the model set the ghost's mood<br><small>It starts replies with a hidden tag such as [happy]. Turn off for models that don't follow it.</small></span></label>
+  <label class="check" style="margin-top: 12px"><input type="checkbox" id="tools" checked><span>Let the model check this computer<br><small>A tool it can call for the CPU, memory, GPU, drives and what is running. It is only read, never changed.</small></span></label>
 </section>
 
 <div class="main">
@@ -604,7 +605,7 @@ for (const ev of ["pointermove", "keydown", "pointerdown", "wheel"]) addEventLis
 
 // ---- settings, kept in this browser
 const think = $("think");
-const prefs = { temp: ["temp", 0], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true] };
+const prefs = { temp: ["temp", 0], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true], tools: ["tools", true] };
 for (const [id, [key, d]] of Object.entries(prefs)) {
   const el = $(id), v = store.get(key, d);
   el.type === "checkbox" ? (el.checked = v) : (el.value = v);
@@ -819,7 +820,8 @@ function view(m) {
     div.appendChild(b);
     return div;
   }
-  div.innerHTML = '<details class="think" hidden><summary></summary><div class="body"></div></details><div class="answer"></div>' +
+  div.innerHTML = '<details class="think" hidden><summary></summary><div class="body"></div></details>' +
+    '<details class="think toolnote" hidden><summary></summary><div class="body"></div></details><div class="answer"></div>' +
     '<div class="error" hidden><span></span><button type="button" class="retry">Try again</button></div>' +
     `<div class="actions"><button type="button" class="ibtn copyall" title="Copy" aria-label="Copy the reply">${ICON.copy}</button>` +
     `<button type="button" class="ibtn retry" title="Write it again" aria-label="Write the reply again">${ICON.retry}</button><span class="stat"></span></div>`;
@@ -828,6 +830,12 @@ function view(m) {
   return div;
 }
 function fill(div, m) {
+  const calls = (m.steps || []).flatMap((st) => st.calls), tn = div.querySelector(".toolnote");
+  tn.hidden = !calls.length;
+  if (calls.length) {
+    tn.querySelector("summary").textContent = [...new Set(calls.map((cl) => TOOL_LABEL[cl.name] || `Used ${cl.name}`))].join(", ");
+    tn.querySelector(".body").textContent = calls.map((cl) => cl.result).join("\n\n");
+  }
   const th = div.querySelector(".think"), hasThink = !!(m.think && m.think.trim());
   th.hidden = !hasThink;
   if (hasThink) {
@@ -896,6 +904,35 @@ log.addEventListener("click", async (e) => {
     setTimeout(() => (b.innerHTML = ICON.copy), 1500);
   } else if (b.classList.contains("retry")) retry();
 });
+
+// ---- tools the model may call; the page runs them and hands the answers back
+const TOOLS = [{
+  type: "function",
+  function: {
+    name: "get_system_info",
+    description: "Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+}];
+const TOOL_LABEL = { get_system_info: "Checked this computer's specs" };
+const TOOL_STATUS = { get_system_info: "Checking this computer's specs" };
+async function runTool(name) {
+  try {
+    if (name === "get_system_info") return JSON.stringify(await (await fetch("/api/system")).json(), null, 1);
+    return JSON.stringify({ error: `no tool named ${name}` });
+  } catch (e) {
+    return JSON.stringify({ error: String(e.message || e) });
+  }
+}
+// a reply that used tools, as the messages the model wrote and read: each round's call and the results, then the answer
+function expand(m) {
+  const out = [];
+  for (const st of m.steps || []) {
+    out.push({ role: "assistant", content: st.sent, tool_calls: st.calls.map((cl) => ({ id: cl.id, type: "function", function: { name: cl.name, arguments: cl.arguments } })) });
+    for (const cl of st.calls) out.push({ role: "tool", tool_call_id: cl.id, content: cl.result });
+  }
+  return out;
+}
 
 // ---- moods: the model starts its reply (or a sentence) with a hidden tag
 const MOOD_TAGS = ["happy", "excited", "neutral", "curious", "serious", "proud", "surprised", "shocked", "confused", "shy", "sorry", "sad", "angry"];
@@ -973,18 +1010,14 @@ async function ask(thinking) {
   save(); renderChats(); renderAll();
   const el = log.lastElementChild;
 
-  // earlier replies go back without their thinking (as Qwen3 expects), with their mood tags
-  const history = c.messages.slice(0, -1).map((m) => ({ role: m.role, content: m.sent ?? m.content }));
+  // earlier replies go back without their thinking (as Qwen3 expects), with their mood tags and any tool rounds
+  const history = c.messages.slice(0, -1).flatMap((m) => [...expand(m), { role: m.role, content: m.sent ?? m.content }]);
   const sys = [$("system").value.trim(), $("moods").checked ? MOOD_PROMPT : ""].filter(Boolean).join("\n\n");
   if (sys) history.unshift({ role: "system", content: sys });
-  const body = {
-    messages: history, stream: true, stream_options: { include_usage: true },
-    chat_template_kwargs: { enable_thinking: thinking }, // explicit, so a server started with --no-think still follows the switch
-    temperature: Number($("temp").value) || 0, max_tokens: Number($("maxTokens").value) || 2048,
-  };
+  const useTools = $("tools").checked;
 
   const t0 = performance.now();
-  let raw = "", firstAt = null, usage = null, finish = null, lastMood = null, tool = null;
+  let raw = "", firstAt = null, usage = null, finish = null, lastMood = null, calls = [];
   let tagChunks = 0, tagLoop = false; // small models can repeat the mood tags instead of answering
   const stamps = []; // token arrival times, for the live speed
   // until the first token: how far the server is through the prompt, and whether it is waiting on the disk
@@ -999,64 +1032,94 @@ async function ask(thinking) {
       else if (p.total >= 256) mood("thinking", `Reading your message, ${pct}`);
     } catch {}
   }, 600);
+  // what earlier rounds of this reply said before calling a tool, shown above the final answer
+  const shownBefore = () => (reply.steps || []).map((st) => st.shown).filter((t) => t.trim());
   try {
-    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: busy.signal });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
-    const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const ev = buf.slice(0, i); buf = buf.slice(i + 2);
-        if (!ev.startsWith("data: ")) continue;
-        const data = ev.slice(6);
-        if (data === "[DONE]") continue;
-        const ch0 = JSON.parse(data);
-        if (ch0.error) throw new Error(ch0.error.message);
-        if (ch0.usage) usage = ch0.usage;
-        const ch = ch0.choices && ch0.choices[0];
-        if (!ch) continue;
-        if (ch.finish_reason) finish = ch.finish_reason;
-        const delta = ch.delta || {};
-        if (delta.tool_calls) { // the model is calling a tool: hold up the magnifier while it does
-          tool = delta.tool_calls[0]?.function?.name || tool || "a tool";
-          mood("tool", `Using ${tool}`);
-          continue;
+    // a round: the model answers, or calls tools; the page runs them and asks again with the results
+    for (let round = 0; ; round++) {
+      const body = {
+        messages: [...history, ...expand(reply)], stream: true, stream_options: { include_usage: true },
+        chat_template_kwargs: { enable_thinking: thinking }, // explicit, so a server started with --no-think still follows the switch
+        temperature: Number($("temp").value) || 0, max_tokens: Number($("maxTokens").value) || 2048,
+        ...(useTools && round < 4 ? { tools: TOOLS } : {}),
+      };
+      raw = ""; finish = null; calls = [];
+      const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: busy.signal });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+          if (!ev.startsWith("data: ")) continue;
+          const data = ev.slice(6);
+          if (data === "[DONE]") continue;
+          const ch0 = JSON.parse(data);
+          if (ch0.error) throw new Error(ch0.error.message);
+          if (ch0.usage) usage = ch0.usage;
+          const ch = ch0.choices && ch0.choices[0];
+          if (!ch) continue;
+          if (ch.finish_reason) finish = ch.finish_reason;
+          const delta = ch.delta || {};
+          if (delta.tool_calls) { // the model is calling a tool: hold up the magnifier while it does
+            for (const tc of delta.tool_calls) {
+              const at = tc.index ?? calls.length;
+              const cl = (calls[at] ||= { id: "", name: "", arguments: "" });
+              if (tc.id) cl.id = tc.id;
+              if (tc.function?.name) cl.name = tc.function.name;
+              if (tc.function?.arguments) cl.arguments += tc.function.arguments;
+            }
+            const name = calls.at(-1)?.name;
+            mood("tool", TOOL_STATUS[name] || `Using ${name || "a tool"}`);
+            continue;
+          }
+          if (!delta.content) continue;
+          const now = performance.now();
+          if (firstAt === null) firstAt = now;
+          stamps.push(now);
+          while (stamps.length && now - stamps[0] > 1000) stamps.shift();
+          const rate = stamps.length > 1 ? (stamps.length - 1) / ((now - stamps[0]) / 1000) : 0;
+          ghost?.rate(rate);
+          $("speed").textContent = rate ? `${rate.toFixed(0)} tok/s` : "";
+          raw += delta.content;
+          split(raw, reply, t0);
+          if (reply.think !== undefined && reply.thinkSecs === undefined) mood("thinking"); // reasoning before the answer
+          else {
+            const { shown, last } = moodOf(reply.answer || "", true);
+            if (last) lastMood = last;
+            reply.content = [...shownBefore(), shown].join("\n\n");
+            if (shown.trim()) { ghost?.token(); mood(talkingFace(lastMood), "Writing"); }
+            else if (lastMood && ++tagChunks > 48) { tagLoop = true; busy.abort(); }
+          }
+          draw(el, reply);
         }
-        if (!delta.content) continue;
-        const now = performance.now();
-        if (firstAt === null) firstAt = now;
-        stamps.push(now);
-        while (stamps.length && now - stamps[0] > 1000) stamps.shift();
-        const rate = stamps.length > 1 ? (stamps.length - 1) / ((now - stamps[0]) / 1000) : 0;
-        ghost?.rate(rate);
-        $("speed").textContent = rate ? `${rate.toFixed(0)} tok/s` : "";
-        raw += delta.content;
-        split(raw, reply, t0);
-        if (reply.think !== undefined && reply.thinkSecs === undefined) mood("thinking"); // reasoning before the answer
-        else {
-          const { shown, last } = moodOf(reply.answer || "", true);
-          if (last) lastMood = last;
-          reply.content = shown;
-          if (shown.trim()) { ghost?.token(); mood(talkingFace(lastMood), "Writing"); }
-          else if (lastMood && ++tagChunks > 48) { tagLoop = true; busy.abort(); }
-        }
-        draw(el, reply);
       }
+      calls = calls.filter(Boolean);
+      if (finish !== "tool_calls" || !calls.length) break;
+      // run the calls, keep the round (what the model wrote, what it asked, what came back), and go again
+      for (const cl of calls) {
+        mood("tool", TOOL_STATUS[cl.name] || `Using ${cl.name}`);
+        cl.result = await runTool(cl.name, cl.arguments);
+      }
+      const { shown } = moodOf(reply.answer || "", false);
+      (reply.steps ||= []).push({ sent: reply.answer || "", shown, calls });
+      reply.think = undefined; reply.thinkSecs = undefined; reply.answer = "";
+      draw(el, reply);
+      mood("thinking", "Reading the results");
     }
     const { shown } = moodOf(reply.answer || "", false);
-    reply.content = shown;
+    reply.content = [...shownBefore(), shown].join("\n\n");
     reply.sent = reply.answer || ""; // with its tags, as the model wrote it
     const secs = (performance.now() - (firstAt ?? t0)) / 1000;
     if (usage) {
       const rate = usage.completion_tokens / Math.max(secs, 1e-3);
       reply.meta = `${usage.completion_tokens} tokens in ${secs.toFixed(1)} s, ${rate.toFixed(1)} tok/s, first token after ${((firstAt ?? t0) - t0).toFixed(0)} ms` + (finish === "length" ? ", stopped at the length limit" : "");
     }
-    if (finish === "tool_calls") settleTo("tool", 3000, `Asked to use ${tool}`);
-    else settleTo(afterFace(lastMood), lastMood && !["happy", "neutral"].includes(lastMood) ? 5000 : 2200);
+    settleTo(afterFace(lastMood), lastMood && !["happy", "neutral"].includes(lastMood) ? 5000 : 2200);
   } catch (e) {
     if (tagLoop) {
       reply.content = "";

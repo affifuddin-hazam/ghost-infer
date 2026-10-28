@@ -6,6 +6,7 @@ mod profile;
 mod quant;
 mod sampler;
 mod server;
+mod sysinfo;
 mod tokenizer;
 
 use std::io::{BufRead, Write};

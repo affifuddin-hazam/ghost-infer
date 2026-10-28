@@ -196,6 +196,8 @@ The CPU path works but is not the focus: llama.cpp's CPU kernels are still ahead
 - **Saved conversations** in the browser, grouped by day.
 - **Model picker**: lists the GGUF files next to the running model; choosing one swaps it on the GPU.
 - **Thinking switch** for reasoning models, and settings for temperature, reply length and system prompt.
+- **A tool to check this computer**: the model can call `get_system_info` for the CPU, RAM, GPU, drives and
+  what is running, and the reply shows what it looked at. It only reads; a setting turns it off.
 - Live speed while a reply streams, and per-reply timing under each answer.
 - Works on a phone too: start the server with `--host 0.0.0.0` and open it from another device on your network.
 
@@ -267,6 +269,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `GET /v1/models` | the loaded model (its file name) and its `context_length` |
 | `GET /api/models` | the GGUF files in the model's folder, the current model, and one being loaded |
 | `POST /api/models/load` | `{"id": "<file name without .gguf>"}`: switch to that model; answers once it is ready |
+| `GET /api/system` | this computer: CPU, RAM, GPU (VRAM, temperature, load), OS, drives, and the model and engine running (the chat page's `get_system_info` tool) |
 | `GET /api/progress` | the prompt being read: `done` and `total` tokens (`total` 0: none), and `disk`: waiting for weights to come off the disk |
 | `GET /` | the chat page |
 | `GET /health` | `{"status":"ok"}` |
