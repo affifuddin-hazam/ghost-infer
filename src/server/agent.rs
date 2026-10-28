@@ -12,6 +12,8 @@
 //!   {"type":"tool_result","id","name","result","denied"}
 //!   {"type":"context","prompt_tokens","completion_tokens","context_length"}  after each round
 //!   {"type":"done","finish"} or {"type":"error","message"}
+//!   {"type":"tasks","tasks"}                      the model's task list changed: [{"text","status"}]
+//!   {"type":"title","id","title"}                 after a chat's first reply: the title the model gave it
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -28,10 +30,14 @@ const MAX_ROUNDS: usize = 40;
 
 // ---- tools
 
-/// The tools, by group: what the client turns on. The system group (get_system_info) is always there.
+/// The tools, by group: what the client turns on. The system group (this computer's specs, the task list
+/// and memory) is always there.
 const TOOLS: &str = r#"{
  "system": [
-  {"type":"function","function":{"name":"get_system_info","description":"Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.","parameters":{"type":"object","properties":{},"required":[]}}}
+  {"type":"function","function":{"name":"get_system_info","description":"Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.","parameters":{"type":"object","properties":{},"required":[]}}},
+  {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for a job of several steps; the user sees it beside the chat. Send the whole list every time. Mark one task in_progress while you work on it, and done as soon as it is finished.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
+  {"type":"function","function":{"name":"remember","description":"Save a lasting fact about the user or this computer for future chats: a preference, where their projects live, how a program runs here. Not for details of one task.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
+  {"type":"function","function":{"name":"forget","description":"Forget a remembered fact that is wrong or no longer true.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact as it was saved"}},"required":["fact"]}}}
  ],
  "files": [
   {"type":"function","function":{"name":"read_file","description":"Read a text file, with line numbers. For a big file, read part of it with offset and limit.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"offset":{"type":"integer","description":"First line to read, from 1"},"limit":{"type":"integer","description":"How many lines (default 300)"}},"required":["path"]}}},
@@ -88,7 +94,75 @@ fn tool_prompt(folders: &[PathBuf]) -> String {
     } else {
         format!("You may use files in {} (relative paths start in {}).", list.join(", "), list[0])
     };
-    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. Use tools until the task is done, then answer briefly.")
+    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. For a job of several steps, keep a task list with update_tasks. Save lasting facts with remember. Use tools until the task is done, then answer briefly.")
+}
+
+// ---- memory: facts the model saved, kept in %LOCALAPPDATA%\ghost-infer\memory.json for every chat
+
+fn memory_file() -> Result<PathBuf, String> {
+    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer")).ok_or("LOCALAPPDATA is not set")?;
+    std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
+    Ok(d.join("memory.json"))
+}
+
+/// The remembered facts, oldest first.
+pub fn memory() -> Vec<String> {
+    let text = memory_file().ok().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let j = Json::parse(&text).unwrap_or(Json::Null);
+    j.get("facts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect()
+}
+
+fn save_memory(facts: &[String]) -> Result<(), String> {
+    let j = obj(vec![("facts", Json::Arr(facts.iter().map(|f| str(f)).collect()))]);
+    std::fs::write(memory_file()?, j.to_string()).map_err(|e| e.to_string())
+}
+
+/// Forgets the fact at `index` (the clients' remove button); the facts left.
+pub fn forget_at(index: usize) -> Result<Vec<String>, String> {
+    let mut facts = memory();
+    if index >= facts.len() {
+        return Err("no such fact".into());
+    }
+    facts.remove(index);
+    save_memory(&facts)?;
+    Ok(facts)
+}
+
+/// The remember and forget tools; their result for the model.
+fn memory_tool(name: &str, args: &Json) -> String {
+    let fact = args.get("fact").and_then(Json::as_str).unwrap_or("").trim().to_string();
+    if fact.is_empty() {
+        return "Error: give the fact".into();
+    }
+    let mut facts = memory();
+    let same = |f: &String| f.trim().eq_ignore_ascii_case(&fact);
+    let result = if name == "remember" {
+        if facts.iter().any(same) {
+            return "Already remembered.".into();
+        }
+        facts.push(fact);
+        "Remembered.".to_string()
+    } else {
+        let before = facts.len();
+        facts.retain(|f| !same(f));
+        if facts.len() == before {
+            return format!("Error: no remembered fact reads exactly that. The facts are: {}", memory().join(" | "));
+        }
+        "Forgotten.".to_string()
+    };
+    match save_memory(&facts) {
+        Ok(()) => result,
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// The facts as the system prompt gives them, or nothing.
+fn memory_prompt() -> String {
+    let facts = memory();
+    if facts.is_empty() {
+        return String::new();
+    }
+    format!("What you remember from earlier chats:\n{}", facts.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"))
 }
 
 // ---- approvals: the run waits on a channel the approve endpoint answers
@@ -158,6 +232,8 @@ struct Chat {
     title: String,
     created: f64,
     messages: Vec<Json>,
+    tokens: f64, // how much of the context the last round used (the clients show it)
+    tasks: Json, // the model's task list (update_tasks), as [{"text","status"}]
 }
 
 impl Chat {
@@ -170,7 +246,7 @@ impl Chat {
             h.write_u64(t as u64);
             h.finish() & 0xffff
         };
-        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, messages: Vec::new() }
+        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()) }
     }
 
     fn load(id: &str) -> Result<Chat, String> {
@@ -180,6 +256,8 @@ impl Chat {
             title: j.get("title").and_then(Json::as_str).unwrap_or("").to_string(),
             created: j.get("created").and_then(Json::as_f64).unwrap_or(0.0),
             messages: j.get("messages").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default(),
+            tokens: j.get("tokens").and_then(Json::as_f64).unwrap_or(0.0),
+            tasks: j.get("tasks").cloned().unwrap_or(Json::Arr(Vec::new())),
         })
     }
 
@@ -189,6 +267,8 @@ impl Chat {
             ("title", str(&self.title)),
             ("created", num(self.created)),
             ("updated", num(now_ms())),
+            ("tokens", num(self.tokens)),
+            ("tasks", self.tasks.clone()),
             ("messages", Json::Arr(self.messages.clone())),
         ]);
         let path = chat_file(&self.id)?;
@@ -211,6 +291,7 @@ struct Request {
     temperature: f32,
     max_tokens: usize,
     groups: Vec<String>,
+    memory: String, // the remembered facts as the reply started
 }
 
 impl Request {
@@ -224,6 +305,7 @@ impl Request {
             temperature: f("temperature").map(|t| t as f32).unwrap_or(shared.defaults.0),
             max_tokens: f("max_tokens").map(|n| n.max(1.0) as usize).unwrap_or(shared.defaults.3),
             groups: b.get("tools").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect()).unwrap_or_default(),
+            memory: memory_prompt(),
         }
     }
 }
@@ -266,16 +348,79 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
     conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
     let checkpoint = format!("{}-{}", chat.id, now_ms() as u64); // this reply's file changes, for undo
     emit(conn, obj(vec![("type", str("chat")), ("id", str(&chat.id)), ("title", str(&chat.title)), ("checkpoint", str(&checkpoint))]))?;
+    let first = req.message.is_some() && chat.messages.iter().filter(|m| m.get("role").and_then(Json::as_str) == Some("user")).count() == 1;
     let result = rounds(conn, &req, &mut chat, &checkpoint, work, shared, loaded);
     chat.save()?;
+    let named = first && result.is_ok();
+    // the model answered with only its current step left open: that step is done
+    if matches!(result, Ok("stop")) && close_last_task(&mut chat) {
+        chat.save()?;
+        let _ = emit(conn, obj(vec![("type", str("tasks")), ("tasks", chat.tasks.clone())]));
+    }
     let end = match result {
         Ok(finish) => obj(vec![("type", str("done")), ("finish", str(finish))]),
         Err(e) => obj(vec![("type", str("error")), ("message", str(&e))]),
     };
     let _ = emit(conn, end);
+    // a chat's first reply: the model names it, after "done" so nobody waits for it
+    if named {
+        if let Some(title) = name_chat(&req, &chat, work, shared, loaded) {
+            chat.title = title;
+            chat.save()?;
+            let _ = emit(conn, obj(vec![("type", str("title")), ("id", str(&chat.id)), ("title", str(&chat.title))]));
+        }
+    }
     let _ = sse(conn, "[DONE]");
     let _ = conn.write_all(b"0\r\n\r\n");
     Ok(())
+}
+
+/// The prompt for these messages: the client's system text plus where tools may work, then the chat.
+fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
+    let folders = shared.harness.lock().unwrap().folders.clone();
+    let system = [req.system.trim().to_string(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders) }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let mut messages = Vec::new();
+    if !system.is_empty() {
+        messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));
+    }
+    messages.extend(history.iter().cloned());
+    let mut fields = vec![("messages", Json::Arr(messages)), ("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(thinking))]))];
+    if !tools.is_empty() {
+        fields.push(("tools", Json::Arr(tools.to_vec())));
+    }
+    let body = obj(fields);
+    if loaded.glm { chat_prompt_glm(&body, shared.think_default, loaded.thinking) } else { chat_prompt(&body, loaded.default_system.as_deref(), shared.think_default, loaded.thinking) }
+}
+
+/// A short title for a chat after its first reply, written by the model; None if it gave nothing usable.
+/// The question goes after the chat itself, so the prompt starts as the reply's did and the server's cache
+/// already holds it: only the question is read, and the next message finds the chat still cached.
+fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Option<String> {
+    let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
+    let mut history = chat.messages.clone();
+    let ask = "Give this chat a title of 3 to 6 words that says what it is about. Reply with the title only: no quotes, no full stop, no tool calls.";
+    history.push(obj(vec![("role", str("user")), ("content", str(ask))]));
+    let prompt = prompt_for(req, &history, &tools, false, shared, loaded).ok()?;
+    let (tx, events) = mpsc::channel();
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(24), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
+    work.send(Work::Job(job)).ok()?;
+    let mut out = String::new();
+    for ev in events {
+        match ev {
+            Event::Text(t) => out.push_str(&t),
+            Event::Done { .. } => break,
+            Event::Error(..) => return None,
+        }
+    }
+    // the title alone: no thinking, quotes, markdown or "Title:" around it
+    let out = out.rsplit("</think>").next().unwrap_or(&out);
+    let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line.trim_start_matches("Title:").trim_start_matches("title:");
+    let title = line.trim_matches(|c: char| c == '"' || c == '\'' || c == '*' || c == '#' || c == '`' || c.is_whitespace()).trim_end_matches('.');
+    if title.is_empty() || title.contains('<') || title.split_whitespace().count() > 10 {
+        return None;
+    }
+    Some(title.chars().take(80).collect())
 }
 
 /// The model's rounds for one reply; Ok is how it finished ("stop", "length", or "rounds" at MAX_ROUNDS).
@@ -284,20 +429,7 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
     let mut changed = false;
     for round in 0..MAX_ROUNDS {
-        // the prompt: the client's system text plus where tools may work, then the whole chat
-        let folders = shared.harness.lock().unwrap().folders.clone();
-        let system = [req.system.trim().to_string(), if tools.is_empty() { String::new() } else { tool_prompt(&folders) }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
-        let mut messages = Vec::new();
-        if !system.is_empty() {
-            messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));
-        }
-        messages.extend(chat.messages.iter().cloned());
-        let mut fields = vec![("messages", Json::Arr(messages)), ("chat_template_kwargs", obj(vec![("enable_thinking", Json::Bool(req.thinking))]))];
-        if !tools.is_empty() {
-            fields.push(("tools", Json::Arr(tools.clone())));
-        }
-        let body = obj(fields);
-        let prompt = if loaded.glm { chat_prompt_glm(&body, shared.think_default, loaded.thinking) } else { chat_prompt(&body, loaded.default_system.as_deref(), shared.think_default, loaded.thinking) }?;
+        let prompt = prompt_for(req, &chat.messages, &tools, req.thinking, shared, loaded)?;
         let lead = if loaded.glm && prompt.ends_with("<think>") { "<think>" } else { "" };
 
         let (tx, events) = mpsc::channel();
@@ -339,6 +471,7 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
             }
         }
         take(split.finish(), conn, &mut text, &mut calls)?;
+        chat.tokens = (usage.0 + usage.1) as f64;
         emit(conn, obj(vec![("type", str("context")), ("prompt_tokens", num(usage.0 as f64)), ("completion_tokens", num(usage.1 as f64)), ("context_length", num(loaded.ctx as f64))]))?;
 
         // the round as the chat keeps it: what the model wrote, and its calls in OpenAI's form
@@ -354,7 +487,7 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
         }
 
         for (id, name, arguments) in calls {
-            let (result, denied) = call(conn, &id, &name, &arguments, chat, reply_start, checkpoint, shared, loaded)?;
+            let (result, denied) = if name == "update_tasks" { (update_tasks(conn, chat, &arguments)?, false) } else { call(conn, &id, &name, &arguments, chat, reply_start, checkpoint, shared, loaded)? };
             if !denied && approval_group(&name) == Some("edit") && !result.starts_with("Error") {
                 changed = true;
             }
@@ -369,6 +502,44 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
         chat.save()?;
     }
     Ok("rounds")
+}
+
+/// The update_tasks tool: the chat's new task list, sent to the client as a tasks event. Its result for the model.
+fn update_tasks(conn: &mut TcpStream, chat: &mut Chat, arguments: &str) -> Result<String, String> {
+    let args = Json::parse(arguments).unwrap_or(Json::Null);
+    let Some(list) = args.get("tasks").and_then(Json::as_array) else {
+        return Ok("Error: give tasks, a list of {\"text\", \"status\"}".into());
+    };
+    let tasks: Vec<Json> = list
+        .iter()
+        .filter_map(|t| {
+            let text = t.get("text").and_then(Json::as_str)?.trim();
+            let status = match t.get("status").and_then(Json::as_str).unwrap_or("pending") {
+                s @ ("in_progress" | "done") => s,
+                _ => "pending",
+            };
+            (!text.is_empty()).then(|| obj(vec![("text", str(text)), ("status", str(status))]))
+        })
+        .collect();
+    let done = tasks.iter().filter(|t| t.get("status").and_then(Json::as_str) == Some("done")).count();
+    let total = tasks.len();
+    chat.tasks = Json::Arr(tasks);
+    emit(conn, obj(vec![("type", str("tasks")), ("tasks", chat.tasks.clone())]))?;
+    Ok(format!("Task list updated: {done} of {total} done."))
+}
+
+/// Marks the task list's one in_progress task done when every other task is done; whether it did.
+fn close_last_task(chat: &mut Chat) -> bool {
+    let Json::Arr(tasks) = &mut chat.tasks else { return false };
+    let status = |t: &Json| t.get("status").and_then(Json::as_str).unwrap_or("").to_string();
+    let open: Vec<usize> = (0..tasks.len()).filter(|&i| status(&tasks[i]) != "done").collect();
+    let [i] = open[..] else { return false };
+    if status(&tasks[i]) != "in_progress" {
+        return false;
+    }
+    let text = tasks[i].get("text").and_then(Json::as_str).unwrap_or("").to_string();
+    tasks[i] = obj(vec![("text", str(&text)), ("status", str("done"))]);
+    true
 }
 
 /// Notes on the reply's last assistant message whether it changed files (the clients offer undo then).
@@ -428,6 +599,9 @@ fn call(conn: &mut TcpStream, id: &str, name: &str, arguments: &str, chat: &Chat
                 _ => return Ok(("The user declined this action. Do not try it again. If there is no other way to proceed, explain the situation clearly and stop.".into(), true)),
             }
         }
+    }
+    if name == "remember" || name == "forget" {
+        return Ok((memory_tool(name, &Json::parse(arguments).unwrap_or(Json::Null)), false));
     }
     if name == "get_system_info" {
         let first = vec![

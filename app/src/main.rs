@@ -61,7 +61,15 @@ fn main() -> iced::Result {
         })
         .font(include_bytes!("../fonts/InstrumentSans.ttf").as_slice())
         .default_font(view::BODY)
-        .window_size((1180.0, 780.0))
+        // no Windows frame: the app draws its own title bar in the skin's colours, like Claude Desktop
+        .window(iced::window::Settings {
+            size: iced::Size::new(1180.0, 780.0),
+            min_size: Some(iced::Size::new(560.0, 420.0)),
+            decorations: false,
+            icon: ghost::icon(view::GRAPHITE.accent),
+            platform_specific: iced::window::settings::PlatformSpecific { undecorated_shadow: true, ..Default::default() },
+            ..Default::default()
+        })
         .run()
 }
 
@@ -216,6 +224,15 @@ fn split_think(raw: &str) -> (&str, &str) {
     }
 }
 
+/// A task list as the server keeps it: [{"text","status"}].
+fn tasks_of(j: Option<&Json>) -> Vec<(String, String)> {
+    j.and_then(Json::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|t| Some((t.get("text")?.as_str()?.to_string(), t.get("status").and_then(Json::as_str).unwrap_or("pending").to_string())))
+        .collect()
+}
+
 /// A short label for a tool call, like the chat page's.
 fn tool_label(t: &ToolLine) -> String {
     let a = Json::parse(&t.arguments).unwrap_or(Json::Null);
@@ -233,6 +250,9 @@ fn tool_label(t: &ToolLine) -> String {
         "web_search" => format!("Searched the web for \"{}\"", s("query")),
         "fetch_url" => format!("Read {}", s("url")),
         "get_system_info" => "Checked this computer's specs".into(),
+        "update_tasks" => "Updated the task list".into(),
+        "remember" => format!("Remembered: {}", s("fact")),
+        "forget" => format!("Forgot: {}", s("fact")),
         other => format!("Used {other}"),
     };
     if t.result.is_some() && !t.denied {
@@ -363,8 +383,8 @@ fn app_file() -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("ghost-infer").join("app.json"))
 }
 
-/// The app's own settings: the theme and the tool groups that are on.
-fn load_settings() -> (ThemeMode, Vec<String>) {
+/// The app's own settings: the theme, the tool groups that are on, and whether the rail is shown.
+fn load_settings() -> (ThemeMode, Vec<String>, bool) {
     let j = app_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| Json::parse(&t).ok()).unwrap_or(Json::Null);
     let mode = match j.get("theme").and_then(Json::as_str) {
         Some("dark") => ThemeMode::Dark,
@@ -375,10 +395,10 @@ fn load_settings() -> (ThemeMode, Vec<String>) {
         Some(a) => a.iter().filter_map(Json::as_str).filter(|g| GROUPS.iter().any(|(k, _)| k == g)).map(String::from).collect(),
         None => vec!["files".to_string()],
     };
-    (mode, tools)
+    (mode, tools, j.get("rail").and_then(Json::as_bool).unwrap_or(false))
 }
 
-fn save_settings(mode: ThemeMode, tools: &[String]) {
+fn save_settings(mode: ThemeMode, tools: &[String], rail: bool) {
     let Some(p) = app_file() else { return };
     let v = match mode {
         ThemeMode::System => "system",
@@ -388,7 +408,7 @@ fn save_settings(mode: ThemeMode, tools: &[String]) {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(p, obj(vec![("theme", str(v)), ("tools", Json::Arr(tools.iter().map(|g| str(g)).collect()))]).to_string());
+    let _ = std::fs::write(p, obj(vec![("theme", str(v)), ("tools", Json::Arr(tools.iter().map(|g| str(g)).collect())), ("rail", Json::Bool(rail))]).to_string());
 }
 
 /// Whether Windows is set to dark mode for apps (HKCU\...\Personalize\AppsUseLightTheme = 0).
@@ -440,6 +460,11 @@ struct App {
     folder: Option<String>,  // the first folder file tools may use
     tools: Vec<String>,      // the tool groups that are on
     repaint: bool,           // flipped on every change but the ghost's tick: the whole window is drawn again
+    maximized: bool,         // the window fills the screen (no resize edges; the button shows "restore")
+    rail: bool,              // the session rail on the right is shown
+    system: Json,            // this computer, as /api/system reports it (for the rail)
+    tasks: Vec<(String, String)>, // the model's task list for this chat: text, and pending / in_progress / done
+    memory: Vec<String>,     // what the model remembers across chats
 }
 
 #[derive(Debug, Clone)]
@@ -479,12 +504,25 @@ enum Message {
     Approved(Result<Json, String>),
     Undo(usize),
     Undone(usize, Result<Json, String>),
+    // the window, which has no Windows frame
+    DragWindow,
+    ToggleMaximize,
+    Minimize,
+    CloseWindow,
+    ResizeWindow(iced::window::Direction),
+    WindowResized,
+    Maximized(bool),
+    ToggleRail,
+    System(Result<Json, String>),
+    UndoAll,
+    Memory(Result<Json, String>),
+    Forget(usize),
 }
 
 impl App {
     fn new(args: Args) -> (App, Task<Message>) {
         let addr = args.addr.clone();
-        let (mode, tools) = load_settings();
+        let (mode, tools, rail) = load_settings();
         let dark = match mode {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
@@ -524,6 +562,11 @@ impl App {
             folder: None,
             tools,
             repaint: false,
+            maximized: false,
+            rail,
+            system: Json::Null,
+            tasks: Vec::new(),
+            memory: Vec::new(),
         };
         (app, Task::perform(blocking(move || connect(&addr)), Message::Connected))
     }
@@ -548,13 +591,15 @@ impl App {
                     Some("settings") => Some(Menu::Settings),
                     _ => None,
                 };
+                let system = Task::batch([self.refresh_system(), self.refresh_memory()]);
                 if let Some(id) = self.start.open.take() {
-                    return self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded);
+                    return Task::batch([system, self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded)]);
                 }
                 if let Some(text) = self.start.send.take() {
                     self.composer = text_editor::Content::with_text(&text);
-                    return self.send(None);
+                    return Task::batch([system, self.send(None)]);
                 }
+                return system;
             }
             Message::Connected(Err(e)) => self.status = e,
             Message::Chats(Ok(c)) => self.set_chats(&c),
@@ -571,6 +616,8 @@ impl App {
                     self.title = None;
                     self.messages.clear();
                     self.shown = window();
+                    self.context.0 = 0.0;
+                    self.tasks.clear();
                 }
             }
             Message::DeleteChat(id) => {
@@ -626,13 +673,13 @@ impl App {
             Message::ToggleTheme => {
                 self.set_dark(!self.dark);
                 self.mode = if self.dark { ThemeMode::Dark } else { ThemeMode::Light };
-                save_settings(self.mode, &self.tools);
+                save_settings(self.mode, &self.tools, self.rail);
                 self.menu = None;
             }
             Message::SystemTheme => {
                 self.mode = ThemeMode::System;
                 self.set_dark(windows_dark());
-                save_settings(self.mode, &self.tools);
+                save_settings(self.mode, &self.tools, self.rail);
                 self.menu = None;
             }
             Message::ToggleTool(i, j) => {
@@ -648,7 +695,7 @@ impl App {
                     }
                     None => self.tools.push(g.to_string()),
                 }
-                save_settings(self.mode, &self.tools);
+                save_settings(self.mode, &self.tools, self.rail);
             }
             Message::Approve(id, decision) => {
                 if let Some(t) = self.messages.last_mut().and_then(|m| m.tools.iter_mut().find(|t| t.id == id)) {
@@ -699,6 +746,41 @@ impl App {
                     return self.update(Message::DeleteChat(id));
                 }
             }
+            Message::DragWindow => return iced::window::latest().and_then(iced::window::drag),
+            Message::ToggleMaximize => return iced::window::latest().and_then(iced::window::toggle_maximize),
+            Message::Minimize => return iced::window::latest().and_then(|id| iced::window::minimize(id, true)),
+            Message::CloseWindow => return iced::exit(),
+            Message::ResizeWindow(d) => return iced::window::latest().and_then(move |id| iced::window::drag_resize(id, d)),
+            // maximized by the button, a double click, snapping or Win+Up: the size changes every time
+            Message::WindowResized => return iced::window::latest().and_then(iced::window::is_maximized).map(Message::Maximized),
+            Message::Maximized(m) => self.maximized = m,
+            Message::ToggleRail => {
+                self.rail = !self.rail;
+                save_settings(self.mode, &self.tools, self.rail);
+                if self.rail {
+                    return self.refresh_system();
+                }
+            }
+            Message::System(Ok(j)) => self.system = j,
+            Message::System(Err(_)) => {}
+            Message::Memory(Ok(j)) => self.memory = j.get("facts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
+            Message::Memory(Err(e)) => self.status = format!("Couldn't read the memory: {e}"),
+            Message::Forget(i) => {
+                let body = obj(vec![("index", num(i as f64))]);
+                return self.call(move |api| api.post("/api/memory/forget", &body), Message::Memory);
+            }
+            // every reply's file changes put back, the newest first, one after another (they share a journal)
+            Message::UndoAll => {
+                let mut task = Task::none();
+                for i in (0..self.messages.len()).rev() {
+                    let m = &self.messages[i];
+                    if let (true, false, Some(cp)) = (m.changed, m.undone, m.checkpoint.clone()) {
+                        let body = obj(vec![("checkpoint", str(&cp))]);
+                        task = task.chain(self.call(move |api| api.post("/api/tools/undo", &body), move |r| Message::Undone(i, r)));
+                    }
+                }
+                return task;
+            }
             Message::Hover(h) => self.hovered = h,
             Message::Copy(i) => {
                 if let Some(m) = self.messages.get(i) {
@@ -717,6 +799,38 @@ impl App {
     fn call<T: Send + 'static>(&self, f: impl FnOnce(&Api) -> Result<T, String> + Send + 'static, done: impl FnOnce(Result<T, String>) -> Message + Send + 'static) -> Task<Message> {
         let Some(api) = self.api.clone() else { return Task::none() };
         Task::perform(blocking(move || f(&api)), done)
+    }
+
+    /// This computer's GPU, memory and model, for the rail (only fetched while it is shown).
+    /// What the model remembers (the rail shows it, with a remove button for each).
+    fn refresh_memory(&self) -> Task<Message> {
+        self.call(|api| api.get("/api/memory"), Message::Memory)
+    }
+
+    fn refresh_system(&self) -> Task<Message> {
+        if !self.rail {
+            return Task::none();
+        }
+        self.call(|api| api.get("/api/system"), Message::System)
+    }
+
+    /// The files this chat changed and not undone, with lines added and removed, for the rail.
+    pub fn changes(&self) -> Vec<(String, usize, usize)> {
+        let mut out: Vec<(String, usize, usize)> = Vec::new();
+        for t in self.messages.iter().filter(|m| !m.undone).flat_map(|m| &m.tools).filter(|t| t.changed_files()) {
+            let a = Json::parse(&t.arguments).unwrap_or(Json::Null);
+            let s = |k: &str| a.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+            let (add, del) = if t.name == "write_file" { (s("content").lines().count(), 0) } else { (s("new_string").lines().count(), s("old_string").lines().count()) };
+            let path = s("path");
+            match out.iter_mut().find(|c| c.0 == path) {
+                Some(c) => {
+                    c.1 += add;
+                    c.2 += del;
+                }
+                None => out.push((path, add, del)),
+            }
+        }
+        out
     }
 
     fn set_models(&mut self, j: &Json) {
@@ -762,7 +876,8 @@ impl App {
 
     /// The ghost's clock: a tick a few times a second (the sprite moves in steps, so no more is needed).
     fn subscription(&self) -> iced::Subscription<Message> {
-        iced::Subscription::run(|| {
+        let resized = iced::window::resize_events().map(|_| Message::WindowResized);
+        let tick = iced::Subscription::run(|| {
             use iced::futures::StreamExt;
             let (tx, rx) = mpsc::unbounded::<()>();
             std::thread::spawn(move || {
@@ -771,13 +886,16 @@ impl App {
                 }
             });
             rx.map(|_| Message::Tick)
-        })
+        });
+        iced::Subscription::batch([tick, resized])
     }
 
     /// A saved chat as messages: each user message, then its reply's rounds folded into one.
     fn show_chat(&mut self, chat: &Json) {
         self.chat = chat.get("id").and_then(Json::as_str).map(String::from);
         self.title = chat.get("title").and_then(Json::as_str).map(String::from);
+        self.context.0 = chat.get("tokens").and_then(Json::as_f64).unwrap_or(0.0); // chats saved before this have none
+        self.tasks = tasks_of(chat.get("tasks"));
         self.messages.clear();
         self.shown = window();
         for m in chat.get("messages").and_then(Json::as_array).unwrap_or(&[]) {
@@ -890,6 +1008,7 @@ impl App {
                 }
                 self.status = "Using a tool".into();
             }
+            "tasks" => self.tasks = tasks_of(ev.get("tasks")),
             "tool_result" => {
                 let id = s("id");
                 if let Some(m) = self.messages.last_mut() {
@@ -911,11 +1030,24 @@ impl App {
                 }
                 self.status = "Waiting for your OK".into();
             }
+            // the model's title for a new chat, a moment after its first reply
+            "title" => {
+                let (id, title) = (s("id"), s("title"));
+                if self.chat.as_deref() == Some(id.as_str()) {
+                    self.title = Some(title.clone());
+                }
+                if let Some(c) = self.chats.iter_mut().find(|c| c.id == id) {
+                    c.title = title;
+                }
+            }
             "context" => {
                 let f = |k: &str| ev.get(k).and_then(Json::as_f64).unwrap_or(0.0);
                 self.context = (f("prompt_tokens") + f("completion_tokens"), f("context_length"));
             }
-            "done" => self.finish(&s("finish")),
+            "done" => {
+                self.finish(&s("finish"));
+                return Task::batch([self.refresh_system(), self.refresh_memory()]); // the reply may have changed what the GPU holds
+            }
             "error" => {
                 self.status = s("message");
                 self.busy = None;

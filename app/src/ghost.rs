@@ -186,6 +186,29 @@ impl Ghost {
     }
 }
 
+/// The window and taskbar icon: the idle ghost, two screen pixels per sprite pixel, centred in a square.
+pub fn icon(accent: Color) -> Option<iced::window::Icon> {
+    let g = Ghost::still(1.0, accent).grid();
+    let cells: Vec<(usize, usize)> = (0..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| g[y][x] != 0).collect();
+    let (x0, x1) = (cells.iter().map(|c| c.0).min()?, cells.iter().map(|c| c.0).max()?);
+    let (y0, y1) = (cells.iter().map(|c| c.1).min()?, cells.iter().map(|c| c.1).max()?);
+    let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+    const SCALE: usize = 2;
+    let side = w.max(h) * SCALE + 2;
+    let (ox, oy) = ((side - w * SCALE) / 2, (side - h * SCALE) / 2);
+    let mut rgba = vec![0u8; side * side * 4];
+    for &(x, y) in &cells {
+        let c = color(g[y][x], accent).into_rgba8();
+        for dy in 0..SCALE {
+            for dx in 0..SCALE {
+                let (px, py) = (ox + (x - x0) * SCALE + dx, oy + (y - y0) * SCALE + dy);
+                rgba[(py * side + px) * 4..][..4].copy_from_slice(&c);
+            }
+        }
+    }
+    iced::window::icon::from_rgba(rgba, side as u32, side as u32).ok()
+}
+
 impl<Message> canvas::Program<Message> for Ghost {
     type State = ();
 

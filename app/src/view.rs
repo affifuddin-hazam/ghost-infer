@@ -6,6 +6,7 @@ use iced::widget::{button, canvas, column, container, markdown, mouse_area, opaq
 use iced::{border, keyboard, Alignment, Background, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Theme};
 
 use crate::ghost::{Ghost, Mood};
+use crate::json::Json;
 use crate::{approval_text, group_name, tool_detail, tool_label, App, Menu, Message, Msg, Role};
 
 /// A skin: the colours every part of the app is drawn with.
@@ -101,6 +102,16 @@ mod ic {
     pub const DELETE: char = '\u{E74D}';
     pub const SETTINGS: char = '\u{E713}';
     pub const CLOSE_PANE: char = '\u{E89F}';
+    pub const MINIMIZE: char = '\u{E921}';
+    pub const MAXIMIZE: char = '\u{E922}';
+    pub const RESTORE: char = '\u{E923}';
+    pub const CLOSE: char = '\u{E8BB}';
+    pub const DOCK_RIGHT: char = '\u{E90D}';
+    pub const CHIP: char = '\u{E950}';
+    pub const TASKS: char = '\u{E9D5}';
+    pub const MEMORY: char = '\u{E734}';
+    pub const NOW: char = '\u{E91F}';
+    pub const TODO: char = '\u{EA3A}';
     pub const OPEN_PANE: char = '\u{E8A0}';
     pub const UP: char = '\u{E74A}';
     pub const STOP: char = '\u{E71A}';
@@ -138,6 +149,8 @@ fn tool_icon(name: &str) -> char {
         "write_file" | "edit_file" => ic::EDIT,
         "run_command" | "start_process" | "check_process" | "stop_process" => ic::TERMINAL,
         "fetch_url" => ic::GLOBE,
+        "update_tasks" => ic::TASKS,
+        "remember" | "forget" => ic::MEMORY,
         _ => ic::PC,
     }
 }
@@ -191,8 +204,16 @@ fn ago(ms: f64) -> String {
 impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let s = self.skin();
-        let body: Element<'_, Message> = if self.sidebar { row![self.sidebar(), self.main()].into() } else { self.main() };
-        let Some(menu) = self.menu else { return body };
+        let mut body = row![];
+        if self.sidebar {
+            body = body.push(self.sidebar());
+        }
+        body = body.push(self.main());
+        if self.rail {
+            body = body.push(self.rail());
+        }
+        let body: Element<'_, Message> = body.into();
+        let Some(menu) = self.menu else { return self.framed(body) };
         // an open menu: a click anywhere else closes it
         let shade = mouse_area(container(Space::new()).width(Fill).height(Fill)).on_press(Message::Menu(None));
         // each item: icon, label, what it does, drawn in red, and for a switch whether it is on
@@ -238,12 +259,181 @@ impl App {
             .width(Fill)
             .height(Fill)
             .align_y(if matches!(menu, Menu::Chat) { Alignment::Start } else { Alignment::End });
-        stack![body, opaque(shade), placed].into()
+        self.framed(stack![body, opaque(shade), placed].into())
+    }
+
+    /// The window's resize edges, invisible strips over everything (the window has no Windows frame to
+    /// grab); a press hands the resize to Windows. None when maximized.
+    fn framed<'a>(&'a self, body: Element<'a, Message>) -> Element<'a, Message> {
+        use iced::mouse::Interaction as I;
+        use iced::window::Direction as D;
+        if self.maximized {
+            return body;
+        }
+        const E: Length = Length::Fixed(5.0);
+        let edge = |w: Length, h: Length, d: D, i: I| -> Element<'a, Message> { mouse_area(Space::new().width(w).height(h)).on_press(Message::ResizeWindow(d)).interaction(i).into() };
+        let top = row![edge(E, E, D::NorthWest, I::ResizingDiagonallyDown), edge(Fill, E, D::North, I::ResizingVertically), edge(E, E, D::NorthEast, I::ResizingDiagonallyUp)];
+        let middle = row![edge(E, Fill, D::West, I::ResizingHorizontally), Space::new().width(Fill).height(Fill), edge(E, Fill, D::East, I::ResizingHorizontally)];
+        let bottom = row![edge(E, E, D::SouthWest, I::ResizingDiagonallyUp), edge(Fill, E, D::South, I::ResizingVertically), edge(E, E, D::SouthEast, I::ResizingDiagonallyDown)];
+        stack![body, column![top, middle, bottom]].into()
+    }
+
+    /// The session rail on the right: this computer and model, how full the context is, and the files this
+    /// chat changed (with undo), the model's task list, and what it remembers across chats.
+    fn rail(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let head = |title: &'static str, right: String| -> Element<'static, Message> {
+            row![text(title).size(13).font(MEDIUM).color(s.text), Space::new().width(Fill), text(right).size(12).color(s.faint)].align_y(Alignment::Center).padding(Padding { top: 14.0, right: 4.0, bottom: 6.0, left: 4.0 }).into()
+        };
+        let section = |content: Element<'static, Message>| -> Element<'static, Message> {
+            container(content).width(Fill).padding([8, 12]).style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(12), ..Default::default() }).into()
+        };
+        let line = |c: char, plain: String, strong: String| -> Element<'static, Message> {
+            // one piece of text, so a long model name wraps with its words
+            let words: [text::Span<'static, (), Font>; 2] = [iced::widget::span(strong).font(MEDIUM).color(s.text), iced::widget::span(plain).color(s.muted)];
+            row![icon(c, 13).color(s.faint).width(18), rich_text(words).size(13).width(Fill)].spacing(6).align_y(Alignment::Center).padding([4, 0]).into()
+        };
+        let sys = &self.system;
+        let f = |j: &Json, k: &str| j.get(k).and_then(Json::as_f64).unwrap_or(0.0);
+        let gpu = sys.get("gpus").and_then(Json::as_array).and_then(|g| g.first()).cloned().unwrap_or(Json::Null);
+
+        // environment: the computer, the model and where it runs, the folder
+        let mut env = column![];
+        if let Some(name) = gpu.get("name").and_then(Json::as_str) {
+            let name = name.trim_start_matches("NVIDIA ").trim_start_matches("GeForce ").to_string();
+            env = env.push(line(ic::PC, format!(", {:.0} of {:.0} GB used", f(&gpu, "vram_used_gb"), f(&gpu, "vram_total_gb")), name));
+        }
+        if f(sys, "ram_total_gb") > 0.0 {
+            env = env.push(line(ic::CHIP, format!(" of {:.0} GB RAM in use", f(sys, "ram_total_gb")), format!("{:.1} GB", f(sys, "ram_total_gb") - f(sys, "ram_available_gb"))));
+        }
+        let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "No model".into());
+        let runs = sys.get("model_runs_on").and_then(Json::as_str).map(|b| if b.starts_with("GPU") { " on the GPU" } else { " on the CPU" }).unwrap_or("");
+        env = env.push(line(ic::BOLT, runs.to_string(), model));
+        env = env.push(line(ic::FOLDER, String::new(), self.folder_label()));
+
+        // context: a meter and the token count
+        let (used, total) = self.context;
+        let pct = if total > 0.0 { (100.0 * used / total).clamp(0.0, 100.0) } else { 0.0 };
+        let fill = (pct.round() as u16).max(1);
+        let meter = container(row![
+            container(Space::new()).width(Length::FillPortion(fill)).height(6).style(move |_| container::Style { background: Some(Background::Color(s.accent)), border: border::rounded(99), ..Default::default() }),
+            Space::new().width(Length::FillPortion(100 - fill.min(99))),
+        ])
+        .width(Fill)
+        .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(99), ..Default::default() });
+        let note = match (used > 0.0, self.messages.is_empty()) {
+            (true, _) => format!("{} of {} tokens", thousands(used), thousands(total)),
+            (false, true) => format!("{} tokens free", thousands(total)),
+            (false, false) => "Shown after the next reply".to_string(), // a chat saved before tokens were kept
+        };
+        let context = column![meter, text(note).size(12).color(s.faint)].spacing(8).padding([6, 0]);
+
+        // changes: the files this chat changed, and undo for all of them
+        let changes = self.changes();
+        let changes_body: Element<'static, Message> = if changes.is_empty() {
+            text("No file changes in this chat").size(12.5).color(s.faint).into()
+        } else {
+            let mut col = column(changes.iter().map(|(path, add, del)| {
+                let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+                row![
+                    container(text(name).size(13).color(s.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+                    text(format!("+{add}")).size(12).font(MONO).color(s.ok),
+                    text(format!("-{del}")).size(12).font(MONO).color(s.bad),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .padding([3, 0])
+                .into()
+            }));
+            col = col.push(button(text("Undo all").size(12.5).color(s.accent)).on_press(Message::UndoAll).padding(Padding { top: 4.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }));
+            col.into()
+        };
+        let files = match changes.len() {
+            0 => String::new(),
+            1 => "1 file".into(),
+            n => format!("{n} files"),
+        };
+
+        // tasks: the model's list for this job, when it keeps one
+        let done = self.tasks.iter().filter(|t| t.1 == "done").count();
+        let tasks = column(self.tasks.iter().map(|(task, status)| {
+            let (mark, mc, tc) = match status.as_str() {
+                "done" => (ic::CHECK, s.ok, s.faint),
+                "in_progress" => (ic::NOW, s.accent, s.text),
+                _ => (ic::TODO, s.faint, s.muted),
+            };
+            row![icon(mark, 10).color(mc).width(14), text(task.clone()).size(13).color(tc).width(Fill)].spacing(8).align_y(Alignment::Center).padding([3, 0]).into()
+        }));
+
+        // memory: what the model keeps across chats, each with a remove button
+        let memory: Element<'static, Message> = if self.memory.is_empty() {
+            text("Nothing remembered yet").size(12.5).color(s.faint).into()
+        } else {
+            column(self.memory.iter().enumerate().map(|(i, fact)| {
+                row![
+                    icon(ic::MEMORY, 11).color(s.faint).width(14),
+                    text(fact.clone()).size(13).color(s.muted).width(Fill),
+                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::Forget(i)).padding([4, 5]).style(move |_, st| bare(s, st)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .padding([2, 0])
+                .into()
+            }))
+            .into()
+        };
+        let facts = match self.memory.len() {
+            0 => String::new(),
+            1 => "1 fact".into(),
+            n => format!("{n} facts"),
+        };
+
+        let mut body = column![
+            head("Environment", String::new()),
+            section(env.into()),
+            head("Context", if total > 0.0 && used > 0.0 { format!("{pct:.0}%") } else { String::new() }),
+            section(context.into()),
+        ];
+        if !self.tasks.is_empty() {
+            body = body.push(head("Tasks", format!("{done} of {}", self.tasks.len()))).push(section(tasks.into()));
+        }
+        let body = body.push(head("Changes", files)).push(section(changes_body)).push(head("Memory", facts)).push(section(memory));
+        let top = row![drag_area(container(Space::new()).width(Fill).height(32)), self.window_controls()];
+        container(column![top, scrollable(container(body).padding(Padding { top: 0.0, right: 14.0, bottom: 14.0, left: 14.0 })).height(Fill).style(move |t, st| scroll_style(s, t, st))])
+            .width(292)
+            .height(Fill)
+            .style(move |_| container::Style { background: Some(Background::Color(s.side)), border: Border { width: 0.0, ..Default::default() }, ..Default::default() })
+            .into()
+    }
+
+    /// Minimise, maximise (or restore) and close, drawn like Windows' own: 46 by 32, close turning red.
+    fn window_controls(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let b = |c: char, msg: Message, close: bool| {
+            button(container(icon(c, 10)).width(46).height(32).align_x(Alignment::Center).align_y(Alignment::Center))
+                .on_press(msg)
+                .padding(0)
+                .style(move |_, st| {
+                    let (bg, fg) = match (hovered(st), close) {
+                        (true, true) => (rgb(0xc4, 0x2b, 0x1c), Color::WHITE),
+                        (true, false) => (s.hover, s.text),
+                        _ => (Color::TRANSPARENT, s.muted),
+                    };
+                    button::Style { background: Some(Background::Color(bg)), text_color: fg, ..Default::default() }
+                })
+        };
+        row![
+            b(ic::MINIMIZE, Message::Minimize, false),
+            b(if self.maximized { ic::RESTORE } else { ic::MAXIMIZE }, Message::ToggleMaximize, false),
+            b(ic::CLOSE, Message::CloseWindow, true)
+        ]
+        .into()
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
         let s = self.skin();
-        let chrome = row![icon_button(s, ic::CLOSE_PANE, Message::ToggleSidebar)].padding(Padding { top: 6.0, bottom: 4.0, left: 0.0, right: 0.0 });
+        // the title bar's left part: drag the window by it, double-click to maximize
+        let chrome = drag_area(container(icon_button(s, ic::CLOSE_PANE, Message::ToggleSidebar)).width(Fill).height(44).align_y(Alignment::Center));
         let nav = |c: char, label: &'static str, msg: Message| {
             button(row![icon(c, 14).color(s.muted), text(label).size(14).color(s.text)].spacing(12).align_y(Alignment::Center))
                 .on_press(msg)
@@ -270,12 +460,19 @@ impl App {
         let rows = column(self.chats.iter().filter(|c| filter.is_empty() || c.title.to_lowercase().contains(&filter)).map(|c| {
             let on = self.chat.as_deref() == Some(c.id.as_str());
             let hover = self.hovered.as_deref() == Some(c.id.as_str());
-            let label = container(text(if c.title.is_empty() { "New chat" } else { c.title.as_str() }).size(14).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true);
+            let name = container(text(if c.title.is_empty() { "New chat" } else { c.title.as_str() }).size(14).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true);
+            // a long title fades out at the right instead of being cut (the fade is the row's own colour)
+            let bg = if on { s.raise } else if hover { s.hover } else { s.side };
+            let fade = iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2)).add_stop(0.0, Color { a: 0.0, ..bg }).add_stop(1.0, bg);
+            let veil = container(Space::new().width(32).height(Fill)).style(move |_| container::Style { background: Some(Background::Gradient(fade.into())), ..Default::default() });
+            // only a title that runs past the row fades (iced draws the gradient a shade off the row's colour,
+            // which would show as a block on a short one)
+            let label: Element<'_, Message> = if c.title.chars().count() > 26 { stack![name, container(veil).width(Fill).height(Fill).align_x(Alignment::End)].into() } else { name.into() };
             let mut line = row![label].align_y(Alignment::Center).spacing(6);
             if hover || on {
                 line = line.push(button(icon(ic::DELETE, 12).color(s.faint)).on_press(Message::DeleteChat(c.id.clone())).padding([3, 5]).style(move |_, st| bare(s, st)));
             }
-            let b = button(line).on_press(Message::OpenChat(c.id.clone())).width(Fill).padding([7, 10]).style(move |_, st| row_style(s, st, on));
+            let b = button(line).on_press(Message::OpenChat(c.id.clone())).width(Fill).padding([7, 10]).style(move |_, _| button::Style { background: Some(Background::Color(bg)), text_color: s.text, border: border::rounded(8), ..Default::default() }); // the same colour as the fade
             mouse_area(b).on_enter(Message::Hover(Some(c.id.clone()))).on_exit(Message::Hover(None)).into()
         }))
         .spacing(1);
@@ -321,6 +518,11 @@ impl App {
         if self.context.1 > 0.0 && self.context.0 > 0.0 && !self.messages.is_empty() {
             top = top.push(text(format!("{:.0}% of context", 100.0 * self.context.0 / self.context.1)).size(12).color(s.faint));
         }
+        // the title bar: drag the window by its empty part, the window's buttons at its right
+        // the rail's switch; with the rail open, the window's buttons move to its top
+        let on = self.rail;
+        top = top.push(button(icon(ic::DOCK_RIGHT, 13).color(if on { s.text } else { s.muted })).on_press(Message::ToggleRail).padding(8).style(move |_, st| row_style(s, st, on)));
+        let top: Element<'_, Message> = if self.rail { drag_area(top) } else { row![drag_area(top), self.window_controls()].into() };
 
         if self.messages.is_empty() {
             // a new chat: the greeting, the ghost on the message box, recent chats
@@ -471,7 +673,8 @@ impl App {
                 flush(&mut group, &mut parts);
                 parts.push(markdown::view_with(r.md.items(), settings, &Md(s)));
             }
-            group.extend(m.tools.iter().enumerate().filter(|(_, t)| t.round == k).map(|(j, _)| j));
+            // task list updates show in the rail, not as lines in the reply
+            group.extend(m.tools.iter().enumerate().filter(|(_, t)| t.round == k && t.name != "update_tasks").map(|(j, _)| j));
         }
         flush(&mut group, &mut parts);
         if !live && (m.rounds.iter().any(|r| !r.answer.is_empty()) || m.changed) {
@@ -615,6 +818,25 @@ impl<'a> markdown::Viewer<'a, Message> for Md {
             .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(10), text_color: Some(s.text), ..Default::default() })
             .into()
     }
+}
+
+/// A count with thousands separators: 16384 -> "16,384".
+fn thousands(n: f64) -> String {
+    let digits = (n.max(0.0).round() as u64).to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Part of the title bar: a press drags the window, a double click maximizes it (buttons inside keep
+/// their own clicks).
+fn drag_area<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    mouse_area(content).on_press(Message::DragWindow).on_double_click(Message::ToggleMaximize).into()
 }
 
 fn icon_button<'a>(s: &'static Skin, c: char, on_press: Message) -> Element<'a, Message> {
