@@ -231,7 +231,7 @@ impl App {
             ),
             Menu::Plus => {
                 let mut items: Vec<(char, &str, Message, bool, Option<bool>)> = crate::GROUPS.iter().map(|&(g, label)| (group_icon(g), label, Message::ToggleGroup(g), false, Some(self.tools.iter().any(|t| t == g)))).collect();
-                items.push((ic::FOLDER, "Add folder (soon)", Message::Menu(None), false, None));
+                items.push((ic::FOLDER, "Add folder…", Message::AddFolder, false, None));
                 (items, Padding { left: if self.sidebar { 264.0 + 60.0 } else { 60.0 }, bottom: 130.0, ..Padding::ZERO })
             }
         };
@@ -309,7 +309,22 @@ impl App {
         let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "No model".into());
         let runs = sys.get("model_runs_on").and_then(Json::as_str).map(|b| if b.starts_with("GPU") { " on the GPU" } else { " on the CPU" }).unwrap_or("");
         env = env.push(line(ic::BOLT, runs.to_string(), model));
-        env = env.push(line(ic::FOLDER, String::new(), self.folder_label()));
+        // the folders file tools may use, each with a remove button, and a way to add one
+        for (i, f) in self.folders.iter().enumerate() {
+            let name = f.rsplit(['\\', '/']).find(|p| !p.is_empty()).unwrap_or(f).to_string();
+            env = env.push(
+                row![
+                    icon(ic::FOLDER, 13).color(s.faint).width(18),
+                    container(text(name).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::RemoveFolder(i)).padding([4, 5]).style(move |_, st| bare(s, st)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .padding([2, 0]),
+            );
+        }
+        let add = if self.folders.is_empty() { "Add a folder the model may use" } else { "Add folder" };
+        env = env.push(button(row![icon(ic::ADD, 10).color(s.accent).width(18), text(add).size(12.5).color(s.accent)].spacing(6).align_y(Alignment::Center)).on_press(Message::AddFolder).padding(Padding { top: 4.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }));
 
         // context: a meter and the token count
         let (used, total) = self.context;

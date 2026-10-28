@@ -457,7 +457,8 @@ struct App {
     start: Args,         // what the command line asked to open or send once connected
     sidebar: bool,       // the chat list shown (it hides with the pane button)
     hovered: Option<String>, // the chat row under the pointer (its delete button shows)
-    folder: Option<String>,  // the first folder file tools may use
+    folder: Option<String>,  // the first folder file tools may use, by its name
+    folders: Vec<String>,    // every folder file tools may use (the server's harness settings)
     tools: Vec<String>,      // the tool groups that are on
     repaint: bool,           // flipped on every change but the ghost's tick: the whole window is drawn again
     maximized: bool,         // the window fills the screen (no resize edges; the button shows "restore")
@@ -515,6 +516,10 @@ enum Message {
     ToggleRail,
     System(Result<Json, String>),
     UndoAll,
+    AddFolder,
+    FolderPicked(Option<String>),
+    RemoveFolder(usize),
+    Harness(Result<Json, String>),
     Memory(Result<Json, String>),
     Forget(usize),
 }
@@ -560,6 +565,7 @@ impl App {
             sidebar: true,
             hovered: None,
             folder: None,
+            folders: Vec::new(),
             tools,
             repaint: false,
             maximized: false,
@@ -581,7 +587,7 @@ impl App {
         match message {
             Message::Connected(Ok((api, models, chats, harness))) => {
                 self.api = Some(api);
-                self.folder = harness.get("folders").and_then(Json::as_array).and_then(|f| f.first()).and_then(Json::as_str).map(|f| f.rsplit(['\\', '/']).next().unwrap_or(f).to_string());
+                self.set_harness(&harness);
                 self.set_models(&models);
                 self.set_chats(&chats);
                 self.status = String::new();
@@ -591,7 +597,10 @@ impl App {
                     Some("settings") => Some(Menu::Settings),
                     _ => None,
                 };
-                let system = Task::batch([self.refresh_system(), self.refresh_memory()]);
+                if self.model.is_none() {
+                    self.status = "Loading the model…".into();
+                }
+                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.wait_for_model()]);
                 if let Some(id) = self.start.open.take() {
                     return Task::batch([system, self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded)]);
                 }
@@ -601,7 +610,18 @@ impl App {
                 }
                 return system;
             }
-            Message::Connected(Err(e)) => self.status = e,
+            // the server not up yet (the launcher starts both at once): try again in a moment
+            Message::Connected(Err(_)) => {
+                let addr = self.start.addr.clone();
+                self.status = format!("Waiting for ghost-infer at {addr}…");
+                return Task::perform(
+                    blocking(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        connect(&addr)
+                    }),
+                    Message::Connected,
+                );
+            }
             Message::Chats(Ok(c)) => self.set_chats(&c),
             Message::Chats(Err(e)) | Message::ChatLoaded(Err(e)) | Message::ModelLoaded(Err(e)) => self.status = e,
             Message::OpenChat(id) => {
@@ -648,7 +668,8 @@ impl App {
             }
             Message::ModelLoaded(Ok(models)) => {
                 self.set_models(&models);
-                self.status = String::new();
+                self.status = if self.model.is_none() { "Loading the model…".into() } else { String::new() };
+                return Task::batch([self.wait_for_model(), self.refresh_system()]);
             }
             Message::Edit(action) => self.composer.perform(action),
             Message::Send => return self.send(None),
@@ -763,6 +784,28 @@ impl App {
             }
             Message::System(Ok(j)) => self.system = j,
             Message::System(Err(_)) => {}
+            Message::AddFolder => {
+                self.menu = None;
+                // the dialog blocks, so it opens on its own thread
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose a folder the model may use").pick_folder().map(|p| p.display().to_string())), Message::FolderPicked);
+            }
+            Message::FolderPicked(None) => {}
+            Message::FolderPicked(Some(f)) => {
+                let mut folders = self.folders.clone();
+                if !folders.contains(&f) {
+                    folders.push(f);
+                }
+                return self.save_folders(folders);
+            }
+            Message::RemoveFolder(i) => {
+                let mut folders = self.folders.clone();
+                if i < folders.len() {
+                    folders.remove(i);
+                }
+                return self.save_folders(folders);
+            }
+            Message::Harness(Ok(j)) => self.set_harness(&j),
+            Message::Harness(Err(e)) => self.status = format!("Couldn't save the folders: {e}"),
             Message::Memory(Ok(j)) => self.memory = j.get("facts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
             Message::Memory(Err(e)) => self.status = format!("Couldn't read the memory: {e}"),
             Message::Forget(i) => {
@@ -802,6 +845,32 @@ impl App {
     }
 
     /// This computer's GPU, memory and model, for the rail (only fetched while it is shown).
+    /// The server's harness settings: the folders file tools may use.
+    fn set_harness(&mut self, j: &Json) {
+        self.folders = j.get("folders").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
+        self.folder = self.folders.first().map(|f| f.rsplit(['\\', '/']).find(|p| !p.is_empty()).unwrap_or(f).to_string());
+    }
+
+    /// Sends the new folder list to the server (it checks each one is a folder).
+    fn save_folders(&self, folders: Vec<String>) -> Task<Message> {
+        let body = obj(vec![("folders", Json::Arr(folders.iter().map(|f| str(f)).collect()))]);
+        self.call(move |api| api.post("/api/harness", &body), Message::Harness)
+    }
+
+    /// While the server is still loading its model, asks again every two seconds until one is running.
+    fn wait_for_model(&self) -> Task<Message> {
+        if self.model.is_some() {
+            return Task::none();
+        }
+        self.call(
+            |api| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                api.get("/api/models")
+            },
+            Message::ModelLoaded,
+        )
+    }
+
     /// What the model remembers (the rail shows it, with a remove button for each).
     fn refresh_memory(&self) -> Task<Message> {
         self.call(|api| api.get("/api/memory"), Message::Memory)
