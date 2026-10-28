@@ -67,6 +67,7 @@ struct Loaded {
     thinking: bool, // the chat template has a thinking switch
     glm: bool,      // GLM-4's chat format instead of ChatML
     backend: String, // where it runs, e.g. "GPU NVIDIA GeForce RTX 2060 SUPER (sm_75, ...)"
+    tok: Arc<crate::tokenizer::Tokenizer>, // to count a prompt's tokens before sending it (the agent fits chats to the context)
 }
 
 #[derive(Default)]
@@ -193,6 +194,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
                 thinking: fmt.as_ref().is_some_and(|f| f.thinking),
                 glm: fmt.as_ref().is_some_and(|f| f.glm),
                 backend: engine.backend.describe(),
+                tok: engine.tok.clone(),
                 default_system: fmt.and_then(|f| f.default_system),
             }),
             loading: None,
@@ -545,12 +547,22 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 Ok(facts) => respond_private(&mut conn, 200, &obj(vec![("facts", Json::Arr(facts.iter().map(|f| str(f)).collect()))])),
                 Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
             },
-            // skills: the installed ones, install from a folder, archive or link {"path"}, remove {"name"}
+            // skills: the installed ones, install from a folder, archive or link {"path", "skills": which ones
+            // when it holds several}, remove {"name"}
             ("GET", "/api/skills") => respond_private(&mut conn, 200, &obj(vec![("skills", skills::list_json())])),
-            ("POST", "/api/skills/install") => match skills::install(body().ok().and_then(|b| b.get("path").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
-                Ok(name) => respond_private(&mut conn, 200, &obj(vec![("installed", str(&name)), ("skills", skills::list_json())])),
-                Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
-            },
+            ("POST", "/api/skills/install") => {
+                let b = body().unwrap_or(Json::Null);
+                let path = b.get("path").and_then(Json::as_str).unwrap_or("").to_string();
+                let pick: Vec<String> = b.get("skills").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
+                match skills::install(&path, &pick) {
+                    Ok(skills::Installed::Done(names)) => respond_private(&mut conn, 200, &obj(vec![("installed", str(&names.join(", "))), ("skills", skills::list_json())])),
+                    Ok(skills::Installed::Choose(choices)) => {
+                        let list = choices.iter().map(|c| obj(vec![("path", str(&c.path)), ("name", str(&c.name)), ("description", str(&c.description))])).collect();
+                        respond_private(&mut conn, 200, &obj(vec![("source", str(&path)), ("choose", Json::Arr(list)), ("skills", skills::list_json())]))
+                    }
+                    Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+                }
+            }
             ("POST", "/api/skills/remove") => match skills::remove(body().ok().and_then(|b| b.get("name").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
                 Ok(()) => respond_private(&mut conn, 200, &obj(vec![("skills", skills::list_json())])),
                 Err(e) => respond_private(&mut conn, 404, &error_body(&e)),

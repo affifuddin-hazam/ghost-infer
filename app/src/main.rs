@@ -131,6 +131,7 @@ fn group_name(group: &str) -> &'static str {
         "edit" => "file changes",
         "cmd" => "commands",
         "mcp" => "MCP tools",
+        "skills" => "skill installs",
         _ => "web access",
     }
 }
@@ -275,6 +276,7 @@ fn tool_label(t: &ToolLine) -> String {
         "remember" => format!("Remembered: {}", s("fact")),
         "forget" => format!("Forgot: {}", s("fact")),
         "use_skill" => format!("Used the {} skill", s("name")),
+        "install_skill" => format!("Installed {}", if s("skill").is_empty() { s("source") } else { format!("{} from {}", s("skill"), s("source")) }),
         "search_chats" => format!("Searched earlier chats for \"{}\"", s("query")),
         "read_chat" => "Read an earlier chat".into(),
         "check_work" => "Asked to check its work".into(),
@@ -295,6 +297,7 @@ fn tool_label(t: &ToolLine) -> String {
         "Ran" => "Run",
         "Started" => "Start",
         "Searched" => "Search",
+        "Installed" => "Install",
         other => other,
     };
     let label = format!("{verb} {rest}");
@@ -316,6 +319,7 @@ fn approval_text(t: &ToolLine) -> (String, String) {
         "start_process" => (format!("Start this in the background{cwd}?"), s("command")),
         "web_search" => (format!("Search the web for \"{}\"?", s("query")), String::new()),
         "fetch_url" => (format!("Open {}?", s("url")), String::new()),
+        "install_skill" => (format!("Install a skill from {}?", s("source")), if s("skill").is_empty() { String::new() } else { format!("Skill: {}", s("skill")) }),
         n if n.starts_with("mcp__") => {
             let (server, tool) = mcp_parts(n);
             let args = match Json::parse(&t.arguments) {
@@ -513,6 +517,7 @@ struct App {
     instructions: Vec<(String, bool, bool)>, // the GHOST.md files: path, whether it exists, whether it is the global one
     skills: Vec<(String, String)>, // installed skills: name, description
     skill_link: String,      // a skill link being pasted in the rail
+    skill_choices: Option<(String, Vec<(String, String, String)>)>, // a source with several skills: it, and each one's path, name, description
     mcp: Vec<(String, String, usize)>, // MCP servers: name, state, how many tools
     mcp_config: String,      // where mcp.json is
 }
@@ -585,6 +590,8 @@ enum Message {
     SkillLink(String),
     InstallLink,
     OpenSkillLink, // the + menu: the rail, with its link field focused
+    InstallChoice(Option<String>), // one of a source's skills, by path (None: all of them)
+    CancelChoice,
     Skills(Result<Json, String>),
     RemoveSkill(String),
     Mcp(Result<Json, String>),
@@ -651,6 +658,7 @@ impl App {
             instructions: Vec::new(),
             skills: Vec::new(),
             skill_link: String::new(),
+            skill_choices: None,
             mcp: Vec::new(),
             mcp_config: String::new(),
         };
@@ -967,10 +975,25 @@ impl App {
                 let body = obj(vec![("path", str(&path))]);
                 return self.call(move |api| api.post("/api/skills/install", &body), Message::Skills);
             }
+            Message::InstallChoice(path) => {
+                if let Some((source, _)) = &self.skill_choices {
+                    self.status = "Installing…".into();
+                    let body = obj(vec![("path", str(source)), ("skills", Json::Arr(vec![str(path.as_deref().unwrap_or("all"))]))]);
+                    return self.call(move |api| api.post("/api/skills/install", &body), Message::Skills);
+                }
+            }
+            Message::CancelChoice => self.skill_choices = None,
             Message::Skills(Ok(j)) => {
                 self.skills = j.get("skills").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("description").and_then(Json::as_str).unwrap_or("").to_string()))).collect();
                 if let Some(name) = j.get("installed").and_then(Json::as_str) {
-                    self.status = format!("Installed the {name} skill");
+                    self.skill_choices = None;
+                    self.status = if name.contains(", ") { format!("Installed the skills {name}") } else { format!("Installed the {name} skill") };
+                }
+                if let Some(list) = j.get("choose").and_then(Json::as_array) {
+                    let s = |c: &Json, k: &str| c.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+                    let choices: Vec<_> = list.iter().map(|c| (s(c, "path"), s(c, "name"), s(c, "description"))).collect();
+                    self.status = format!("That link has {} skills: pick one in the rail", choices.len());
+                    self.skill_choices = Some((s(&j, "source"), choices));
                 }
             }
             Message::Skills(Err(e)) => self.status = format!("Couldn't install the skill: {e}"),

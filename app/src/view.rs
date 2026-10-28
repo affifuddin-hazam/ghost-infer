@@ -480,6 +480,24 @@ impl App {
         skills = skills.push(row![link("Install from folder", Message::InstallSkill(false)), link("From .zip", Message::InstallSkill(true))]);
         let skill_link = text_input("Paste a skill link (GitHub or .zip)", &self.skill_link).id("skill-link").on_input(Message::SkillLink).on_submit(Message::InstallLink).size(13).padding([6, 8]).style(move |t, st| input_style(s, t, st));
         skills = skills.push(container(skill_link).padding(Padding { top: 6.0, ..Padding::ZERO }));
+        // a link or folder with several skills: which to install
+        if let Some((_, choices)) = &self.skill_choices {
+            skills = skills.push(container(text(format!("It has {} skills. Install which?", choices.len())).size(12.5).color(s.faint)).padding(Padding { top: 8.0, ..Padding::ZERO }));
+            for (path, name, desc) in choices {
+                let place = if path.is_empty() { desc.clone() } else { format!("{path} · {desc}") };
+                skills = skills.push(
+                    row![
+                        icon(ic::SKILL, 11).color(s.faint).width(14),
+                        column![text(name.clone()).size(13).font(MEDIUM).color(s.text), text(crate::clip_line(&place, 90)).size(12).color(s.faint)].width(Fill),
+                        link("Install", Message::InstallChoice(Some(path.clone()))),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .padding([3, 0]),
+                );
+            }
+            skills = skills.push(row![link("Install all", Message::InstallChoice(None)), link("Cancel", Message::CancelChoice)]);
+        }
 
         // MCP servers: each with its state, and editing the list
         let mut mcp = column![].spacing(2);

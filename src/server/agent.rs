@@ -67,15 +67,19 @@ fn tool_groups() -> &'static Json {
     T.get_or_init(|| Json::parse(TOOLS).expect("the built-in tool list is valid JSON"))
 }
 
-/// The tools of these groups (and the system one), as the chat template's "tools": use_skill when skills are
-/// installed, and the MCP servers' tools when the mcp group is on.
+/// Loading and installing skills: always offered, so a skill installed during a reply can be used in it and
+/// the tool list (part of the cached prompt) does not change.
+const SKILL_TOOLS: [&str; 2] = [
+    r#"{"type":"function","function":{"name":"use_skill","description":"Load an installed skill's instructions (the installed skills are listed in the system prompt). Call it before a task one of them is for.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The skill's name"}},"required":["name"]}}}"#,
+    r#"{"type":"function","function":{"name":"install_skill","description":"Install a skill (a folder with a SKILL.md and any files it uses) so it can be loaded with use_skill. The source can be a GitHub link (a repository, a folder in one, or a SKILL.md in one), a link to a .zip, or a folder or .zip on this computer. Use this, not git or a download, when the user asks to install or add a skill. When the source holds several skills, the result lists them; call again with skill set to the path of the one wanted, or all.","parameters":{"type":"object","properties":{"source":{"type":"string","description":"The link, folder or .zip"},"skill":{"type":"string","description":"Which skill, when the source holds several: its path from the list, or all"}},"required":["source"]}}}"#,
+];
+
+/// The tools of these groups (and the system one), as the chat template's "tools": with the skill tools, and
+/// the MCP servers' tools when the mcp group is on.
 fn tools_for(groups: &[String]) -> Vec<Json> {
     let all = tool_groups();
     let mut tools: Vec<Json> = std::iter::once("system").chain(groups.iter().map(String::as_str)).filter_map(|g| all.get(g).and_then(Json::as_array)).flatten().cloned().collect();
-    if !super::skills::list().is_empty() {
-        let t = r#"{"type":"function","function":{"name":"use_skill","description":"Load a skill's instructions (the skills are listed in the system prompt). Call it before a task one of them is for.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The skill's name"}},"required":["name"]}}}"#;
-        tools.push(Json::parse(t).expect("valid tool"));
-    }
+    tools.extend(SKILL_TOOLS.iter().map(|t| Json::parse(t).expect("valid tool")));
     if groups.iter().any(|g| g == "mcp") {
         tools.extend(super::mcp::tools());
     }
@@ -88,6 +92,7 @@ fn approval_group(name: &str) -> Option<&'static str> {
         "write_file" | "edit_file" => Some("edit"),
         "run_command" | "start_process" => Some("cmd"),
         "web_search" | "fetch_url" => Some("web"),
+        "install_skill" => Some("skills"),
         n if n.starts_with("mcp__") => Some("mcp"),
         _ => None,
     }
@@ -138,6 +143,143 @@ fn with_reminder(messages: &[Json], at: usize) -> Vec<Json> {
 /// The harness's own messages in a chat (the nudge): not the user's, so retrying and searching pass them by.
 fn is_auto(m: &Json) -> bool {
     m.get("auto").and_then(Json::as_bool).unwrap_or(false)
+}
+
+// ---- fitting a chat to the context: the chat keeps every message, marked with what the model no longer gets
+
+/// What the model gets in place of a tool's output taken out to make room.
+const TRIMMED: &str = "[This output was taken out to make room in the context. Call the tool again if it is needed.]";
+
+/// Put before the first message the model still gets, once earlier ones were left out.
+const LEFT_OUT: &str = "(Earlier messages of this chat were left out to make room in the context.)";
+
+fn flag(m: &Json, k: &str) -> bool {
+    m.get(k).and_then(Json::as_bool).unwrap_or(false)
+}
+
+fn role(m: &Json) -> &str {
+    m.get("role").and_then(Json::as_str).unwrap_or("")
+}
+
+/// Sets a message's field `k`.
+fn mark(m: &mut Json, k: &str, v: Json) {
+    if let Json::Obj(fields) = m {
+        fields.retain(|(f, _)| f != k);
+        fields.push((k.into(), v));
+    }
+}
+
+/// The chat as the model reads it: messages left out ("dropped") skipped, tool outputs taken out ("trimmed")
+/// replaced by a note, and messages cut down ("clip": the characters kept) cut in the middle.
+fn for_model(messages: &[Json]) -> Vec<Json> {
+    let mut out: Vec<Json> = Vec::with_capacity(messages.len());
+    let mut left_out = false;
+    for m in messages {
+        if flag(m, "dropped") {
+            left_out = true;
+            continue;
+        }
+        let (trimmed, clip, note) = (flag(m, "trimmed"), m.get("clip").and_then(Json::as_f64).map(|c| c as usize), left_out && out.is_empty());
+        let mut m = m.clone();
+        if let (true, Json::Obj(fields)) = (trimmed || clip.is_some() || note, &mut m) {
+            if let Some((_, Json::Str(t))) = fields.iter_mut().find(|(k, _)| k == "content") {
+                if trimmed {
+                    *t = TRIMMED.into();
+                } else if let Some(c) = clip {
+                    *t = crate::tools::clip(t, c);
+                }
+                if note {
+                    *t = format!("{LEFT_OUT}\n\n{t}");
+                }
+            }
+        }
+        out.push(m);
+    }
+    out
+}
+
+/// Makes about `need` tokens of room, the least missed first: tool outputs taken out, oldest first, all but
+/// the last 3; then the oldest turns left out whole; then, when the turn being answered is too big on its
+/// own, its biggest messages cut in half. Whether it found anything to take out.
+fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) -> bool {
+    // a message's text as the model gets it now, in tokens
+    let cost = |m: &Json| -> usize {
+        if flag(m, "dropped") {
+            return 0;
+        }
+        if flag(m, "trimmed") {
+            return 25;
+        }
+        let t = m.get("content").and_then(Json::as_str).unwrap_or("");
+        let shown = m.get("clip").and_then(Json::as_f64).map(|c| crate::tools::clip(t, c as usize));
+        tok.encode(shown.as_deref().unwrap_or(t)).len()
+    };
+    let msgs = &mut chat.messages;
+    let current = msgs.iter().rposition(|m| role(m) == "user" && !is_auto(m)).unwrap_or(0);
+    let mut freed = 0;
+    let outputs: Vec<usize> = (0..msgs.len()).filter(|&i| role(&msgs[i]) == "tool" && !flag(&msgs[i], "trimmed") && !flag(&msgs[i], "dropped")).collect();
+    for &i in &outputs[..outputs.len().saturating_sub(3)] {
+        if freed >= need {
+            break;
+        }
+        let c = cost(&msgs[i]);
+        if c > 100 {
+            mark(&mut msgs[i], "trimmed", Json::Bool(true));
+            freed += c - 25;
+        }
+    }
+    // a turn: a user's message and everything up to their next one
+    let mut i = 0;
+    while freed < need && i < current {
+        let end = (i + 1..current).find(|&j| role(&msgs[j]) == "user" && !is_auto(&msgs[j])).unwrap_or(current);
+        for j in i..end {
+            freed += cost(&msgs[j]);
+            mark(&mut msgs[j], "dropped", Json::Bool(true));
+        }
+        i = end;
+    }
+    let mut big: Vec<(usize, usize)> = (current..msgs.len()).map(|j| (cost(&msgs[j]), j)).filter(|(c, _)| *c > 1000).collect();
+    big.sort_by(|a, b| b.cmp(a));
+    for (c, j) in big {
+        if freed >= need {
+            break;
+        }
+        let chars = msgs[j].get("content").and_then(Json::as_str).map_or(0, |t| t.chars().count());
+        let kept = msgs[j].get("clip").and_then(Json::as_f64).map_or(chars, |c| c as usize);
+        mark(&mut msgs[j], "clip", num((kept / 2) as f64));
+        freed += c / 2;
+    }
+    freed > 0
+}
+
+/// This round's prompt, made to fit: when it would leave the reply less room than it asks for (up to a
+/// quarter of the context), make_room takes out enough that it fills at most 3/4 of the rest, so the next
+/// rounds fit too and start the same way (the server's cache still holds them).
+fn fitted_prompt(req: &Request, chat: &mut Chat, at: Option<usize>, tools: &[Json], shared: &Shared, loaded: &Loaded) -> Result<String, String> {
+    let limit = loaded.ctx - req.max_tokens.min(loaded.ctx / 4);
+    for _ in 0..8 {
+        let history = match at {
+            Some(at) => with_reminder(&chat.messages, at),
+            None => chat.messages.clone(),
+        };
+        let prompt = prompt_for(req, &for_model(&history), tools, req.thinking, shared, loaded)?;
+        // a token is at least one byte, so a prompt this short fits without counting
+        if prompt.len() <= limit {
+            return Ok(prompt);
+        }
+        let n = loaded.tok.encode(&prompt).len();
+        if n <= limit {
+            return Ok(prompt);
+        }
+        if !make_room(chat, n - limit * 3 / 4, &loaded.tok) {
+            return Err(format!(
+                "this message is too long for the model: it needs {n} tokens, and the context holds {} with {} kept for the reply. Shorten it, or start a new chat",
+                loaded.ctx,
+                loaded.ctx - limit
+            ));
+        }
+    }
+    Err("this chat cannot be made to fit the model's context; start a new chat".into())
 }
 
 // ---- memory: facts the model saved, kept in %LOCALAPPDATA%\ghost-infer\memory.json for every chat
@@ -615,7 +757,7 @@ fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, s
 /// already holds it: only the question is read, and the next message finds the chat still cached.
 fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Option<String> {
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
-    let mut history = chat.messages.clone();
+    let mut history = for_model(&chat.messages);
     let ask = "Give this chat a title of 3 to 6 words that says what it is about. Reply with the title only: no quotes, no full stop, no tool calls.";
     history.push(obj(vec![("role", str("user")), ("content", str(ask))]));
     let prompt = prompt_for(req, &history, &tools, false, shared, loaded).ok()?;
@@ -656,10 +798,7 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
     let plans = tools.iter().any(|t| tool_name(t) == "update_tasks");
     let asked = chat.messages[..reply_start].iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m));
     for round in 0..MAX_ROUNDS {
-        let prompt = match asked.filter(|_| plans) {
-            Some(at) => prompt_for(req, &with_reminder(&chat.messages, at), &tools, req.thinking, shared, loaded)?,
-            None => prompt_for(req, &chat.messages, &tools, req.thinking, shared, loaded)?,
-        };
+        let prompt = fitted_prompt(req, chat, asked.filter(|_| plans), &tools, shared, loaded)?;
         let lead = if loaded.glm && prompt.ends_with("<think>") { "<think>" } else { "" };
 
         let (tx, events) = mpsc::channel();
@@ -842,9 +981,10 @@ fn call(conn: &mut TcpStream, id: &str, name: &str, arguments: &str, chat: &Chat
             }
         }
     }
-    if name == "use_skill" {
+    if name == "use_skill" || name == "install_skill" {
         let args = Json::parse(arguments).unwrap_or(Json::Null);
-        return Ok((super::skills::use_skill(args.get("name").and_then(Json::as_str).unwrap_or("")), false));
+        let s = |k: &str| args.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+        return Ok((if name == "use_skill" { super::skills::use_skill(&s("name")) } else { super::skills::install_tool(&s("source"), &s("skill")) }, false));
     }
     if name == "search_chats" || name == "read_chat" {
         let args = Json::parse(arguments).unwrap_or(Json::Null);

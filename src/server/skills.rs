@@ -115,7 +115,8 @@ fn skill_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > 5 {
         return;
     }
-    let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.ends_with(".git")).collect();
+    let skip = |p: &Path| p.file_name().is_some_and(|n| n == ".git" || n == "node_modules");
+    let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir() && !skip(p)).collect();
     subs.sort();
     for p in subs {
         if p.join("SKILL.md").is_file() {
@@ -126,22 +127,19 @@ fn skill_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The one skill in `dir`: itself, or the only one below it. With several, which they are.
-fn locate(dir: &Path) -> Result<PathBuf, String> {
+/// The skills in `dir`: itself, or every one below it.
+fn found(dir: &Path) -> Vec<PathBuf> {
     if dir.join("SKILL.md").is_file() {
-        return Ok(dir.to_path_buf());
+        return vec![dir.to_path_buf()];
     }
-    let mut found = Vec::new();
-    skill_dirs(dir, 0, &mut found);
-    match found.len() {
-        0 => Err("there is no SKILL.md in it".into()),
-        1 => Ok(found.remove(0)),
-        n => {
-            let names: Vec<String> = found.iter().take(8).map(|p| p.strip_prefix(dir).unwrap_or(p).display().to_string().replace('\\', "/")).collect();
-            let more = if n > 8 { ", …" } else { "" };
-            Err(format!("it has {n} skills ({}{more}). Install them one at a time, from the link or folder of each", names.join(", ")))
-        }
-    }
+    let mut out = Vec::new();
+    skill_dirs(dir, 0, &mut out);
+    out
+}
+
+/// A skill's path below the folder it was found in, with forward slashes ("" for the folder itself).
+fn rel(dir: &Path, base: &Path) -> String {
+    dir.strip_prefix(base).unwrap_or(dir).display().to_string().replace('\\', "/")
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -193,7 +191,7 @@ fn github(url: &str) -> Option<(String, Option<String>)> {
     Some((format!("https://codeload.github.com/{owner}/{repo}/zip/{reference}"), Some(sub.join("/"))))
 }
 
-/// Downloads a skill into `tmp`; the folder holding it.
+/// Downloads a skill into `tmp`; the folder to look for skills in.
 fn download(url: &str, tmp: &Path) -> Result<PathBuf, String> {
     let (fetch, sub) = github(url).unwrap_or((url.to_string(), None));
     let file = tmp.join("download");
@@ -223,50 +221,141 @@ fn download(url: &str, tmp: &Path) -> Result<PathBuf, String> {
     } else {
         return Err("that link gives neither a skill archive nor a SKILL.md".into());
     }
-    let Some(sub) = sub else { return locate(&dir) };
+    let Some(sub) = sub else { return Ok(dir) };
     // a repository's zip holds one folder, <repo>-<ref>
     let top = std::fs::read_dir(&dir).ok().and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.is_dir())).ok_or("the repository's download is empty")?;
     let base = if sub.is_empty() { top } else { top.join(&sub) };
     if !base.is_dir() {
         return Err(format!("the repository has no folder {sub}"));
     }
-    locate(&base)
+    Ok(base)
 }
 
-/// Installs a skill from a folder or a .zip / .skill archive (with SKILL.md in it, or as the only skill
-/// below it), or from a link: GitHub (a repository, a folder in one, or its SKILL.md) or a direct
-/// link to an archive or a SKILL.md. A skill of the same name is replaced. Its name.
-pub fn install(source: &str) -> Result<String, String> {
+/// A skill in a source that holds several: its path there, its name and what it is for.
+pub struct Choice {
+    pub path: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// What installing did: the skills it installed, by name, or (a source with several skills and none
+/// picked) the skills to choose from.
+pub enum Installed {
+    Done(Vec<String>),
+    Choose(Vec<Choice>),
+}
+
+/// Copies the skill in `dir` into the skills folder, replacing one of the same name. Its name.
+fn install_dir(root: &Path, dir: &Path) -> Result<String, String> {
+    let skill = read(dir).ok_or("its SKILL.md cannot be read")?;
+    let name = clean_name(&skill.name);
+    if name.is_empty() {
+        return Err("its SKILL.md has no usable name".to_string());
+    }
+    let target = root.join(&name);
+    if target.exists() {
+        std::fs::remove_dir_all(&target).map_err(|e| format!("cannot replace the installed {name}: {e}"))?;
+    }
+    copy_dir(dir, &target).map_err(|e| format!("cannot copy {name}: {e}"))?;
+    Ok(name)
+}
+
+/// Installs skills from a folder or a .zip / .skill archive, or from a link: GitHub (a repository, a folder
+/// in one, or its SKILL.md) or a direct link to an archive or a SKILL.md. Every folder with a SKILL.md
+/// counts, with all its files. When the source holds several skills, `pick` says which: their paths or names,
+/// or "all"; with none picked, the answer is the list to choose from, and a download is kept (in .pending)
+/// so that choosing does not download it again. A skill of the same name is replaced.
+pub fn install(source: &str, pick: &[String]) -> Result<Installed, String> {
     let root = root()?;
     let source = source.trim().trim_matches('"');
+    let link = source.starts_with("https://") || source.starts_with("http://");
     let tmp = root.join(format!(".install-{}", std::process::id()));
+    let held = root.join(".pending");
     let _ = std::fs::remove_dir_all(&tmp);
     let result = (|| {
         let src = PathBuf::from(source);
-        let dir = if source.starts_with("https://") || source.starts_with("http://") {
+        // the download kept when the list was shown, if this is the same link
+        let kept = std::fs::read_to_string(held.join("source.txt")).ok().filter(|s| link && !pick.is_empty() && s == source);
+        let base = if let Some(rel) = kept.and_then(|_| std::fs::read_to_string(held.join("base.txt")).ok()) {
+            held.join(rel)
+        } else if link {
             download(source, &tmp)?
         } else if src.is_dir() {
-            locate(&src).map_err(|e| format!("that folder has no skill: {e}"))?
+            src
         } else if src.is_file() {
-            unpack(&src, &tmp)?;
-            locate(&tmp)?
+            unpack(&src, &tmp.join("files"))?;
+            tmp.join("files")
         } else {
             return Err(format!("{source} is not a folder, a file or a link"));
         };
-        let skill = read(&dir).ok_or("its SKILL.md cannot be read")?;
-        let name = clean_name(&skill.name);
-        if name.is_empty() {
-            return Err("its SKILL.md has no usable name".to_string());
+        let all = found(&base);
+        if all.is_empty() {
+            return Err("there is no SKILL.md in it".into());
         }
-        let target = root.join(&name);
-        if target.exists() {
-            std::fs::remove_dir_all(&target).map_err(|e| format!("cannot replace the installed {name}: {e}"))?;
+        if all.len() > 1 && pick.is_empty() {
+            let choices = all.iter().filter_map(|d| read(d).map(|s| Choice { path: rel(d, &base), name: s.name, description: s.description })).collect();
+            if link && base.starts_with(&tmp) {
+                let _ = std::fs::remove_dir_all(&held);
+                std::fs::rename(&tmp, &held).map_err(|e| e.to_string())?;
+                let _ = std::fs::write(held.join("source.txt"), source);
+                let _ = std::fs::write(held.join("base.txt"), base.strip_prefix(&tmp).unwrap_or(&base).display().to_string());
+            }
+            return Ok(Installed::Choose(choices));
         }
-        copy_dir(&dir, &target).map_err(|e| format!("cannot copy it: {e}"))?;
-        Ok(name)
+        // which ones: by path or folder name or skill name; "all" for every one (the first of a name)
+        let wanted = |d: &PathBuf| {
+            let (path, folder) = (rel(d, &base), d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            let name = read(d).map(|s| s.name).unwrap_or_default();
+            all.len() == 1 || pick.iter().any(|p| {
+                let p = p.trim().trim_matches('/').replace('\\', "/");
+                p.eq_ignore_ascii_case("all") || p.eq_ignore_ascii_case(&path) || p.eq_ignore_ascii_case(&folder) || p.eq_ignore_ascii_case(&name)
+            })
+        };
+        let mut names: Vec<String> = Vec::new();
+        for d in all.iter().filter(|d| wanted(d)) {
+            if read(d).is_some_and(|s| names.contains(&clean_name(&s.name))) {
+                continue;
+            }
+            names.push(install_dir(&root, d)?);
+        }
+        if names.is_empty() {
+            let paths: Vec<String> = all.iter().map(|d| rel(d, &base)).collect();
+            return Err(format!("it has no skill {}; its skills are: {}", pick.join(", "), paths.join(", ")));
+        }
+        let _ = std::fs::remove_dir_all(&held);
+        Ok(Installed::Done(names))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     result
+}
+
+/// The install_skill tool: installs from `source` (`skill` picks one when it holds several) and says
+/// what happened in words the model can act on.
+pub fn install_tool(source: &str, skill: &str) -> String {
+    let pick: Vec<String> = if skill.trim().is_empty() { Vec::new() } else { vec![skill.trim().to_string()] };
+    match install(source, &pick) {
+        Ok(Installed::Done(names)) => {
+            let skills = list();
+            let lines: Vec<String> = names
+                .iter()
+                .map(|n| {
+                    let about = skills.iter().find(|s| clean_name(&s.name) == *n).map(|s| crate::tools::clip(&s.description, 300)).unwrap_or_default();
+                    format!("- {n}: {about}")
+                })
+                .collect();
+            format!("Installed:\n{}\nTo use one, call use_skill with its name.", lines.join("\n"))
+        }
+        Ok(Installed::Choose(choices)) => {
+            let lines: Vec<String> = choices.iter().take(40).map(|c| format!("- {} ({}): {}", c.path, c.name, crate::tools::clip(&c.description, 200))).collect();
+            let more = if choices.len() > 40 { format!("\n(and {} more)", choices.len() - 40) } else { String::new() };
+            format!(
+                "Nothing installed yet: this holds {} skills.\n{}{more}\nCall install_skill again with the same source and skill set to the path of the one the user wants, or to \"all\". If it is not clear which one, ask the user.",
+                choices.len(),
+                lines.join("\n")
+            )
+        }
+        Err(e) => format!("Error: cannot install it: {e}"),
+    }
 }
 
 /// Removes an installed skill.
