@@ -399,7 +399,8 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
         None => None,
     };
     let mut stop: Vec<u32> = tok.eos_id.into_iter().collect();
-    for t in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+    // GLM ends its turn by starting the next one (<|user|>, or <|observation|> for a tool's result)
+    for t in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|user|>", "<|observation|>"] {
         if let Some(id) = tok.token_id(t) {
             if !stop.contains(&id) {
                 stop.push(id);
@@ -711,13 +712,19 @@ struct ChatFormat {
     /// the template has Qwen3's thinking switch (enable_thinking); models without it never think, and
     /// an empty <think></think> block where they do not expect one makes them stop after a few tokens
     thinking: bool,
+    /// GLM-4's format ([gMASK]<sop>, <|user|> / <|assistant|> with no newlines) instead of ChatML
+    glm: bool,
 }
 
 impl ChatFormat {
     fn detect(g: &Gguf) -> Result<ChatFormat, String> {
         let tpl = g.get("tokenizer.chat_template").and_then(Value::as_str).unwrap_or("");
+        let glm = tpl.contains("[gMASK]") && tpl.contains("<|assistant|>");
+        if glm {
+            return Ok(ChatFormat { default_system: None, thinking: tpl.contains("enable_thinking"), glm });
+        }
         if !tpl.contains("<|im_start|>") {
-            return Err("this model's chat template is not ChatML; use --raw".into());
+            return Err("this model's chat template is neither ChatML nor GLM's; use --raw".into());
         }
         // the template's built-in system prompt, if it has one: '<|im_start|>system\n…<|im_end|>'
         let default_system = tpl.find("<|im_start|>system").and_then(|i| {
@@ -727,10 +734,14 @@ impl ChatFormat {
             let text = &after[..end];
             (!text.is_empty() && !text.contains("{{") && !text.contains("{%")).then(|| text.to_string())
         });
-        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking") })
+        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking"), glm })
     }
 
     fn first_turn(&self, system: Option<&str>, user: &str) -> String {
+        if self.glm {
+            let sys = system.map(|s| format!("<|system|>{s}")).unwrap_or_default();
+            return format!("[gMASK]<sop>{sys}{}", self.next_turn(user));
+        }
         let mut s = String::new();
         if let Some(sys) = system.or(self.default_system.as_deref()) {
             s.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
@@ -740,6 +751,9 @@ impl ChatFormat {
     }
 
     fn next_turn(&self, user: &str) -> String {
+        if self.glm {
+            return format!("<|user|>{user}<|assistant|>{}", if self.thinking { "<think>" } else { "</think>" });
+        }
         format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
     }
 }
@@ -808,7 +822,7 @@ fn chat(o: &Opts) -> Result<(), String> {
         }
         // close the previous assistant turn: its <|im_end|> was sampled but not yet fed to the model
         let mut ids = Vec::new();
-        if let Some(end) = pending_end.take() {
+        if let Some(end) = pending_end.take().filter(|_| !fmt.glm) {
             ids.push(end);
             ids.extend(engine.tok.encode("\n"));
         }

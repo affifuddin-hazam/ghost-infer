@@ -105,6 +105,19 @@ pub enum GgmlType {
     Q5K,
     /// 256-value super-blocks: 16 sub-blocks of 16 with 8-bit scale, 6-bit values
     Q6K,
+    /// Older and rarer formats, read by dequantising rows: llama.cpp falls back to them for tensors whose
+    /// rows are not a multiple of 256 (e.g. GLM-4.7-Flash's 192-wide attn_k_b), and BF16 for full precision.
+    Bf16,
+    /// 32-value blocks, f16 scale: (4-bit - 8) * d
+    Q4_0,
+    /// 32-value blocks, f16 scale and min: 4-bit * d + m
+    Q4_1,
+    /// 32-value blocks, f16 scale, 5th bits apart: (5-bit - 16) * d
+    Q5_0,
+    /// 32-value blocks, f16 scale and min, 5th bits apart: 5-bit * d + m
+    Q5_1,
+    /// 32-value blocks, f16 scale, 4-bit indices into a fixed non-linear table
+    Iq4Nl,
     Other(u32),
 }
 
@@ -118,6 +131,12 @@ impl GgmlType {
             12 => GgmlType::Q4K,
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
+            30 => GgmlType::Bf16,
+            2 => GgmlType::Q4_0,
+            3 => GgmlType::Q4_1,
+            6 => GgmlType::Q5_0,
+            7 => GgmlType::Q5_1,
+            20 => GgmlType::Iq4Nl,
             other => GgmlType::Other(other),
         }
     }
@@ -132,6 +151,12 @@ impl GgmlType {
             GgmlType::Q4K => Some((256, 144)),
             GgmlType::Q5K => Some((256, 176)),
             GgmlType::Q6K => Some((256, 210)),
+            GgmlType::Bf16 => Some((1, 2)),
+            GgmlType::Q4_0 => Some((32, 18)),
+            GgmlType::Q4_1 => Some((32, 20)),
+            GgmlType::Q5_0 => Some((32, 22)),
+            GgmlType::Q5_1 => Some((32, 24)),
+            GgmlType::Iq4Nl => Some((32, 18)),
             GgmlType::Other(_) => None,
         }
     }
@@ -145,6 +170,12 @@ impl GgmlType {
             GgmlType::Q4K => "Q4_K".into(),
             GgmlType::Q5K => "Q5_K".into(),
             GgmlType::Q6K => "Q6_K".into(),
+            GgmlType::Bf16 => "BF16".into(),
+            GgmlType::Q4_0 => "Q4_0".into(),
+            GgmlType::Q4_1 => "Q4_1".into(),
+            GgmlType::Q5_0 => "Q5_0".into(),
+            GgmlType::Q5_1 => "Q5_1".into(),
+            GgmlType::Iq4Nl => "IQ4_NL".into(),
             GgmlType::Other(id) => format!("type#{id}"),
         }
     }
@@ -152,6 +183,11 @@ impl GgmlType {
     /// K-quant formats (256-value super-blocks dotted against per-32 int8 activations).
     pub fn is_kquant(self) -> bool {
         matches!(self, GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+    }
+
+    /// Formats with no fast dot product here: their rows are dequantised to f32 and dotted as floats.
+    pub fn dequant_only(self) -> bool {
+        matches!(self, GgmlType::Bf16 | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Iq4Nl)
     }
 }
 

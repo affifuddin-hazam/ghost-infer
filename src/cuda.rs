@@ -57,6 +57,18 @@ const PREFILL_QT: usize = 32; // query tokens per prompt-attention block (must m
 const PREFILL_KT: usize = 32; // key positions per shared-memory tile (must match PKT)
 const PREFILL_TC_QT: usize = 64; // query tokens per tensor-core prompt-attention block (must match BQ)
 const SPLIT_MAX_BATCH: usize = TILED_MIN_BATCH - 1; // tokens per split-attention launch
+// latent attention: batches up to this many tokens split each token's context into slices of about
+// MLA_SPLIT_SPAN positions (at most MLA_MAX_SPLIT); bigger batches have blocks enough without
+const MLA_SPLIT_MAX_BATCH: usize = 4;
+const MLA_SPLIT_SPAN: usize = 32;
+const MLA_MAX_SPLIT: usize = 128;
+const MLA_T: usize = 32; // must match MLA_T
+const HMV_T: usize = 8; // must match HMV_T
+
+/// head_matvec's row slices per head: one token's heads alone are too few blocks to fill the GPU.
+fn hmv_slices(n: usize, rows: usize) -> usize {
+    if n > 2 * HMV_T { 1 } else { (rows / 64).max(1) }
+}
 /// Most tokens per decode batch: one token, or a speculative verify batch.
 pub const DECODE_MAX_BATCH: usize = 8;
 
@@ -2126,6 +2138,228 @@ __global__ void add_rows(float* __restrict__ x, const float* __restrict__ y, int
     if (i < n) x[i] += y[i];
 }
 
+// ---- multi-head latent attention (deepseek2, e.g. GLM-4.7-Flash) ----
+// A token's cache row is kl + rd f16 values: the RMS-normed compressed key-value vector, then the RoPE key
+// every head shares. The values are the compressed vector itself.
+
+// one block per row: RMSNorm of `cols` values read with row stride xs, written with row stride os
+__global__ void rmsnorm_rows(const float* __restrict__ x, int xs, const float* __restrict__ w, float* __restrict__ out,
+                             int os, int cols, float eps) {
+    __shared__ float sh[32];
+    const float* xr = x + (size_t)blockIdx.x * xs;
+    float* o = out + (size_t)blockIdx.x * os;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) ss += xr[i] * xr[i];
+    ss = block_sum(ss, sh);
+    float scale = rsqrtf(ss / cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) o[i] = xr[i] * scale * w[i];
+}
+
+// One block per token: its compressed vector (normed) and RoPE key (rotated, adjacent pairs) into the cache
+// row of its position. kva: rows of `xs` floats, the vector and key starting at `off`.
+__global__ void mla_kv(const float* __restrict__ kva, int xs, int off, const float* __restrict__ w,
+                       unsigned short* __restrict__ cache, int pos0, const int* __restrict__ posp,
+                       int kl, int rd, float base, float eps) {
+    __shared__ float sh[32];
+    if (posp) pos0 = *posp;
+    int b = blockIdx.x, pos = pos0 + b;
+    const float* row = kva + (size_t)b * xs + off;
+    unsigned short* dst = cache + (size_t)pos * (kl + rd);
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < kl; i += blockDim.x) ss += row[i] * row[i];
+    ss = block_sum(ss, sh);
+    float scale = rsqrtf(ss / kl + eps);
+    for (int i = threadIdx.x; i < kl; i += blockDim.x) dst[i] = f2h(row[i] * scale * w[i]);
+    for (int i = threadIdx.x; i < rd / 2; i += blockDim.x) {
+        float s, c;
+        sincosf((float)pos * powf(base, -2.0f * (float)i / (float)rd), &s, &c);
+        float a = row[kl + 2 * i], bb = row[kl + 2 * i + 1];
+        dst[kl + 2 * i] = f2h(a * c - bb * s);
+        dst[kl + 2 * i + 1] = f2h(a * s + bb * c);
+    }
+}
+
+// Grid (tokens, heads): the RoPE part of each head's query (the last rd of its hd values in q), rotated,
+// to the end of the head's row in qa (kl + rd values).
+__global__ void mla_q_rope(const float* __restrict__ q, float* __restrict__ qa, int pos0, const int* __restrict__ posp,
+                           int hd, int kl, int rd, float base) {
+    if (posp) pos0 = *posp;
+    int b = blockIdx.x, h = blockIdx.y, H = gridDim.y, pos = pos0 + b;
+    const float* src = q + ((size_t)b * H + h) * hd + (hd - rd);
+    float* dst = qa + ((size_t)b * H + h) * (kl + rd) + kl;
+    for (int i = threadIdx.x; i < rd / 2; i += blockDim.x) {
+        float s, c;
+        sincosf((float)pos * powf(base, -2.0f * (float)i / (float)rd), &s, &c);
+        float a = src[2 * i], bb = src[2 * i + 1];
+        dst[2 * i] = a * c - bb * s;
+        dst[2 * i + 1] = a * s + bb * c;
+    }
+}
+
+// Per-head projection with f16 weights: y[t][h][r] = W[h][r] . x[t][h] (`rows` rows of `cols` values per
+// head). Head h of token t is read at x + t * xs + h * xh and written at y + t * ys + h * yh. Grid
+// (ceil(n / HMV_T), heads, row slices), 256 threads, HMV_T * cols floats of dynamic shared memory: a block
+// reads its slice of the head's weights once for HMV_T tokens, one warp per row. Row slices spread a
+// single token over the GPU.
+#define HMV_T 8
+__global__ void head_matvec(const unsigned short* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
+                            int rows, int cols, int n, int xs, int xh, int ys, int yh) {
+    extern __shared__ float xin[];
+    int h = blockIdx.y, t0 = blockIdx.x * HMV_T, nt = min(HMV_T, n - t0);
+    for (int i = threadIdx.x; i < HMV_T * cols; i += blockDim.x) {
+        int t = i / cols;
+        xin[i] = t < nt ? x[(size_t)(t0 + t) * xs + (size_t)h * xh + i % cols] : 0.f;
+    }
+    __syncthreads();
+    const unsigned short* wh = w + (size_t)h * rows * cols;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int per = (rows + gridDim.z - 1) / gridDim.z, r1 = min(rows, (int)(blockIdx.z + 1) * per);
+    for (int r = blockIdx.z * per + warp; r < r1; r += blockDim.x >> 5) {
+        const unsigned short* wr = wh + (size_t)r * cols;
+        float acc[HMV_T];
+#pragma unroll
+        for (int t = 0; t < HMV_T; t++) acc[t] = 0.f;
+        for (int c = lane; c < cols; c += 32) {
+            float wv = h2f(wr[c]);
+#pragma unroll
+            for (int t = 0; t < HMV_T; t++) acc[t] += wv * xin[t * cols + c];
+        }
+#pragma unroll
+        for (int t = 0; t < HMV_T; t++) {
+            float v = warp_sum(acc[t]);
+            if (lane == 0 && t < nt) y[(size_t)(t0 + t) * ys + (size_t)h * yh + r] = v;
+        }
+    }
+}
+
+// Latent attention. Grid (tokens, nsplit), 256 threads; token b sees positions 0..=pos0 + b, and block
+// (b, s) takes the s-th of nsplit equal slices of them for all H heads at once, so each cache row is read
+// once. Scores in tiles of MLA_T positions (a warp per position, every head), an online softmax per head,
+// then each thread accumulates 2 of the kl value dims (kl == 2 * blockDim) for every head. nsplit == 1
+// writes normalised outputs to out[b][h][kl]; otherwise the unnormalised sums, then each head's max and
+// total, to part for mla_combine. Dynamic shared memory: (H * (kl + rd) + H * MLA_T + 3 * H) floats.
+#define MLA_T 32
+#define MLA_MAX_H 32
+#define MLA_MAX_KW 24
+__global__ void __launch_bounds__(256) mla_attention(const float* __restrict__ qa, const unsigned short* __restrict__ cache,
+                                                     float* __restrict__ part, float* __restrict__ out, int pos0,
+                                                     const int* __restrict__ posp, int H, int kl, int rd, float scale, int nsplit) {
+    extern __shared__ float smem[];
+    if (posp) pos0 = *posp;
+    int b = blockIdx.x, sp = blockIdx.y, kd = kl + rd;
+    int span = pos0 + b + 1, per = (span + nsplit - 1) / nsplit;
+    int start = min(span, sp * per), end = min(span, start + per);
+    float* sq = smem;               // H x kd: the queries
+    float* ss = sq + H * kd;        // H x MLA_T: scores, then weights
+    float* sm = ss + H * MLA_T;     // H: running max
+    float* sl = sm + H;             // H: running total
+    float* sc = sl + H;             // H: this tile's rescale
+    const float* qb = qa + (size_t)b * H * kd;
+    for (int i = threadIdx.x; i < H * kd; i += blockDim.x) sq[i] = qb[i];
+    if (threadIdx.x < H) { sm[threadIdx.x] = NEG_INF; sl[threadIdx.x] = 0.f; }
+    float acc[MLA_MAX_H][2];
+#pragma unroll
+    for (int h = 0; h < MLA_MAX_H; h++) acc[h][0] = acc[h][1] = 0.f;
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, kw = kd / 32;
+    for (int t0 = start; t0 < end; t0 += MLA_T) {
+        // scores of this tile: a warp per position
+        for (int t = warp; t < MLA_T; t += 8) {
+            int pos = t0 + t;
+            float kv[MLA_MAX_KW];
+            if (pos < end) {
+                const unsigned short* kr = cache + (size_t)pos * kd;
+#pragma unroll
+                for (int i = 0; i < MLA_MAX_KW; i++) kv[i] = i < kw ? h2f(kr[lane + 32 * i]) : 0.f;
+            }
+            for (int h = 0; h < H; h++) {
+                float d = 0.f;
+                if (pos < end) {
+                    const float* qh = sq + h * kd + lane;
+#pragma unroll
+                    for (int i = 0; i < MLA_MAX_KW; i++) if (i < kw) d += qh[32 * i] * kv[i];
+                }
+                d = warp_sum(d);
+                if (lane == 0) ss[h * MLA_T + t] = pos < end ? d * scale : NEG_INF;
+            }
+        }
+        __syncthreads();
+        // online softmax, a thread per head
+        if (threadIdx.x < H) {
+            int h = threadIdx.x;
+            float* row = ss + h * MLA_T;
+            float m = sm[h];
+            for (int t = 0; t < MLA_T; t++) m = fmaxf(m, row[t]);
+            float c = __expf(sm[h] - m), total = 0.f;
+            for (int t = 0; t < MLA_T; t++) { float e = __expf(row[t] - m); row[t] = e; total += e; }
+            sl[h] = sl[h] * c + total;
+            sm[h] = m;
+            sc[h] = c;
+        }
+        __syncthreads();
+        // values: this thread's 2 dims of every head
+        int d0 = threadIdx.x, d1 = threadIdx.x + blockDim.x;
+#pragma unroll
+        for (int h = 0; h < MLA_MAX_H; h++) if (h < H) { acc[h][0] *= sc[h]; acc[h][1] *= sc[h]; }
+        int nt = min(MLA_T, end - t0);
+        for (int t = 0; t < nt; t++) {
+            const unsigned short* vr = cache + (size_t)(t0 + t) * kd;
+            float v0 = h2f(vr[d0]), v1 = h2f(vr[d1]);
+#pragma unroll
+            for (int h = 0; h < MLA_MAX_H; h++) if (h < H) {
+                float p = ss[h * MLA_T + t];
+                acc[h][0] += p * v0;
+                acc[h][1] += p * v1;
+            }
+        }
+        __syncthreads();
+    }
+    int d0 = threadIdx.x, d1 = threadIdx.x + blockDim.x;
+    if (nsplit == 1) {
+#pragma unroll
+        for (int h = 0; h < MLA_MAX_H; h++) if (h < H) {
+            float inv = sl[h] > 0.f ? 1.f / sl[h] : 0.f;
+            float* o = out + ((size_t)b * H + h) * kl;
+            o[d0] = acc[h][0] * inv;
+            o[d1] = acc[h][1] * inv;
+        }
+        return;
+    }
+    float* pb = part + ((size_t)b * nsplit + sp) * H * (kl + 2);
+#pragma unroll
+    for (int h = 0; h < MLA_MAX_H; h++) if (h < H) {
+        pb[h * kl + d0] = acc[h][0];
+        pb[h * kl + d1] = acc[h][1];
+    }
+    if (threadIdx.x < H) {
+        pb[H * kl + 2 * threadIdx.x] = sm[threadIdx.x];
+        pb[H * kl + 2 * threadIdx.x + 1] = sl[threadIdx.x];
+    }
+}
+
+// Grid (tokens, heads): the nsplit slices of mla_attention merged into normalised outputs.
+__global__ void mla_combine(const float* __restrict__ part, float* __restrict__ out, int H, int kl, int nsplit) {
+    int b = blockIdx.x, h = blockIdx.y;
+    const float* pb = part + (size_t)b * nsplit * H * (kl + 2);
+    size_t stride = (size_t)H * (kl + 2);
+    float m = NEG_INF;
+    for (int s = 0; s < nsplit; s++) m = fmaxf(m, pb[s * stride + H * kl + 2 * h]);
+    float total = 0.f;
+    for (int s = 0; s < nsplit; s++) {
+        float ms = pb[s * stride + H * kl + 2 * h];
+        if (ms > NEG_INF) total += pb[s * stride + H * kl + 2 * h + 1] * __expf(ms - m);
+    }
+    float inv = total > 0.f ? 1.f / total : 0.f;
+    for (int d = threadIdx.x; d < kl; d += blockDim.x) {
+        float v = 0.f;
+        for (int s = 0; s < nsplit; s++) {
+            float ms = pb[s * stride + H * kl + 2 * h];
+            if (ms > NEG_INF) v += pb[s * stride + h * kl + d] * __expf(ms - m);
+        }
+        out[((size_t)b * H + h) * kl + d] = v * inv;
+    }
+}
+
 }
 "#;
 
@@ -2408,6 +2642,13 @@ struct Kernels {
     moe_scatter: Ptr,
     q3k_to_q8: Ptr,
     q5k_to_q8: Ptr,
+    // multi-head latent attention
+    rmsnorm_rows: Ptr,
+    mla_kv: Ptr,
+    mla_q_rope: Ptr,
+    head_matvec: Ptr,
+    mla_attention: Ptr,
+    mla_combine: Ptr,
     /// every launch goes here (a blocking stream: the synchronous copies still order against it); CUDA
     /// graphs need a stream other than the legacy default one
     stream: Ptr,
@@ -2542,6 +2783,12 @@ impl Kernels {
                 moe_scatter: get("moe_scatter")?,
                 q3k_to_q8: get("q3k_to_q8")?,
                 q5k_to_q8: get("q5k_to_q8")?,
+                rmsnorm_rows: get("rmsnorm_rows")?,
+                mla_kv: get("mla_kv")?,
+                mla_q_rope: get("mla_q_rope")?,
+                head_matvec: get("head_matvec")?,
+                mla_attention: get("mla_attention")?,
+                mla_combine: get("mla_combine")?,
                 stream: {
                     let mut st: Ptr = std::ptr::null_mut();
                     a.check((f.cuStreamCreate)(&mut st, 0), "stream")?;
@@ -2822,7 +3069,7 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
         let mut run = Vec::new();
         while let Some(t) = names.get(i).and_then(|n| g.tensor(n)).filter(|t| t.ty == ty) {
             let cols = t.dims[0] as usize;
-            if (cols % 256 != 0 && ty != GgmlType::Q8_0) || cols % 32 != 0 {
+            if (cols % 256 != 0 && ty.is_kquant()) || cols % 32 != 0 {
                 return Err(format!("unsupported row length {cols} in {}", names[i]));
             }
             run.push(t);
@@ -2831,8 +3078,10 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
         let cols = run[0].dims[0] as usize;
         let rows: usize = run.iter().map(|t| t.dims[1] as usize).sum();
         let (fmt, gpu_bytes) = match ty {
-            // no 3- or 5-bit GPU kernels yet: requantised to int8 (about 2.4x / 1.5x the memory)
+            // no 3- or 5-bit GPU kernels yet: requantised to int8 (about 2.4x / 1.5x the memory), as are
+            // the rarer formats (Q5_0, IQ4_NL, ...)
             GgmlType::Q8_0 | GgmlType::Q3K | GgmlType::Q5K => (Fmt::Q8, rows * cols),
+            t if t.dequant_only() => (Fmt::Q8, rows * cols),
             GgmlType::Q4K => (Fmt::Q4K, run.iter().map(|t| t.n_bytes).sum()),
             GgmlType::Q6K => (Fmt::Q6K, rows * (cols / 256) * GPU_Q6K_BYTES),
             other => return Err(format!("GPU backend does not handle {} weights yet", other.name())),
@@ -2908,6 +3157,24 @@ fn upload_one(g: &Gguf, name: &str, up: &mut Uploader) -> Result<GpuMatrix, Stri
     Ok(upload_parts(g, &[name.to_string()], up)?.pop().unwrap().0)
 }
 
+/// A tensor as f16 rows (any format; a 3-D one's matrices one after the other): the latent attention's
+/// small per-head projections.
+fn upload_f16(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, String> {
+    let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+    let cols = t.dims[0] as usize;
+    let rows = t.n_elements() as usize / cols;
+    let m = crate::quant::Matrix { data: &g.mmap[t.offset..t.offset + t.n_bytes], ty: t.ty, rows, cols };
+    let mut h = vec![0u16; rows * cols];
+    let mut row = vec![0f32; cols];
+    for (r, out) in h.chunks_exact_mut(cols).enumerate() {
+        m.row_f32(r, &mut row);
+        for (o, v) in out.iter_mut().zip(&row) {
+            *o = crate::quant::f32_to_f16(*v);
+        }
+    }
+    up.put_vec(&h)
+}
+
 fn upload_vec(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, String> {
     let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     if t.ty != GgmlType::F32 {
@@ -2920,18 +3187,31 @@ fn upload_vec(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, Stri
 
 struct GpuLayer {
     attn_norm: DeviceBuf,
-    qkv: Vec<(GpuMatrix, usize)>, // with output row offsets in the packed [q | k | v] rows
+    qkv: Vec<(GpuMatrix, usize)>, // with output row offsets in the packed [q | k | v] rows (empty: latent attention)
     q_norm: Option<DeviceBuf>,    // Qwen3 per-head norms
     k_norm: Option<DeviceBuf>,
+    mla: Option<GpuMla>,
     wo: GpuMatrix,
     ffn_norm: DeviceBuf,
     ffn: GpuFfn,
 }
 
+/// Latent attention weights (see model::Mla): the low-rank query step and its norm (if any), the query
+/// projection, the compressed key-value projection and its norm, and the per-head k_b / v_b as f16.
+struct GpuMla {
+    q_a: Option<(GpuMatrix, DeviceBuf)>,
+    q: GpuMatrix,
+    kv_a: GpuMatrix,
+    kv_norm: DeviceBuf,
+    k_b: DeviceBuf,
+    v_b: DeviceBuf,
+}
+
 enum GpuFfn {
     Dense { gate_up: Vec<(GpuMatrix, usize)>, down: GpuMatrix }, // gate_up: [gate | up]
-    /// mixture of experts: routed and computed on the CPU (GpuModel::moe)
-    Moe,
+    /// mixture of experts: routed and computed on the CPU (GpuModel::moe); deepseek2 adds a shared
+    /// expert, as a dense block on the GPU
+    Moe { shared: Option<(Vec<(GpuMatrix, usize)>, GpuMatrix)> },
 }
 
 /// What the current prompt pass is doing, for the server's /api/progress (the chat page shows it while it
@@ -3073,8 +3353,9 @@ struct CpuMoe {
     prefetch: Prefetcher, // first, so its thread has stopped before the mapping it reads goes
     mmap: memmap2::Mmap,
     n_experts: usize,
-    routers: Vec<Vec<f32>>,          // per layer: n_experts rows of dim logit weights
-    tensors: Vec<[ExpertTensor; 3]>, // per layer: gate, up, down
+    routers: Vec<Vec<f32>>,          // per layer: n_experts rows of dim logit weights (empty: a dense layer)
+    biases: Vec<Option<Vec<f32>>>,   // deepseek2: per-expert pick bias
+    tensors: Vec<[ExpertTensor; 3]>, // per layer: gate, up, down (no rows: a dense layer)
 }
 
 /// Where one 3-D expert tensor lies in the file: expert e's matrix starts at offset + e * stride.
@@ -3093,8 +3374,22 @@ impl CpuMoe {
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("cannot map {}: {e}", g.path.display()))?;
         let mut routers = Vec::with_capacity(cfg.n_layers);
         let mut tensors = Vec::with_capacity(cfg.n_layers);
+        let mut biases = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
+            if i < cfg.n_dense_lead {
+                // deepseek2's dense first layers: run as dense blocks on the GPU, nothing here
+                let none = ExpertTensor { offset: 0, stride: 0, ty: GgmlType::F32, rows: 0, cols: 0 };
+                routers.push(Vec::new());
+                biases.push(None);
+                tensors.push([none; 3]);
+                continue;
+            }
+            biases.push(match g.tensor(&format!("blk.{i}.exp_probs_b.bias")) {
+                Some(t) if t.ty == GgmlType::F32 && t.n_elements() as usize == cfg.n_experts => Some(g.mmap[t.offset..t.offset + t.n_bytes].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()),
+                Some(t) => return Err(format!("{}: expected {} F32 values", t.name, cfg.n_experts)),
+                None => None,
+            });
             let r = g.tensor(&p("ffn_gate_inp")).ok_or_else(|| format!("missing tensor {}", p("ffn_gate_inp")))?;
             if r.ty != GgmlType::F32 || r.n_elements() as usize != cfg.n_experts * cfg.dim {
                 return Err(format!("{}: expected an F32 router of {} x {}", r.name, cfg.n_experts, cfg.dim));
@@ -3110,7 +3405,7 @@ impl CpuMoe {
             let (dim, ffn) = (cfg.dim, cfg.expert_ffn_dim);
             tensors.push([part("ffn_gate_exps", ffn, dim)?, part("ffn_up_exps", ffn, dim)?, part("ffn_down_exps", dim, ffn)?]);
         }
-        Ok(CpuMoe { prefetch: Prefetcher::new(), mmap, n_experts: cfg.n_experts, routers, tensors })
+        Ok(CpuMoe { prefetch: Prefetcher::new(), mmap, n_experts: cfg.n_experts, routers, biases, tensors })
     }
 
     /// Lets Windows reuse the RAM holding expert e of layer l (now in GPU memory) before anything else.
@@ -3217,7 +3512,7 @@ impl ExpertCache {
         let a = api()?;
         let cacheable: Vec<bool> = moe.tensors.iter().map(|[g, u, d]| g.ty == GgmlType::Q3K && u.ty == GgmlType::Q3K && d.ty == GgmlType::Q4K).collect();
         let shape = moe.tensors.iter().zip(&cacheable).find(|(_, c)| **c).map(|(t, _)| *t);
-        let [g0, _, _] = moe.tensors[0];
+        let [g0, _, _] = *moe.tensors.iter().find(|t| t[0].rows > 0).ok_or("no expert layers")?;
         let gate_bytes = g0.rows * (g0.cols / 256) * Q3K_GPU_BYTES;
         let slot_bytes = match shape {
             Some([_, _, d]) => 2 * gate_bytes + d.stride,
@@ -3225,7 +3520,7 @@ impl ExpertCache {
         };
         // a scratch slot holds any layer's expert (some downs are bigger formats than the cached ones)
         let scratch_bytes = 2 * gate_bytes + moe.tensors.iter().map(|t| t[2].stride).max().unwrap_or(0);
-        let routers = moe.routers.iter().map(|r| DeviceBuf::alloc(r.len() * 4).and_then(|b| b.write(r).map(|_| b))).collect::<Result<Vec<_>, _>>()?;
+        let routers = moe.routers.iter().map(|r| DeviceBuf::alloc(r.len().max(1) * 4).and_then(|b| b.write(r).map(|_| b))).collect::<Result<Vec<_>, _>>()?;
         let conv_elems = (2 * g0.rows * g0.cols).max(g0.rows * g0.cols);
         let extras = routers.iter().map(|b| b.bytes).sum::<usize>() + 2 * scratch_bytes + conv_elems * 9 / 8 + 8 * MAX_BATCH * 8;
         let slots = if shape.is_some() { (budget.saturating_sub(extras) / slot_bytes).min(cfg.n_layers * cfg.n_experts) } else { 0 };
@@ -3411,7 +3706,11 @@ pub struct GpuModel {
 
 impl GpuModel {
     pub fn load(g: &Gguf, cfg: Config) -> Result<GpuModel, String> {
-        if cfg.head_dim > ATT_MAX_HD || ATT_MAX_HD % cfg.head_dim != 0 || cfg.head_dim % 4 != 0 {
+        if let Some(m) = cfg.mla {
+            if m.kv_lora != 512 || cfg.n_heads > 32 || (m.kv_lora + cfg.rope_dim) % 32 != 0 || m.kv_lora + cfg.rope_dim > 32 * 24 {
+                return Err(format!("GPU backend: latent attention with {} heads and a {}-wide cache row is not supported (512 + RoPE, up to 32 heads)", cfg.n_heads, m.kv_lora + cfg.rope_dim));
+            }
+        } else if cfg.head_dim > ATT_MAX_HD || ATT_MAX_HD % cfg.head_dim != 0 || cfg.head_dim % 4 != 0 {
             return Err(format!("GPU backend: head size {} not supported (needs a divisor of {ATT_MAX_HD})", cfg.head_dim));
         }
         let t0 = std::time::Instant::now();
@@ -3425,17 +3724,36 @@ impl GpuModel {
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
             let attn_norm = upload_vec(g, &p("attn_norm"), up)?;
-            let qkv = upload_parts(g, &[p("attn_q"), p("attn_k"), p("attn_v")], up)?;
+            let (qkv, mla) = match cfg.mla {
+                Some(m) => {
+                    let q_a = if m.q_lora > 0 { Some((upload_one(g, &p("attn_q_a"), up)?, upload_vec(g, &p("attn_q_a_norm"), up)?)) } else { None };
+                    let mla = GpuMla {
+                        q: upload_one(g, &p(if m.q_lora > 0 { "attn_q_b" } else { "attn_q" }), up)?,
+                        q_a,
+                        kv_a: upload_one(g, &p("attn_kv_a_mqa"), up)?,
+                        kv_norm: upload_vec(g, &p("attn_kv_a_norm"), up)?,
+                        k_b: upload_f16(g, &p("attn_k_b"), up)?,
+                        v_b: upload_f16(g, &p("attn_v_b"), up)?,
+                    };
+                    (Vec::new(), Some(mla))
+                }
+                None => (upload_parts(g, &[p("attn_q"), p("attn_k"), p("attn_v")], up)?, None),
+            };
             let q_norm = if g.tensor(&p("attn_q_norm")).is_some() { Some(upload_vec(g, &p("attn_q_norm"), up)?) } else { None };
             let k_norm = if g.tensor(&p("attn_k_norm")).is_some() { Some(upload_vec(g, &p("attn_k_norm"), up)?) } else { None };
             let wo = upload_one(g, &p("attn_output"), up)?;
             let ffn_norm = upload_vec(g, &p("ffn_norm"), up)?;
-            let ffn = if cfg.is_moe() {
-                GpuFfn::Moe
+            let ffn = if cfg.is_moe() && i >= cfg.n_dense_lead {
+                let shared = if g.tensor(&p("ffn_gate_shexp")).is_some() {
+                    Some((upload_parts(g, &[p("ffn_gate_shexp"), p("ffn_up_shexp")], up)?, upload_one(g, &p("ffn_down_shexp"), up)?))
+                } else {
+                    None
+                };
+                GpuFfn::Moe { shared }
             } else {
                 GpuFfn::Dense { gate_up: upload_parts(g, &[p("ffn_gate"), p("ffn_up")], up)?, down: upload_one(g, &p("ffn_down"), up)? }
             };
-            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, wo, ffn_norm, ffn });
+            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, mla, wo, ffn_norm, ffn });
         }
         let moe = if cfg.is_moe() { Some(CpuMoe::load(g, &cfg)?) } else { None };
         let embd = upload_one(g, "token_embd.weight", up)?;
@@ -3446,6 +3764,13 @@ impl GpuModel {
         let bytes = ((2 * PREFILL_KT + PREFILL_QT) * ld + PREFILL_QT * (PREFILL_KT + 1)) * 4;
         const MAX_DYNAMIC_SHARED: i32 = 8; // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
         let prefill_shared = (bytes <= 48 * 1024 || unsafe { (a.f.cuFuncSetAttribute)(k.attention_prefill, MAX_DYNAMIC_SHARED, bytes as i32) } == 0).then_some(bytes);
+        if let Some(m) = cfg.mla {
+            let h = cfg.n_heads;
+            let bytes = (h * (m.kv_lora + cfg.rope_dim) + h * MLA_T + 3 * h) * 4;
+            if bytes > 48 * 1024 && unsafe { (a.f.cuFuncSetAttribute)(k.mla_attention, MAX_DYNAMIC_SHARED, bytes as i32) } != 0 {
+                return Err(format!("GPU backend: latent attention needs {bytes} bytes of shared memory per block"));
+            }
+        }
 
         let device = format!("{} (sm_{}{}, NVRTC {})", a.device_name, a.compute.0, a.compute.1, std::path::Path::new(&a.nvrtc_path).file_name().and_then(|n| n.to_str()).unwrap_or("?"));
         // the logits buffer is sized from cfg.vocab; a mismatch would write past it
@@ -3786,7 +4111,11 @@ impl GpuModel {
         h.xb.resize(len, 0.0);
         // synchronous copy: waits for the norm (the launch stream is a blocking one)
         a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.xb.ptr, len * 4) }, "copy to host")?;
-        crate::model::moe_route(&moe.routers[l], c.n_experts_used, &h.xb, dim, &mut h.picks, &mut h.scratch);
+        if c.mla.is_some() {
+            crate::model::moe_route_deepseek(c, &moe.routers[l], moe.biases[l].as_deref(), &h.xb, &mut h.picks, &mut h.scratch);
+        } else {
+            crate::model::moe_route(&moe.routers[l], c.n_experts_used, &h.xb, dim, &mut h.picks, &mut h.scratch);
+        }
 
         // the token's GPU-resident experts: table of matrix addresses, then their weights
         let mut ptrs: Vec<u64> = Vec::new();
@@ -3883,7 +4212,11 @@ impl GpuModel {
         a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.gu.ptr, n * ne * 4) }, "copy router logits")?;
         h.picks.clear();
         for row in h.xb.chunks_exact(ne) {
-            crate::model::route(row, top, &mut h.cpu_picks);
+            if c.mla.is_some() {
+                crate::model::route_deepseek(row, moe.biases[l].as_deref(), top, c.gating_sigmoid, c.expert_weights_norm, c.expert_weights_scale, &mut h.cpu_picks);
+            } else {
+                crate::model::route(row, top, &mut h.cpu_picks);
+            }
             h.picks.extend_from_slice(&h.cpu_picks);
         }
         cache.note(moe, l, &h.picks)?;
@@ -3946,6 +4279,122 @@ impl GpuModel {
         Ok(())
     }
 
+    /// Layer l's feed-forward, added to s.x.
+    fn ffn(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession) -> Result<(), String> {
+        match &layer.ffn {
+            GpuFfn::Dense { gate_up, down } => self.swiglu(gate_up, down, &layer.ffn_norm, None, n, s),
+            GpuFfn::Moe { shared } => {
+                self.moe_ffn(l, layer, n, s)?;
+                match shared {
+                    // the shared expert reads the same normed input, still in s.xb
+                    Some((gate_up, down)) => self.swiglu(gate_up, down, &layer.ffn_norm, Some(s.xb.ptr), n, s),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// A SwiGLU block added to s.x: [gate | up] from RMSNorm(s.x) with `norm` (or from `normed`, already
+    /// normed input), then down.
+    fn swiglu(&self, gate_up: &[(GpuMatrix, usize)], down: &GpuMatrix, norm: &DeviceBuf, normed: Option<u64>, n: usize, s: &GpuSession) -> Result<(), String> {
+        let k = &self.k;
+        let hidden = down.cols;
+        let gate_up: Vec<(&GpuMatrix, usize)> = gate_up.iter().map(|(m, off)| (m, *off)).collect();
+        match normed {
+            Some(x) => self.matmul(&gate_up, x, s.gu.ptr, 2 * hidden, n, false, s)?,
+            None => self.norm_matmul(norm, &gate_up, s.gu.ptr, 2 * hidden, n, s)?,
+        }
+        let down = [(down, 0)];
+        if self.dp4a_path(&down, n) {
+            // decoding: silu(gate) * up straight to int8 for the down projection
+            let nv = (hidden / 4) as u32;
+            k.launch(k.silu_q8, (nv.div_ceil(256), n as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(hidden as i32)])?;
+            return self.matmul_dp4a(&down, s.x.ptr, self.cfg.dim, n, true, s);
+        }
+        let total = (n * hidden) as u32;
+        k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(hidden as i32), Arg::I(n as i32)])?;
+        self.matmul_one(down[0].0, s.h.ptr, s.x.ptr, n, true, s)
+    }
+
+    /// Latent attention's inputs: the queries (low-rank step if any) to s.qkv, the compressed key-value
+    /// rows normed and rotated into the cache, and each head's query moved into the latent space, its RoPE
+    /// part rotated after it, in s.gu (heads x (kl + rd) per token).
+    fn mla_in(&self, layer: &GpuLayer, mla: &GpuMla, cache: u64, n: usize, s: &GpuSession, posp: u64) -> Result<(), String> {
+        let (c, k) = (&self.cfg, &self.k);
+        let m = c.mla.unwrap();
+        let (h, hd, rd, kd) = (c.n_heads, c.head_dim, c.rope_dim, c.k_row());
+        let q_dim = h * hd;
+        // s.qkv: the queries (MAX_BATCH rows of q_dim), then rows of [low-rank query | compressed kv]
+        let (q, lat) = (s.qkv.ptr, s.qkv.at(MAX_BATCH * q_dim * 4));
+        let lat_w = m.q_lora + kd;
+        match &mla.q_a {
+            Some((wa, wa_norm)) => {
+                self.norm_matmul(&layer.attn_norm, &[(wa, 0), (&mla.kv_a, m.q_lora)], lat, lat_w, n, s)?;
+                k.launch(k.rmsnorm_rows, (n as u32, 1), 256, 0, &[Arg::P(lat), Arg::I(lat_w as i32), Arg::P(wa_norm.ptr), Arg::P(s.xb.ptr), Arg::I(m.q_lora as i32), Arg::I(m.q_lora as i32), Arg::F(c.norm_eps)])?;
+                self.matmul_one(&mla.q, s.xb.ptr, q, n, false, s)?;
+            }
+            None => {
+                self.norm_matmul(&layer.attn_norm, &[(&mla.kv_a, 0)], lat, lat_w, n, s)?;
+                self.norm_matmul(&layer.attn_norm, &[(&mla.q, 0)], q, q_dim, n, s)?;
+            }
+        }
+        k.launch(
+            k.mla_kv,
+            (n as u32, 1),
+            256,
+            0,
+            &[Arg::P(lat), Arg::I(lat_w as i32), Arg::I(m.q_lora as i32), Arg::P(mla.kv_norm.ptr), Arg::P(cache), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(m.kv_lora as i32), Arg::I(rd as i32), Arg::F(c.rope_base), Arg::F(c.norm_eps)],
+        )?;
+        let qa = s.gu.ptr;
+        k.launch3(
+            k.head_matvec,
+            (n.div_ceil(HMV_T) as u32, h as u32, hmv_slices(n, m.kv_lora) as u32),
+            256,
+            (HMV_T * m.nope * 4) as u32,
+            &[Arg::P(mla.k_b.ptr), Arg::P(q), Arg::P(qa), Arg::I(m.kv_lora as i32), Arg::I(m.nope as i32), Arg::I(n as i32), Arg::I(q_dim as i32), Arg::I(hd as i32), Arg::I((h * kd) as i32), Arg::I(kd as i32)],
+        )?;
+        k.launch(k.mla_q_rope, (n as u32, h as u32), 32, 0, &[Arg::P(q), Arg::P(qa), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(hd as i32), Arg::I(m.kv_lora as i32), Arg::I(rd as i32), Arg::F(c.rope_base)])
+    }
+
+    /// Latent attention over the layer's cache (queries in s.gu) into s.att (heads x kl per token).
+    /// fixed_split: one-token steps use the session's widest split grid, so a captured graph fits.
+    fn mla_attention(&self, cache: u64, n: usize, s: &GpuSession, posp: u64, fixed_split: bool) -> Result<(), String> {
+        let (c, k) = (&self.cfg, &self.k);
+        let m = c.mla.unwrap();
+        let (h, rd) = (c.n_heads, c.rope_dim);
+        let span = if fixed_split { s.ctx } else { s.pos + n };
+        let nsplit = if n > MLA_SPLIT_MAX_BATCH { 1 } else { span.div_ceil(MLA_SPLIT_SPAN).clamp(1, MLA_MAX_SPLIT) };
+        let shared = (h * (m.kv_lora + rd) + h * MLA_T + 3 * h) * 4;
+        let scale = 1.0 / (c.head_dim as f32).sqrt();
+        k.launch(
+            k.mla_attention,
+            (n as u32, nsplit as u32),
+            256,
+            shared as u32,
+            &[Arg::P(s.gu.ptr), Arg::P(cache), Arg::P(s.att_part.ptr), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(h as i32), Arg::I(m.kv_lora as i32), Arg::I(rd as i32), Arg::F(scale), Arg::I(nsplit as i32)],
+        )?;
+        if nsplit > 1 {
+            k.launch(k.mla_combine, (n as u32, h as u32), 256, 0, &[Arg::P(s.att_part.ptr), Arg::P(s.att.ptr), Arg::I(h as i32), Arg::I(m.kv_lora as i32), Arg::I(nsplit as i32)])?;
+        }
+        Ok(())
+    }
+
+    /// Each head's latent result out to its values (v_b, into s.qkv: the queries are used up), then the
+    /// output projection added to s.x.
+    fn mla_out(&self, layer: &GpuLayer, mla: &GpuMla, n: usize, s: &GpuSession) -> Result<(), String> {
+        let (c, k) = (&self.cfg, &self.k);
+        let m = c.mla.unwrap();
+        let h = c.n_heads;
+        k.launch3(
+            k.head_matvec,
+            (n.div_ceil(HMV_T) as u32, h as u32, hmv_slices(n, m.v_head) as u32),
+            256,
+            (HMV_T * m.kv_lora * 4) as u32,
+            &[Arg::P(mla.v_b.ptr), Arg::P(s.att.ptr), Arg::P(s.qkv.ptr), Arg::I(m.v_head as i32), Arg::I(m.kv_lora as i32), Arg::I(n as i32), Arg::I((h * m.kv_lora) as i32), Arg::I(m.kv_lora as i32), Arg::I((h * m.v_head) as i32), Arg::I(m.v_head as i32)],
+        )?;
+        self.matmul_one(&layer.wo, s.qkv.ptr, s.x.ptr, n, true, s)
+    }
+
     /// Every kernel of a forward pass over `n` tokens at `s.pos..` (`posp`: the position from device memory
     /// instead, for graphs), ending with the last token's logits (Last) or every token's argmax (Argmax) on
     /// the device. Launches only, so it can be captured.
@@ -3963,6 +4412,14 @@ impl GpuModel {
         let layer_scales = s.ctx * c.n_kv_heads * 4;
         let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
         for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(mla) = &layer.mla {
+                let cache = s.k_cache.at(l * s.ctx * c.k_row() * 2);
+                self.timed(2, || self.mla_in(layer, mla, cache, n, s, posp))?;
+                self.timed(4, || self.mla_attention(cache, n, s, posp, fixed_split))?;
+                self.timed(5, || self.mla_out(layer, mla, n, s))?;
+                self.timed(6, || self.ffn(l, layer, n, s))?;
+                continue;
+            }
             let (kc, vc) = (s.k_cache.at(l * layer_kv), s.v_cache.at(l * layer_kv));
             let (ks, vs) = if kv_int8() { (s.k_scale.at(l * layer_scales), s.v_scale.at(l * layer_scales)) } else { (0, 0) };
             let qkv: Vec<(&GpuMatrix, usize)> = layer.qkv.iter().map(|(m, off)| (m, *off)).collect();
@@ -3983,23 +4440,7 @@ impl GpuModel {
             self.timed(4, || self.attention(s, n, (kc, vc, ks, vs), posp, fixed_split))?;
             self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
 
-            self.timed(6, || {
-                let GpuFfn::Dense { gate_up, down } = &layer.ffn else {
-                    return self.moe_ffn(l, layer, n, s);
-                };
-                let gate_up: Vec<(&GpuMatrix, usize)> = gate_up.iter().map(|(m, off)| (m, *off)).collect();
-                self.norm_matmul(&layer.ffn_norm, &gate_up, s.gu.ptr, 2 * c.ffn_dim, n, s)?;
-                let down = [(down, 0)];
-                if self.dp4a_path(&down, n) {
-                    // decoding: silu(gate) * up straight to int8 for the down projection
-                    let nv = (c.ffn_dim / 4) as u32;
-                    k.launch(k.silu_q8, (nv.div_ceil(256), n as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.ffn_dim as i32)])?;
-                    return self.matmul_dp4a(&down, s.x.ptr, dim, n, true, s);
-                }
-                let total = (n * c.ffn_dim) as u32;
-                k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(c.ffn_dim as i32), Arg::I(n as i32)])?;
-                self.matmul_one(down[0].0, s.h.ptr, s.x.ptr, n, true, s)
-            })?;
+            self.timed(6, || self.ffn(l, layer, n, s))?;
         }
 
         if want != Out::None {
@@ -4114,6 +4555,9 @@ impl GpuSession {
 
     /// Bytes of each device buffer, in the order `new` takes them.
     fn sizes(cfg: &Config, ctx: usize) -> [usize; 18] {
+        if let Some(m) = cfg.mla {
+            return Self::sizes_mla(cfg, m, ctx);
+        }
         let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
         let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim);
         // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 32 positions
@@ -4136,6 +4580,37 @@ impl GpuSession {
             kv,
             scales,
             scales,
+            4 * DECODE_MAX_BATCH * cfg.vocab,
+            4 * DECODE_MAX_BATCH,
+            4,
+        ]
+    }
+
+    /// `sizes` for latent attention: an f16 cache of one (kl + rd)-wide row per position and layer (no
+    /// separate values, no int8 option); s.qkv holds the queries then [low-rank query | compressed kv]
+    /// rows; s.att a token's heads x kl outputs; s.gu also the queries moved into the latent space.
+    fn sizes_mla(cfg: &Config, m: crate::model::Mla, ctx: usize) -> [usize; 18] {
+        let (h, kd) = (cfg.n_heads, cfg.k_row());
+        let q_dim = h * cfg.head_dim;
+        let att = (h * m.kv_lora).max(q_dim);
+        let gu = (2 * cfg.ffn_dim.max(cfg.expert_ffn_dim * cfg.n_shared_experts)).max(h * kd);
+        let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim).max(att);
+        [
+            MAX_BATCH * widest,
+            4 * MAX_BATCH * widest / 32,
+            4 * MAX_BATCH * widest / 32,
+            4 * MLA_SPLIT_MAX_BATCH * MLA_MAX_SPLIT * h * (m.kv_lora + 2),
+            4 * MAX_BATCH,
+            4 * MAX_BATCH * cfg.dim,
+            4 * MAX_BATCH * cfg.dim,
+            4 * MAX_BATCH * (q_dim + m.q_lora + kd),
+            4 * MAX_BATCH * att,
+            4 * MAX_BATCH * gu,
+            4 * MAX_BATCH * cfg.ffn_dim,
+            2 * cfg.n_layers * ctx * kd,
+            4,
+            4,
+            4,
             4 * DECODE_MAX_BATCH * cfg.vocab,
             4 * DECODE_MAX_BATCH,
             4,

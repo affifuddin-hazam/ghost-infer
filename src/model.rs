@@ -1,5 +1,6 @@
-//! Llama-family transformer on the CPU: Llama 2/3, SmolLM, Mistral-style GQA, and Qwen3
-//! (per-head RMSNorm on queries and keys, NEOX-style RoPE).
+//! Llama-family transformer on the CPU: Llama 2/3, SmolLM, Mistral-style GQA, Qwen3
+//! (per-head RMSNorm on queries and keys, NEOX-style RoPE), and DeepSeek-style models such as
+//! GLM-4.7-Flash (multi-head latent attention, sigmoid-routed experts beside a shared one).
 
 use rayon::prelude::*;
 
@@ -31,9 +32,33 @@ pub struct Config {
     pub n_experts: usize,
     pub n_experts_used: usize,
     pub expert_ffn_dim: usize,
+    /// Multi-head latent attention (deepseek2); None for plain grouped-query attention.
+    pub mla: Option<Mla>,
+    /// deepseek2: the first layers keep a dense feed-forward; the others add always-on shared experts
+    /// to the routed ones.
+    pub n_dense_lead: usize,
+    pub n_shared_experts: usize,
+    /// deepseek2 routing: sigmoid scores (else softmax) picked with a per-expert bias, renormalised over
+    /// the picks if `expert_weights_norm`, then times `expert_weights_scale`.
+    pub gating_sigmoid: bool,
+    pub expert_weights_norm: bool,
+    pub expert_weights_scale: f32,
 }
 
-pub const SUPPORTED_ARCHS: [&str; 3] = ["llama", "qwen3", "qwen3moe"];
+/// Multi-head latent attention sizes. Every head's keys and values come from one compressed vector per
+/// token (`kv_lora` wide) plus a shared `rope_dim`-wide RoPE key, and only those are cached. Each head's
+/// position-free query part (`nope` wide) is moved into the compressed space (attn_k_b), attention runs
+/// over the cache as is, and each head's result is moved back out to `v_head` values (attn_v_b).
+#[derive(Debug, Clone, Copy)]
+pub struct Mla {
+    /// width of the low-rank query step (0: queries come straight from attn_q)
+    pub q_lora: usize,
+    pub kv_lora: usize,
+    pub nope: usize,
+    pub v_head: usize,
+}
+
+pub const SUPPORTED_ARCHS: [&str; 4] = ["llama", "qwen3", "qwen3moe", "deepseek2"];
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Config, String> {
@@ -47,16 +72,39 @@ impl Config {
 
         let dim = need("embedding_length")?;
         let n_heads = need("attention.head_count")?;
-        let head_dim = u("attention.key_length").unwrap_or(dim / n_heads);
+        let deepseek = arch == "deepseek2";
+        let mla = if deepseek {
+            if g.tensor("blk.0.attn_k_b.weight").is_none() {
+                return Err("this deepseek2 GGUF keeps attn_kv_b whole; convert it with a newer llama.cpp (attn_k_b / attn_v_b)".into());
+            }
+            if g.get(&format!("{arch}.rope.scaling.type")).and_then(Value::as_str).is_some_and(|t| t != "none") {
+                return Err("RoPE scaling (YaRN) is not supported yet".into());
+            }
+            let rope = need("rope.dimension_count")?;
+            // per-head sizes; in these GGUFs key_length / value_length describe the cache row instead
+            let key = u("attention.key_length_mla").ok_or("missing attention.key_length_mla")?;
+            let v_head = u("attention.value_length_mla").ok_or("missing attention.value_length_mla")?;
+            Some(Mla { q_lora: u("attention.q_lora_rank").unwrap_or(0), kv_lora: need("attention.kv_lora_rank")?, nope: key - rope, v_head })
+        } else {
+            None
+        };
+        let head_dim = match mla {
+            Some(m) => m.nope + need("rope.dimension_count")?,
+            None => u("attention.key_length").unwrap_or(dim / n_heads),
+        };
+        let vocab = u("vocab_size").or_else(|| g.tensor("token_embd.weight").and_then(|t| t.dims.get(1)).map(|&v| v as usize)).ok_or("cannot tell the vocabulary size")?;
+        let blocks = need("block_count")?;
         Ok(Config {
             dim,
-            n_layers: need("block_count")?,
+            // multi-token-prediction blocks come after the real ones; they are not run
+            n_layers: blocks - u("nextn_predict_layers").unwrap_or(0),
             n_heads,
-            n_kv_heads: u("attention.head_count_kv").unwrap_or(n_heads),
+            // latent attention: one shared key-value "head" for all query heads
+            n_kv_heads: if mla.is_some() { 1 } else { u("attention.head_count_kv").unwrap_or(n_heads) },
             head_dim,
             ffn_dim: need("feed_forward_length")?,
             // not every GGUF has <arch>.vocab_size; the embedding table always says
-            vocab: u("vocab_size").or_else(|| g.tensor("token_embd.weight").and_then(|t| t.dims.get(1)).map(|&v| v as usize)).ok_or("cannot tell the vocabulary size")?,
+            vocab,
             max_ctx: need("context_length")?,
             rope_dim: u("rope.dimension_count").unwrap_or(head_dim),
             rope_base: f("rope.freq_base").unwrap_or(10_000.0),
@@ -65,6 +113,16 @@ impl Config {
             n_experts: u("expert_count").unwrap_or(0),
             n_experts_used: u("expert_used_count").unwrap_or(0),
             expert_ffn_dim: u("expert_feed_forward_length").unwrap_or(0),
+            mla,
+            n_dense_lead: u("leading_dense_block_count").unwrap_or(0),
+            n_shared_experts: u("expert_shared_count").unwrap_or(0),
+            // 1 softmax, 2 sigmoid; older GLM-4.7-Flash files lack the key, and llama.cpp then picks sigmoid
+            gating_sigmoid: match u("expert_gating_func") {
+                Some(f) => f == 2,
+                None => deepseek && vocab == 154_880 && matches!(blocks, 47 | 48),
+            },
+            expert_weights_norm: g.get(&format!("{arch}.expert_weights_norm")).and_then(Value::as_bool).unwrap_or(false),
+            expert_weights_scale: f("expert_weights_scale").unwrap_or(1.0),
         })
     }
 
@@ -76,6 +134,25 @@ impl Config {
         self.n_kv_heads * self.head_dim
     }
 
+    /// Floats cached per token and layer for keys and for values. Latent attention keeps the compressed
+    /// vector with the RoPE key after it, and the values are that same vector.
+    pub fn k_row(&self) -> usize {
+        self.mla.map_or(self.kv_dim(), |m| m.kv_lora + self.rope_dim)
+    }
+
+    pub fn v_row(&self) -> usize {
+        self.mla.map_or(self.kv_dim(), |m| m.kv_lora)
+    }
+
+    /// Attention as the kernel sees it: key and value width per kv head, and the score scale.
+    fn att_dims(&self) -> (usize, usize, f32) {
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        match self.mla {
+            Some(m) => (m.kv_lora + self.rope_dim, m.kv_lora, scale),
+            None => (self.head_dim, self.head_dim, scale),
+        }
+    }
+
     fn q_dim(&self) -> usize {
         self.n_heads * self.head_dim
     }
@@ -83,20 +160,36 @@ impl Config {
 
 struct Layer<'a> {
     attn_norm: Vec<f32>,
-    wq: Matrix<'a>,
-    wk: Matrix<'a>,
-    wv: Matrix<'a>,
+    attn: Attn<'a>,
     wo: Matrix<'a>,
-    q_norm: Option<Vec<f32>>, // Qwen3: RMSNorm over each query head before RoPE
-    k_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
     ffn: Ffn<'a>,
 }
 
+enum Attn<'a> {
+    Gqa {
+        wq: Matrix<'a>,
+        wk: Matrix<'a>,
+        wv: Matrix<'a>,
+        q_norm: Option<Vec<f32>>, // Qwen3: RMSNorm over each query head before RoPE
+        k_norm: Option<Vec<f32>>,
+    },
+    /// See `Mla`. `wq_a` and its norm are the low-rank query step (absent: `wq` reads the input directly).
+    Mla {
+        wq_a: Option<(Matrix<'a>, Vec<f32>)>,
+        wq: Matrix<'a>,
+        wkv_a: Matrix<'a>,
+        kv_a_norm: Vec<f32>,
+        k_b: Vec<Matrix<'a>>, // per head: kv_lora rows of nope
+        v_b: Vec<Matrix<'a>>, // per head: v_head rows of kv_lora
+    },
+}
+
 enum Ffn<'a> {
     Dense { gate: Matrix<'a>, up: Matrix<'a>, down: Matrix<'a> },
-    /// router: n_experts rows of dim f32 logit weights
-    Moe { router: Vec<f32>, experts: Vec<Expert<'a>> },
+    /// router: n_experts rows of dim f32 logit weights; bias: deepseek2's per-expert pick bias;
+    /// shared: deepseek2's always-on expert(s), as one SwiGLU block
+    Moe { router: Vec<f32>, bias: Option<Vec<f32>>, experts: Vec<Expert<'a>>, shared: Option<Expert<'a>> },
 }
 
 /// One expert's SwiGLU feed-forward, inside the model file.
@@ -142,13 +235,17 @@ fn expert_matrices<'g>(g: &'g Gguf, name: &str) -> Result<Vec<Matrix<'g>>, Strin
     Ok((0..n).map(|e| Matrix { data: &g.mmap[t.offset + e * bytes..t.offset + (e + 1) * bytes], ty: t.ty, rows, cols }).collect())
 }
 
-/// Every layer's experts (empty for a dense model), for the CPU expert path of the GPU backend too.
+/// Every layer's experts (none for a dense model; empty for deepseek2's dense lead layers), for the CPU
+/// expert path of the GPU backend too.
 pub fn load_experts<'g>(g: &'g Gguf, cfg: &Config) -> Result<Vec<Vec<Expert<'g>>>, String> {
     if !cfg.is_moe() {
         return Ok(Vec::new());
     }
     (0..cfg.n_layers)
         .map(|i| {
+            if i < cfg.n_dense_lead {
+                return Ok(Vec::new()); // a dense layer
+            }
             let p = |s: &str| format!("blk.{i}.{s}.weight");
             let (gate, up, down) = (expert_matrices(g, &p("ffn_gate_exps"))?, expert_matrices(g, &p("ffn_up_exps"))?, expert_matrices(g, &p("ffn_down_exps"))?);
             if gate.len() != cfg.n_experts || up.len() != cfg.n_experts || down.len() != cfg.n_experts {
@@ -178,6 +275,43 @@ pub fn route(logits: &[f32], k: usize, out: &mut Vec<(usize, f32)>) {
     }
 }
 
+/// deepseek2 routing for one token: scores are sigmoid(logit) (or a softmax over every expert), the `k`
+/// best by score + `bias` are picked, and weighted by their scores, renormalised to sum to 1 if `norm`,
+/// then times `scale`.
+pub fn route_deepseek(logits: &[f32], bias: Option<&[f32]>, k: usize, sigmoid: bool, norm: bool, scale: f32, out: &mut Vec<(usize, f32)>) {
+    let mut scores: Vec<f32> = if sigmoid {
+        logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
+    } else {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+        let total: f32 = e.iter().sum();
+        e.into_iter().map(|v| v / total).collect()
+    };
+    out.clear();
+    out.extend(scores.iter().enumerate().map(|(e, &sc)| (e, sc + bias.map_or(0.0, |b| b[e]))));
+    out.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    out.truncate(k);
+    out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let total: f32 = out.iter().map(|&(e, _)| scores[e]).sum();
+    let div = if norm { total.max(f32::MIN_POSITIVE) } else { 1.0 };
+    for p in out.iter_mut() {
+        p.1 = scores[p.0] / div * scale;
+    }
+    scores.clear();
+}
+
+/// deepseek2's `moe_route`: every row's router logits, then `route_deepseek` with the model's settings.
+pub fn moe_route_deepseek(c: &Config, router: &[f32], bias: Option<&[f32]>, xb: &[f32], picks: &mut Vec<(usize, f32)>, sc: &mut MoeScratch) {
+    picks.clear();
+    let mut top = Vec::new();
+    for row in xb.chunks_exact(c.dim) {
+        sc.logits.clear();
+        sc.logits.extend(router.chunks_exact(c.dim).map(|w| dot_f32(w, row)));
+        route_deepseek(&sc.logits, bias, c.n_experts_used, c.gating_sigmoid, c.expert_weights_norm, c.expert_weights_scale, &mut top);
+        picks.extend_from_slice(&top);
+    }
+}
+
 fn vector(g: &Gguf, name: &str) -> Result<Vec<f32>, String> {
     let t = tensor(g, name)?;
     if t.ty.block().is_none() {
@@ -198,21 +332,42 @@ impl<'a> Model<'a> {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
-            let ffn = match experts.next() {
-                Some(experts) => Ffn::Moe { router: vector(g, &p("ffn_gate_inp"))?, experts },
+            let ffn = match experts.next().filter(|e| !e.is_empty()) {
+                Some(experts) => Ffn::Moe {
+                    router: vector(g, &p("ffn_gate_inp"))?,
+                    bias: g.tensor(&format!("blk.{i}.exp_probs_b.bias")).map(|_| vector(g, &format!("blk.{i}.exp_probs_b.bias"))).transpose()?,
+                    experts,
+                    shared: match g.tensor(&p("ffn_gate_shexp")) {
+                        Some(_) => Some(Expert { gate: matrix(g, &p("ffn_gate_shexp"))?, up: matrix(g, &p("ffn_up_shexp"))?, down: matrix(g, &p("ffn_down_shexp"))? }),
+                        None => None,
+                    },
+                },
                 None => Ffn::Dense { gate: matrix(g, &p("ffn_gate"))?, up: matrix(g, &p("ffn_up"))?, down: matrix(g, &p("ffn_down"))? },
             };
-            layers.push(Layer {
-                attn_norm: vector(g, &p("attn_norm"))?,
-                wq: matrix(g, &p("attn_q"))?,
-                wk: matrix(g, &p("attn_k"))?,
-                wv: matrix(g, &p("attn_v"))?,
-                wo: matrix(g, &p("attn_output"))?,
-                q_norm: g.tensor(&p("attn_q_norm")).map(|_| vector(g, &p("attn_q_norm"))).transpose()?,
-                k_norm: g.tensor(&p("attn_k_norm")).map(|_| vector(g, &p("attn_k_norm"))).transpose()?,
-                ffn_norm: vector(g, &p("ffn_norm"))?,
-                ffn,
-            });
+            let attn = match cfg.mla {
+                Some(m) => {
+                    let (k_b, v_b) = (expert_matrices(g, &p("attn_k_b"))?, expert_matrices(g, &p("attn_v_b"))?);
+                    if k_b.len() != cfg.n_heads || k_b[0].cols != m.nope || k_b[0].rows != m.kv_lora || v_b.len() != cfg.n_heads || v_b[0].cols != m.kv_lora || v_b[0].rows != m.v_head {
+                        return Err(format!("layer {i}: attn_k_b / attn_v_b shapes do not match the attention sizes"));
+                    }
+                    Attn::Mla {
+                        wq_a: if m.q_lora > 0 { Some((matrix(g, &p("attn_q_a"))?, vector(g, &p("attn_q_a_norm"))?)) } else { None },
+                        wq: matrix(g, &p(if m.q_lora > 0 { "attn_q_b" } else { "attn_q" }))?,
+                        wkv_a: matrix(g, &p("attn_kv_a_mqa"))?,
+                        kv_a_norm: vector(g, &p("attn_kv_a_norm"))?,
+                        k_b,
+                        v_b,
+                    }
+                }
+                None => Attn::Gqa {
+                    wq: matrix(g, &p("attn_q"))?,
+                    wk: matrix(g, &p("attn_k"))?,
+                    wv: matrix(g, &p("attn_v"))?,
+                    q_norm: g.tensor(&p("attn_q_norm")).map(|_| vector(g, &p("attn_q_norm"))).transpose()?,
+                    k_norm: g.tensor(&p("attn_k_norm")).map(|_| vector(g, &p("attn_k_norm"))).transpose()?,
+                },
+            };
+            layers.push(Layer { attn_norm: vector(g, &p("attn_norm"))?, attn, wo: matrix(g, &p("attn_output"))?, ffn_norm: vector(g, &p("ffn_norm"))?, ffn });
         }
         // small models tie the output projection to the embedding table
         let output = if g.tensor("output.weight").is_some() { matrix(g, "output.weight")? } else { token_embd };
@@ -224,8 +379,8 @@ impl<'a> Model<'a> {
 pub struct Session {
     pub pos: usize,
     pub ctx: usize,
-    k_cache: Vec<f32>, // [layer][pos][kv_dim]
-    v_cache: Vec<f32>,
+    k_cache: Vec<f32>, // [layer][pos][k_row]
+    v_cache: Vec<f32>, // [layer][pos][v_row]
     x: Vec<f32>,
     xb: Vec<f32>,
     xq: QuantizedBatch,
@@ -238,6 +393,13 @@ pub struct Session {
     gate: Vec<f32>,
     picks: Vec<(usize, f32)>, // mixture of experts: (expert, weight) per token and pick
     moe: MoeScratch,
+    // latent attention: the low-rank queries, the queries moved into the latent space, every head's
+    // output moved back out, and one head's rows gathered for its own projection
+    lat: Vec<f32>,
+    qa: Vec<f32>,
+    heads: Vec<f32>,
+    head_in: Vec<f32>,
+    head_out: Vec<f32>,
     pub logits: Vec<f32>,
     rope_inv_freq: Vec<f32>,
 }
@@ -245,13 +407,12 @@ pub struct Session {
 impl Session {
     pub fn new(cfg: &Config, ctx: usize) -> Session {
         let ctx = ctx.min(cfg.max_ctx);
-        let kv = cfg.n_layers * ctx * cfg.kv_dim();
         let half = cfg.rope_dim / 2;
         Session {
             pos: 0,
             ctx,
-            k_cache: vec![0.0; kv],
-            v_cache: vec![0.0; kv],
+            k_cache: vec![0.0; cfg.n_layers * ctx * cfg.k_row()],
+            v_cache: vec![0.0; cfg.n_layers * ctx * cfg.v_row()],
             x: Vec::new(),
             xb: Vec::new(),
             xq: QuantizedBatch::default(),
@@ -264,6 +425,11 @@ impl Session {
             gate: Vec::new(),
             picks: Vec::new(),
             moe: MoeScratch::default(),
+            lat: Vec::new(),
+            qa: Vec::new(),
+            heads: Vec::new(),
+            head_in: Vec::new(),
+            head_out: Vec::new(),
             logits: vec![0.0; cfg.vocab],
             rope_inv_freq: (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.rope_dim as f32)).collect(),
         }
@@ -274,15 +440,20 @@ impl Session {
     }
 
     fn size_for(&mut self, cfg: &Config, n: usize) {
+        let (kd, vd, _) = cfg.att_dims();
+        let m = cfg.mla.unwrap_or(Mla { q_lora: 0, kv_lora: 0, nope: 0, v_head: 0 });
         for (buf, width) in [
             (&mut self.x, cfg.dim),
             (&mut self.xb, cfg.dim),
             (&mut self.q, cfg.q_dim()),
-            (&mut self.k, cfg.kv_dim()),
+            (&mut self.k, cfg.k_row()),
             (&mut self.v, cfg.kv_dim()),
-            (&mut self.att_out, cfg.q_dim()),
+            (&mut self.att_out, cfg.n_heads * vd),
             (&mut self.proj, cfg.dim),
-            (&mut self.gate, cfg.ffn_dim),
+            (&mut self.gate, cfg.ffn_dim.max(cfg.expert_ffn_dim * cfg.n_shared_experts)),
+            (&mut self.lat, m.q_lora),
+            (&mut self.qa, if cfg.mla.is_some() { cfg.n_heads * kd } else { 0 }),
+            (&mut self.heads, cfg.n_heads * m.v_head),
         ] {
             buf.resize(n * width, 0.0);
         }
@@ -424,30 +595,57 @@ impl Model<'_> {
                 rms_norm_rows(&mut s.xb, &s.x, &layer.attn_norm, c.norm_eps);
                 s.xq.quantize(&s.xb, dim);
             });
-            profile::time(2, || {
-                matmul_many(&mut [(&layer.wq, &mut s.q), (&layer.wk, &mut s.k), (&layer.wv, &mut s.v)], &s.xb, &s.xq);
-            });
-            let layer_base = l * s.ctx * kv_dim;
-            profile::time(3, || {
-                if let Some(w) = &layer.q_norm {
-                    rms_norm_inplace(&mut s.q, w, c.norm_eps);
+            let (k_base, v_base) = (l * s.ctx * c.k_row(), l * s.ctx * c.v_row());
+            match &layer.attn {
+                Attn::Gqa { wq, wk, wv, q_norm, k_norm } => {
+                    profile::time(2, || {
+                        matmul_many(&mut [(wq, &mut s.q), (wk, &mut s.k), (wv, &mut s.v)], &s.xb, &s.xq);
+                    });
+                    profile::time(3, || {
+                        if let Some(w) = q_norm {
+                            rms_norm_inplace(&mut s.q, w, c.norm_eps);
+                        }
+                        if let Some(w) = k_norm {
+                            rms_norm_inplace(&mut s.k, w, c.norm_eps);
+                        }
+                        for b in 0..n {
+                            rope(&mut s.q[b * q_dim..(b + 1) * q_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq, c.rope_neox);
+                            rope(&mut s.k[b * kv_dim..(b + 1) * kv_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq, c.rope_neox);
+                        }
+                        let at = k_base + pos0 * kv_dim;
+                        s.k_cache[at..at + n * kv_dim].copy_from_slice(&s.k);
+                        s.v_cache[at..at + n * kv_dim].copy_from_slice(&s.v);
+                    });
                 }
-                if let Some(w) = &layer.k_norm {
-                    rms_norm_inplace(&mut s.k, w, c.norm_eps);
-                }
-                for b in 0..n {
-                    rope(&mut s.q[b * q_dim..(b + 1) * q_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq, c.rope_neox);
-                    rope(&mut s.k[b * kv_dim..(b + 1) * kv_dim], hd, c.rope_dim, pos0 + b, &s.rope_inv_freq, c.rope_neox);
-                }
-                let at = layer_base + pos0 * kv_dim;
-                s.k_cache[at..at + n * kv_dim].copy_from_slice(&s.k);
-                s.v_cache[at..at + n * kv_dim].copy_from_slice(&s.v);
-            });
-            profile::time(4, || self.attention(s, layer_base, n));
+                Attn::Mla { wq_a, wq, wkv_a, kv_a_norm, k_b, .. } => profile::time(2, || self.mla_in(s, n, k_base, v_base, wq_a.as_ref(), wq, wkv_a, kv_a_norm, k_b)),
+            }
+            profile::time(4, || self.attention(s, k_base, v_base, n));
 
             profile::time(5, || {
-                s.xq.quantize(&s.att_out, q_dim);
-                layer.wo.matmul(&s.att_out, &s.xq, &mut s.proj);
+                let heads = match &layer.attn {
+                    Attn::Gqa { .. } => &s.att_out,
+                    Attn::Mla { v_b, .. } => {
+                        // every head's latent result out to its values
+                        let (m, vd) = (c.mla.unwrap(), c.att_dims().1);
+                        for (h, vb) in v_b.iter().enumerate() {
+                            s.head_in.clear();
+                            for b in 0..n {
+                                let o = (b * c.n_heads + h) * vd;
+                                s.head_in.extend_from_slice(&s.att_out[o..o + vd]);
+                            }
+                            s.xq.quantize(&s.head_in, vd);
+                            s.head_out.resize(n * m.v_head, 0.0);
+                            vb.matmul(&s.head_in, &s.xq, &mut s.head_out);
+                            for b in 0..n {
+                                let o = (b * c.n_heads + h) * m.v_head;
+                                s.heads[o..o + m.v_head].copy_from_slice(&s.head_out[b * m.v_head..(b + 1) * m.v_head]);
+                            }
+                        }
+                        &s.heads
+                    }
+                };
+                s.xq.quantize(heads, layer.wo.cols);
+                layer.wo.matmul(heads, &s.xq, &mut s.proj);
                 for (x, p) in s.x.iter_mut().zip(&s.proj) {
                     *x += p;
                 }
@@ -467,9 +665,23 @@ impl Model<'_> {
                         *x += f;
                     }
                 }
-                Ffn::Moe { router, experts } => {
-                    moe_route(router, c.n_experts_used, &s.xb, dim, &mut s.picks, &mut s.moe);
+                Ffn::Moe { router, bias, experts, shared } => {
+                    if c.mla.is_some() {
+                        moe_route_deepseek(c, router, bias.as_deref(), &s.xb, &mut s.picks, &mut s.moe);
+                    } else {
+                        moe_route(router, c.n_experts_used, &s.xb, dim, &mut s.picks, &mut s.moe);
+                    }
                     moe_experts(experts.len(), |e| experts[e], &s.picks, c.n_experts_used, &s.xb, dim, &mut s.x, &mut s.moe);
+                    if let Some(sh) = shared {
+                        let hid = sh.gate.rows;
+                        let h = &mut s.gate[..n * hid];
+                        gate_up_silu(&sh.gate, &sh.up, &s.xb, &s.xq, h);
+                        s.xq.quantize(h, hid);
+                        sh.down.matmul(h, &s.xq, &mut s.proj);
+                        for (x, f) in s.x.iter_mut().zip(&s.proj) {
+                            *x += f;
+                        }
+                    }
                 }
             });
         }
@@ -487,16 +699,64 @@ impl Model<'_> {
         Ok(())
     }
 
-    /// Causal multi-head attention for the batch, reading keys/values from the cache.
-    fn attention(&self, s: &mut Session, layer_base: usize, n: usize) {
+    /// Latent attention's inputs for the batch: the queries (each head's position-free part moved into the
+    /// latent space, then its RoPE part) into `s.qa`, and the cache rows (normed latent + RoPE key; the
+    /// values are the latent alone).
+    #[allow(clippy::too_many_arguments)]
+    fn mla_in(&self, s: &mut Session, n: usize, k_base: usize, v_base: usize, wq_a: Option<&(Matrix, Vec<f32>)>, wq: &Matrix, wkv_a: &Matrix, kv_a_norm: &[f32], k_b: &[Matrix]) {
         let c = &self.cfg;
-        let (kv_dim, q_dim, hd) = (c.kv_dim(), c.q_dim(), c.head_dim);
+        let (m, hd, rd, pos0) = (c.mla.unwrap(), c.head_dim, c.rope_dim, s.pos);
+        let (kd, vd) = (c.k_row(), c.v_row());
+        match wq_a {
+            Some((wa, norm)) => {
+                matmul_many(&mut [(wa, &mut s.lat), (wkv_a, &mut s.k)], &s.xb, &s.xq);
+                rms_norm_inplace(&mut s.lat, norm, c.norm_eps);
+                s.xq.quantize(&s.lat, m.q_lora);
+                wq.matmul(&s.lat, &s.xq, &mut s.q);
+            }
+            None => matmul_many(&mut [(wq, &mut s.q), (wkv_a, &mut s.k)], &s.xb, &s.xq),
+        }
+        for b in 0..n {
+            let (lat, pe) = s.k[b * kd..(b + 1) * kd].split_at_mut(m.kv_lora);
+            rms_norm_inplace(lat, kv_a_norm, c.norm_eps);
+            rope(pe, rd, rd, pos0 + b, &s.rope_inv_freq, c.rope_neox);
+            for h in 0..c.n_heads {
+                let q0 = (b * c.n_heads + h) * hd + m.nope;
+                rope(&mut s.q[q0..q0 + rd], rd, rd, pos0 + b, &s.rope_inv_freq, c.rope_neox);
+            }
+            let (ka, va) = (k_base + (pos0 + b) * kd, v_base + (pos0 + b) * vd);
+            s.k_cache[ka..ka + kd].copy_from_slice(&s.k[b * kd..(b + 1) * kd]);
+            s.v_cache[va..va + vd].copy_from_slice(&s.k[b * kd..b * kd + vd]);
+        }
+        for (h, kb) in k_b.iter().enumerate() {
+            s.head_in.clear();
+            for b in 0..n {
+                let q0 = (b * c.n_heads + h) * hd;
+                s.head_in.extend_from_slice(&s.q[q0..q0 + m.nope]);
+            }
+            s.xq.quantize(&s.head_in, m.nope);
+            s.head_out.resize(n * m.kv_lora, 0.0);
+            kb.matmul(&s.head_in, &s.xq, &mut s.head_out);
+            for b in 0..n {
+                let (a0, q0) = ((b * c.n_heads + h) * kd, (b * c.n_heads + h) * hd + m.nope);
+                s.qa[a0..a0 + m.kv_lora].copy_from_slice(&s.head_out[b * m.kv_lora..(b + 1) * m.kv_lora]);
+                s.qa[a0 + m.kv_lora..a0 + kd].copy_from_slice(&s.q[q0..q0 + rd]);
+            }
+        }
+    }
+
+    /// Causal multi-head attention for the batch, reading keys/values from the cache. Each kv head has
+    /// `kd`-wide keys and `vd`-wide values (equal, except for latent attention).
+    fn attention(&self, s: &mut Session, k_base: usize, v_base: usize, n: usize) {
+        let c = &self.cfg;
+        let (kd, vd, scale) = c.att_dims();
+        let (k_row, v_row) = (c.k_row(), c.v_row());
+        let (q_dim, o_dim) = (c.n_heads * kd, c.n_heads * vd);
         let group = c.n_heads / c.n_kv_heads;
-        let scale = 1.0 / (hd as f32).sqrt();
         let pos0 = s.pos;
-        let k_cache = &s.k_cache[layer_base..layer_base + (pos0 + n) * kv_dim];
-        let v_cache = &s.v_cache[layer_base..layer_base + (pos0 + n) * kv_dim];
-        let q = &s.q;
+        let k_cache = &s.k_cache[k_base..k_base + (pos0 + n) * k_row];
+        let v_cache = &s.v_cache[v_base..v_base + (pos0 + n) * v_row];
+        let q = if c.mla.is_some() { &s.qa } else { &s.q };
         let span_of = |b: usize| pos0 + b + 1; // causal: token b sees positions 0..=pos0+b
 
         // Work unit = (token, kv head, slice of the context). The `group` query heads sharing a kv head
@@ -506,7 +766,7 @@ impl Model<'_> {
         let pairs = n * c.n_kv_heads;
         let threads = rayon::current_num_threads();
         let splits = if pairs >= threads { 1 } else { threads.div_ceil(pairs).min(span_of(0).div_ceil(64)).max(1) };
-        let unit = group * hd + 2 * group; // per slice: unnormalised outputs, then max and sum per head
+        let unit = group * vd + 2 * group; // per slice: unnormalised outputs, then max and sum per head
         s.att_partial.resize(pairs * splits * unit, 0.0);
 
         let slice_task = |scores: &mut Vec<f32>, (idx, part): (usize, &mut [f32])| {
@@ -516,9 +776,9 @@ impl Model<'_> {
             let per = span.div_ceil(splits);
             let (t0, t1) = ((split * per).min(span), ((split + 1) * per).min(span));
             let len = t1 - t0;
-            let q0 = b * q_dim + kvh * group * hd;
-            let qs = &q[q0..q0 + group * hd];
-            let (out, stats) = part.split_at_mut(group * hd);
+            let q0 = b * q_dim + kvh * group * kd;
+            let qs = &q[q0..q0 + group * kd];
+            let (out, stats) = part.split_at_mut(group * vd);
             out.fill(0.0);
             if len == 0 {
                 for g in 0..group {
@@ -529,8 +789,8 @@ impl Model<'_> {
             }
             scores.resize(group * len, 0.0);
             for t in t0..t1 {
-                let kt = &k_cache[t * kv_dim + kvh * hd..t * kv_dim + (kvh + 1) * hd];
-                for (g, qh) in qs.chunks_exact(hd).enumerate() {
+                let kt = &k_cache[t * k_row + kvh * kd..t * k_row + (kvh + 1) * kd];
+                for (g, qh) in qs.chunks_exact(kd).enumerate() {
                     scores[g * len + (t - t0)] = dot_f32(qh, kt) * scale;
                 }
             }
@@ -545,8 +805,8 @@ impl Model<'_> {
                 stats[2 * g + 1] = total;
             }
             for t in t0..t1 {
-                let vt = &v_cache[t * kv_dim + kvh * hd..t * kv_dim + (kvh + 1) * hd];
-                for (g, oh) in out.chunks_exact_mut(hd).enumerate() {
+                let vt = &v_cache[t * v_row + kvh * vd..t * v_row + (kvh + 1) * vd];
+                for (g, oh) in out.chunks_exact_mut(vd).enumerate() {
                     let w = scores[g * len + (t - t0)];
                     for (o, v) in oh.iter_mut().zip(vt) {
                         *o += w * v;
@@ -555,7 +815,7 @@ impl Model<'_> {
             }
         };
         // a single token over a short context is too little work to be worth waking threads
-        if n * c.n_heads * (pos0 + n) * hd < 1 << 16 {
+        if n * c.n_heads * (pos0 + n) * kd < 1 << 16 {
             let mut scores = Vec::new();
             s.att_partial.chunks_mut(unit).enumerate().for_each(|t| slice_task(&mut scores, t));
         } else {
@@ -567,18 +827,18 @@ impl Model<'_> {
             let (b, kvh) = (pair / c.n_kv_heads, pair % c.n_kv_heads);
             let parts = &s.att_partial[pair * splits * unit..(pair + 1) * splits * unit];
             for g in 0..group {
-                let m = parts.chunks_exact(unit).map(|p| p[group * hd + 2 * g]).fold(f32::NEG_INFINITY, f32::max);
-                let o0 = b * q_dim + (kvh * group + g) * hd;
-                let out = &mut s.att_out[o0..o0 + hd];
+                let m = parts.chunks_exact(unit).map(|p| p[group * vd + 2 * g]).fold(f32::NEG_INFINITY, f32::max);
+                let o0 = b * o_dim + (kvh * group + g) * vd;
+                let out = &mut s.att_out[o0..o0 + vd];
                 out.fill(0.0);
                 let mut total = 0.0;
                 for p in parts.chunks_exact(unit) {
-                    let w = (p[group * hd + 2 * g] - m).exp();
+                    let w = (p[group * vd + 2 * g] - m).exp();
                     if w == 0.0 {
                         continue;
                     }
-                    total += p[group * hd + 2 * g + 1] * w;
-                    for (o, v) in out.iter_mut().zip(&p[g * hd..(g + 1) * hd]) {
+                    total += p[group * vd + 2 * g + 1] * w;
+                    for (o, v) in out.iter_mut().zip(&p[g * vd..(g + 1) * vd]) {
                         *o += w * v;
                     }
                 }

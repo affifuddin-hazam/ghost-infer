@@ -642,6 +642,44 @@ fn has_avx2() -> bool {
     false
 }
 
+/// IQ4_NL's 16 levels (ggml's kvalues_iq4nl).
+const IQ4NL_LEVELS: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+/// One row of a 32-value-block format (or BF16) as f32. In each block, value j comes from the low nibble
+/// of byte j and value j + 16 from its high nibble; Q5 formats keep the fifth bits in a 32-bit mask.
+fn dequant_small(ty: GgmlType, row: &[u8], out: &mut [f32]) {
+    if ty == GgmlType::Bf16 {
+        for (o, b) in out.iter_mut().zip(row.chunks_exact(2)) {
+            *o = f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16);
+        }
+        return;
+    }
+    let bytes = ty.block().unwrap().1;
+    for (blk, o) in row.chunks_exact(bytes).zip(out.chunks_exact_mut(32)) {
+        let d = read_f16(blk);
+        let (min, qh, qs) = match ty {
+            GgmlType::Q4_0 | GgmlType::Iq4Nl => (0.0, 0, &blk[2..18]),
+            GgmlType::Q4_1 => (read_f16(&blk[2..]), 0, &blk[4..20]),
+            GgmlType::Q5_0 => (0.0, u32::from_le_bytes(blk[2..6].try_into().unwrap()), &blk[6..22]),
+            _ => (read_f16(&blk[2..]), u32::from_le_bytes(blk[4..8].try_into().unwrap()), &blk[8..24]), // Q5_1
+        };
+        for (j, &q) in qs.iter().enumerate() {
+            let (lo, hi) = ((q & 0x0f) as u32, (q >> 4) as u32);
+            let (a, b) = match ty {
+                GgmlType::Iq4Nl => (IQ4NL_LEVELS[lo as usize] as f32 * d, IQ4NL_LEVELS[hi as usize] as f32 * d),
+                GgmlType::Q4_0 => ((lo as f32 - 8.0) * d, (hi as f32 - 8.0) * d),
+                GgmlType::Q4_1 => (lo as f32 * d + min, hi as f32 * d + min),
+                _ => {
+                    let (lo, hi) = (lo | ((qh >> j) & 1) << 4, hi | ((qh >> (j + 16)) & 1) << 4);
+                    if ty == GgmlType::Q5_0 { ((lo as f32 - 16.0) * d, (hi as f32 - 16.0) * d) } else { (lo as f32 * d + min, hi as f32 * d + min) }
+                }
+            };
+            o[j] = a;
+            o[j + 16] = b;
+        }
+    }
+}
+
 impl<'a> Matrix<'a> {
     fn row_bytes(&self) -> usize {
         let (per_block, bytes) = self.ty.block().expect("unsupported weight type");
@@ -679,7 +717,8 @@ impl<'a> Matrix<'a> {
             GgmlType::Q4K => kernels::dequant_q4k(row, out),
             GgmlType::Q5K => kernels::dequant_q5k(row, out),
             GgmlType::Q6K => kernels::dequant_q6k(row, out),
-            GgmlType::Other(_) => panic!("unsupported weight type {}", self.ty.name()),
+            ty if ty.dequant_only() => dequant_small(ty, row, out),
+            _ => panic!("unsupported weight type {}", self.ty.name()),
         }
     }
 
@@ -730,7 +769,7 @@ impl<'a> Matrix<'a> {
                     b += 1;
                 }
             }
-            GgmlType::F32 | GgmlType::F16 => {
+            ty if ty == GgmlType::F32 || ty == GgmlType::F16 || ty.dequant_only() => {
                 let mut wf = vec![0f32; self.cols];
                 self.row_f32(r, &mut wf);
                 for b in 0..n {

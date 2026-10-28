@@ -16,6 +16,8 @@ enum PreTokenizer {
     Gpt2IsolatedDigits,
     /// Qwen2/Qwen3 split regex (see `split_qwen2`).
     Qwen2,
+    /// GLM-4 ("glm4"): the Qwen2 regex with numbers in runs of up to three digits (`\p{N}{1,3}`), as in Llama 3.
+    Glm4,
 }
 
 pub struct Tokenizer {
@@ -121,7 +123,8 @@ fn split_gpt2(text: &str, out: &mut Vec<String>) {
 
 /// Splits text the way the Qwen2 regex does:
 /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
-fn split_qwen2(text: &str, out: &mut Vec<String>) {
+/// with numbers in runs of up to `digits` (1 for Qwen, 3 for GLM-4).
+fn split_qwen2(text: &str, digits: usize, out: &mut Vec<String>) {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let is_nl = |c: char| c == '\r' || c == '\n';
@@ -153,9 +156,9 @@ fn split_qwen2(text: &str, out: &mut Vec<String>) {
             if !is_nl(c) && !is_number(c) && i + 1 < n && is_letter(chars[i + 1]) {
                 break 'm run(i + 1, &is_letter);
             }
-            // 3. a single digit
+            // 3. a digit, or a run of up to `digits` of them
             if is_number(c) {
-                break 'm i + 1;
+                break 'm run(i, &is_number).min(i + digits);
             }
             // 4. optional space, a run of symbols, then any newlines
             let start = if c == ' ' && i + 1 < n && is_other(chars[i + 1]) { i + 1 } else { i };
@@ -187,6 +190,7 @@ impl Tokenizer {
         let pre = match g.get("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("default") {
             "smollm" | "starcoder" | "refact" => PreTokenizer::Gpt2IsolatedDigits,
             "qwen2" => PreTokenizer::Qwen2,
+            "glm4" => PreTokenizer::Glm4,
             _ => PreTokenizer::Gpt2,
         };
 
@@ -294,7 +298,8 @@ impl Tokenizer {
         let mut pieces = Vec::new();
         match self.pre {
             PreTokenizer::Gpt2 => split_gpt2(text, &mut pieces),
-            PreTokenizer::Qwen2 => split_qwen2(text, &mut pieces),
+            PreTokenizer::Qwen2 => split_qwen2(text, 1, &mut pieces),
+            PreTokenizer::Glm4 => split_qwen2(text, 3, &mut pieces),
             PreTokenizer::Gpt2IsolatedDigits => {
                 let mut chunk = String::new();
                 for c in text.chars() {
@@ -419,7 +424,7 @@ mod tests {
     fn qwen2_split_matches_regex() {
         let split = |s: &str| {
             let mut v = Vec::new();
-            split_qwen2(s, &mut v);
+            split_qwen2(s, 1, &mut v);
             v
         };
         assert_eq!(split("Hello world"), ["Hello", " world"]);
@@ -431,6 +436,13 @@ mod tests {
         assert_eq!(split("a  b"), ["a", " ", " b"]);
         assert_eq!(split("end   "), ["end", "   "]);
         assert_eq!(split("hi !!"), ["hi", " !!"]);
+    }
+
+    #[test]
+    fn glm4_split_groups_digits_by_three() {
+        let mut v = Vec::new();
+        split_qwen2("(x) 1234567 a1", 3, &mut v);
+        assert_eq!(v, ["(x", ")", " ", "123", "456", "7", " a", "1"]);
     }
 
     #[test]

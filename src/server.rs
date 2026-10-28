@@ -41,6 +41,9 @@ struct Job {
     top_p: f32,
     seed: u64,
     stop: Vec<String>,
+    /// sent before the reply: text the prompt already holds but the reply is read with (GLM's
+    /// prompt ends with <think>, so a thinking reply starts with it too)
+    lead: &'static str,
     events: mpsc::Sender<Event>,
 }
 
@@ -58,6 +61,7 @@ struct Loaded {
     chat_ok: bool,
     default_system: Option<String>,
     thinking: bool, // the chat template has a thinking switch
+    glm: bool,      // GLM-4's chat format instead of ChatML
     backend: String, // where it runs, e.g. "GPU NVIDIA GeForce RTX 2060 SUPER (sm_75, ...)"
 }
 
@@ -164,7 +168,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
             eprintln!("OpenAI-compatible API: http://{host}:{port}/v1 (/v1/chat/completions, /v1/completions, /v1/models)");
         }
         if fmt.is_none() {
-            eprintln!("[note: no ChatML template in this model, so /v1/chat/completions is off]");
+            eprintln!("[note: no chat template this server knows (ChatML or GLM) in this model, so /v1/chat/completions is off]");
         }
         *shared.status.lock().unwrap() = Status {
             current: Some(Loaded {
@@ -172,6 +176,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
                 ctx: engine.backend.ctx(),
                 chat_ok: fmt.is_some(),
                 thinking: fmt.as_ref().is_some_and(|f| f.thinking),
+                glm: fmt.as_ref().is_some_and(|f| f.glm),
                 backend: engine.backend.describe(),
                 default_system: fmt.and_then(|f| f.default_system),
             }),
@@ -219,7 +224,8 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
 
     let tok = engine.tok.clone();
     let mut utf8 = Utf8Stream::default();
-    let mut held = String::new(); // text not sent yet: it could be the start of a stop string
+    // text not sent yet: it could be the start of a stop string (the lead goes out with the first token)
+    let mut held = job.lead.to_string();
     let mut hit_stop = false;
     let events = job.events.clone();
     let stops = job.stop.clone();
@@ -392,6 +398,8 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 ("loading", opt(loading.as_deref())),
                 ("context_length", current.as_ref().map(|c| num(c.ctx as f64)).unwrap_or(Json::Null)),
                 ("thinking", Json::Bool(current.as_ref().is_some_and(|c| c.thinking))),
+                // Qwen3 also reads "/no_think" in a message as switching thinking off; GLM does not
+                ("no_think_tag", Json::Bool(current.as_ref().is_some_and(|c| c.thinking && !c.glm))),
                 ("models", Json::Arr(models)),
             ]);
             return respond(&mut conn, 200, &body);
@@ -434,7 +442,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         _ => {}
     }
     // everything else needs a running model
-    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, .. }) = current.filter(|_| loading.is_none()) else {
+    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, .. }) = current.filter(|_| loading.is_none()) else {
         if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
             let what = loading.as_deref().unwrap_or("the model");
             return respond(&mut conn, 503, &error_body(&format!("loading {what}; try again in a moment")));
@@ -474,11 +482,16 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         Ok(b) => b,
         Err(e) => return respond(&mut conn, 400, &error_body(&format!("request body: {e}"))),
     };
-    let prompt = if chat { chat_prompt(&body, default_system, think_default, thinking) } else { completion_prompt(&body) };
+    let prompt = match (chat, glm) {
+        (true, true) => chat_prompt_glm(&body, think_default, thinking),
+        (true, false) => chat_prompt(&body, default_system, think_default, thinking),
+        (false, _) => completion_prompt(&body),
+    };
     let prompt = match prompt {
         Ok(p) => p,
         Err(e) => return respond(&mut conn, 400, &error_body(&e)),
     };
+    let lead = if chat && glm && prompt.ends_with("<think>") { "<think>" } else { "" };
     let f = |k: &str| body.get(k).and_then(Json::as_f64);
     let stop = match body.get("stop") {
         Some(Json::Str(s)) => vec![s.clone()],
@@ -498,6 +511,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         top_p: f("top_p").map(|p| p as f32).unwrap_or(defaults.2),
         seed: f("seed").map(|s| s as u64).unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)),
         stop,
+        lead,
         events: tx,
     };
     work.send(Work::Job(job)).map_err(|_| "the model thread stopped")?;
@@ -770,6 +784,96 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
     Ok(s)
 }
 
+/// `chat_prompt` for GLM-4 (GLM-4.7-Flash), as its template writes it: `[gMASK]<sop>`, then each message
+/// after its role token with no newlines, earlier replies without their reasoning, tools and tool calls
+/// in GLM's XML form, and `<|assistant|>` followed by `<think>` (thinking) or `</think>` (not).
+fn chat_prompt_glm(body: &Json, think_default: bool, switch: bool) -> Result<String, String> {
+    let messages = body.get("messages").and_then(Json::as_array).ok_or("messages must be a list")?;
+    if messages.is_empty() {
+        return Err("messages is empty".into());
+    }
+    let mut roles = Vec::with_capacity(messages.len());
+    let mut contents = Vec::with_capacity(messages.len());
+    for m in messages {
+        roles.push(match m.get("role").and_then(Json::as_str) {
+            Some("developer") => "system",
+            Some(r @ ("system" | "user" | "assistant" | "tool")) => r,
+            Some(other) => return Err(format!("unknown message role {other}")),
+            None => return Err("a message has no role".into()),
+        });
+        contents.push(content_text(m.get("content"))?);
+    }
+    let mut s = String::from("[gMASK]<sop>");
+    let tools = request_tools(body);
+    if !tools.is_empty() {
+        s.push_str("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n");
+        for t in tools {
+            s.push_str(&t.to_python_string());
+            s.push('\n');
+        }
+        s.push_str("</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>");
+    }
+    let last_user = (0..messages.len()).rev().find(|&i| roles[i] == "user").unwrap_or(0);
+    for (i, m) in messages.iter().enumerate() {
+        let content = contents[i].as_str();
+        match roles[i] {
+            r @ ("system" | "user") => s.push_str(&format!("<|{r}|>{content}")),
+            "assistant" => {
+                let (mut reasoning, mut content) = (String::new(), content.to_string());
+                if let Some(r) = m.get("reasoning_content").and_then(Json::as_str) {
+                    reasoning = r.to_string();
+                } else if let Some((before, after)) = content.split_once("</think>") {
+                    reasoning = before.rsplit("<think>").next().unwrap_or("").to_string();
+                    content = after.to_string();
+                }
+                s.push_str("<|assistant|>");
+                let reasoning = reasoning.trim();
+                if i > last_user && !reasoning.is_empty() {
+                    s.push_str(&format!("<think>{reasoning}</think>"));
+                } else {
+                    s.push_str("</think>");
+                }
+                s.push_str(content.trim());
+                let calls = m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]);
+                if !calls.is_empty() {
+                    for call in calls {
+                        let f = call.get("function").unwrap_or(call);
+                        s.push_str(&format!("<tool_call>{}", f.get("name").and_then(Json::as_str).unwrap_or("")));
+                        let args = match f.get("arguments") {
+                            Some(Json::Str(a)) => Json::parse(a).unwrap_or(Json::Null),
+                            Some(a) => a.clone(),
+                            None => Json::Null,
+                        };
+                        if let Json::Obj(fields) = args {
+                            for (k, v) in fields {
+                                let v = match v {
+                                    Json::Str(t) => t,
+                                    other => other.to_python_string(),
+                                };
+                                s.push_str(&format!("<arg_key>{k}</arg_key><arg_value>{v}</arg_value>"));
+                            }
+                        }
+                        s.push_str("</tool_call>");
+                    }
+                }
+            }
+            _ => {
+                // tool results: one <|observation|> for a run of them
+                if i == 0 || roles[i - 1] != "tool" {
+                    s.push_str("<|observation|>");
+                }
+                s.push_str(&format!("<tool_response>{content}</tool_response>"));
+            }
+        }
+    }
+    let thinking = body.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")).and_then(Json::as_bool).or_else(|| {
+        body.get("reasoning_effort").and_then(Json::as_str).map(|e| !matches!(e.to_ascii_lowercase().as_str(), "none" | "minimal"))
+    });
+    s.push_str("<|assistant|>");
+    s.push_str(if switch && thinking.unwrap_or(think_default) { "<think>" } else { "</think>" });
+    Ok(s)
+}
+
 /// One piece of a reply, once tool calls are split out of the text.
 #[derive(Debug, PartialEq)]
 enum Part {
@@ -850,6 +954,7 @@ impl ToolCalls {
             };
             Some(Part::Call { name, arguments })
         });
+        let parsed = parsed.or_else(|| glm_call(inner));
         match parsed {
             Some(p) => {
                 self.calls += 1;
@@ -858,6 +963,29 @@ impl ToolCalls {
             None => Part::Text(format!("{}{inner}", Self::OPEN)),
         }
     }
+}
+
+/// GLM's tool call: `name<arg_key>k</arg_key><arg_value>v</arg_value>...`. Values that read as JSON
+/// (numbers, true/false, lists, objects) keep that type; anything else is a string.
+fn glm_call(inner: &str) -> Option<Part> {
+    let (name, mut rest) = inner.split_once("<arg_key>").map_or((inner, ""), |(n, r)| (n, r));
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+        return None; // a function name is one word
+    }
+    let mut fields = Vec::new();
+    while !rest.is_empty() {
+        let (key, after) = rest.split_once("</arg_key>")?;
+        let after = after.trim_start().strip_prefix("<arg_value>")?;
+        let (value, after) = after.split_once("</arg_value>")?;
+        let v = match Json::parse(value.trim()) {
+            Ok(j @ (Json::Num(_) | Json::Bool(_) | Json::Arr(_) | Json::Obj(_) | Json::Null)) => j,
+            _ => Json::Str(value.to_string()),
+        };
+        fields.push((key.trim().to_string(), v));
+        rest = after.trim_start().strip_prefix("<arg_key>").unwrap_or(after.trim());
+    }
+    Some(Part::Call { name: name.to_string(), arguments: Json::Obj(fields).to_string() })
 }
 
 fn completion_prompt(body: &Json) -> Result<String, String> {
@@ -945,5 +1073,38 @@ mod tests {
         let mut parts = tc.push("a <tool_call>not json</tool_call> b");
         parts.extend(tc.finish());
         assert_eq!(parts.iter().map(|p| if let Part::Text(t) = p { t.as_str() } else { "" }).collect::<String>(), "a <tool_call>not json</tool_call> b");
+    }
+
+    #[test]
+    fn glm_prompt_and_tool_calls() {
+        let body = Json::parse(
+            r#"{"messages":[{"role":"system","content":"Sys"},{"role":"user","content":"Time?"},
+            {"role":"assistant","content":"<think>hm</think>Let me check.","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"UTC\", \"n\": 2}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"12:00"},{"role":"tool","tool_call_id":"c2","content":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            chat_prompt_glm(&body, true, true).unwrap(),
+            "[gMASK]<sop><|system|>Sys<|user|>Time?<|assistant|><think>hm</think>Let me check.<tool_call>get_time<arg_key>tz</arg_key><arg_value>UTC</arg_value><arg_key>n</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>12:00</tool_response><tool_response>x</tool_response><|assistant|><think>"
+        );
+        // tools, as llama.cpp (b9106) renders GLM-4.7-Flash's own template
+        let tools = Json::parse(r#"{"messages":[{"role":"user","content":"Time?"}],"tools":[{"type":"function","function":{"name":"get_time","description":"Current time","parameters":{"type":"object","properties":{"tz":{"type":"string"}}}}}]}"#).unwrap();
+        assert_eq!(
+            chat_prompt_glm(&tools, true, true).unwrap(),
+            concat!(
+                "[gMASK]<sop><|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+                r#"{"type": "function", "function": {"name": "get_time", "description": "Current time", "parameters": {"type": "object", "properties": {"tz": {"type": "string"}}}}}"#,
+                "\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>",
+                "<|user|>Time?<|assistant|><think>"
+            )
+        );
+        let earlier = Json::parse(r#"{"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"<think>r</think>b"},{"role":"user","content":"c"}],"chat_template_kwargs":{"enable_thinking":false}}"#).unwrap();
+        assert_eq!(chat_prompt_glm(&earlier, true, true).unwrap(), "[gMASK]<sop><|user|>a<|assistant|></think>b<|user|>c<|assistant|></think>");
+
+        let mut tc = ToolCalls::default();
+        let mut parts = tc.push("Checking.\n<tool_call>get_time<arg_key>tz</arg_key><arg_value>UTC</arg_value><arg_key>n</arg_key><arg_value>2</arg_value></tool_call>\n");
+        parts.extend(tc.finish());
+        assert_eq!(parts, vec![Part::Text("Checking.\n".into()), Part::Call { name: "get_time".into(), arguments: r#"{"tz":"UTC","n":2}"#.into() }]);
+        assert!(glm_call("get_system_info").is_some_and(|p| p == Part::Call { name: "get_system_info".into(), arguments: "{}".into() }));
     }
 }
