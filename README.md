@@ -289,13 +289,13 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | | |
 |---|---|
-| Architectures | Llama, Qwen3, Qwen3-MoE (`general.architecture` `llama`, `qwen3`, `qwen3moe`) |
-| Weight formats | Q8_0, Q3_K, Q4_K, Q5_K, Q6_K (so Q3_K_M, Q4_K_M, Q5_K_M, Q6_K and Q8_0 files), F16/F32 on the CPU |
-| Tokenizer | byte-level BPE (`gpt2`): GPT-2 / Qwen2 splitting, SmolLM-style digits |
-| Chat template | ChatML (SmolLM2, Qwen); Qwen3's thinking and tool-call format |
-| Tested with | [SmolLM2-135M-Instruct](https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF), Qwen3 0.6B and 8B fine-tunes, [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) |
+| Architectures | Llama, Qwen3, Qwen3-MoE, and DeepSeek-style models such as GLM-4.7-Flash (`general.architecture` `llama`, `qwen3`, `qwen3moe`, `deepseek2`; on the GPU, `deepseek2` with a 512-wide latent and up to 32 heads) |
+| Weight formats | Q8_0, Q3_K, Q4_K, Q5_K, Q6_K (so Q3_K_M, Q4_K_M, Q5_K_M, Q6_K and Q8_0 files), F16/F32 on the CPU; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL and BF16 by dequantising, for the few tensors llama.cpp stores that way |
+| Tokenizer | byte-level BPE (`gpt2`): GPT-2 / Qwen2 / GLM-4 splitting, SmolLM-style digits |
+| Chat template | ChatML (SmolLM2, Qwen) with Qwen3's thinking and tool-call format; GLM-4's format with its XML tool calls |
+| Tested with | [SmolLM2-135M-Instruct](https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF), Qwen3 0.6B and 8B fine-tunes, [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF), [GLM-4.7-Flash (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-GLM-4.7-Flash-abliterated-i1-GGUF) |
 
-Not yet: Q4_0 and IQ formats, Gemma, Llama 3's tokenizer split, images.
+Not yet: IQ formats other than IQ4_NL, Gemma, Llama 3's tokenizer split, images.
 
 ## GPU requirements
 
@@ -334,6 +334,11 @@ it. Remove that file to build a portable binary.
   page shows that it is loading weights from disk. Experts copied into GPU memory give their RAM back, and
   short prompts run a token at a time so the GPU-held experts are never read from RAM again: with 16 GB
   of RAM, a new chat's first token came after 20 s instead of 56 s, and replies ran at 14 tokens/s instead of 3.
+- **Multi-head latent attention** (GLM-4.7-Flash, DeepSeek-style): each token caches one compressed
+  key-value vector and a shared RoPE key, 54 KB per token where Qwen3-30B-A3B needs 96 KB. Each head's
+  query moves into that compressed space and attention runs over the cache as it is, every head scored
+  against a row read once; generation splits the context into slices across the GPU. Its experts are
+  picked by sigmoid scores with a per-expert bias, beside an always-on shared expert.
 - **Speculative decoding** checks all drafted tokens in one batched pass; a token's logits are
   bit-identical whether computed alone or inside a check batch, so the output equals plain greedy output.
 - **CPU backend**: AVX2 integer kernels for every format (with a scalar fallback), fused passes and
@@ -354,6 +359,12 @@ difference in next-token log-probability:
 
 The most likely next token matched the exact result in every test. Full-vocabulary KL divergence against
 exact maths is measured by [`scripts/kld.py`](scripts/kld.py).
+
+GLM-4.7-Flash (i1-Q3_K_M) was checked against llama.cpp b9106 instead: identical token ids on 12 texts
+(code, Chinese, Malay, emoji), the chat template identical to llama.cpp's rendering of the model's own
+template (tools included), and the same most likely next token on 7 of 7 prompts of up to 629 tokens on
+the CPU and the GPU. The largest log-probability difference in the top 10 was 0.55 (CPU) and 0.69 (GPU);
+llama.cpp's own CPU and GPU builds differ by up to 0.85 on the same prompts.
 
 <details>
 <summary>Environment variables and accuracy tools</summary>
