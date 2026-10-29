@@ -7,7 +7,8 @@
 <p align="center">
   <b>Fast local LLM inference for the GPU you already have.</b><br>
   One small Rust program that runs GGUF models on an NVIDIA card, serves an OpenAI-compatible API,<br>
-  and comes with a chat page where a little ghost shows you what the model is doing.
+  and comes with a desktop app where the model works on your files, and a chat page where a little ghost<br>
+  shows you what the model is doing.
 </p>
 
 <p align="center">
@@ -20,8 +21,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/demo.gif" width="860" alt="ghost-infer answering a coding question in real time">
-  <br><sub>Real time, not sped up: Qwen3 8B Q4_K_M on an RTX 2060 SUPER (8 GB).</sub>
+  <img src="docs/demo.gif" width="860" alt="The ghost-infer desktop app finding and fixing a bug, then running the tests">
+  <br><sub>The desktop app fixing a failing test, 4× speed (<a href="docs/demo.mp4">real time</a>: 75 s): Qwen3-30B-A3B-Instruct-2507 Q3_K_M on an RTX 2060 SUPER (8 GB) with 16 GB of RAM.</sub>
 </p>
 
 ## Why ghost-infer
@@ -211,6 +212,10 @@ The CPU path works but is not the focus: llama.cpp's CPU kernels are still ahead
 `ghost-app` is a native window onto the server, drawn on the CPU so it takes no GPU memory from the model.
 The server runs the agent: the model works on your files and your computer with tools, round after
 round, asks before anything that changes something, and keeps every chat in `%LOCALAPPDATA%\ghost-infer`.
+
+<p align="center">
+  <img src="docs/screenshot-app.png" width="860" alt="The desktop app: a bug found and fixed, its plan done, and the rail with the model, the context, the tasks, the changed file and the scheduled tasks">
+</p>
 
 ```bash
 cargo build --release -p ghost-app
