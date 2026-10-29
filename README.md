@@ -87,7 +87,7 @@ Measured with [GuideLLM](https://github.com/vllm-project/guidellm), vLLM's bench
 | GPU | NVIDIA GeForce RTX 2060 SUPER, 8 GB (Turing, sm_75), driver 577.00 |
 | CPU | AMD Ryzen 5 3600, 6 cores / 12 threads |
 | RAM | 16 GB DDR4-2133 (2 × 8 GB) |
-| Storage | the 8B on a USB 3.0 external hard drive; the 30B on an NVMe SSD (part of it is read again from the disk while it runs) |
+| Storage | the 4B and 8B on a USB 3.0 external hard drive (read once, at load); the 30B on an NVMe SSD (part of it is read again from the disk while it runs) |
 | OS | Windows 10 Pro 22H2 (build 19045), nothing else running (11.7–12.5 GB of RAM free at the start) |
 | Engines | ghost-infer (this repo), llama.cpp b11747 (`llama-server` and `llama-bench`, CUDA 12.4), Ollama 0.40.13 |
 | Models | Qwen3 8B, Q4_K_M, 5.0 GB (a JOSIEFIED fine-tune: same architecture and size as the base model, so the same speed); Qwen3 4B, Q4_K_M, 2.5 GB; Qwen3-30B-A3B-Instruct-2507, Q3_K_M, 13.7 GB |
