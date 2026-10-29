@@ -14,6 +14,7 @@
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#the-chat-page">Chat page</a> ·
+  <a href="#the-desktop-app-and-agent">Desktop app</a> ·
   <a href="#server-api">Server API</a> ·
   <a href="#how-it-works">How it works</a>
 </p>
@@ -205,6 +206,54 @@ The CPU path works but is not the focus: llama.cpp's CPU kernels are still ahead
   <img src="docs/screenshot-mobile.png" width="260" alt="The chat page on a phone">
 </p>
 
+## The desktop app and agent
+
+`ghost-app` is a native window onto the server, drawn on the CPU so it takes no GPU memory from the model.
+The server runs the agent: the model works on your files and your computer with tools, round after
+round, asks before anything that changes something, and keeps every chat in `%LOCALAPPDATA%\ghost-infer`.
+
+```bash
+cargo build --release -p ghost-app
+target\release\ghost-infer serve models\Qwen3-8B-Q4_K_M.gguf --gpu
+target\release\ghost-app                # connects to 127.0.0.1:8080; give another host:port to change it
+```
+
+The app runs on the same computer as the server: the agent only answers requests from this computer.
+
+- **Tools, with your OK.** The + menu turns tool groups on: reading files (on by default), changing files,
+  running PowerShell commands, the web, and MCP tools. File tools only work inside the folders you add.
+  Changing files, running commands, the web, MCP tools and installing a skill ask first (once, always, or
+  no), and every reply's file changes can be undone.
+- **Plans and checks.** The model keeps a task list, pinned above the message box. After changing code it
+  is sent back once to run it. With **Keep going until done** on (+ menu), a reply that stops with steps
+  of its list still open is sent back to them.
+- **Long chats fit.** Before each round, old tool outputs are taken out, then the oldest turns, so a chat
+  never outgrows the context; the chat file keeps everything, and the server's cache stays valid.
+- **Instructions and memory.** `GHOST.md` goes into every chat: the one in `%LOCALAPPDATA%\ghost-infer`,
+  and one in each folder you add (a folder's `CLAUDE.md` or `AGENTS.md` works too). The model saves
+  lasting facts with `remember` and can search earlier chats.
+- **Skills and MCP servers.** Install [Agent Skills](https://agentskills.io) (a folder with a `SKILL.md`)
+  from a folder, a .zip or a GitHub link; a repository with several skills lets you pick. MCP servers go in
+  `mcp.json` in Claude Desktop's format, and **From Claude** copies the ones Claude Desktop has.
+- **Scheduled tasks.** Ask in a chat ("remind me in 20 minutes to…", "every weekday at 9:00, check the
+  build"): the model schedules it once, every N minutes or daily at a time, and it runs in that chat even
+  while you are away. Its reply waits there, marked unread.
+- **The heartbeat.** Turn it on in the rail (every 15 minutes to 2 hours) and write a checklist in
+  `HEARTBEAT.md`: the model goes through it and tells you only when something needs you. A reply of
+  `HEARTBEAT_OK` is dropped, and a checklist with nothing in it is not checked at all.
+
+Scheduled tasks and the heartbeat wait until nothing else has used the model for 20 seconds, and use only
+the tool groups you set to always allowed, since nobody is there to ask.
+
+| In `%LOCALAPPDATA%\ghost-infer` | |
+|---|---|
+| `chats\` | every chat, for the app and any other client of the agent |
+| `harness.json` | the folders tools may use, and the groups always allowed |
+| `GHOST.md`, `memory.json` | instructions and remembered facts, for every chat |
+| `skills\`, `mcp.json` | installed skills and MCP servers |
+| `schedules.json`, `HEARTBEAT.md` | scheduled tasks, and the heartbeat and its checklist |
+| `app.json` | the app's own settings |
+
 ## Usage
 
 ```bash
@@ -283,6 +332,9 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
   `tool_calls` with `finish_reason: "tool_calls"`; streamed, each call is one `delta.tool_calls` chunk.
 - **Switching models** drops the running model (freeing its GPU memory) and loads the new one. Requests
   during a switch get `503`; if the new model fails to load, the server goes back to the previous one.
+- The agent's endpoints (`/api/agent`, `/api/tools`, `/api/chats` and the rest the app uses) are not part
+  of this API: they answer only requests from this computer that carry the token written into the chat
+  page. Other agent harnesses bring their own loop and tools and use `/v1`.
 - Not supported: images, log-probabilities, several choices per request (`n`).
 
 ## Supported models

@@ -2,3 +2,5 @@
 /models
 *.gguf
 /bench-*
+/.playwright-mcp
+/log_*.txt
