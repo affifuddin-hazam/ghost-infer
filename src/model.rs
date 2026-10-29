@@ -463,6 +463,7 @@ impl Session {
 /// Scratch for the CPU expert path, reused between calls.
 #[derive(Default)]
 pub struct MoeScratch {
+    one: crate::quant::ExpertScratch,
     logits: Vec<f32>,
     by_expert: Vec<Vec<(usize, f32)>>, // per expert: (token, weight)
     xin: Vec<f32>,
@@ -489,6 +490,19 @@ pub fn moe_route(router: &[f32], k: usize, xb: &[f32], dim: usize, picks: &mut V
 /// are read once per batch.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_experts<'e>(n_experts: usize, expert: impl Fn(usize) -> Expert<'e>, picks: &[(usize, f32)], k: usize, xb: &[f32], dim: usize, acc: &mut [f32], sc: &mut MoeScratch) {
+    // one token: all its experts at once on the spinning pool (row blocks of 32 for the quantised hidden)
+    if xb.len() == dim && !picks.is_empty() && !crate::quant::exact_mode() {
+        let ex: Vec<_> = picks
+            .iter()
+            .map(|&(e, w)| {
+                let x = expert(e);
+                (x.gate, x.up, x.down, w)
+            })
+            .collect();
+        if ex[0].0.rows % 32 == 0 {
+            return crate::quant::experts_one(&ex, xb, acc, &mut sc.one);
+        }
+    }
     sc.by_expert.resize_with(n_experts, Vec::new);
     sc.by_expert.iter_mut().for_each(Vec::clear);
     for (i, &(e, w)) in picks.iter().enumerate() {

@@ -5,6 +5,7 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::model::Config;
@@ -2788,6 +2789,21 @@ __global__ void router_logits(const float* __restrict__ xb, const float* __restr
     }
 }
 
+// one token's router logits, a warp per expert: out[e] = R[e] . x (dim a multiple of 4)
+__global__ void router_logits1(const float* __restrict__ x, const float* __restrict__ R, float* __restrict__ out, int dim, int ne) {
+    int e = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (e >= ne) return;
+    const float4* r = reinterpret_cast<const float4*>(R + (size_t)e * dim);
+    const float4* v = reinterpret_cast<const float4*>(x);
+    float acc = 0.f;
+    for (int d = lane; d < dim / 4; d += 32) {
+        float4 a = r[d], b = v[d];
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) out[e] = acc;
+}
+
 // out[i] = xb[idx[i]] for the m rows an expert takes (one block per row)
 __global__ void moe_gather(const float* __restrict__ xb, const int* __restrict__ idx, float* __restrict__ out, int dim) {
     const float4* s = reinterpret_cast<const float4*>(xb + (size_t)idx[blockIdx.x] * dim);
@@ -3350,6 +3366,7 @@ struct Kernels {
     moe_down_q4k: Ptr,
     moe_combine: Ptr,
     router_logits: Ptr,
+    router_logits1: Ptr,
     moe_gather: Ptr,
     moe_scatter: Ptr,
     q3k_to_q8: Ptr,
@@ -3525,6 +3542,7 @@ impl Kernels {
                 moe_down_q4k: get("moe_down_q4k")?,
                 moe_combine: get("moe_combine")?,
                 router_logits: get("router_logits")?,
+                router_logits1: get("router_logits1")?,
                 moe_gather: get("moe_gather")?,
                 moe_scatter: get("moe_scatter")?,
                 q3k_to_q8: get("q3k_to_q8")?,
@@ -4945,17 +4963,36 @@ impl GpuModel {
         if on_gpu {
             k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
         }
+        // one token's router logits come from the GPU, right after the normalised row (s.xb holds a batch)
+        let ne = c.n_experts;
+        let gpu_route = n == 1 && dim % 4 == 0;
+        if gpu_route {
+            k.launch(k.router_logits1, (ne.div_ceil(2) as u32, 1), 64, 0, &[Arg::P(s.xb.ptr), Arg::P(cache.routers[l].ptr), Arg::P(s.xb.ptr + (dim * 4) as u64), Arg::I(dim as i32), Arg::I(ne as i32)])?;
+        }
         let mut guard = s.moe.borrow_mut();
         let h = &mut *guard;
         let len = n * dim;
-        h.xb.resize(len, 0.0);
+        let got = if gpu_route { len + ne } else { len };
+        h.xb.resize(got, 0.0);
+        let stats = moe_stats_on() && on_gpu;
+        let t0 = stats.then(Instant::now);
         // synchronous copy: waits for the norm (the launch stream is a blocking one)
-        a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.xb.ptr, len * 4) }, "copy to host")?;
-        if c.mla.is_some() {
+        a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.xb.ptr, got * 4) }, "copy to host")?;
+        let t1 = stats.then(Instant::now);
+        if gpu_route {
+            let logits = &h.xb[len..];
+            if c.mla.is_some() {
+                crate::model::route_deepseek(logits, moe.biases[l].as_deref(), c.n_experts_used, c.gating_sigmoid, c.expert_weights_norm, c.expert_weights_scale, &mut h.picks);
+            } else {
+                crate::model::route(logits, c.n_experts_used, &mut h.picks);
+            }
+            h.xb.truncate(len);
+        } else if c.mla.is_some() {
             crate::model::moe_route_deepseek(c, &moe.routers[l], moe.biases[l].as_deref(), &h.xb, &mut h.picks, &mut h.scratch);
         } else {
             crate::model::moe_route(&moe.routers[l], c.n_experts_used, &h.xb, dim, &mut h.picks, &mut h.scratch);
         }
+        let t2 = stats.then(Instant::now);
 
         // the token's GPU-resident experts: table of matrix addresses, then their weights
         let mut ptrs: Vec<u64> = Vec::new();
@@ -4987,15 +5024,18 @@ impl GpuModel {
         // the CPU's share, computed while the GPU works on its own
         let cpu_k = if on_gpu { h.cpu_picks.len() } else { c.n_experts_used };
         let cpu_picks = if on_gpu { &h.cpu_picks } else { &h.picks };
+        let mut t3 = None;
         let cpu = if cpu_k > 0 {
             h.acc.clear();
             h.acc.resize(len, 0.0);
             crate::model::moe_experts(c.n_experts, |e| moe.expert(l, e), cpu_picks, cpu_k, &h.xb, dim, &mut h.acc, &mut h.scratch);
+            t3 = stats.then(Instant::now);
             s.att.write(&h.acc)?; // free here: the attention output was consumed by the output projection
             s.att.ptr
         } else {
             0
         };
+        let t4 = stats.then(Instant::now);
         // GHOST_INFER_MOE_CHECK=1: the GPU-resident experts again on the CPU, largest difference printed
         if nk > 0 && std::env::var_os("GHOST_INFER_MOE_CHECK").is_some() {
             let mut gpu = vec![0f32; nk * dim];
@@ -5020,7 +5060,20 @@ impl GpuModel {
         } else {
             k.launch(k.add_rows, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(cpu), Arg::I(len as i32)])?;
         }
-        cache.note(moe, l, &h.picks)
+        let noted = cache.note(moe, l, &h.picks);
+        if let (Some(t0), Some(t1), Some(t2), Some(t4)) = (t0, t1, t2, t4) {
+            let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
+            let t3 = t3.unwrap_or(t4);
+            moe_stat(MS_HITS, nk as u64);
+            moe_stat(MS_MISSES, h.cpu_picks.len() as u64);
+            moe_stat(MS_STEPS, 1);
+            moe_stat(MS_WAIT, ns(t0, t1));
+            moe_stat(MS_ROUTE, ns(t1, t2));
+            moe_stat(MS_CPU, ns(t2, t3));
+            moe_stat(MS_BACK, ns(t3, t4));
+            moe_stat(MS_NOTE, ns(t4, Instant::now()));
+        }
+        noted
     }
 
     /// Mixture of experts for a prompt batch, all on the GPU: routed there (f32), grouped by expert on the
@@ -5505,6 +5558,46 @@ fn expert_cache_budget() -> Result<usize, String> {
 
 /// Prompt batches of at least this many tokens run every expert on the GPU (smaller ones on the CPU).
 const MOE_GPU_MIN_BATCH: usize = 32;
+
+/// GHOST_INFER_MOE_STATS=1: where a mixture of experts' one-token steps go. Per layer step: picks found in the
+/// expert cache and not; time waiting for the GPU (the copy to the host), routing, the CPU's experts, the copy
+/// back, and the cache's bookkeeping and uploads.
+static MOE_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const MS_HITS: usize = 0;
+const MS_MISSES: usize = 1;
+const MS_STEPS: usize = 2;
+const MS_WAIT: usize = 3;
+const MS_ROUTE: usize = 4;
+const MS_CPU: usize = 5;
+const MS_BACK: usize = 6;
+const MS_NOTE: usize = 7;
+fn moe_stats_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_MOE_STATS").is_some())
+}
+fn moe_stat(i: usize, v: u64) {
+    MOE_STATS[i].fetch_add(v, Ordering::Relaxed);
+}
+/// The one-token MoE steps since the last call, per token of the `tokens` generated; None when not collected.
+pub fn moe_stats_take(tokens: usize) -> Option<String> {
+    if !moe_stats_on() {
+        return None;
+    }
+    let v: Vec<u64> = MOE_STATS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+    let tokens = tokens.max(1) as f64;
+    let ms = |i: usize| v[i] as f64 / 1e6 / tokens;
+    let hits = v[MS_HITS] as f64 / (v[MS_HITS] + v[MS_MISSES]).max(1) as f64;
+    Some(format!(
+        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache; per token: waiting for the GPU {:.2} ms, routing {:.2} ms, CPU experts {:.2} ms, copy back {:.2} ms, cache upkeep {:.2} ms]",
+        v[MS_STEPS],
+        100.0 * hits,
+        ms(MS_WAIT),
+        ms(MS_ROUTE),
+        ms(MS_CPU),
+        ms(MS_BACK),
+        ms(MS_NOTE)
+    ))
+}
 
 /// Default context of a mixture-of-experts model on the GPU: the memory a longer one would take is
 /// worth more as expert cache.

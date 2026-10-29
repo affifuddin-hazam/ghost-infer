@@ -97,18 +97,17 @@ impl QuantizedBatch {
         self.quants.resize(x.len(), 0);
         self.sums.resize(x.len() / QK8_0, 0);
         for (((chunk, q), d_out), s_out) in x.chunks_exact(QK8_0).zip(self.quants.chunks_exact_mut(QK8_0)).zip(&mut self.scales).zip(&mut self.sums) {
-            let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let d = amax / 127.0;
-            let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
-            let mut sum = 0i32;
-            for (qv, v) in q.iter_mut().zip(chunk) {
-                *qv = (v * inv).round() as i8;
-                sum += *qv as i32;
-            }
-            *s_out = sum;
-            // the scale goes through f16 like ggml's, so results line up with reference engines
-            *d_out = f16_to_f32(f32_to_f16(d));
+            (*d_out, *s_out) = quantize_block(chunk, q);
         }
+    }
+
+    /// Sizes the buffers for `n` rows of `cols` (filled block by block elsewhere).
+    fn shape(&mut self, n: usize, cols: usize) {
+        self.n = n;
+        self.cols = cols;
+        self.scales.resize(n * cols / QK8_0, 0.0);
+        self.quants.resize(n * cols, 0);
+        self.sums.resize(n * cols / QK8_0, 0);
     }
 
     fn row(&self, b: usize) -> (&[f32], &[i8]) {
@@ -120,6 +119,21 @@ impl QuantizedBatch {
         let nb = self.cols / QK8_0;
         XRow { d: &self.scales[b * nb..(b + 1) * nb], q: &self.quants[b * self.cols..(b + 1) * self.cols], s: &self.sums[b * nb..(b + 1) * nb] }
     }
+}
+
+/// One block of 32 values to int8: returns its scale and the sum of its int8 values.
+#[inline]
+fn quantize_block(x: &[f32], q: &mut [i8]) -> (f32, i32) {
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let d = amax / 127.0;
+    let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let mut sum = 0i32;
+    for (qv, v) in q.iter_mut().zip(x) {
+        *qv = (v * inv).round() as i8;
+        sum += *qv as i32;
+    }
+    // the scale goes through f16 like ggml's, so results line up with reference engines
+    (f16_to_f32(f32_to_f16(d)), sum)
 }
 
 /// One quantised activation row: per-32 scales, int8 values, per-32 sums of the values.
@@ -218,6 +232,27 @@ mod kernels {
         out
     }
 
+    /// `q3k_scales` four at a time: 32-bit words of low nibbles and their top 2 bits (as ggml unpacks them).
+    #[inline]
+    pub fn q3k_scales_fast(s: &[u8]) -> [i8; 16] {
+        let w = |i: usize| u32::from_le_bytes([s[4 * i], s[4 * i + 1], s[4 * i + 2], s[4 * i + 3]]);
+        let (a0, a1, a2) = (w(0), w(1), w(2));
+        let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+        let v = [
+            (a0 & k2) | ((a2 & k1) << 4),
+            (a1 & k2) | (((a2 >> 2) & k1) << 4),
+            ((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4),
+            ((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4),
+        ];
+        let mut out = [0i8; 16];
+        for (o, b) in out.chunks_exact_mut(4).zip(v) {
+            for (oi, bi) in o.iter_mut().zip(b.to_le_bytes()) {
+                *oi = bi as i8 - 32;
+            }
+        }
+        out
+    }
+
     /// Value `l` (0..32) of group `j` (0..4) in 128-value half `half` of a Q3_K block, as -4..3:
     /// two low bits from qs, and 4 subtracted unless the high bit is set.
     #[inline]
@@ -306,6 +341,24 @@ mod kernels {
             }
         }
         out
+    }
+
+    /// All 8 (scale, min) pairs of a Q4_K / Q5_K block at once (`q4k_scale_min` for j = 0..8), with
+    /// 32-bit word operations as ggml unpacks them.
+    #[inline]
+    pub fn q4k_scales_mins(s: &[u8]) -> ([u8; 8], [u8; 8]) {
+        let w = |i: usize| u32::from_le_bytes([s[4 * i], s[4 * i + 1], s[4 * i + 2], s[4 * i + 3]]);
+        let (u0, u1, u2) = (w(0), w(1), w(2));
+        let (k1, k2, k3) = (0x3f3f_3f3fu32, 0x0f0f_0f0fu32, 0x0303_0303u32);
+        let sc_hi = (u2 & k2) | (((u0 >> 6) & k3) << 4);
+        let mn_hi = ((u2 >> 4) & k2) | (((u1 >> 6) & k3) << 4);
+        let mut sc = [0u8; 8];
+        let mut mn = [0u8; 8];
+        sc[..4].copy_from_slice(&(u0 & k1).to_le_bytes());
+        sc[4..].copy_from_slice(&sc_hi.to_le_bytes());
+        mn[..4].copy_from_slice(&(u1 & k1).to_le_bytes());
+        mn[4..].copy_from_slice(&mn_hi.to_le_bytes());
+        (sc, mn)
     }
 
     /// Scale and min of Q4_K sub-block `j` (0..8), 6 bits each, packed into 12 bytes.
@@ -424,76 +477,86 @@ mod kernels {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn q4k_row_avx2<const N: usize>(w: &[u8], xs: [super::XRow; N]) -> [f32; N] {
         use std::arch::x86_64::*;
-        let ones = _mm256_set1_epi16(1);
         let nib = _mm256_set1_epi8(0x0f);
-        let mut acc = [_mm256_setzero_ps(); N];
-        let mut mins = [0f32; N];
+        let mut acc = [[_mm256_setzero_ps(); 2]; N];
+        let mut mins = [_mm256_setzero_ps(); N];
         for (sb, blk) in w.chunks_exact(Q4K_BYTES).enumerate() {
             _mm_prefetch::<_MM_HINT_T0>(blk.as_ptr().wrapping_add(2 * Q4K_BYTES) as *const i8);
             let (d, dmin) = (read_f16(blk), read_f16(&blk[2..]));
-            let sc = &blk[4..16];
+            let (sc, mn) = q4k_scales_mins(&blk[4..16]);
+            unsafe { q4k_mins_avx2(&mut mins, &xs, sb, dmin, mn) };
             for j2 in 0..4 {
                 let qv = unsafe { _mm256_loadu_si256(blk.as_ptr().add(16 + 32 * j2) as *const __m256i) };
                 let vals = [_mm256_and_si256(qv, nib), _mm256_and_si256(_mm256_srli_epi16(qv, 4), nib)];
                 for half in 0..2 {
-                    let (s, m) = q4k_scale_min(2 * j2 + half, sc);
+                    let s16 = _mm256_set1_epi16(sc[2 * j2 + half] as i16);
                     let xb = sb * 8 + 2 * j2 + half;
-                    for ((a, mn), x) in acc.iter_mut().zip(mins.iter_mut()).zip(xs.iter()) {
+                    for (a, x) in acc.iter_mut().zip(xs.iter()) {
                         let xv = unsafe { _mm256_loadu_si256(x.q.as_ptr().add(xb * QK8_0) as *const __m256i) };
-                        // weights are unsigned 0..15, exactly what maddubs wants
-                        let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(vals[half], xv), ones);
-                        *a = _mm256_fmadd_ps(_mm256_set1_ps(x.d[xb] * d * s as f32), _mm256_cvtepi32_ps(p32), *a);
-                        *mn += x.d[xb] * dmin * m as f32 * x.s[xb] as f32;
+                        // weights are unsigned 0..15, exactly what maddubs wants; the scale goes in as an integer
+                        let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(vals[half], xv), s16);
+                        a[half] = _mm256_fmadd_ps(_mm256_set1_ps(x.d[xb] * d), _mm256_cvtepi32_ps(p32), a[half]);
                     }
                 }
             }
         }
         let mut out = [0f32; N];
         for ((o, a), mn) in out.iter_mut().zip(acc).zip(mins) {
-            *o = unsafe { hsum(a) } - mn;
+            *o = unsafe { hsum(_mm256_add_ps(a[0], a[1])) - hsum(mn) };
         }
         out
+    }
+
+    /// The "min" terms of a Q4_K / Q5_K super-block, all 8 sub-blocks at once: mins[n] += dmin * m * dx * sx.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn q4k_mins_avx2<const N: usize>(mins: &mut [std::arch::x86_64::__m256; N], xs: &[super::XRow; N], sb: usize, dmin: f32, mn: [u8; 8]) {
+        use std::arch::x86_64::*;
+        let m = _mm256_mul_ps(_mm256_set1_ps(dmin), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_set_epi64x(0, i64::from_le_bytes(mn)))));
+        for (acc, x) in mins.iter_mut().zip(xs.iter()) {
+            let dx = unsafe { _mm256_loadu_ps(x.d.as_ptr().add(sb * 8)) };
+            let sx = _mm256_cvtepi32_ps(unsafe { _mm256_loadu_si256(x.s.as_ptr().add(sb * 8) as *const __m256i) });
+            *acc = _mm256_fmadd_ps(m, _mm256_mul_ps(dx, sx), *acc);
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn q3k_row_avx2<const N: usize>(w: &[u8], xs: [super::XRow; N]) -> [f32; N] {
         use std::arch::x86_64::*;
-        let ones16 = _mm256_set1_epi16(1);
-        let ones8 = _mm256_set1_epi8(1);
-        let three = _mm256_set1_epi8(3);
-        let mut acc = [_mm256_setzero_ps(); N];
+        let m3 = _mm256_set1_epi8(3);
+        // two accumulators per row: the fused multiply-adds of neighbouring groups do not wait on each other
+        let mut acc = [[_mm256_setzero_ps(); 2]; N];
         for (sb, blk) in w.chunks_exact(Q3K_BYTES).enumerate() {
             _mm_prefetch::<_MM_HINT_T0>(blk.as_ptr().wrapping_add(2 * Q3K_BYTES) as *const i8);
             let d = read_f16(&blk[108..]);
-            let sc = q3k_scales(&blk[96..108]);
+            let sc = q3k_scales_fast(&blk[96..108]);
             let hm = unsafe { _mm256_loadu_si256(blk.as_ptr() as *const __m256i) };
             for half in 0..2 {
                 let q = unsafe { _mm256_loadu_si256(blk.as_ptr().add(32 + 32 * half) as *const __m256i) };
                 for j in 0..4 {
-                    // unsigned 0..7 values (2 low bits, high bit as 4); the -4 offset goes through the
-                    // activation sums below. 16-bit shifts are safe: every byte is masked afterwards.
-                    let lo = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * j as i32)), three);
-                    let hi = _mm256_and_si256(_mm256_srl_epi16(hm, _mm_cvtsi32_si128((4 * half + j) as i32)), ones8);
-                    let u = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 2));
-                    let xb = sb * 8 + 4 * half + j;
-                    let (sa, sbv) = (sc[8 * half + 2 * j] as f32, sc[8 * half + 2 * j + 1] as f32);
+                    let g = 4 * half + j;
+                    // the two low bits (0..3), and 4 where the high bit is clear: value = low - that. Both
+                    // unsigned, as maddubs wants; 16-bit shifts are safe, every byte is masked.
+                    let lo = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * j as i32)), m3);
+                    let clear = _mm256_andnot_si256(hm, _mm256_set1_epi8(1 << g));
+                    let four = _mm256_slli_epi16(_mm256_srl_epi16(clear, _mm_cvtsi32_si128(g as i32)), 2);
+                    // the sub-block scales by 16-bit lane: values 0..16 (low 128 bits) and 16..32
+                    let s16 = _mm256_set_m128i(_mm_set1_epi16(sc[2 * g + 1] as i16), _mm_set1_epi16(sc[2 * g] as i16));
+                    let xb = sb * 8 + g;
                     for (a, x) in acc.iter_mut().zip(xs.iter()) {
                         let xv = unsafe { _mm256_loadu_si256(x.q.as_ptr().add(xb * QK8_0) as *const __m256i) };
-                        let qx = _mm256_madd_epi16(_mm256_maddubs_epi16(u, xv), ones16);
-                        let sx = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xv), ones16);
-                        // lanes 0-3 cover values 0..16 (scale a), lanes 4-7 values 16..32 (scale b)
-                        let p32 = _mm256_sub_epi32(qx, _mm256_slli_epi32(sx, 2));
-                        let f = x.d[xb] * d;
-                        let scale = _mm256_setr_ps(f * sa, f * sa, f * sa, f * sa, f * sbv, f * sbv, f * sbv, f * sbv);
-                        *a = _mm256_fmadd_ps(scale, _mm256_cvtepi32_ps(p32), *a);
+                        let p16 = _mm256_sub_epi16(_mm256_maddubs_epi16(lo, xv), _mm256_maddubs_epi16(four, xv));
+                        let p32 = _mm256_madd_epi16(p16, s16);
+                        a[j & 1] = _mm256_fmadd_ps(_mm256_set1_ps(x.d[xb] * d), _mm256_cvtepi32_ps(p32), a[j & 1]);
                     }
                 }
             }
         }
         let mut out = [0f32; N];
         for (o, a) in out.iter_mut().zip(acc) {
-            *o = unsafe { hsum(a) };
+            *o = unsafe { hsum(_mm256_add_ps(a[0], a[1])) };
         }
         out
     }
@@ -502,15 +565,15 @@ mod kernels {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn q5k_row_avx2<const N: usize>(w: &[u8], xs: [super::XRow; N]) -> [f32; N] {
         use std::arch::x86_64::*;
-        let ones = _mm256_set1_epi16(1);
         let nib = _mm256_set1_epi8(0x0f);
         let one = _mm256_set1_epi8(1);
-        let mut acc = [_mm256_setzero_ps(); N];
-        let mut mins = [0f32; N];
+        let mut acc = [[_mm256_setzero_ps(); 2]; N];
+        let mut mins = [_mm256_setzero_ps(); N];
         for (sb, blk) in w.chunks_exact(Q5K_BYTES).enumerate() {
             _mm_prefetch::<_MM_HINT_T0>(blk.as_ptr().wrapping_add(2 * Q5K_BYTES) as *const i8);
             let (d, dmin) = (read_f16(blk), read_f16(&blk[2..]));
-            let sc = &blk[4..16];
+            let (sc, mn) = q4k_scales_mins(&blk[4..16]);
+            unsafe { q4k_mins_avx2(&mut mins, &xs, sb, dmin, mn) };
             let qh = unsafe { _mm256_loadu_si256(blk.as_ptr().add(16) as *const __m256i) };
             for j2 in 0..4 {
                 let qv = unsafe { _mm256_loadu_si256(blk.as_ptr().add(48 + 32 * j2) as *const __m256i) };
@@ -522,21 +585,20 @@ mod kernels {
                     _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qv, 4), nib), h1),
                 ];
                 for half in 0..2 {
-                    let (s, m) = q4k_scale_min(2 * j2 + half, sc);
+                    let s16 = _mm256_set1_epi16(sc[2 * j2 + half] as i16);
                     let xb = sb * 8 + 2 * j2 + half;
-                    for ((a, mn), x) in acc.iter_mut().zip(mins.iter_mut()).zip(xs.iter()) {
+                    for (a, x) in acc.iter_mut().zip(xs.iter()) {
                         let xv = unsafe { _mm256_loadu_si256(x.q.as_ptr().add(xb * QK8_0) as *const __m256i) };
                         // weights are unsigned 0..31, exactly what maddubs wants
-                        let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(vals[half], xv), ones);
-                        *a = _mm256_fmadd_ps(_mm256_set1_ps(x.d[xb] * d * s as f32), _mm256_cvtepi32_ps(p32), *a);
-                        *mn += x.d[xb] * dmin * m as f32 * x.s[xb] as f32;
+                        let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(vals[half], xv), s16);
+                        a[half] = _mm256_fmadd_ps(_mm256_set1_ps(x.d[xb] * d), _mm256_cvtepi32_ps(p32), a[half]);
                     }
                 }
             }
         }
         let mut out = [0f32; N];
         for ((o, a), mn) in out.iter_mut().zip(acc).zip(mins) {
-            *o = unsafe { hsum(a) } - mn;
+            *o = unsafe { hsum(_mm256_add_ps(a[0], a[1])) - hsum(mn) };
         }
         out
     }
@@ -818,6 +880,95 @@ pub fn matmul_many(jobs: &mut [(&Matrix, &mut [f32])], x: &[f32], xq: &Quantized
     });
 }
 
+/// Raw pointers that parallel tasks write disjoint parts through.
+#[derive(Clone, Copy)]
+struct Raw<T>(*mut T);
+unsafe impl<T> Send for Raw<T> {}
+unsafe impl<T> Sync for Raw<T> {}
+
+impl<T> Raw<T> {
+    /// SAFETY: as `pointer::add`; callers write each element from one task only.
+    #[inline]
+    unsafe fn at(self, i: usize) -> *mut T {
+        unsafe { self.0.add(i) }
+    }
+}
+
+/// Scratch for `experts_one`.
+#[derive(Default)]
+pub struct ExpertScratch {
+    xq: QuantizedBatch,
+    h: Vec<f32>,
+    hq: QuantizedBatch,
+}
+
+/// Row r of `m` dotted with one quantised activation row (`x` the same row unquantised).
+#[inline]
+fn dot1(m: &Matrix, r: usize, x: XRow, xf: &[f32], avx2: bool) -> f32 {
+    match m.ty {
+        ty if ty.is_kquant() => kernels::kq_row(ty, avx2, m.row(r), [x])[0],
+        GgmlType::Q8_0 if avx2 => unsafe { kernels::q8_row_avx2(m.row(r), [(x.d, x.q)])[0] },
+        GgmlType::Q8_0 => kernels::q8_row_scalar(m.row(r), [(x.d, x.q)])[0],
+        _ => {
+            let mut wf = vec![0f32; m.cols];
+            m.row_f32(r, &mut wf);
+            dot_f32(&wf, xf)
+        }
+    }
+}
+
+/// One token through several experts on the CPU: `acc += Σ w · down(silu(gate · x) * (up · x))` over
+/// `experts` (gate, up, down, weight). Two passes on the spinning pool: every expert's gate and up rows
+/// split evenly across the threads (each quantises the 32-row blocks of activations it produced), then
+/// every output row, which sums all the experts' downs for it.
+pub fn experts_one(experts: &[(Matrix, Matrix, Matrix, f32)], x: &[f32], acc: &mut [f32], sc: &mut ExpertScratch) {
+    let avx2 = has_avx2();
+    let (dim, hidden, k) = (x.len(), experts[0].0.rows, experts.len());
+    sc.xq.quantize(x, dim);
+    sc.h.resize(k * hidden, 0.0);
+    sc.hq.shape(k, hidden);
+    let pool = crate::pool::pool();
+    {
+        let (xq, units) = (&sc.xq, k * hidden / QK8_0);
+        let h = Raw(sc.h.as_mut_ptr());
+        let (hq, hd, hs) = (Raw(sc.hq.quants.as_mut_ptr()), Raw(sc.hq.scales.as_mut_ptr()), Raw(sc.hq.sums.as_mut_ptr()));
+        pool.run(&|t, n| {
+            let mut gv = [0f32; QK8_0];
+            for u in units * t / n..units * (t + 1) / n {
+                let (e, r0) = (u * QK8_0 / hidden, u * QK8_0 % hidden);
+                let (gate, up, _, _) = &experts[e];
+                // SAFETY: 32-value block u (of h and of its quantised copy) belongs to this task only
+                let hv = unsafe { std::slice::from_raw_parts_mut(h.at(u * QK8_0), QK8_0) };
+                for (i, (o, g)) in hv.iter_mut().zip(gv.iter_mut()).enumerate() {
+                    *g = dot1(gate, r0 + i, xq.row3(0), x, avx2);
+                    let v = dot1(up, r0 + i, xq.row3(0), x, avx2);
+                    *o = *g / (1.0 + (-*g).exp()) * v;
+                }
+                let q = unsafe { std::slice::from_raw_parts_mut(hq.at(u * QK8_0), QK8_0) };
+                let (d, s) = quantize_block(hv, q);
+                unsafe {
+                    *hd.at(u) = d;
+                    *hs.at(u) = s;
+                }
+            }
+        });
+    }
+    {
+        let (hq, hf) = (&sc.hq, &sc.h);
+        let out = Raw(acc.as_mut_ptr());
+        pool.run(&|t, n| {
+            for r in dim * t / n..dim * (t + 1) / n {
+                let mut v = 0f32;
+                for (e, (_, _, down, w)) in experts.iter().enumerate() {
+                    v += w * dot1(down, r, hq.row3(e), &hf[e * hidden..(e + 1) * hidden], avx2);
+                }
+                // SAFETY: output row r belongs to this task only
+                unsafe { *out.at(r) += v };
+            }
+        });
+    }
+}
+
 /// SwiGLU front half in one pass: `h[b * rows + r] = silu(gate[r] · x[b]) * (up[r] · x[b])`.
 pub fn gate_up_silu(gate: &Matrix, up: &Matrix, x: &[f32], xq: &QuantizedBatch, h: &mut [f32]) {
     let avx2 = has_avx2();
@@ -852,6 +1003,31 @@ mod tests {
         }
         assert_eq!(f16_to_f32(0x3c00), 1.0);
         assert_eq!(f16_to_f32(0xc000), -2.0);
+    }
+
+    #[test]
+    fn q4k_scale_unpackings_agree() {
+        let mut s = [0u8; 12];
+        for seed in 0..200u32 {
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = (seed.wrapping_mul(2654435761).rotate_left(i as u32 * 5) >> 9) as u8;
+            }
+            let (sc, mn) = kernels::q4k_scales_mins(&s);
+            for j in 0..8 {
+                assert_eq!(kernels::q4k_scale_min(j, &s), (sc[j], mn[j]), "sub-block {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn q3k_scale_unpackings_agree() {
+        let mut s = [0u8; 12];
+        for seed in 0..200u32 {
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = (seed.wrapping_mul(2654435761).rotate_left(i as u32 * 3) >> 7) as u8;
+            }
+            assert_eq!(kernels::q3k_scales(&s), kernels::q3k_scales_fast(&s));
+        }
     }
 
     #[test]

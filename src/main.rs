@@ -3,6 +3,7 @@ mod gguf;
 mod json;
 mod lookup;
 mod model;
+mod pool;
 mod profile;
 mod quant;
 mod sampler;
@@ -465,6 +466,9 @@ impl Engine<'_> {
         }
         self.hist.extend_from_slice(prompt);
         let prompt_secs = t0.elapsed().as_secs_f64();
+        if let Some(s) = cuda::moe_stats_take(prompt.len()) {
+            eprintln!("prompt {s}");
+        }
 
         let mut ids = Vec::new();
         let t1 = Instant::now();
@@ -913,6 +917,9 @@ fn print_stats(st: &Stats) {
         st.gen_tokens as f64 / st.gen_secs.max(1e-9),
         if st.stopped_on.is_some() { ", stopped at end-of-turn" } else { "" }
     );
+    if let Some(s) = cuda::moe_stats_take(st.gen_tokens) {
+        eprintln!("{s}");
+    }
     if st.rounds > 0 {
         eprintln!("[lookup: {} of {} guessed tokens kept, in {} checks]", st.accepted, st.proposed, st.rounds);
     }
