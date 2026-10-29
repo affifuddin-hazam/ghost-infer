@@ -141,7 +141,7 @@ const GOAL_NUDGES: usize = 1;
 
 /// What the harness says when a reply would end with its task list unfinished.
 fn goal_nudge(open: &[String]) -> String {
-    format!("(Automatic check from ghost, not a message from the user) Your reply ended with steps of your task list still open: {}. Look again at what the user asked. If they asked you to stop or wait before these steps, do not do them: reply in one line that they are waiting for the user. If a step cannot be done here, say why in one line. Otherwise their request is not finished: carry on with the next step now.", open.join("; "))
+    format!("(Automatic check from ghost, not a message from the user) Your reply ended with steps of your task list still open: {}. If you have done them already, mark them done with update_tasks. If the user asked you to stop or wait before them, do not do them: reply in one line that they are waiting for the user. If a step cannot be done here, say why in one line. Otherwise the user's request is not finished: carry on with the next step now.", open.join("; "))
 }
 
 /// The task list's open steps, unless the reply is about to close them: when only the step in progress is
