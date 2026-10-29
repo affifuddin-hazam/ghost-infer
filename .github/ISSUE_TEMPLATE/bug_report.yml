@@ -1,0 +1,54 @@
+name: Bug report
+description: Something crashes, gives wrong output, or is slower than it should be
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command line, or the API request.
+      render: shell
+      placeholder: target\release\ghost-infer serve models\Qwen3-8B-Q4_K_M.gguf --gpu
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model file
+      description: File name, and a link to where it came from if you have one.
+      placeholder: Qwen3-8B-Q4_K_M.gguf from https://huggingface.co/...
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: Or "CPU only".
+      placeholder: RTX 2060 SUPER 8 GB, driver 577.00
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: CPU, RAM and Windows version
+      placeholder: Ryzen 5 3600, 16 GB, Windows 10 22H2
+  - type: input
+    id: commit
+    attributes:
+      label: ghost-infer commit
+      description: Output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Everything ghost-infer printed, from the start. For a slowdown, the `bench` numbers.
+      render: text

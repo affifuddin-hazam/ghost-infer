@@ -1,0 +1,30 @@
+name: Model support
+description: A GGUF model that doesn't load or doesn't run correctly
+labels: [model support]
+body:
+  - type: input
+    id: link
+    attributes:
+      label: Model link
+      description: The GGUF file on Hugging Face (or wherever it comes from).
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture and format
+      description: From `ghost-infer inspect <model>`, if it gets that far.
+      placeholder: general.architecture = gemma3, Q4_K_M
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: The error, or what is wrong with the output. Paste what ghost-infer printed.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this model
+      description: Optional. What you'd use it for, and whether it fits on your GPU.
