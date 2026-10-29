@@ -49,6 +49,13 @@ const KQ_TB: usize = 4; // tokens per block row in the K-quant generation matmul
 const TILE: usize = 64; // must match TILE in the kernel source
 const TILED_MIN_BATCH: usize = 16; // from this many tokens, the int8 tiled matmul beats one-warp-per-row
 const ATT_MAX_CHUNK: usize = 256; // must match ATT_MAX_CHUNK
+/// (token, head, slice) rows of scores and weights the tiled verify attention holds per head (s.att_scr): the
+/// tokens of one launch times their slices.
+const AV_SCR_ROWS: usize = 1024;
+/// A model whose verify batches go through the tiled attention (and whose sessions keep its scratch).
+fn vfy_attention_fits(c: &Config) -> bool {
+    c.mla.is_none() && !c.is_moe() && c.head_dim == 128 && c.n_heads % c.n_kv_heads == 0 && c.n_heads / c.n_kv_heads <= 8 && kv_int8()
+}
 const ATT_MAX_HD: usize = 128; // must match ATT_MAX_HD
 const ATT_MAX_G: usize = 8; // query heads per kv head the GQA attention kernel handles (must match ATT_MAX_G)
 const SPLIT_MIN_SPAN: usize = 32; // contexts up to this many positions are not split across blocks (must match ATT_SPLIT_MIN_SPAN)
@@ -1455,22 +1462,26 @@ __global__ void attention_prefill(const float* __restrict__ qkv, const kv_t* __r
 }  // extern "C": the template below needs C++ linkage
 
 #ifdef KV8
-// Decode attention for a verify batch: attention_partial_gqa's results for each token, bit for bit, at the
-// cost of a tiled matrix product. Grouped-query models, int8 cache, head size 128. One block per (kv head,
-// slice s, group of NB tokens, NB G <= 16 (token, head) pairs); each token keeps its own slice
-// (att_chunk_for of its own span). Keys, then values, are staged AV_TILE rows at a time in shared memory as
-// words (rows padded by one word: lanes reading different rows hit different banks). 256 threads, 8 warps:
-// warp w owns pairs 4 (w % 4) .. + 3 and half w / 4 of the tile's positions (scores) or of the dimensions
-// (outputs). Scores: lane holds positions lane + 32c (c = 2 half, 2 half + 1), so a thread makes 8 at once.
-// A score is attention_partial_gqa's: 32 lane shares (lane_dot) summed as its xor butterfly sums them, which is
-// a perfect tree over the shares in bit-reversed order, built here with a binary-counter stack in registers.
-// The exp-sum is that kernel's 128 thread partials and block_sum's trees (warp_sum on the same layout); the max
-// is order-free; each output element the same chain over the slice in order (positions outside a token's
-// slice are skipped, not weighted by zero). Values: lane holds dimensions 64 half + 2 lane, + 1, so a thread
-// makes 8 outputs at once.
-#define AV_TILE 128
-#define AV_UMAX (ATT_MAX_CHUNK + 64) // positions of a group's slices kept per pair (the host checks the bound)
-#define AV_RW 33                     // words per staged row of 128 int8 values
+// Decode attention for a verify batch: attention_partial_gqa's results for each token, bit for bit, at the cost
+// of tiled matrix products. Grouped-query models, int8 cache, head size 128. Two kernels, each light enough on
+// shared memory and registers that several blocks share an SM: attention_vfy_s (scores, then the softmax) and
+// attention_vfy_o (outputs). They pass scores, then weights, through `scr`: a row of ATT_MAX_CHUNK floats per
+// (token, head, slice), from the token's slice start. A block takes one (kv head, slice s, group of NB tokens,
+// NB G <= 16 (token, head) pairs); each token keeps its own slice (att_chunk_for of its own span), and the
+// group's tokens share every staged key and value row (rows padded by one word: lanes reading different rows
+// hit different banks). 256 threads, 8 warps; for scores warp w owns pairs 4 (w % 4) .. + 3 and half w / 4 of
+// a tile's positions.
+// Scores: lane holds positions lane + 32c (c = 2 half, 2 half + 1). A score is attention_partial_gqa's: 32 lane
+// shares (lane_dot) summed as its xor butterfly sums them, a perfect tree over the shares in bit-reversed order,
+// built with a binary-counter stack in registers. The exp-sum is that kernel's 128 thread partials and
+// block_sum's trees (warp_sum on the same layout); the max is order-free. Outputs (128 threads): warp w owns
+// pairs 4w .. 4w + 3 and lane dimensions 4 lane .. + 3, from value rows converted to floats once per tile and the
+// 4 pairs' weights side by side (one broadcast read); each is the same chain over the slice in order (positions
+// outside a token's slice are skipped, not weighted by zero).
+#define AV_TILE 128 // key rows per staged tile
+#define AV_VO 32    // value rows per staged tile (as floats)
+#define AV_WS 20    // floats per staged position of weights: 16 pairs (+4: the stores' banks spread)
+#define AV_RW 33    // words per staged row of 128 int8 values
 
 // 4 int8 values of a word to floats, exactly, at full rate: each byte xor 0x80 (so 0..255) goes into the low
 // mantissa bits of 2^23, then 2^23 + 128 comes off
@@ -1480,80 +1491,114 @@ __device__ __forceinline__ void i8x4_to_f(int w, float* f) {
     for (int k = 0; k < 4; k++) f[k] = __fsub_rn(__int_as_float(__byte_perm(u, 0x4B000000u, 0x7650 + k)), 8388736.f);
 }
 
+// A group's slices, as every thread of both kernels sees them.
 template <int NB>
-__device__ __forceinline__ void att_vfy(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
-                                        const float* __restrict__ ks, const float* __restrict__ vs, float* __restrict__ part,
-                                        float* __restrict__ out, int pos0, int n_heads, int n_kv, float scale, int nsplit, int want, int n) {
+struct AvSlices {
+    int t0[NB], len[NB], u0, u1; // each token's slice; the positions any of them covers
+    __device__ __forceinline__ AvSlices(int pos0, int b0, int n, int s, int want) {
+        u0 = 0x7fffffff;
+        u1 = 0;
+        #pragma unroll
+        for (int b = 0; b < NB; b++) {
+            t0[b] = 0;
+            len[b] = 0;
+            if (b0 + b < n) {
+                int span = pos0 + b0 + b + 1; // causal
+                int chunk = att_chunk_for(span, want);
+                t0[b] = s * chunk;
+                int l = min(span, t0[b] + chunk) - t0[b];
+                if (l > 0) {
+                    len[b] = l;
+                    u0 = min(u0, t0[b]);
+                    u1 = max(u1, t0[b] + l);
+                }
+            }
+        }
+    }
+    // pair pr's token and slice [lo, hi) (absolute positions; empty for pr >= NB G); unrolled selects: no local memory
+    __device__ __forceinline__ void pair(int pr, int G, int* b, int* lo, int* hi) const {
+        *b = 0;
+        *lo = 0;
+        *hi = 0;
+        #pragma unroll
+        for (int bb = 0; bb < NB; bb++)
+            if (pr >= bb * G && pr < (bb + 1) * G) { *b = bb; *lo = t0[bb]; *hi = t0[bb] + len[bb]; }
+    }
+};
+
+// the (token, head, slice) row of a pair, in part (hd + 2 floats) or scr (ATT_MAX_CHUNK floats)
+__device__ __forceinline__ size_t av_row(int tok, int n_heads, int h, int nsplit, int s) {
+    return ((size_t)tok * n_heads + h) * nsplit + s;
+}
+
+template <int NB>
+__device__ __forceinline__ void att_vfy_s(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const float* __restrict__ ks,
+                                          const float* __restrict__ vs, float* __restrict__ part, float* __restrict__ scr, int pos0,
+                                          int n_heads, int n_kv, float scale, int nsplit, int want, int n) {
     const int hd = 128;
-    __shared__ __align__(16) float sq[16 * 128];        // [pair][hd]: queries, times scale
-    __shared__ __align__(16) float sw[16 * AV_UMAX];    // [pair][union position]: scores, then weights
-    __shared__ int skv[AV_TILE * AV_RW];                // a tile of key or value rows
-    __shared__ float sks[AV_TILE];                      // their key scales
-    __shared__ float smx[16], ssum[16];
+    __shared__ __align__(16) float sq[16 * 128];     // [pair][hd]: queries, times scale
+    __shared__ __align__(16) int skv[AV_TILE * AV_RW]; // a tile of key rows
+    __shared__ float sks[AV_TILE];                   // their scales
     int kvh = blockIdx.x, s = blockIdx.y, b0 = blockIdx.z * NB;
     int G = n_heads / n_kv, P = NB * G; // pair i is token i / G, head i % G
     int q_dim = n_heads * hd, kv_dim = n_kv * hd;
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, half = warp >> 2;
-    // each token's slice
-    int t0[NB], len[NB];
-    int u0 = 0x7fffffff, u1 = 0; // the positions any of the group's slices covers
+    AvSlices<NB> sl(pos0, b0, n, s, want);
     #pragma unroll
     for (int b = 0; b < NB; b++) {
-        t0[b] = 0;
-        len[b] = 0;
-        if (b0 + b < n) {
-            int span = pos0 + b0 + b + 1; // causal
-            int chunk = att_chunk_for(span, want);
-            t0[b] = s * chunk;
-            int l = min(span, t0[b] + chunk) - t0[b];
-            if (l <= 0) {
-                // nothing in this slice: an empty part, as attention_combine expects
-                for (int g = 0; g < G; g++) {
-                    float* pp = part + (((size_t)(b0 + b) * n_heads + kvh * G + g) * nsplit + s) * (hd + 2);
-                    for (int d = tid; d < hd; d += blockDim.x) pp[d] = 0.f;
-                    if (tid == 0) { pp[hd] = NEG_INF; pp[hd + 1] = 0.f; }
-                }
-            } else {
-                len[b] = l;
-                u0 = min(u0, t0[b]);
-                u1 = max(u1, t0[b] + l);
+        if (b0 + b < n && sl.len[b] == 0) {
+            // nothing in this slice: an empty part, as attention_combine expects
+            for (int g = 0; g < G; g++) {
+                float* pp = part + av_row(b0 + b, n_heads, kvh * G + g, nsplit, s) * (hd + 2);
+                for (int d = tid; d < hd; d += blockDim.x) pp[d] = 0.f;
+                if (tid == 0) { pp[hd] = NEG_INF; pp[hd + 1] = 0.f; }
             }
         }
     }
-    if (u1 <= u0) return; // the same for the whole block: safe before the barriers
-    // the slice of pair pr, relative to the union's start (unrolled selects: no local memory)
-    auto pair_slice = [&](int pr, int* lo, int* hi) {
-        *lo = 0;
-        *hi = 0;
-        #pragma unroll
-        for (int b = 0; b < NB; b++)
-            if (pr >= b * G && pr < (b + 1) * G && pr < P) { *lo = t0[b] - u0; *hi = t0[b] - u0 + len[b]; }
-    };
+    if (sl.u1 <= sl.u0) return; // the same for the whole block: safe before the barriers
     for (int pr = 0; pr < P; pr++) {
-        int b = 0;
-        #pragma unroll
-        for (int bb = 1; bb < NB; bb++) if (pr >= bb * G) b = bb;
+        int b, lo, hi;
+        sl.pair(pr, G, &b, &lo, &hi);
         const float* q = qkv + (size_t)min(b0 + b, n - 1) * (q_dim + 2 * kv_dim) + (kvh * G + pr - b * G) * hd;
         if (tid < hd) sq[pr * hd + tid] = __fmul_rn(q[tid], scale);
     }
     int w4 = 4 * (warp & 3); // this warp's pairs
     int plo[4], phi[4];
+    float* prow[4]; // a pair's scores by absolute position
     #pragma unroll
-    for (int j = 0; j < 4; j++) pair_slice(w4 + j, &plo[j], &phi[j]);
-
-    // ---- scores
-    for (int p0 = u0; p0 < u1; p0 += AV_TILE) {
-        int tl = min(AV_TILE, u1 - p0), x0 = p0 - u0;
-        __syncthreads(); // the queries are in; the last tile is done with
-        for (int i = tid; i < tl * 8; i += blockDim.x) {
-            int rr = i >> 3, c = i & 7;
-            int4 v = *reinterpret_cast<const int4*>(kc + (size_t)(p0 + rr) * kv_dim + kvh * hd + 16 * c);
-            int* dst = skv + rr * AV_RW + 4 * c;
-            dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
+    for (int j = 0; j < 4; j++) {
+        int b;
+        sl.pair(w4 + j, G, &b, &plo[j], &phi[j]);
+        prow[j] = scr + av_row(b0 + b, n_heads, kvh * G + w4 + j - b * G, nsplit, s) * ATT_MAX_CHUNK - plo[j];
+    }
+    // a key tile is 4 pieces of 16 bytes per thread (and a scale for the first AV_TILE threads), fetched into
+    // registers a tile ahead so the loads are in flight while the last tile is scored
+    int4 kn[4];
+    float ksn = 0.f;
+    auto fetch = [&](int p0) {
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int i = tid + 256 * k, rr = i >> 3;
+            if (p0 + rr < sl.u1) kn[k] = *reinterpret_cast<const int4*>(kc + (size_t)(p0 + rr) * kv_dim + kvh * hd + 16 * (i & 7));
         }
-        for (int i = tid; i < tl; i += blockDim.x) sks[i] = KV_SCALE(ks, p0 + i, n_kv, kvh);
+        if (tid < AV_TILE && p0 + tid < sl.u1) ksn = KV_SCALE(ks, p0 + tid, n_kv, kvh);
+    };
+    fetch(sl.u0);
+    for (int p0 = sl.u0; p0 < sl.u1; p0 += AV_TILE) {
+        int tl = min(AV_TILE, sl.u1 - p0);
+        __syncthreads(); // the queries are in; the last tile is done with
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int i = tid + 256 * k, rr = i >> 3;
+            if (rr < tl) {
+                int* dst = skv + rr * AV_RW + 4 * (i & 7);
+                dst[0] = kn[k].x; dst[1] = kn[k].y; dst[2] = kn[k].z; dst[3] = kn[k].w;
+            }
+        }
+        if (tid < tl) sks[tid] = ksn;
         __syncthreads();
-        if (w4 < P) {
+        if (p0 + AV_TILE < sl.u1) fetch(p0 + AV_TILE);
+        if (w4 < P && 64 * half < tl) { // a half of the tile with no rows left: nothing to score
             float st[4][2][5], res[4][2];
             #pragma unroll
             for (int i = 0; i < 32; i++) {
@@ -1588,100 +1633,164 @@ __device__ __forceinline__ void att_vfy(const float* __restrict__ qkv, const kv_
             for (int j = 0; j < 4; j++)
                 #pragma unroll
                 for (int c = 0; c < 2; c++) {
-                    int r = lane + 32 * (2 * half + c), x = x0 + r;
-                    if (r < tl && x >= plo[j] && x < phi[j]) sw[(w4 + j) * AV_UMAX + x] = __fmul_rn(res[j][c], sks[r]);
+                    int r = lane + 32 * (2 * half + c), tp = p0 + r;
+                    if (r < tl && tp >= plo[j] && tp < phi[j]) prow[j][tp] = __fmul_rn(res[j][c], sks[r]);
                 }
         }
     }
-    __syncthreads();
-    // ---- each pair's max, weights and exp-sum, as attention_partial_gqa's 128 threads and block_sum form them
+    __syncthreads(); // the block's scores are in
+    // each pair's max, weights and exp-sum, as attention_partial_gqa's 128 threads and block_sum form them
     for (int pr = warp; pr < P; pr += 8) {
-        int lo, hi;
-        pair_slice(pr, &lo, &hi);
-        int L = hi - lo;
-        float* wr = sw + pr * AV_UMAX + lo;
+        int b, lo, hi;
+        sl.pair(pr, G, &b, &lo, &hi);
+        int L = hi - lo, h = kvh * G + pr - b * G;
+        if (L <= 0) continue;
+        float* w = scr + av_row(b0 + b, n_heads, h, nsplit, s) * ATT_MAX_CHUNK;
         float m = NEG_INF;
-        for (int x = lane; x < L; x += 32) m = fmaxf(m, wr[x]);
+        for (int x = lane; x < L; x += 32) m = fmaxf(m, w[x]);
         m = __shfl_sync(0xffffffff, warp_max(m), 0);
-        float w4s[4];
+        float part4[4];
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             float se = 0.f;
             for (int x = 32 * k + lane; x < L; x += 128) {
-                float e = expf(__fsub_rn(wr[x], m));
-                wr[x] = __fmul_rn(e, KV_SCALE(vs, u0 + lo + x, n_kv, kvh));
+                float e = expf(__fsub_rn(w[x], m));
+                w[x] = __fmul_rn(e, KV_SCALE(vs, lo + x, n_kv, kvh));
                 se = __fadd_rn(se, e);
             }
-            w4s[k] = __shfl_sync(0xffffffff, warp_sum(se), 0); // thread block k's warp sum
+            part4[k] = __shfl_sync(0xffffffff, warp_sum(se), 0); // thread block k's warp sum
         }
-        float tot = warp_sum(lane < 4 ? (lane == 0 ? w4s[0] : lane == 1 ? w4s[1] : lane == 2 ? w4s[2] : w4s[3]) : 0.f);
-        if (lane == 0) { smx[pr] = m; ssum[pr] = tot; }
+        float tot = warp_sum(lane < 4 ? (lane == 0 ? part4[0] : lane == 1 ? part4[1] : lane == 2 ? part4[2] : part4[3]) : 0.f);
+        if (lane == 0) {
+            float* pp = part + av_row(b0 + b, n_heads, h, nsplit, s) * (hd + 2);
+            pp[hd] = m;
+            pp[hd + 1] = tot;
+        }
     }
+}
 
-    // ---- outputs: pairs w4 + j, dimensions 64 half + 2 lane + e; one chain over each pair's slice, in order
-    float acc[4][2];
+template <int NB>
+__device__ __forceinline__ void att_vfy_o(const kv_t* __restrict__ vc, float* __restrict__ part, float* __restrict__ out,
+                                          const float* __restrict__ scr, int pos0, int n_heads, int n_kv, int nsplit, int want, int n) {
+    const int hd = 128, ld = hd + 4; // value rows as floats, padded to 16-byte rows
+    __shared__ __align__(16) float sv[AV_VO * (128 + 4)]; // a tile of value rows, converted once
+    __shared__ __align__(16) float sw[AV_VO * AV_WS];     // [tile position][pair]: weights, a warp's 4 side by side
+    int kvh = blockIdx.x, s = blockIdx.y, b0 = blockIdx.z * NB;
+    int G = n_heads / n_kv, P = NB * G;
+    int q_dim = n_heads * hd, kv_dim = n_kv * hd;
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    AvSlices<NB> sl(pos0, b0, n, s, want);
+    if (sl.u1 <= sl.u0) return;
+    // warp w: pairs 4w .. 4w + 3; lane: dimensions 4 lane .. + 3
+    int p4 = 4 * warp, bj[4], lo[4], hi[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) sl.pair(p4 + j, G, &bj[j], &lo[j], &hi[j]);
+    bool one = lo[0] == lo[1] && lo[0] == lo[2] && lo[0] == lo[3] && hi[0] == hi[1] && hi[0] == hi[2] && hi[0] == hi[3];
+    // a tile: two 16-byte pieces of value rows and 4 of the P x AV_VO weights per thread, fetched into registers a
+    // tile ahead so the loads are in flight while the last tile is used
+    int4 vn[2];
+    float wn[4];
+    auto fetch = [&](int p0) {
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int i = tid + 128 * k, rr = i >> 3;
+            if (p0 + rr < sl.u1) vn[k] = *reinterpret_cast<const int4*>(vc + (size_t)(p0 + rr) * kv_dim + kvh * hd + 16 * (i & 7));
+        }
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int i = tid + 128 * k, pr = i / AV_VO, tp = p0 + i % AV_VO;
+            wn[k] = 0.f;
+            if (pr < P) {
+                int b, l0, h0;
+                sl.pair(pr, G, &b, &l0, &h0);
+                if (tp >= l0 && tp < h0) wn[k] = scr[av_row(b0 + b, n_heads, kvh * G + pr - b * G, nsplit, s) * ATT_MAX_CHUNK + tp - l0];
+            }
+        }
+    };
+    fetch(sl.u0);
+    float acc[4][4];
     #pragma unroll
     for (int j = 0; j < 4; j++)
         #pragma unroll
-        for (int e = 0; e < 2; e++) acc[j][e] = 0.f;
-    for (int p0 = u0; p0 < u1; p0 += AV_TILE) {
-        int tl = min(AV_TILE, u1 - p0), x0 = p0 - u0;
-        __syncthreads(); // the weights are in; the last tile is done with
-        for (int i = tid; i < tl * 8; i += blockDim.x) {
-            int rr = i >> 3, c = i & 7;
-            int4 v = *reinterpret_cast<const int4*>(vc + (size_t)(p0 + rr) * kv_dim + kvh * hd + 16 * c);
-            int* dst = skv + rr * AV_RW + 4 * c;
-            dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
+        for (int e = 0; e < 4; e++) acc[j][e] = 0.f;
+    for (int p0 = sl.u0; p0 < sl.u1; p0 += AV_VO) {
+        int tl = min(AV_VO, sl.u1 - p0);
+        __syncthreads(); // the last tile is done with
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int i = tid + 128 * k, rr = i >> 3;
+            if (rr < tl) {
+                float f[16];
+                i8x4_to_f(vn[k].x, f);
+                i8x4_to_f(vn[k].y, f + 4);
+                i8x4_to_f(vn[k].z, f + 8);
+                i8x4_to_f(vn[k].w, f + 12);
+                float4* dst = reinterpret_cast<float4*>(sv + rr * ld + 16 * (i & 7));
+                #pragma unroll
+                for (int q = 0; q < 4; q++) dst[q] = make_float4(f[4 * q], f[4 * q + 1], f[4 * q + 2], f[4 * q + 3]);
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int i = tid + 128 * k;
+            sw[(i % AV_VO) * AV_WS + i / AV_VO] = wn[k];
         }
         __syncthreads();
-        if (w4 < P) {
-            // the word with dimensions 64 half + 2 lane, + 1 (bytes 2 (lane & 1), + 1 of it)
-            int wd = 16 * half + (lane >> 1), sel = 0x7650 + 2 * (lane & 1);
-            for (int r = 0; r < tl; r++) {
-                int x = x0 + r;
-                unsigned u = (unsigned)skv[r * AV_RW + wd] ^ 0x80808080u;
-                float vf[2] = {__fsub_rn(__int_as_float(__byte_perm(u, 0x4B000000u, sel)), 8388736.f),
-                               __fsub_rn(__int_as_float(__byte_perm(u, 0x4B000000u, sel + 1)), 8388736.f)};
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    if (x >= plo[j] && x < phi[j]) {
-                        float w = sw[(w4 + j) * AV_UMAX + x];
-                        acc[j][0] = __fmaf_rn(w, vf[0], acc[j][0]);
-                        acc[j][1] = __fmaf_rn(w, vf[1], acc[j][1]);
-                    }
+        if (p0 + AV_VO < sl.u1) fetch(p0 + AV_VO);
+        if (p4 < P) {
+            if (one) {
+                int from = max(p0, lo[0]), to = min(p0 + tl, hi[0]);
+                #pragma unroll 2
+                for (int tp = from; tp < to; tp++) {
+                    float4 v = *reinterpret_cast<const float4*>(sv + (tp - p0) * ld + 4 * lane);
+                    float4 w = *reinterpret_cast<const float4*>(sw + (tp - p0) * AV_WS + p4);
+                    float wv[4] = {w.x, w.y, w.z, w.w}, vv[4] = {v.x, v.y, v.z, v.w};
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) acc[j][e] = __fmaf_rn(wv[j], vv[e], acc[j][e]);
+                }
+            } else {
+                for (int tp = p0; tp < p0 + tl; tp++) {
+                    float4 v = *reinterpret_cast<const float4*>(sv + (tp - p0) * ld + 4 * lane);
+                    float4 w = *reinterpret_cast<const float4*>(sw + (tp - p0) * AV_WS + p4);
+                    float wv[4] = {w.x, w.y, w.z, w.w}, vv[4] = {v.x, v.y, v.z, v.w};
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        if (tp >= lo[j] && tp < hi[j])
+                            #pragma unroll
+                            for (int e = 0; e < 4; e++) acc[j][e] = __fmaf_rn(wv[j], vv[e], acc[j][e]);
                 }
             }
         }
     }
-    __syncthreads(); // smx and ssum are in
     #pragma unroll
     for (int j = 0; j < 4; j++) {
-        int pr = w4 + j;
-        if (pr >= P || phi[j] <= plo[j]) continue;
-        int b = 0;
+        int pr = p4 + j;
+        if (pr >= P || hi[j] <= lo[j]) continue;
+        int h = kvh * G + pr - bj[j] * G, tok = b0 + bj[j];
+        float* pp = part + av_row(tok, n_heads, h, nsplit, s) * (hd + 2); // its max and exp-sum: attention_vfy_s's
         #pragma unroll
-        for (int bb = 1; bb < NB; bb++) if (pr >= bb * G) b = bb;
-        int h = kvh * G + pr - b * G, tok = b0 + b;
-        #pragma unroll
-        for (int e = 0; e < 2; e++) {
-            int d = 64 * half + 2 * lane + e;
-            if (nsplit == 1) {
-                out[(size_t)tok * q_dim + h * hd + d] = __fmul_rn(acc[j][e], __fdiv_rn(1.f, ssum[pr]));
-            } else {
-                float* pp = part + (((size_t)tok * n_heads + h) * nsplit + s) * (hd + 2);
-                pp[d] = acc[j][e];
-                if (d == 0) { pp[hd] = smx[pr]; pp[hd + 1] = ssum[pr]; }
-            }
+        for (int e = 0; e < 4; e++) {
+            int d = 4 * lane + e;
+            if (nsplit == 1) out[(size_t)tok * q_dim + h * hd + d] = __fmul_rn(acc[j][e], __fdiv_rn(1.f, pp[hd + 1]));
+            else pp[d] = acc[j][e];
         }
     }
 }
-#define ATT_VFY_PARAMS const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc, \
-                       const float* __restrict__ ks, const float* __restrict__ vs, float* __restrict__ part, \
-                       float* __restrict__ out, int pos0, int n_heads, int n_kv, float scale, int nsplit, int want, int n
-#define ATT_VFY_ARGS qkv, kc, vc, ks, vs, part, out, pos0, n_heads, n_kv, scale, nsplit, want, n
-extern "C" __global__ void __launch_bounds__(256) attention_vfy2(ATT_VFY_PARAMS) { att_vfy<2>(ATT_VFY_ARGS); }
-extern "C" __global__ void __launch_bounds__(256) attention_vfy4(ATT_VFY_PARAMS) { att_vfy<4>(ATT_VFY_ARGS); }
-extern "C" __global__ void __launch_bounds__(256) attention_vfy8(ATT_VFY_PARAMS) { att_vfy<8>(ATT_VFY_ARGS); }
+#define ATT_VFY_S_PARAMS const float* __restrict__ qkv, const kv_t* __restrict__ kc, const float* __restrict__ ks, \
+                         const float* __restrict__ vs, float* __restrict__ part, float* __restrict__ scr, int pos0, int n_heads, \
+                         int n_kv, float scale, int nsplit, int want, int n
+#define ATT_VFY_S_ARGS qkv, kc, ks, vs, part, scr, pos0, n_heads, n_kv, scale, nsplit, want, n
+#define ATT_VFY_O_PARAMS const kv_t* __restrict__ vc, float* __restrict__ part, float* __restrict__ out, const float* __restrict__ scr, \
+                         int pos0, int n_heads, int n_kv, int nsplit, int want, int n
+#define ATT_VFY_O_ARGS vc, part, out, scr, pos0, n_heads, n_kv, nsplit, want, n
+extern "C" __global__ void __launch_bounds__(256, 2) attention_vfy_s2(ATT_VFY_S_PARAMS) { att_vfy_s<2>(ATT_VFY_S_ARGS); }
+extern "C" __global__ void __launch_bounds__(256, 2) attention_vfy_s4(ATT_VFY_S_PARAMS) { att_vfy_s<4>(ATT_VFY_S_ARGS); }
+extern "C" __global__ void __launch_bounds__(256, 2) attention_vfy_s8(ATT_VFY_S_PARAMS) { att_vfy_s<8>(ATT_VFY_S_ARGS); }
+extern "C" __global__ void __launch_bounds__(128, 3) attention_vfy_o2(ATT_VFY_O_PARAMS) { att_vfy_o<2>(ATT_VFY_O_ARGS); }
+extern "C" __global__ void __launch_bounds__(128, 3) attention_vfy_o4(ATT_VFY_O_PARAMS) { att_vfy_o<4>(ATT_VFY_O_ARGS); }
+extern "C" __global__ void __launch_bounds__(128, 3) attention_vfy_o8(ATT_VFY_O_PARAMS) { att_vfy_o<8>(ATT_VFY_O_ARGS); }
 #endif
 
 // two floats -> one f16x2 word (low half first); sm_75 has no packed f32->f16x2 convert
@@ -3230,7 +3339,7 @@ struct Kernels {
     quantize_q8k: Ptr,
     attention_partial: Ptr,
     attention_partial_gqa: Ptr,
-    attention_vfy: Option<[Ptr; 3]>, // verify batches, grouped-query, int8 cache: 2 / 4 / 8 tokens per block, exact per token
+    attention_vfy: Option<[[Ptr; 2]; 3]>, // verify batches, grouped-query, int8 cache: [2 | 4 | 8 tokens per block][scores, outputs]
     attention_combine: Ptr,
     attention_prefill: Ptr,
     attention_prefill_tc: Option<[Ptr; 2]>, // f16 tensor cores (sm_75+), head size 64 / 128
@@ -3393,7 +3502,11 @@ impl Kernels {
                 attention_partial_gqa: get("attention_partial_gqa")?,
                 // GHOST_INFER_NO_VFY_ATT=1: verify batches attend token by token (attention_partial_gqa)
                 attention_vfy: if kv_int8() && std::env::var_os("GHOST_INFER_NO_VFY_ATT").is_none() {
-                    Some([get("attention_vfy2")?, get("attention_vfy4")?, get("attention_vfy8")?])
+                    Some([
+                        [get("attention_vfy_s2")?, get("attention_vfy_o2")?],
+                        [get("attention_vfy_s4")?, get("attention_vfy_o4")?],
+                        [get("attention_vfy_s8")?, get("attention_vfy_o8")?],
+                    ])
                 } else {
                     None
                 },
@@ -4564,15 +4677,14 @@ impl GpuModel {
         self.matmul(&[(m, 0)], x, out, m.rows, n, accumulate, s)
     }
 
-    /// The tiled verify-batch attention for m tokens from position pos0, and its tokens per block, when it
-    /// applies: a verify batch, grouped-query heads of size 128 with at most 16 (token, head) pairs per block, an
-    /// int8 cache, and every group's slices within the positions a block keeps (AV_UMAX).
-    fn vfy_attention(&self, s: &GpuSession, pos0: usize, m: usize, want: usize) -> Option<(Ptr, usize)> {
-        const AV_UMAX: usize = ATT_MAX_CHUNK + 64; // must match AV_UMAX
+    /// The tiled verify-batch attention (scores and outputs kernels) for a launch of m tokens, and its tokens per
+    /// block, when it applies: a verify batch, grouped-query heads of size 128 (at most 16 (token, head) pairs per
+    /// block) and an int8 cache.
+    fn vfy_attention(&self, s: &GpuSession, m: usize) -> Option<([Ptr; 2], usize)> {
         let c = &self.cfg;
         let funcs = self.k.attention_vfy?;
         let g = c.n_heads / c.n_kv_heads;
-        if !s.exact.get() || m < 2 || !self.gqa_kernel() || c.head_dim != 128 {
+        if !s.exact.get() || m < 2 || !self.gqa_kernel() || !vfy_attention_fits(c) {
             return None;
         }
         let (i, nb) = match g {
@@ -4580,25 +4692,6 @@ impl GpuModel {
             3 | 4 => (1, 4),
             _ => (0, 2),
         };
-        // the union of a group's slices, for every slice index the grid runs
-        let nsplit = (pos0 + 1..=pos0 + m).map(|span| span.div_ceil(Self::att_chunk(span, want))).max().unwrap_or(1);
-        for b0 in (0..m).step_by(nb) {
-            for sl in 0..nsplit {
-                let (mut u0, mut u1) = (usize::MAX, 0);
-                for b in b0..(b0 + nb).min(m) {
-                    let span = pos0 + b + 1;
-                    let chunk = Self::att_chunk(span, want);
-                    let t0 = sl * chunk;
-                    if t0 < span {
-                        u0 = u0.min(t0);
-                        u1 = u1.max((t0 + chunk).min(span));
-                    }
-                }
-                if u1 > u0 && u1 - u0 > AV_UMAX {
-                    return None;
-                }
-            }
-        }
         Some((funcs[i], nb))
     }
 
@@ -4671,12 +4764,11 @@ impl GpuModel {
             // SPLIT_MAX_BATCH tokens per launch, or the rest of a verify batch for the tiled kernel when the
             // partial results (sized for SPLIT_MAX_BATCH tokens' slices) hold them
             let mut m = (n - b0).min(SPLIT_MAX_BATCH);
-            if s.exact.get() && self.k.attention_vfy.is_some() && n - b0 > m {
+            if s.exact.get() && self.k.attention_vfy.is_some() && vfy_attention_fits(c) && n - b0 > 1 {
+                // the tiled kernels: as many tokens as their (token, head, slice) rows fit, in part and in scr
                 let all = n - b0;
                 let slices = (pos0 + 1..=pos0 + all).map(|span| span.div_ceil(Self::att_chunk(span, want))).max().unwrap_or(1);
-                if all * slices <= SPLIT_MAX_BATCH * s.ctx.div_ceil(32) {
-                    m = all;
-                }
+                m = ((SPLIT_MAX_BATCH * s.ctx.div_ceil(32)).min(AV_SCR_ROWS) / slices).clamp(1, all);
             }
             // the grid covers the token needing the most slices; the others' extra slices are empty
             let nsplit = if fixed_split {
@@ -4685,14 +4777,23 @@ impl GpuModel {
                 (pos0 + 1..=pos0 + m).map(|span| span.div_ceil(Self::att_chunk(span, want))).max().unwrap_or(1)
             };
             let (qkv, out) = (s.qkv.at(b0 * row), s.att.at(b0 * q_dim * 4));
-            if let Some((func, nb)) = self.vfy_attention(s, pos0, m, want) {
+            if let Some(([scores, outputs], nb)) = self.vfy_attention(s, m) {
                 // a verify batch: groups of nb tokens share every key and value row, each gets its one-token result
+                let grid = (c.n_kv_heads as u32, nsplit as u32, m.div_ceil(nb) as u32);
+                let (part, scr) = (s.att_part.ptr, s.att_scr.ptr);
                 k.launch3(
-                    func,
-                    (c.n_kv_heads as u32, nsplit as u32, m.div_ceil(nb) as u32),
+                    scores,
+                    grid,
                     256,
                     0,
-                    &[Arg::P(qkv), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::F(scale), Arg::I(nsplit as i32), Arg::I(want as i32), Arg::I(m as i32)],
+                    &[Arg::P(qkv), Arg::P(kc), Arg::P(ks), Arg::P(vs), Arg::P(part), Arg::P(scr), Arg::I(pos0 as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::F(scale), Arg::I(nsplit as i32), Arg::I(want as i32), Arg::I(m as i32)],
+                )?;
+                k.launch3(
+                    outputs,
+                    grid,
+                    128,
+                    0,
+                    &[Arg::P(vc), Arg::P(part), Arg::P(out), Arg::P(scr), Arg::I(pos0 as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(nsplit as i32), Arg::I(want as i32), Arg::I(m as i32)],
                 )?;
             } else {
             let (func, heads) = if self.gqa_kernel() { (k.attention_partial_gqa, c.n_kv_heads) } else { (k.attention_partial, c.n_heads) };
@@ -5235,6 +5336,7 @@ pub struct GpuSession {
     moe: std::cell::RefCell<MoeHost>, // host scratch of the CPU expert path
     moe_tab: DeviceBuf,               // a token's GPU-resident experts: matrix addresses, then weights
     graphs: [Ptr; 2],      // captured one-token steps: Last, Argmax
+    att_scr: DeviceBuf,    // the tiled verify attention's scores and weights (vfy_attention_fits models)
     exact: std::cell::Cell<bool>, // this pass checks a draft: verify kernels, no prompt kernels
     pub logits: Vec<f32>,
     pub rows: Vec<f32>, // Out::All: a batch's logits, one vocab-long row per token
@@ -5285,7 +5387,7 @@ fn graphs_enabled() -> bool {
 impl GpuSession {
     pub fn new(cfg: &Config, ctx: usize) -> Result<GpuSession, String> {
         let ctx = ctx.min(cfg.max_ctx);
-        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, k_cache, v_cache, k_scale, v_scale, logits_dev, picks, pos_dev] = Self::sizes(cfg, ctx).map(DeviceBuf::alloc);
+        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, k_cache, v_cache, k_scale, v_scale, logits_dev, picks, pos_dev, att_scr] = Self::sizes(cfg, ctx).map(DeviceBuf::alloc);
         Ok(GpuSession {
             xq: xq?,
             xd: xd?,
@@ -5310,6 +5412,7 @@ impl GpuSession {
             moe: Default::default(),
             moe_tab: DeviceBuf::alloc(4096)?,
             graphs: [std::ptr::null_mut(); 2],
+            att_scr: att_scr?,
             exact: Default::default(),
             logits: vec![0.0; cfg.vocab],
             rows: Vec::new(),
@@ -5317,7 +5420,7 @@ impl GpuSession {
     }
 
     /// Bytes of each device buffer, in the order `new` takes them.
-    fn sizes(cfg: &Config, ctx: usize) -> [usize; 18] {
+    fn sizes(cfg: &Config, ctx: usize) -> [usize; 19] {
         if let Some(m) = cfg.mla {
             return Self::sizes_mla(cfg, m, ctx);
         }
@@ -5346,13 +5449,14 @@ impl GpuSession {
             4 * VERIFY_MAX_BATCH * cfg.vocab,
             4 * VERIFY_MAX_BATCH,
             4,
+            if vfy_attention_fits(cfg) { 4 * AV_SCR_ROWS * cfg.n_heads * ATT_MAX_CHUNK } else { 4 },
         ]
     }
 
     /// `sizes` for latent attention: an f16 cache of one (kl + rd)-wide row per position and layer (no
     /// separate values, no int8 option); s.qkv holds the queries then [low-rank query | compressed kv]
     /// rows; s.att a token's heads x kl outputs; s.gu also the queries moved into the latent space.
-    fn sizes_mla(cfg: &Config, m: crate::model::Mla, ctx: usize) -> [usize; 18] {
+    fn sizes_mla(cfg: &Config, m: crate::model::Mla, ctx: usize) -> [usize; 19] {
         let (h, kd) = (cfg.n_heads, cfg.k_row());
         let q_dim = h * cfg.head_dim;
         let att = (h * m.kv_lora).max(q_dim);
@@ -5377,6 +5481,7 @@ impl GpuSession {
             4 * DECODE_MAX_BATCH * cfg.vocab,
             4 * DECODE_MAX_BATCH,
             4,
+            4, // no tiled verify attention for latent attention
         ]
     }
 }
