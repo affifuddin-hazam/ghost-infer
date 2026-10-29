@@ -22,7 +22,7 @@
 
 <p align="center">
   <img src="docs/demo.gif" width="860" alt="The ghost-infer desktop app finding and fixing a bug, then running the tests">
-  <br><sub>The desktop app fixing a failing test, 4× speed (<a href="docs/demo.mp4">real time</a>: 75 s): Qwen3-30B-A3B-Instruct-2507 Q3_K_M on an RTX 2060 SUPER (8 GB) with 16 GB of RAM.</sub>
+  <br><sub>Real time, not sped up: the desktop app fixing a failing test, Qwen3-30B-A3B-Instruct-2507 Q3_K_M on an RTX 2060 SUPER (8 GB) with 16 GB of RAM.</sub>
 </p>
 
 ## Why ghost-infer
