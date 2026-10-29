@@ -71,6 +71,14 @@ fn hmv_slices(n: usize, rows: usize) -> usize {
 }
 /// Most tokens per decode batch: one token, or a speculative verify batch.
 pub const DECODE_MAX_BATCH: usize = 8;
+/// Most tokens per verify batch on the tensor-core verify kernels (GpuModel::verify_max says whether a
+/// model can use them).
+pub const VERIFY_MAX_BATCH: usize = 64;
+/// Verify batches of at least this many tokens take the tensor-core kernels (GHOST_INFER_VFY_MIN tunes it).
+fn vfy_min() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("GHOST_INFER_VFY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(3).max(2))
+}
 
 const KERNELS: &str = r#"
 #define TB 8
@@ -518,22 +526,54 @@ __device__ void q6k_matvec(const unsigned char* __restrict__ w, const float* __r
 // and go straight into __dp4a (4 multiply-adds per instruction), instead of being unpacked to floats.
 // Templated on NT, the most tokens per launch: NT = 1 for normal decoding, NT = 8 for speculative verify
 // batches, where each weight block is read and decoded once and applied to every token (each token's
-// activations come from cache as needed), and on R, the rows per warp. A token's arithmetic is the same sequence of operations in
-// both instances, so it gets bit-identical results alone or in a batch: speculative decoding reproduces
-// plain greedy output exactly. RPW rows per warp (K-quants).
+// activations come from cache as needed), and on R, the rows per warp. RPW rows per warp (K-quants).
+//
+// A token gets bit-identical results alone, in a batch of 8 or in a tensor-core verify batch (q4k_vfy /
+// q6k_vfy), so speculative decoding reproduces plain greedy output exactly. Every K-quant decode kernel
+// does the same arithmetic: integer sums over whole sub-blocks (exact, in any order), then the float steps
+// below, spelled out with explicit roundings (no kernel's compiler may fuse them differently) and summed in
+// one fixed order. A super-block's sub-blocks pair up (Q4_K: 2p and 2p + 1, p < 4; Q6_K: groups g and
+// g + 2 of the same half and 16-value part, p = 4 half + 2 g + part < 8); each pair p has an accumulator per
+// chain q of super-blocks (q, q + G, q + 2G, ...; Q4_K G = 4, Q6_K G = 2), and per super-block of the chain
+//   s = sc_b dx_b I_b + sc_a dx_a I_a    (I: integer sum, dx: activation scale, sc: sub-block scale)
+//   Q4_K  A = A + d s, then A = A - dmin m, with m = m_b sl_b + m_a sl_a (sl = dx * activation block sum)
+//   Q6_K  A = A + d s
+// and the row's result is, per chain, the pairs as a tree (((A0 + A1) + (A2 + A3)), Q6_K the same over 8),
+// then the chains: Q4_K (T0 + T1) + (T2 + T3), Q6_K T0 + T1. The dp4a kernels' lanes are those pairs and
+// chains, so all their cross-lane sums come at the end.
 #define DP4A_PARAMS const unsigned char* __restrict__ w, const float* __restrict__ wd, const signed char* __restrict__ xq, \
                     const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off
+
+__device__ __forceinline__ float pair_sf(float sca, float scb, float dxa, float dxb, float ia, float ib) {
+    return __fmaf_rn(__fmul_rn(scb, dxb), ib, __fmul_rn(__fmul_rn(sca, dxa), ia));
+}
+__device__ __forceinline__ float pair_s(int sca, int scb, float dxa, float dxb, int ia, int ib) {
+    return pair_sf((float)sca, (float)scb, dxa, dxb, (float)ia, (float)ib);
+}
+__device__ __forceinline__ float q4k_pair_mf(float ma, float mb, float sla, float slb) {
+    return __fmaf_rn(mb, slb, __fmul_rn(ma, sla));
+}
+__device__ __forceinline__ float q4k_pair_m(int ma, int mb, float sla, float slb) {
+    return q4k_pair_mf((float)ma, (float)mb, sla, slb);
+}
+__device__ __forceinline__ float q4k_step(float acc, float d, float dmin, float s, float m) {
+    return __fmaf_rn(-dmin, m, __fmaf_rn(d, s, acc));
+}
+__device__ __forceinline__ float tree4(const float* s) {
+    return __fadd_rn(__fadd_rn(s[0], s[1]), __fadd_rn(s[2], s[3]));
+}
 
 // Q4_K: each lane takes 16 bytes of a 32-byte nibble chunk = 16 values of each of two sub-blocks (32
 // values), plus the block's 16-byte header (d, dmin and all 12 scale bytes) in one load; 8 lanes cover a
 // super-block, so the warp walks four super-blocks per step. The R rows of a warp are decoded first, then
-// each token's activations are loaded once for all of them. The "min" term uses the activation block
-// sums from the quantiser (xs): of the two lanes sharing a 32-value block, the first adds it.
+// each token's activations are loaded once for all of them. Lane pairs swap halves for whole sub-block
+// sums and keep the same accumulator (the "min" term uses the activation block sums from the quantiser).
 template <int NT, int R>
 __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
     int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
     int lane = threadIdx.x & 31;
     if (row0 >= rows) return;
+    unsigned grp = 0xFFu << (lane & 24); // the 8 lanes on the same super-blocks (shuffles inside the loop)
     int nsb = cols >> 8;
     int qsel = lane >> 3, l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
     size_t row_bytes = (size_t)nsb * Q4K_BYTES;
@@ -555,7 +595,7 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
             int4 hdr = *reinterpret_cast<const int4*>(b);
             int4 p = *reinterpret_cast<const int4*>(b + 16 + 32 * j2 + 16 * hf);
             d[r] = h2f((unsigned)hdr.x & 0xFFFF);
-            dmin[r] = hf ? 0.f : h2f((unsigned)hdr.x >> 16);
+            dmin[r] = h2f((unsigned)hdr.x >> 16);
             q4k_scale_min2w(2 * j2, hdr.y, hdr.z, hdr.w, &sc1[r], &m1[r], &sc2[r], &m2[r]);
             lo4[r] = make_int4(p.x & 0x0F0F0F0F, p.y & 0x0F0F0F0F, p.z & 0x0F0F0F0F, p.w & 0x0F0F0F0F);
             hi4[r] = make_int4((p.x >> 4) & 0x0F0F0F0F, (p.y >> 4) & 0x0F0F0F0F, (p.z >> 4) & 0x0F0F0F0F, (p.w >> 4) & 0x0F0F0F0F);
@@ -568,12 +608,14 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
                 const int* sx = xs + (size_t)j * (cols >> 5);
                 int4 xl = *reinterpret_cast<const int4*>(x + pos), xh = *reinterpret_cast<const int4*>(x + pos + 32);
                 float dl = dx[pos >> 5], dh = dx[(pos >> 5) + 1];
-                float sl = dl * (float)sx[pos >> 5], sh = dh * (float)sx[(pos >> 5) + 1];
+                float sl = __fmul_rn(dl, (float)sx[pos >> 5]), sh = __fmul_rn(dh, (float)sx[(pos >> 5) + 1]);
                 #pragma unroll
                 for (int r = 0; r < R; r++) {
                     int lo = __dp4a(lo4[r].x, xl.x, __dp4a(lo4[r].y, xl.y, __dp4a(lo4[r].z, xl.z, __dp4a(lo4[r].w, xl.w, 0))));
                     int hi = __dp4a(hi4[r].x, xh.x, __dp4a(hi4[r].y, xh.y, __dp4a(hi4[r].z, xh.z, __dp4a(hi4[r].w, xh.w, 0))));
-                    acc[r][j] += d[r] * (sc1[r] * dl * (float)lo + sc2[r] * dh * (float)hi) - dmin[r] * (m1[r] * sl + m2[r] * sh);
+                    lo += __shfl_xor_sync(grp, lo, 1); // the other 16 values of both sub-blocks
+                    hi += __shfl_xor_sync(grp, hi, 1);
+                    acc[r][j] = q4k_step(acc[r][j], d[r], dmin[r], pair_s(sc1[r], sc2[r], dl, dh, lo, hi), q4k_pair_m(m1[r], m2[r], sl, sh));
                 }
             }
         }
@@ -582,7 +624,10 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
     for (int r = 0; r < R; r++)
         #pragma unroll
         for (int j = 0; j < NT; j++) {
-            float v = warp_sum(acc[r][j]);
+            // the pairs (lane bits 1-2), then the chains (bits 3-4): ((A0 + A1) + (A2 + A3)) per chain, (T0 + T1) + (T2 + T3)
+            float v = acc[r][j];
+            #pragma unroll
+            for (int o = 2; o < 32; o <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o));
             if (lane == 0 && j < n && row0 + r < rows) {
                 size_t idx = (size_t)j * out_stride + out_off + row0 + r;
                 out[idx] = accumulate ? out[idx] + v : v;
@@ -593,11 +638,13 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
 // Q6_K: per 128-value half, 4 lanes take groups {0,2} and 4 lanes groups {1,3}; each lane 8 consecutive
 // positions of both groups (they share the low-nibble bytes: low nibble = first group, high = second).
 // A half-warp covers a super-block, so the warp walks two super-blocks per step. R rows decoded first.
+// Lane pairs swap halves for whole 16-value sub-block sums and keep the same accumulator.
 template <int NT, int R>
 __device__ __forceinline__ void q6k_dp4a(DP4A_PARAMS) {
     int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
     int lane = threadIdx.x & 31;
     if (row0 >= rows) return;
+    unsigned grp = 0xFFFFu << (lane & 16); // the 16 lanes on the same super-blocks
     int nsb = cols >> 8;
     int hl = lane >> 4, l16 = lane & 15;
     int half = l16 >> 3, gsel = (l16 >> 2) & 1, l = 8 * (l16 & 3), is = l >> 4;
@@ -636,9 +683,12 @@ __device__ __forceinline__ void q6k_dp4a(DP4A_PARAMS) {
                 int2 xa = *reinterpret_cast<const int2*>(x + pa), xb = *reinterpret_cast<const int2*>(x + pb);
                 float da = dx[pa >> 5], db = dx[pb >> 5];
                 #pragma unroll
-                for (int r = 0; r < R; r++)
-                    acc[r][j] += d[r] * (sa[r] * da * (float)__dp4a(qa0[r], xa.x, __dp4a(qa1[r], xa.y, 0))
-                                      + sbb[r] * db * (float)__dp4a(qb0[r], xb.x, __dp4a(qb1[r], xb.y, 0)));
+                for (int r = 0; r < R; r++) {
+                    int ia = __dp4a(qa0[r], xa.x, __dp4a(qa1[r], xa.y, 0)), ib = __dp4a(qb0[r], xb.x, __dp4a(qb1[r], xb.y, 0));
+                    ia += __shfl_xor_sync(grp, ia, 1); // the other 8 values of both sub-blocks
+                    ib += __shfl_xor_sync(grp, ib, 1);
+                    acc[r][j] = __fmaf_rn(d[r], pair_s(sa[r], sbb[r], da, db, ia, ib), acc[r][j]);
+                }
             }
         }
     }
@@ -646,7 +696,10 @@ __device__ __forceinline__ void q6k_dp4a(DP4A_PARAMS) {
     for (int r = 0; r < R; r++)
         #pragma unroll
         for (int j = 0; j < NT; j++) {
-            float v = warp_sum(acc[r][j]);
+            // the pairs (lane bits 1-3: part, group, half) as a tree, then the chains (bit 4)
+            float v = acc[r][j];
+            #pragma unroll
+            for (int o = 2; o < 32; o <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o));
             if (lane == 0 && j < n && row0 + r < rows) {
                 size_t idx = (size_t)j * out_stride + out_off + row0 + r;
                 out[idx] = accumulate ? out[idx] + v : v;
@@ -759,6 +812,310 @@ __device__ __forceinline__ void q8_dp4a(DP4A_PARAMS) {
     }
 }
 
+// Verify batches (speculative decoding) on int8 tensor cores, sm_75 and newer: up to TILES x 8 tokens per
+// launch, each given bit for bit what the dp4a kernels give it. An m8n8k16 product is an exact integer sum
+// over 16 values (two chained, a 32-value sub-block); the float steps are theirs, in their order (above).
+// A block of 4 warps owns 32 rows (4 tiles of 8) and TILES tiles of 8 tokens; per super-block it stages the
+// rows' blocks and the tokens' activations (with their scales and scaled sums, computed once per token) in
+// shared memory with coalesced 16-byte loads, padded so the fragment reads hit different banks, and fetches
+// the next super-block's into registers while computing. Each warp takes one token tile and TILES row tiles
+// (shared memory is the scarce part: a thread reads its two tokens' activations and scales once for all its
+// rows); lane T holds the weights of row T/4 of a row tile and the activations of token T/4 of the token tile,
+// and owns the results of row T/4 for tokens 2 (T%4) and 2 (T%4) + 1. The chains of super-blocks go one at a
+// time, so a result needs only its pairs' accumulators and what the chain tree has summed so far.
+__device__ __forceinline__ void mma_s8(int a, int b, int& c0, int& c1) {
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};" : "+r"(c0), "+r"(c1) : "r"(a), "r"(b));
+}
+#define VFY_ROWS 32
+#define VFY_SC 12 // floats per staged token's 8 block scales (padded: bank spread)
+
+// (float)i for |i| < 2^22, exactly, at full rate (the I2F instruction runs at a quarter of it)
+__device__ __forceinline__ float i2f(int i) {
+    return __fsub_rn(__int_as_float(0x4B400000 + i), 12582912.f);
+}
+
+// One super-block's staging, held in registers so the next one's loads are in flight while this one computes:
+// the block's 32 rows (WN 16-byte pieces each, and Q6_K's d), the tokens' 256 activations, their 8 block scales
+// and (SUMS) block sums. 128 threads.
+template <int TILES, int WN, bool SUMS>
+struct VfyStage {
+    static constexpr int NW = (VFY_ROWS * WN + 127) / 128, NS = (TILES + 1) / 2;
+    int4 w[NW], x[TILES];
+    float dx[NS], d;
+    int sx[NS];
+    __device__ __forceinline__ void fetch(const unsigned char* wq, const float* wd, int bytes, int rows, int row0, int nsb,
+                                          const signed char* xq, const float* xd, const int* xs, int n, int cols, int sb) {
+        int tid = threadIdx.x, ntok = ((n + 7) >> 3) * 8, nb = cols >> 5;
+        #pragma unroll
+        for (int k = 0; k < NW; k++) {
+            int i = tid + 128 * k;
+            if (i < VFY_ROWS * WN) {
+                int rr = i / WN, c = i - WN * rr;
+                w[k] = *reinterpret_cast<const int4*>(wq + ((size_t)min(row0 + rr, rows - 1) * nsb + sb) * bytes + 16 * c);
+            }
+        }
+        if (wd && tid < VFY_ROWS) d = wd[(size_t)min(row0 + tid, rows - 1) * nsb + sb];
+        #pragma unroll
+        for (int k = 0; k < TILES; k++) {
+            int i = tid + 128 * k;
+            if (i < ntok * 16) x[k] = *reinterpret_cast<const int4*>(xq + (size_t)min(i >> 4, n - 1) * cols + sb * 256 + 16 * (i & 15));
+        }
+        #pragma unroll
+        for (int k = 0; k < NS; k++) {
+            int i = tid + 128 * k;
+            if (i < ntok * 8) {
+                size_t at = (size_t)min(i >> 3, n - 1) * nb + sb * 8 + (i & 7);
+                dx[k] = xd[at];
+                if (SUMS) sx[k] = xs[at];
+            }
+        }
+    }
+    __device__ __forceinline__ void store(int* ws, int vw, float* sd, int* xsh, int vx, float* sdx, float* ssl, int n) {
+        int tid = threadIdx.x, ntok = ((n + 7) >> 3) * 8;
+        #pragma unroll
+        for (int k = 0; k < NW; k++) {
+            int i = tid + 128 * k;
+            if (i < VFY_ROWS * WN) {
+                int rr = i / WN;
+                *reinterpret_cast<int4*>(ws + rr * vw + 4 * (i - WN * rr)) = w[k];
+            }
+        }
+        if (sd && tid < VFY_ROWS) sd[tid] = d;
+        #pragma unroll
+        for (int k = 0; k < TILES; k++) {
+            int i = tid + 128 * k;
+            if (i < ntok * 16) *reinterpret_cast<int4*>(xsh + (i >> 4) * vx + 4 * (i & 15)) = x[k];
+        }
+        #pragma unroll
+        for (int k = 0; k < NS; k++) {
+            int i = tid + 128 * k;
+            if (i < ntok * 8) {
+                sdx[(i >> 3) * VFY_SC + (i & 7)] = dx[k];
+                if (SUMS) ssl[(i >> 3) * VFY_SC + (i & 7)] = __fmul_rn(dx[k], (float)sx[k]);
+            }
+        }
+    }
+};
+
+// The super-blocks of chain q (q, q + G, q + 2G, ...) in order, chain after chain: the step after sb.
+__device__ __forceinline__ bool vfy_next(int G, int nsb, int q, int sb, int* nq, int* nsb2) {
+    *nq = q;
+    *nsb2 = sb + G;
+    if (*nsb2 >= nsb) {
+        *nq = q + 1;
+        *nsb2 = q + 1;
+    }
+    return *nq < G && *nsb2 < nsb;
+}
+
+#define Q4K_VW 40 // words per staged Q4_K row block (36 + padding)
+#define Q4K_VX 72 // words per staged token (64 + padding)
+template <int TILES>
+__device__ __forceinline__ void q4k_vfy(DP4A_PARAMS) {
+    __shared__ __align__(16) int ws[VFY_ROWS * Q4K_VW];
+    __shared__ __align__(16) int xsh[TILES * 8 * Q4K_VX];
+    __shared__ __align__(16) float sdx[TILES * 8 * VFY_SC], ssl[TILES * 8 * VFY_SC];
+    int tid = threadIdx.x, lane = tid & 31, tq = lane & 3, g = lane >> 2, wp = tid >> 5;
+    int tt = wp / (4 / TILES), rt0 = (wp % (4 / TILES)) * TILES; // this warp's token tile and first row tile
+    int row0 = blockIdx.x * VFY_ROWS;
+    if (row0 >= rows) return;
+    int ntiles = (n + 7) >> 3, nsb = cols >> 8;
+    VfyStage<TILES, 9, true> st;
+    st.fetch(w, nullptr, Q4K_BYTES, rows, row0, nsb, xq, xd, xs, n, cols, 0);
+    float acc[TILES][2][4], held[TILES][2], left[TILES][2]; // [row tile][result token][pair]
+    #pragma unroll
+    for (int k = 0; k < TILES; k++)
+        #pragma unroll
+        for (int u = 0; u < 2; u++)
+            #pragma unroll
+            for (int p = 0; p < 4; p++) acc[k][u][p] = 0.f;
+    for (int q = 0, sb = 0;;) {
+        __syncthreads(); // the last super-block's reads are done
+        st.store(ws, Q4K_VW, nullptr, xsh, Q4K_VX, sdx, ssl, n);
+        __syncthreads();
+        int nq, nsb2;
+        bool more = vfy_next(4, nsb, q, sb, &nq, &nsb2);
+        if (more) st.fetch(w, nullptr, Q4K_BYTES, rows, row0, nsb, xq, xd, xs, n, cols, nsb2);
+        if (tt < ntiles) {
+            // this thread's token of the tile (B fragments: bytes 64 p + 8 tq .. + 7, and + 32), its two results' scales
+            const int* xr = xsh + (8 * tt + g) * Q4K_VX + 2 * tq;
+            int2 xa[4], xb[4];
+            #pragma unroll
+            for (int p = 0; p < 4; p++) {
+                xa[p] = *reinterpret_cast<const int2*>(xr + 16 * p);
+                xb[p] = *reinterpret_cast<const int2*>(xr + 16 * p + 8);
+            }
+            float dx[2][8], sl[2][8];
+            #pragma unroll
+            for (int u = 0; u < 2; u++) {
+                const float* dr = sdx + (8 * tt + 2 * tq + u) * VFY_SC;
+                const float* sr = ssl + (8 * tt + 2 * tq + u) * VFY_SC;
+                float4 d0 = *reinterpret_cast<const float4*>(dr), d1 = *reinterpret_cast<const float4*>(dr + 4);
+                float4 s0 = *reinterpret_cast<const float4*>(sr), s1 = *reinterpret_cast<const float4*>(sr + 4);
+                dx[u][0] = d0.x; dx[u][1] = d0.y; dx[u][2] = d0.z; dx[u][3] = d0.w; dx[u][4] = d1.x; dx[u][5] = d1.y; dx[u][6] = d1.z; dx[u][7] = d1.w;
+                sl[u][0] = s0.x; sl[u][1] = s0.y; sl[u][2] = s0.z; sl[u][3] = s0.w; sl[u][4] = s1.x; sl[u][5] = s1.y; sl[u][6] = s1.z; sl[u][7] = s1.w;
+            }
+            #pragma unroll
+            for (int k = 0; k < TILES; k++) {
+                const int* wr = ws + (8 * (rt0 + k) + g) * Q4K_VW;
+                int4 hdr = *reinterpret_cast<const int4*>(wr);
+                float d = h2f((unsigned)hdr.x & 0xFFFF), dmin = h2f((unsigned)hdr.x >> 16);
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    int s1, m1, s2, m2;
+                    q4k_scale_min2w(2 * p, hdr.y, hdr.z, hdr.w, &s1, &m1, &s2, &m2);
+                    float sca = i2f(s1), ma = i2f(m1), scb = i2f(s2), mb = i2f(m2);
+                    // nibble bytes 32 p + 8 tq .. + 7: values 8 tq .. + 7 of sub-blocks 2p (low) and 2p + 1 (high)
+                    int2 wq = *reinterpret_cast<const int2*>(wr + 4 + 8 * p + 2 * tq);
+                    int a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+                    mma_s8(wq.x & 0x0F0F0F0F, xa[p].x, a0, a1);
+                    mma_s8(wq.y & 0x0F0F0F0F, xa[p].y, a0, a1);
+                    mma_s8((wq.x >> 4) & 0x0F0F0F0F, xb[p].x, b0, b1);
+                    mma_s8((wq.y >> 4) & 0x0F0F0F0F, xb[p].y, b0, b1);
+                    int a = 2 * p, b = a + 1;
+                    acc[k][0][p] = q4k_step(acc[k][0][p], d, dmin, pair_sf(sca, scb, dx[0][a], dx[0][b], i2f(a0), i2f(b0)), q4k_pair_mf(ma, mb, sl[0][a], sl[0][b]));
+                    acc[k][1][p] = q4k_step(acc[k][1][p], d, dmin, pair_sf(sca, scb, dx[1][a], dx[1][b], i2f(a1), i2f(b1)), q4k_pair_mf(ma, mb, sl[1][a], sl[1][b]));
+                }
+            }
+        }
+        if (!more || nq != q) {
+            // chain q is done (and, at the end, any empty ones after it): its pairs as a tree, then (T0 + T1) + (T2 + T3)
+            for (int c = q; c < (more ? nq : 4); c++) {
+                #pragma unroll
+                for (int k = 0; k < TILES; k++)
+                    #pragma unroll
+                    for (int u = 0; u < 2; u++) {
+                        float tc = c == q ? tree4(acc[k][u]) : 0.f;
+                        if (c == 0 || c == 2) held[k][u] = tc;
+                        else if (c == 1) left[k][u] = __fadd_rn(held[k][u], tc);
+                        else held[k][u] = __fadd_rn(left[k][u], __fadd_rn(held[k][u], tc));
+                        #pragma unroll
+                        for (int p = 0; p < 4; p++) acc[k][u][p] = 0.f;
+                    }
+            }
+        }
+        if (!more) break;
+        q = nq;
+        sb = nsb2;
+    }
+    if (tt >= ntiles) return;
+    #pragma unroll
+    for (int k = 0; k < TILES; k++)
+        #pragma unroll
+        for (int u = 0; u < 2; u++) {
+            int tok = 8 * tt + 2 * tq + u, row = row0 + 8 * (rt0 + k) + g;
+            if (tok < n && row < rows) {
+                size_t idx = (size_t)tok * out_stride + out_off + row;
+                out[idx] = accumulate ? out[idx] + held[k][u] : held[k][u];
+            }
+        }
+}
+
+#define Q6K_VW 68 // words per staged Q6_K row block (52 + padding)
+#define Q6K_VX 68 // words per staged token (64 + padding)
+template <int TILES>
+__device__ __forceinline__ void q6k_vfy(DP4A_PARAMS) {
+    __shared__ __align__(16) int ws[VFY_ROWS * Q6K_VW];
+    __shared__ __align__(16) int xsh[TILES * 8 * Q6K_VX];
+    __shared__ __align__(16) float sdx[TILES * 8 * VFY_SC];
+    __shared__ float sd[VFY_ROWS];
+    int tid = threadIdx.x, lane = tid & 31, tq = lane & 3, g = lane >> 2, wp = tid >> 5;
+    int tt = wp / (4 / TILES), rt0 = (wp % (4 / TILES)) * TILES;
+    int row0 = blockIdx.x * VFY_ROWS;
+    if (row0 >= rows) return;
+    int ntiles = (n + 7) >> 3, nsb = cols >> 8;
+    VfyStage<TILES, 13, false> st;
+    st.fetch(w, wd, Q6K_BYTES, rows, row0, nsb, xq, xd, xs, n, cols, 0);
+    float acc[TILES][2][8], held[TILES][2];
+    #pragma unroll
+    for (int k = 0; k < TILES; k++)
+        #pragma unroll
+        for (int u = 0; u < 2; u++)
+            #pragma unroll
+            for (int p = 0; p < 8; p++) acc[k][u][p] = 0.f;
+    for (int q = 0, sb = 0;;) {
+        __syncthreads();
+        st.store(ws, Q6K_VW, sd, xsh, Q6K_VX, sdx, nullptr, n);
+        __syncthreads();
+        int nq, nsb2;
+        bool more = vfy_next(2, nsb, q, sb, &nq, &nsb2);
+        if (more) st.fetch(w, wd, Q6K_BYTES, rows, row0, nsb, xq, xd, xs, n, cols, nsb2);
+        if (tt < ntiles) {
+            const int* xr = xsh + (8 * tt + g) * Q6K_VX + tq;
+            int xv[2][4][2]; // B fragments of sub-block (half, group, part)
+            #pragma unroll
+            for (int h = 0; h < 2; h++)
+                #pragma unroll
+                for (int gr = 0; gr < 4; gr++)
+                    #pragma unroll
+                    for (int is = 0; is < 2; is++) xv[h][gr][is] = xr[32 * h + 8 * gr + 4 * is];
+            float dx[2][8];
+            #pragma unroll
+            for (int u = 0; u < 2; u++) {
+                const float* dr = sdx + (8 * tt + 2 * tq + u) * VFY_SC;
+                float4 d0 = *reinterpret_cast<const float4*>(dr), d1 = *reinterpret_cast<const float4*>(dr + 4);
+                dx[u][0] = d0.x; dx[u][1] = d0.y; dx[u][2] = d0.z; dx[u][3] = d0.w; dx[u][4] = d1.x; dx[u][5] = d1.y; dx[u][6] = d1.z; dx[u][7] = d1.w;
+            }
+            #pragma unroll
+            for (int k = 0; k < TILES; k++) {
+                int rr = 8 * (rt0 + k) + g;
+                const int* wr = ws + rr * Q6K_VW;
+                float d = sd[rr];
+                int4 scv = *reinterpret_cast<const int4*>(wr + 48);
+                int words[4] = {scv.x, scv.y, scv.z, scv.w};
+                #pragma unroll
+                for (int h = 0; h < 2; h++)
+                    #pragma unroll
+                    for (int is = 0; is < 2; is++) {
+                        // values 4 tq .. + 3 of sub-blocks (h, group, is): low nibbles for groups 0-1, high for 2-3
+                        int qh = wr[32 + 8 * h + 4 * is + tq];
+                        #pragma unroll
+                        for (int gs = 0; gs < 2; gs++) {
+                            int ql = wr[16 * h + 8 * gs + 4 * is + tq];
+                            int wa = __vsub4((ql & 0x0F0F0F0F) | (((qh >> (2 * gs)) & 0x03030303) << 4), 0x20202020);
+                            int wb = __vsub4(((ql >> 4) & 0x0F0F0F0F) | (((qh >> (2 * gs + 4)) & 0x03030303) << 4), 0x20202020);
+                            int a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+                            mma_s8(wa, xv[h][gs][is], a0, a1);
+                            mma_s8(wb, xv[h][gs + 2][is], b0, b1);
+                            int pp = 4 * h + 2 * gs + is, sa = 8 * h + 2 * gs + is;
+                            float sca = i2f((int)(signed char)((words[sa >> 2] >> (8 * (sa & 3))) & 0xFF));
+                            float scb = i2f((int)(signed char)((words[(sa + 4) >> 2] >> (8 * ((sa + 4) & 3))) & 0xFF));
+                            acc[k][0][pp] = __fmaf_rn(d, pair_sf(sca, scb, dx[0][4 * h + gs], dx[0][4 * h + gs + 2], i2f(a0), i2f(b0)), acc[k][0][pp]);
+                            acc[k][1][pp] = __fmaf_rn(d, pair_sf(sca, scb, dx[1][4 * h + gs], dx[1][4 * h + gs + 2], i2f(a1), i2f(b1)), acc[k][1][pp]);
+                        }
+                    }
+            }
+        }
+        if (!more || nq != q) {
+            for (int c = q; c < (more ? nq : 2); c++) {
+                #pragma unroll
+                for (int k = 0; k < TILES; k++)
+                    #pragma unroll
+                    for (int u = 0; u < 2; u++) {
+                        float tc = c == q ? __fadd_rn(tree4(acc[k][u]), tree4(acc[k][u] + 4)) : 0.f;
+                        held[k][u] = c == 0 ? tc : __fadd_rn(held[k][u], tc);
+                        #pragma unroll
+                        for (int p = 0; p < 8; p++) acc[k][u][p] = 0.f;
+                    }
+            }
+        }
+        if (!more) break;
+        q = nq;
+        sb = nsb2;
+    }
+    if (tt >= ntiles) return;
+    #pragma unroll
+    for (int k = 0; k < TILES; k++)
+        #pragma unroll
+        for (int u = 0; u < 2; u++) {
+            int tok = 8 * tt + 2 * tq + u, row = row0 + 8 * (rt0 + k) + g;
+            if (tok < n && row < rows) {
+                size_t idx = (size_t)tok * out_stride + out_off + row;
+                out[idx] = accumulate ? out[idx] + held[k][u] : held[k][u];
+            }
+        }
+}
+
 extern "C" {
 
 // the batch instances get a register budget, so the compiler cannot hoist every token's loads at once
@@ -769,6 +1126,13 @@ __global__ void matmul_q6k_dp4a(DP4A_PARAMS) { q6k_dp4a<1, RPW>(DP4A_ARGS); }
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q6k_dp4a8(DP4A_PARAMS) { q6k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
 __global__ void matmul_q8_dp4a(DP4A_PARAMS) { q8_dp4a<1>(DP4A_ARGS); }
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q8_dp4a8(DP4A_PARAMS) { q8_dp4a<8>(DP4A_ARGS); }
+// verify batches of up to 8, 16 and 32 tokens (128 threads: 4 warps of 8 rows)
+__global__ void __launch_bounds__(128) matmul_q4k_vfy1(DP4A_PARAMS) { q4k_vfy<1>(DP4A_ARGS); }
+__global__ void __launch_bounds__(128) matmul_q4k_vfy2(DP4A_PARAMS) { q4k_vfy<2>(DP4A_ARGS); }
+__global__ void __launch_bounds__(128) matmul_q4k_vfy4(DP4A_PARAMS) { q4k_vfy<4>(DP4A_ARGS); }
+__global__ void __launch_bounds__(128) matmul_q6k_vfy1(DP4A_PARAMS) { q6k_vfy<1>(DP4A_ARGS); }
+__global__ void __launch_bounds__(128) matmul_q6k_vfy2(DP4A_PARAMS) { q6k_vfy<2>(DP4A_ARGS); }
+__global__ void __launch_bounds__(128) matmul_q6k_vfy4(DP4A_PARAMS) { q6k_vfy<4>(DP4A_ARGS); }
 // Mixture of experts, one token, for the experts held in GPU memory. ptrs is a table of matrix
 // addresses: gate and up of expert k at 2k and 2k + 1, its down at 2 * nk + k; blockIdx.y picks the entry.
 // gate / up: row block y of out gets matrix y applied to the token's int8 activations.
@@ -2465,6 +2829,7 @@ api! {
     cuMemcpyDtoH_v2: fn(*mut c_void, u64, usize) -> CuResult;
     cuLaunchKernel: fn(Ptr, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> CuResult;
     cuFuncSetAttribute: fn(Ptr, i32, i32) -> CuResult;
+    cuFuncGetAttribute: fn(*mut i32, i32, Ptr) -> CuResult;
     cuCtxSynchronize: fn() -> CuResult;
     cuStreamCreate: fn(*mut Ptr, u32) -> CuResult;
     cuStreamSynchronize: fn(Ptr) -> CuResult;
@@ -2624,6 +2989,7 @@ struct Kernels {
     matmul_tiled: Ptr,
     matmul_mma: Option<Ptr>, // int8 tensor cores, sm_75 and newer
     matmul_mma_k: Option<[Ptr; 2]>, // the same for Q4_K / Q6_K with per-256 activation scales
+    matmul_vfy: Option<[[Ptr; 3]; 2]>, // verify batches, exact per token: [Q4_K | Q6_K][8 | 16 | 32 tokens]
     quantize_q8: Ptr,
     quantize_q8k: Ptr,
     attention_partial: Ptr,
@@ -2738,6 +3104,16 @@ impl Kernels {
                 a.check((f.cuModuleGetFunction)(&mut func, module, c.as_ptr()), name)?;
                 Ok(func)
             };
+            // GHOST_INFER_KERNEL_INFO=1: registers and spills of the decode and verify kernels, for tuning
+            if std::env::var_os("GHOST_INFER_KERNEL_INFO").is_some() {
+                for name in ["matmul_q4k_dp4a", "matmul_q4k_dp4a8", "matmul_q4k_vfy1", "matmul_q4k_vfy2", "matmul_q4k_vfy4", "matmul_q6k_vfy1", "matmul_q6k_vfy2", "matmul_q6k_vfy4"] {
+                    let f = get(name)?;
+                    let (mut regs, mut local) = (0, 0);
+                    (a.f.cuFuncGetAttribute)(&mut regs, 4, f);
+                    (a.f.cuFuncGetAttribute)(&mut local, 3, f);
+                    eprintln!("[{name}: {regs} registers, {local} bytes of local memory per thread]");
+                }
+            }
             Ok(Kernels {
                 embed: get("embed")?,
                 rmsnorm: get("rmsnorm")?,
@@ -2757,6 +3133,20 @@ impl Kernels {
                 // GHOST_INFER_NO_Q8K=1 keeps K-quant prompts on matmul_mma (per-32 activation scales)
                 matmul_mma_k: if a.compute >= (7, 5) && std::env::var_os("GHOST_INFER_NO_MMA").is_none() && std::env::var_os("GHOST_INFER_NO_Q8K").is_none() {
                     Some([get("matmul_mma_q4k")?, get("matmul_mma_q6k")?])
+                } else {
+                    None
+                },
+                // GHOST_INFER_NO_VFY=1: verify batches stay on the dp4a kernels (8 tokens at most)
+                matmul_vfy: if a.compute >= (7, 5) && std::env::var_os("GHOST_INFER_NO_VFY").is_none() {
+                    // they live on shared memory: ask for the largest carveout, or only one block fits per SM
+                    const PREFERRED_SHARED_CARVEOUT: i32 = 9;
+                    let vfy = |name: &str| get(name).inspect(|&f| {
+                        (a.f.cuFuncSetAttribute)(f, PREFERRED_SHARED_CARVEOUT, 100);
+                    });
+                    Some([
+                        [vfy("matmul_q4k_vfy1")?, vfy("matmul_q4k_vfy2")?, vfy("matmul_q4k_vfy4")?],
+                        [vfy("matmul_q6k_vfy1")?, vfy("matmul_q6k_vfy2")?, vfy("matmul_q6k_vfy4")?],
+                    ])
                 } else {
                     None
                 },
@@ -3809,7 +4199,7 @@ impl GpuModel {
     fn matmul(&self, parts: &[(&GpuMatrix, usize)], x: u64, out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
         let cols = parts[0].0.cols;
-        if n >= TILED_MIN_BATCH {
+        if n >= TILED_MIN_BATCH && !self.dp4a_path(parts, n, s) {
             if let Some(mk) = k.matmul_mma_k.filter(|_| parts.iter().all(|(m, _)| m.fmt != Fmt::Q8)) {
                 // K-quant prompts: one activation scale per 128 (or 256) values keeps the tensor-core epilogue integer
                 let chunks = n * cols / qch();
@@ -3843,8 +4233,9 @@ impl GpuModel {
             }
             return Ok(());
         }
-        // decoding (up to DECODE_MAX_BATCH tokens): int8 activations + dp4a (GHOST_INFER_EXACT=1 keeps f32)
-        if self.dp4a_path(parts, n) {
+        // decoding (up to DECODE_MAX_BATCH tokens, or a verify batch): int8 activations + dp4a or tensor cores
+        // (GHOST_INFER_EXACT=1 keeps f32)
+        if self.dp4a_path(parts, n, s) {
             let blocks = n * cols / 32;
             k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(blocks as i32)])?;
             return self.matmul_dp4a(parts, out, out_stride, n, accumulate, s);
@@ -3864,16 +4255,44 @@ impl GpuModel {
     }
 
     /// Decoding batches (1..=DECODE_MAX_BATCH tokens) with K-quant weights go through int8 activations and
-    /// dp4a; Q8_0 too when the model is a draft (`int8_q8`), keeping exact f32 decoding otherwise.
-    fn dp4a_path(&self, parts: &[(&GpuMatrix, usize)], n: usize) -> bool {
-        n <= DECODE_MAX_BATCH && !crate::quant::exact_mode() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8 || self.int8_q8)
+    /// dp4a; Q8_0 too when the model is a draft (`int8_q8`), keeping exact f32 decoding otherwise. So do
+    /// verify batches up to VERIFY_MAX_BATCH (`s.exact`) when the tensor-core verify kernels take them.
+    fn dp4a_path(&self, parts: &[(&GpuMatrix, usize)], n: usize, s: &GpuSession) -> bool {
+        if crate::quant::exact_mode() {
+            return false;
+        }
+        (n <= DECODE_MAX_BATCH && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8 || self.int8_q8))
+            || (s.exact.get() && n <= VERIFY_MAX_BATCH && self.k.matmul_vfy.is_some() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8))
     }
 
     /// The dp4a matmuls on `n` tokens' activations already quantised into `s.xq` / `s.xd`. One token uses
-    /// the 1-token kernels, batches the 8-token ones; both give a token bit-identical results.
+    /// the 1-token kernels, batches the 8-token ones or, verifying, the tensor-core ones; all give a token
+    /// bit-identical results.
     fn matmul_dp4a(&self, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
         for &(m, off) in parts {
+            if let Some(vfy) = k.matmul_vfy.filter(|_| m.fmt != Fmt::Q8 && n >= vfy_min() && (s.exact.get() || n > DECODE_MAX_BATCH)) {
+                // 32 tokens per launch at most (the kernels' tiles and shared memory)
+                let nb = m.cols / 32;
+                for t0 in (0..n).step_by(32) {
+                    let nt = (n - t0).min(32);
+                    let func = vfy[(m.fmt == Fmt::Q6K) as usize][match nt.div_ceil(8) {
+                        1 => 0,
+                        2 => 1,
+                        _ => 2,
+                    }];
+                    let (xq, xd, xs) = (s.xq.ptr + (t0 * m.cols) as u64, s.xd.ptr + (4 * t0 * nb) as u64, s.xsum.ptr + (4 * t0 * nb) as u64);
+                    let out = out + (4 * t0 * out_stride) as u64;
+                    k.launch(
+                        func,
+                        (m.rows.div_ceil(32) as u32, 1),
+                        128,
+                        0,
+                        &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(xq), Arg::P(xd), Arg::P(xs), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(nt as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
+                    )?;
+                }
+                continue;
+            }
             let rpw = if m.fmt == Fmt::Q8 { 1 } else if n > 1 { batch_rpw() } else { kq_rpw() };
             k.launch(
                 k.matmul_dp4a[m.fmt as usize][(n > 1) as usize],
@@ -3890,7 +4309,7 @@ impl GpuModel {
     /// int8 activations directly.
     fn norm_matmul(&self, norm: &DeviceBuf, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, s: &GpuSession) -> Result<(), String> {
         let (k, c) = (&self.k, &self.cfg);
-        if self.dp4a_path(parts, n) {
+        if self.dp4a_path(parts, n, s) {
             k.launch(k.rmsnorm_q8, (n as u32, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
             return self.matmul_dp4a(parts, out, out_stride, n, false, s);
         }
@@ -3941,7 +4360,9 @@ impl GpuModel {
             128 => Some(f[1]),
             _ => None,
         });
-        if let (true, Some(func)) = (n >= TILED_MIN_BATCH, tc) {
+        // a verify batch keeps every token on the split kernel below, as a one-token step
+        let tiled = n >= TILED_MIN_BATCH && !s.exact.get();
+        if let (true, Some(func)) = (tiled, tc) {
             return k.launch(
                 func,
                 (c.n_heads as u32, n.div_ceil(PREFILL_TC_QT) as u32),
@@ -3950,7 +4371,7 @@ impl GpuModel {
                 &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(n as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(c.head_dim as i32), Arg::F(scale)],
             );
         }
-        if let (true, Some(shared)) = (n >= TILED_MIN_BATCH, self.prefill_shared) {
+        if let (true, Some(shared)) = (tiled, self.prefill_shared) {
             return k.launch(
                 k.attention_prefill,
                 (c.n_heads as u32, n.div_ceil(PREFILL_QT) as u32),
@@ -4021,14 +4442,24 @@ impl GpuModel {
         self.forward(tokens, s, if want_logits { Out::Last } else { Out::None }).map(|_| ())
     }
 
-    /// Runs up to DECODE_MAX_BATCH `tokens` and returns the greedy next token after each of them (argmax on
+    /// Runs up to `verify_max()` `tokens` and returns the greedy next token after each of them (argmax on
     /// the GPU). Each position gets exactly the logits a one-token step would give it, so this is how a
     /// speculative draft is checked.
     pub fn forward_argmax(&self, tokens: &[u32], s: &mut GpuSession) -> Result<Vec<u32>, String> {
-        if tokens.len() > DECODE_MAX_BATCH {
-            return Err(format!("argmax batch of {} exceeds {DECODE_MAX_BATCH}", tokens.len()));
+        if tokens.len() > self.verify_max() {
+            return Err(format!("argmax batch of {} exceeds {}", tokens.len(), self.verify_max()));
         }
         self.forward(tokens, s, Out::Argmax)
+    }
+
+    /// Runs up to `verify_max()` `tokens` and copies the next-token logits after each of them into
+    /// `s.rows` (row i at i * vocab): the same logits one-token steps would give, for checking a draft
+    /// under sampling.
+    pub fn forward_logits(&self, tokens: &[u32], s: &mut GpuSession) -> Result<(), String> {
+        if tokens.len() > self.verify_max() {
+            return Err(format!("logits batch of {} exceeds {}", tokens.len(), self.verify_max()));
+        }
+        self.forward(tokens, s, Out::All).map(|_| ())
     }
 
     fn forward(&self, tokens: &[u32], s: &mut GpuSession, want: Out) -> Result<Vec<u32>, String> {
@@ -4046,6 +4477,8 @@ impl GpuModel {
         let a = api()?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         s.tokens.write(&ids)?;
+        // checking a draft: every token as a one-token step would compute it
+        s.exact.set(matches!(want, Out::Argmax | Out::All));
         // one-token steps replay a CUDA graph captured on the session's first one (GHOST_INFER_NO_GRAPH=1:
         // plain launches); the kernels then read the position from s.pos_dev
         // (not for a mixture of experts: its experts run on the CPU between the kernels)
@@ -4073,6 +4506,9 @@ impl GpuModel {
         let mut picks = Vec::new();
         if want == Out::Last {
             a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(s.logits.as_mut_ptr() as *mut c_void, s.logits_dev.ptr, s.logits.len() * 4) }, "copy logits")?;
+        } else if want == Out::All {
+            s.rows.resize(n * s.logits.len(), 0.0);
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(s.rows.as_mut_ptr() as *mut c_void, s.logits_dev.ptr, s.rows.len() * 4) }, "copy logits")?;
         } else if want == Out::Argmax {
             let mut ids = vec![0i32; n];
             a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(ids.as_mut_ptr() as *mut c_void, s.picks.ptr, n * 4) }, "copy argmax")?;
@@ -4305,7 +4741,7 @@ impl GpuModel {
             None => self.norm_matmul(norm, &gate_up, s.gu.ptr, 2 * hidden, n, s)?,
         }
         let down = [(down, 0)];
-        if self.dp4a_path(&down, n) {
+        if self.dp4a_path(&down, n, s) {
             // decoding: silu(gate) * up straight to int8 for the down projection
             let nv = (hidden / 4) as u32;
             k.launch(k.silu_q8, (nv.div_ceil(256), n as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(hidden as i32)])?;
@@ -4445,7 +4881,7 @@ impl GpuModel {
 
         if want != Out::None {
             self.timed(7, || {
-                // Last: the last token's logits; Argmax: every token's, reduced on the GPU
+                // Last: the last token's logits; All: every token's; Argmax: every token's, reduced on the GPU
                 let rows = if want == Out::Last { 1 } else { n };
                 let first = s.x.at((n - rows) * dim * 4);
                 k.launch(k.rmsnorm, (rows as u32, 1), 256, 0, &[Arg::P(first), Arg::P(self.output_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
@@ -4468,6 +4904,8 @@ enum Out {
     Last,
     /// the greedy next token after every token of the batch
     Argmax,
+    /// every token's logits, copied to `GpuSession::rows`
+    All,
 }
 
 pub struct GpuSession {
@@ -4488,16 +4926,36 @@ pub struct GpuSession {
     xd: DeviceBuf,       // their per-32 scales
     xsum: DeviceBuf,     // and per-32 sums of the int8 values
     att_part: DeviceBuf, // flash-decoding partial results
-    logits_dev: DeviceBuf, // up to DECODE_MAX_BATCH rows
+    logits_dev: DeviceBuf, // up to VERIFY_MAX_BATCH rows
     picks: DeviceBuf,      // their argmax
     pos_dev: DeviceBuf,    // the position, for CUDA graphs
     moe: std::cell::RefCell<MoeHost>, // host scratch of the CPU expert path
     moe_tab: DeviceBuf,               // a token's GPU-resident experts: matrix addresses, then weights
     graphs: [Ptr; 2],      // captured one-token steps: Last, Argmax
+    exact: std::cell::Cell<bool>, // this pass checks a draft: verify kernels, no prompt kernels
     pub logits: Vec<f32>,
+    pub rows: Vec<f32>, // Out::All: a batch's logits, one vocab-long row per token
 }
 
 impl GpuModel {
+    /// The most tokens a verify batch (forward_argmax, forward_logits) may hold: VERIFY_MAX_BATCH on the
+    /// tensor-core verify kernels, when every matrix is Q4_K or Q6_K and attention is not latent; else
+    /// DECODE_MAX_BATCH.
+    pub fn verify_max(&self) -> usize {
+        let kq = |m: &GpuMatrix| matches!(m.fmt, Fmt::Q4K | Fmt::Q6K);
+        let layers = self.layers.iter().all(|l| {
+            l.mla.is_none()
+                && l.qkv.iter().all(|(m, _)| kq(m))
+                && kq(&l.wo)
+                && matches!(&l.ffn, GpuFfn::Dense { gate_up, down } if gate_up.iter().all(|(m, _)| kq(m)) && kq(down))
+        });
+        if self.k.matmul_vfy.is_some() && !crate::quant::exact_mode() && layers && kq(self.output.as_ref().unwrap_or(&self.embd)) {
+            VERIFY_MAX_BATCH
+        } else {
+            DECODE_MAX_BATCH
+        }
+    }
+
     /// The GPU expert cache's state, if this model has one yet.
     pub fn expert_cache(&self) -> Option<String> {
         self.cache.borrow().as_ref().map(ExpertCache::describe)
@@ -4549,7 +5007,9 @@ impl GpuSession {
             moe: Default::default(),
             moe_tab: DeviceBuf::alloc(4096)?,
             graphs: [std::ptr::null_mut(); 2],
+            exact: Default::default(),
             logits: vec![0.0; cfg.vocab],
+            rows: Vec::new(),
         })
     }
 
@@ -4580,8 +5040,8 @@ impl GpuSession {
             kv,
             scales,
             scales,
-            4 * DECODE_MAX_BATCH * cfg.vocab,
-            4 * DECODE_MAX_BATCH,
+            4 * VERIFY_MAX_BATCH * cfg.vocab,
+            4 * VERIFY_MAX_BATCH,
             4,
         ]
     }

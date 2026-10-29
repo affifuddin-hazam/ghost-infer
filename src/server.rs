@@ -275,7 +275,7 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
             let finish = if hit_stop || st.stopped_on.is_some() { "stop" } else { "length" };
             let _ = job.events.send(Event::Done { finish, prompt_tokens: ids.len(), completion_tokens: st.gen_tokens });
             eprintln!(
-                "[{}: prompt {} tokens ({} new), {} generated in {:.2}s ({:.1} tok/s), finish {finish}]",
+                "[{}: prompt {} tokens ({} new), {} generated in {:.2}s ({:.1} tok/s), finish {finish}{}]",
                 match job.kind {
                     Kind::Chat => "chat",
                     Kind::Completion => "completion",
@@ -285,6 +285,7 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
                 st.gen_tokens,
                 t0.elapsed().as_secs_f64(),
                 st.gen_tokens as f64 / st.gen_secs.max(1e-9),
+                if st.rounds > 0 { format!(", lookup kept {} of {} guessed tokens in {} checks", st.accepted, st.proposed, st.rounds) } else { String::new() },
             );
         }
         Err(e) => {

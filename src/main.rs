@@ -1,6 +1,7 @@
 mod cuda;
 mod gguf;
 mod json;
+mod lookup;
 mod model;
 mod profile;
 mod quant;
@@ -47,6 +48,8 @@ OPTIONS:
         --gpu             run on the NVIDIA GPU (CUDA driver + NVRTC, loaded at runtime)
         --draft <gguf>    speculative decoding with this small model (GPU, greedy; same output, faster)
         --draft-k <n>     tokens the draft proposes per step  [3]
+        --no-lookup       GPU: one token per step, no guesses copied from the context to check in a batch
+                          (also GHOST_INFER_NO_LOOKUP=1)
         --kv <f16|int8>   GPU KV cache: int8 holds about twice the context  [int8, or GHOST_INFER_KV]
         --threads <n>     CPU worker threads                 [physical cores]
         --special         print special tokens
@@ -131,6 +134,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--no-think" => o.no_think = true,
             "--draft" => o.draft = Some(PathBuf::from(val(a)?)),
             "--draft-k" => o.draft_k = num(val(a)?, a)? as usize,
+            "--no-lookup" => lookup::set_off(),
             "--host" => o.host = val(a)?,
             "--port" => o.port = num(val(a)?, a)? as u16,
             "--models" => o.models.push(PathBuf::from(val(a)?)),
@@ -333,14 +337,23 @@ struct Engine<'a> {
     draft: Option<Draft>,
     /// the tokens in the main model's cache, in order (generate_with keeps it; the draft catches up from it)
     hist: Vec<u32>,
+    /// GPU without a draft model: guesses copied from `hist`, and whether they pay (lookup.rs), for sampled
+    /// and greedy requests (their rounds cost and keep differently)
+    lookup: lookup::Lookup,
+    pace: [lookup::Pace; 2],
 }
 
+#[derive(Default)]
 struct Stats {
     prompt_tokens: usize,
     prompt_secs: f64,
     gen_tokens: usize,
     gen_secs: f64,
     stopped_on: Option<u32>,
+    /// lookup decoding: rounds that checked guesses, guesses checked, guesses kept
+    rounds: usize,
+    proposed: usize,
+    accepted: usize,
 }
 
 /// Called with each generated token; Ok(false) stops after it (the token is still read into the cache).
@@ -408,7 +421,7 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
             }
         }
     }
-    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new() })
+    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new(), lookup: Default::default(), pace: Default::default() })
 }
 
 impl Engine<'_> {
@@ -429,7 +442,9 @@ impl Engine<'_> {
     }
 
     /// Feeds `prompt` after what the cache holds, then samples up to `max_new` tokens, handing each to
-    /// `emit`. Greedy sampling with a draft model goes through speculative decoding (same tokens).
+    /// `emit`. Greedy sampling with a draft model goes through speculative decoding (same tokens); on the GPU
+    /// otherwise, guesses looked up in the context are checked in batches (same tokens, or when sampling,
+    /// tokens with the same distribution).
     fn generate_with(&mut self, prompt: &[u32], max_new: usize, sampler: &mut Sampler, emit: Emit) -> Result<Stats, String> {
         if prompt.is_empty() {
             return Err("empty prompt".into());
@@ -459,7 +474,29 @@ impl Engine<'_> {
                 emit(id)
             })?;
             self.hist.extend_from_slice(&ids);
-            return Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on });
+            return Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on, ..Default::default() });
+        }
+        // not for a mixture of experts (a batch runs even the GPU-held experts on the CPU: other arithmetic than
+        // a one-token step, and slower than it pays) or MLA attention (its split changes above 4 tokens)
+        if lookup::enabled() && matches!(&self.backend, Backend::Gpu(m, _) if !m.cfg.is_moe() && m.cfg.mla.is_none()) {
+            self.lookup.sync(&self.hist);
+            let pace = &mut self.pace[sampler.is_greedy() as usize];
+            let before = (pace.rounds, pace.proposed, pace.accepted);
+            let (generated, stopped_on) = lookup_decode(&mut self.backend, &mut self.lookup, pace, sampler, &self.stop, max_new, &mut |id| {
+                ids.push(id);
+                emit(id)
+            })?;
+            self.hist.extend_from_slice(&ids);
+            return Ok(Stats {
+                prompt_tokens: prompt.len(),
+                prompt_secs,
+                gen_tokens: generated,
+                gen_secs: t1.elapsed().as_secs_f64(),
+                stopped_on,
+                rounds: pace.rounds - before.0,
+                proposed: pace.proposed - before.1,
+                accepted: pace.accepted - before.2,
+            });
         }
 
         let mut generated = 0;
@@ -479,7 +516,7 @@ impl Engine<'_> {
             }
         }
         self.hist.extend_from_slice(&ids);
-        Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on })
+        Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on, ..Default::default() })
     }
 
     /// Makes the cache hold only its first `pos` tokens (in the draft model too).
@@ -512,6 +549,9 @@ fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize,
     let mut generated = 0;
     let mut stopped_on = None;
     'decode: loop {
+        if ts.pos >= ts.ctx {
+            break; // a round filled the context: the plain loop stops after reading its last token too
+        }
         generated += 1;
         if honour_stop && stop.contains(&last) {
             stopped_on = Some(last);
@@ -576,6 +616,91 @@ fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize,
         d.sess.pos = ts.pos;
     } else if d.sess.pos < ts.pos {
         d.model.forward_batch(&seq[d.sess.pos - base..], &mut d.sess, false)?;
+    }
+    Ok((generated, stopped_on))
+}
+
+/// Decoding that checks guesses looked up in the context (lookup.rs), after the model has read the prompt:
+/// the model reads the last token and the guesses in one batch, and the guesses it would have picked itself
+/// are kept. Greedy, that is exactly the plain loop's tokens; sampled, each guess is kept with the probability
+/// sampling gives it, so the tokens have exactly the plain loop's distribution. Leaves the cache as the plain
+/// loop leaves it. Returns (tokens generated, stop token if any).
+fn lookup_decode(backend: &mut Backend, lk: &mut lookup::Lookup, pace: &mut lookup::Pace, sampler: &mut Sampler, stop: &[u32], max_new: usize, emit: Emit) -> Result<(usize, Option<u32>), String> {
+    let Backend::Gpu(tm, ts) = backend else { return Err("lookup decoding needs the GPU".into()) };
+    let vocab = ts.logits.len();
+    pace.new_reply();
+    let mut last = sampler.sample(&ts.logits); // decided, not yet read
+    let mut generated = 0;
+    let mut stopped_on = None;
+    'decode: loop {
+        if ts.pos >= ts.ctx {
+            break; // a round filled the context: the plain loop stops after reading its last token too
+        }
+        generated += 1;
+        if stop.contains(&last) {
+            stopped_on = Some(last);
+            break;
+        }
+        lk.push(last);
+        let more = emit(last)?;
+        if !more || generated >= max_new || ts.pos + 1 >= ts.ctx {
+            tm.forward_batch(&[last], ts, false)?; // the plain loop reads its last token too
+            break;
+        }
+        let t = Instant::now();
+        let room = (max_new - generated).min(ts.ctx - ts.pos - 1).min(tm.verify_max() - 1);
+        let (matched, guesses) = match lk.draft(room).filter(|_| pace.drafting()) {
+            Some((matched, toks)) => (matched, toks[..pace.guesses(matched, toks.len())].to_vec()),
+            None => (0, Vec::new()),
+        };
+        if guesses.is_empty() {
+            tm.forward_batch(&[last], ts, true)?;
+            last = sampler.sample(&ts.logits);
+            pace.step(t.elapsed().as_secs_f64());
+            continue;
+        }
+        let tpos0 = ts.pos;
+        let mut batch = vec![last];
+        batch.extend_from_slice(&guesses);
+        let k = guesses.len();
+        let (a, next) = if sampler.is_greedy() {
+            let picks = tm.forward_argmax(&batch, ts)?;
+            let a = guesses.iter().zip(&picks).take_while(|(g, p)| g == p).count();
+            (a, picks[a])
+        } else {
+            tm.forward_logits(&batch, ts)?;
+            let row = |i: usize| &ts.rows[i * vocab..(i + 1) * vocab];
+            let mut a = 0;
+            let mut instead = None;
+            for (i, &g) in guesses.iter().enumerate() {
+                match sampler.accept(row(i), g) {
+                    Ok(()) => a += 1,
+                    Err(t) => {
+                        instead = Some(t);
+                        break;
+                    }
+                }
+            }
+            (a, instead.unwrap_or_else(|| sampler.sample(row(k))))
+        };
+        // keep `last` and the accepted guesses; positions after them get overwritten later
+        ts.pos = tpos0 + 1 + a;
+        pace.round(t.elapsed().as_secs_f64(), matched, k, a);
+        for (i, &g) in guesses[..a].iter().enumerate() {
+            generated += 1;
+            if stop.contains(&g) {
+                ts.pos = tpos0 + 1 + i; // the plain loop does not read a stop token
+                stopped_on = Some(g);
+                break 'decode;
+            }
+            lk.push(g);
+            let more = emit(g)?;
+            if !more || generated >= max_new {
+                ts.pos = tpos0 + 2 + i;
+                break 'decode;
+            }
+        }
+        last = next;
     }
     Ok((generated, stopped_on))
 }
@@ -687,7 +812,7 @@ fn bench(o: &Opts) -> Result<(), String> {
     // GHOST_INFER_VERIFY_N=n: time one n-token decode batch (a speculative verify step) on its own
     if let (Some(n), Backend::Gpu(m, s)) = (std::env::var("GHOST_INFER_VERIFY_N").ok().and_then(|v| v.parse::<usize>().ok()), &mut engine.backend) {
         let batch: Vec<u32> = ids[..n].to_vec();
-        let pos = s.pos;
+        let pos = ids.len(); // right after the prompt, whose cache is still there
         profile::reset();
         let t = Instant::now();
         for _ in 0..10 {
@@ -698,6 +823,24 @@ fn bench(o: &Opts) -> Result<(), String> {
         if profile::enabled() {
             profile::report(10 * n);
         }
+    }
+    // GHOST_INFER_VERIFY_CHECK=n: n one-token steps, then the same n tokens as one verify batch; every row's
+    // logits must match the step's bit for bit
+    if let (Some(n), Backend::Gpu(m, s)) = (std::env::var("GHOST_INFER_VERIFY_CHECK").ok().and_then(|v| v.parse::<usize>().ok()), &mut engine.backend) {
+        let batch: Vec<u32> = ids[..n].to_vec();
+        let pos = ids.len(); // right after the prompt, whose cache is still there
+        s.pos = pos;
+        let mut steps = Vec::new();
+        for &t in &batch {
+            m.forward_batch(&[t], s, true)?;
+            steps.extend_from_slice(&s.logits);
+        }
+        s.pos = pos;
+        m.forward_logits(&batch, s)?;
+        let vocab = s.logits.len();
+        let same = (0..n).filter(|&i| steps[i * vocab..(i + 1) * vocab].iter().zip(&s.rows[i * vocab..]).all(|(a, b)| a.to_bits() == b.to_bits())).count();
+        let worst = steps.iter().zip(&s.rows).fold(0f32, |w, (a, b)| w.max((a - b).abs()));
+        println!("verify check: {same} of {n} rows identical to one-token steps (largest difference {worst:e})");
     }
     engine.print_draft_stats();
     if profile::enabled() {
@@ -770,6 +913,9 @@ fn print_stats(st: &Stats) {
         st.gen_tokens as f64 / st.gen_secs.max(1e-9),
         if st.stopped_on.is_some() { ", stopped at end-of-turn" } else { "" }
     );
+    if st.rounds > 0 {
+        eprintln!("[lookup: {} of {} guessed tokens kept, in {} checks]", st.accepted, st.proposed, st.rounds);
+    }
 }
 
 fn run(o: &Opts) -> Result<(), String> {
