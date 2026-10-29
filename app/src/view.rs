@@ -873,8 +873,8 @@ impl App {
     }
 
     fn status_text(&self) -> String {
-        let rate = match self.started {
-            Some(t) if self.chunks > 1 && self.status == "Writing" => format!(", {:.0} tok/s", self.chunks as f64 / t.elapsed().as_secs_f64().max(0.001)),
+        let rate = match self.writing_since {
+            Some(t) if self.chunks > 1 && self.status == "Writing" => format!(", {:.0} tok/s", (self.chunks - 1) as f64 / t.elapsed().as_secs_f64().max(0.001)),
             _ => String::new(),
         };
         format!("{}{rate}", self.status)

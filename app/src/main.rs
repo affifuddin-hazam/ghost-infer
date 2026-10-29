@@ -521,7 +521,8 @@ struct App {
     thinking: bool,
     busy: Option<task::Handle>,
     started: Option<Instant>,
-    chunks: usize,
+    chunks: usize,               // text pieces of this round so far (about one token each)
+    writing_since: Option<Instant>, // this round's first text: the speed shown counts from it
     context: (f64, f64), // tokens used, context length
     start: Args,         // what the command line asked to open or send once connected
     sidebar: bool,       // the chat list shown (it hides with the pane button)
@@ -674,6 +675,7 @@ impl App {
             busy: None,
             started: None,
             chunks: 0,
+            writing_since: None,
             context: (0.0, 0.0),
             start: args,
             sidebar: true,
@@ -844,8 +846,9 @@ impl App {
             Message::ToggleSidebar => self.sidebar = !self.sidebar,
             Message::Tick => {
                 self.clock = self.born.elapsed().as_millis() as u64;
-                // scheduled runs happen on the server on their own: a look every few seconds
-                if !self.polling && self.api.is_some() && self.clock.saturating_sub(self.polled_at) > 4000 {
+                // scheduled runs happen on the server on their own: a look every few seconds (the first at once)
+                let due = self.background == Json::Null || self.clock.saturating_sub(self.polled_at) > 4000;
+                if !self.polling && self.api.is_some() && due {
                     self.polling = true;
                     return self.call(|api| api.get("/api/background"), Message::Background);
                 }
@@ -1445,7 +1448,7 @@ impl App {
         }
         self.messages.push(Msg::reply());
         self.started = Some(Instant::now());
-        self.chunks = 0;
+        (self.chunks, self.writing_since) = (0, None);
         // the server holds this message until a scheduled run answering in this chat is done
         let waits = self.chat.is_some() && self.background.get("running").and_then(Json::as_str) == self.chat.as_deref();
         self.status = if waits { "Waiting for the scheduled task in this chat to finish".into() } else { "Reading".into() };
@@ -1480,6 +1483,7 @@ impl App {
             }
             "text" => {
                 self.chunks += 1;
+                self.writing_since.get_or_insert_with(Instant::now);
                 self.last_chunk_at = Some(self.born.elapsed().as_millis() as u64);
                 if let Some(m) = self.messages.last_mut() {
                     m.push(&s("text"));
@@ -1531,9 +1535,11 @@ impl App {
                     c.title = title;
                 }
             }
+            // a round ended: the next one's speed counts afresh (not over the tools run in between)
             "context" => {
                 let f = |k: &str| ev.get(k).and_then(Json::as_f64).unwrap_or(0.0);
                 self.context = (f("prompt_tokens") + f("completion_tokens"), f("context_length"));
+                (self.chunks, self.writing_since) = (0, None);
             }
             "done" => {
                 self.finish(&s("finish"));
