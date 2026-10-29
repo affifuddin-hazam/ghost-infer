@@ -287,6 +287,9 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
                 st.gen_tokens as f64 / st.gen_secs.max(1e-9),
                 if st.rounds > 0 { format!(", lookup kept {} of {} guessed tokens in {} checks", st.accepted, st.proposed, st.rounds) } else { String::new() },
             );
+            if let Some(s) = crate::cuda::moe_stats_take(st.gen_tokens) {
+                eprintln!("{s}");
+            }
         }
         Err(e) => {
             // the cache may be half-written: start the next request from scratch

@@ -3120,6 +3120,26 @@ mod os {
         unsafe { PrefetchVirtualMemory(GetCurrentProcess(), r.len(), r.as_ptr(), 0) };
     }
 
+    /// This process's page faults so far and its working set in bytes.
+    pub fn page_faults() -> (u64, u64) {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Pmc {
+            cb: u32,
+            faults: u32,
+            peak_ws: usize,
+            ws: usize,
+            rest: [usize; 6],
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32GetProcessMemoryInfo(p: *mut c_void, c: *mut Pmc, cb: u32) -> i32;
+        }
+        let mut c = Pmc { cb: size_of::<Pmc>() as u32, ..Default::default() };
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        (c.faults as u64, c.ws as u64)
+    }
+
     /// Takes these ranges of mapped memory out of the working set (VirtualUnlock on pages that are not
     /// locked does exactly that): they stay in the file cache, but are the first memory Windows reuses.
     pub fn release(ranges: &[(usize, usize)]) {
@@ -3157,6 +3177,9 @@ mod os {
     }
     pub fn prefetch(_: &[(usize, usize)]) {}
     pub fn release(_: &[(usize, usize)]) {}
+    pub fn page_faults() -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 macro_rules! api {
@@ -3181,6 +3204,7 @@ api! {
     cuDeviceGetAttribute: fn(*mut i32, i32, i32) -> CuResult;
     cuDeviceGetName: fn(*mut c_char, i32, i32) -> CuResult;
     cuCtxCreate_v2: fn(*mut Ptr, u32, i32) -> CuResult;
+    cuCtxSetCurrent: fn(Ptr) -> CuResult;
     cuModuleLoadData: fn(*mut Ptr, *const c_void) -> CuResult;
     cuModuleGetFunction: fn(*mut Ptr, Ptr, *const c_char) -> CuResult;
     cuMemAlloc_v2: fn(*mut u64, usize) -> CuResult;
@@ -3194,6 +3218,7 @@ api! {
     cuCtxSynchronize: fn() -> CuResult;
     cuStreamCreate: fn(*mut Ptr, u32) -> CuResult;
     cuStreamSynchronize: fn(Ptr) -> CuResult;
+    cuStreamDestroy_v2: fn(Ptr) -> CuResult;
     cuMemAllocHost_v2: fn(*mut *mut c_void, usize) -> CuResult;
     cuMemFreeHost: fn(*mut c_void) -> CuResult;
     cuMemcpyHtoDAsync_v2: fn(u64, *const c_void, usize, Ptr) -> CuResult;
@@ -3219,6 +3244,7 @@ api! {
 
 struct Api {
     f: Fns,
+    ctx: usize, // the context, for threads other than the one that made it
     pub device_name: String,
     pub compute: (i32, i32),
     pub nvrtc_path: String,
@@ -3273,7 +3299,7 @@ fn api() -> Result<&'static Api, String> {
         let nvrtc_path = find_nvrtc().ok_or("no NVRTC found (install the CUDA toolkit or set GHOST_INFER_NVRTC)")?;
         let nvrtc = os::open(&nvrtc_path).ok_or_else(|| format!("cannot load {nvrtc_path}"))?;
         let f = Fns::load(cuda, nvrtc)?;
-        let mut api = Api { f, device_name: String::new(), compute: (0, 0), nvrtc_path };
+        let mut api = Api { f, ctx: 0, device_name: String::new(), compute: (0, 0), nvrtc_path };
         unsafe {
             api.check((api.f.cuInit)(0), "init")?;
             let mut dev = 0;
@@ -3287,6 +3313,7 @@ fn api() -> Result<&'static Api, String> {
             api.compute = (major, minor);
             let mut ctx: Ptr = std::ptr::null_mut();
             api.check((api.f.cuCtxCreate_v2)(&mut ctx, 0, dev), "context")?;
+            api.ctx = ctx as usize;
         }
         Ok(api)
     })
@@ -4172,13 +4199,6 @@ impl CpuMoe {
         Ok(CpuMoe { prefetch: Prefetcher::new(), mmap, n_experts: cfg.n_experts, routers, biases, tensors })
     }
 
-    /// Lets Windows reuse the RAM holding expert e of layer l (now in GPU memory) before anything else.
-    fn release_expert(&self, l: usize, e: usize) {
-        let base = self.mmap.as_ptr() as usize;
-        let ranges: Vec<(usize, usize)> = self.tensors[l].iter().map(|t| (base + t.offset + e * t.stride, t.stride)).collect();
-        os::release(&ranges);
-    }
-
     /// Starts reading layer l's experts (those `cached` does not hold in GPU memory) off the disk, as
     /// runs of neighbouring experts in file order.
     fn prefetch_layer(&self, l: usize, cached: &[i32]) {
@@ -4223,28 +4243,144 @@ struct MoeHost {
     scratch: crate::model::MoeScratch,
 }
 
-/// Picks (routing decisions) after which every expert's heat is halved, so the cache follows the
-/// current work rather than freezing on what came first.
-const HEAT_HALF_LIFE: usize = 1024;
-/// Expert uploads per token at most: promotions never stall generation for long.
-const MAX_PROMOTIONS_PER_TOKEN: usize = 8;
+/// Experts queued for upload per token at most (GHOST_INFER_UPLOADS_PER_TOKEN): each moves ~2 MB through RAM
+/// and PCIe in the background, bandwidth the CPU's experts share. Replaying routing traces of varied prompts
+/// (Qwen3-30B-A3B, a third of its experts cached): 8 a token keep 72% of picks on the GPU, 16 80%, 24 84%,
+/// every miss 88%; the cache before this one, which kept the most picked experts, 64%. Through the server
+/// (scripts/bench-moe.py), median tokens/s: 8 30.5, 12 33.0, 16 32.8, 24 28.8.
+fn uploads_per_token() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("GHOST_INFER_UPLOADS_PER_TOKEN").ok().and_then(|v| v.parse().ok()).unwrap_or(12))
+}
 
-/// Experts of a mixture-of-experts model held in GPU memory: the ones the router picks most get a slot
-/// and run on the GPU; the rest run on the CPU. Only layers whose experts the GPU kernels handle (Q3_K
-/// gate and up, Q4_K down) are cached. Placement never changes which experts run, only where (and the
-/// rounding of their sums).
+/// An expert to copy into a cache slot: its gate, up and down in the mapping (address, bytes), the slot's
+/// device address.
+struct UploadJob {
+    l: usize,
+    e: usize,
+    slot: usize,
+    src: [(usize, usize); 3],
+    dst: u64,
+    evicted: Option<[(usize, usize); 3]>, // the expert the slot held, back to the CPU: its pages are read in
+}
+
+/// Copies experts into cache slots on a thread of its own: packs each into one of two pinned buffers and
+/// copies it on a stream of its own, so the GPU's work and the CPU's experts go on meanwhile. Each slot is
+/// reported back once its copy has landed.
+struct ExpertUploader {
+    tx: Option<std::sync::mpsc::Sender<UploadJob>>,
+    done: std::sync::mpsc::Receiver<(usize, usize, usize)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExpertUploader {
+    fn new(slot_bytes: usize, gate_bytes: usize) -> ExpertUploader {
+        use std::sync::mpsc::{channel, TryRecvError};
+        let (tx, rx) = channel::<UploadJob>();
+        let (done_tx, done) = channel();
+        let thread = std::thread::Builder::new()
+            .name("expert upload".into())
+            .spawn(move || {
+                let Ok(a) = api() else { return };
+                let mut stream: Ptr = std::ptr::null_mut();
+                let mut pinned = [std::ptr::null_mut::<c_void>(); 2];
+                let mut events: [Ptr; 2] = [std::ptr::null_mut(); 2];
+                let ok = unsafe {
+                    (a.f.cuCtxSetCurrent)(a.ctx as Ptr) == 0
+                        && (a.f.cuStreamCreate)(&mut stream, 1) == 0 // CU_STREAM_NON_BLOCKING
+                        && (0..2).all(|i| (a.f.cuMemAllocHost_v2)(&mut pinned[i], slot_bytes) == 0 && (a.f.cuEventCreate)(&mut events[i], 2) == 0)
+                };
+                if !ok {
+                    return; // no uploads: the CPU keeps running these experts
+                }
+                let mut inflight: [Option<((usize, usize, usize), [(usize, usize); 3])>; 2] = [None, None];
+                let mut b = 0;
+                // a landed copy: its slot is reported, and the expert's pages leave the working set (it runs
+                // from GPU memory now; RAM is usually short of the whole model, and the CPU's experts need it)
+                let land = |i: usize, inflight: &mut [Option<((usize, usize, usize), [(usize, usize); 3])>; 2]| {
+                    if let Some((d, src)) = inflight[i].take() {
+                        unsafe { (a.f.cuEventSynchronize)(events[i]) };
+                        let _ = done_tx.send(d);
+                        os::release(&src);
+                    }
+                };
+                loop {
+                    let job = match rx.try_recv() {
+                        Ok(j) => j,
+                        Err(TryRecvError::Disconnected) => break,
+                        Err(TryRecvError::Empty) => {
+                            // nothing waiting: let the copies in flight land, then sleep until there is
+                            land(0, &mut inflight);
+                            land(1, &mut inflight);
+                            match rx.recv() {
+                                Ok(j) => j,
+                                Err(_) => break,
+                            }
+                        }
+                    };
+                    land(b, &mut inflight); // this buffer's last copy is done with it
+                    // SAFETY: the mapping outlives this thread (see GpuModel), and nothing else writes the buffer
+                    let src = job.src.map(|(at, n)| unsafe { std::slice::from_raw_parts(at as *const u8, n) });
+                    let buf = unsafe { std::slice::from_raw_parts_mut(pinned[b] as *mut u8, slot_bytes) };
+                    let bytes = ExpertCache::pack_parts(src[0], src[1], src[2], gate_bytes, buf);
+                    unsafe {
+                        (a.f.cuMemcpyHtoDAsync_v2)(job.dst, pinned[b], bytes, stream);
+                        (a.f.cuEventRecord)(events[b], stream);
+                    }
+                    inflight[b] = Some(((job.l, job.e, job.slot), job.src));
+                    b ^= 1;
+                    // the expert this one replaces runs on the CPU from now on: fault its pages back into the
+                    // working set here, while the copy runs, rather than in the middle of a token
+                    if let Some(ranges) = job.evicted {
+                        os::prefetch(&ranges);
+                        for (at, n) in ranges {
+                            for p in (at..at + n).step_by(4096) {
+                                unsafe { std::ptr::read_volatile(p as *const u8) };
+                            }
+                        }
+                    }
+                }
+                unsafe {
+                    (a.f.cuStreamSynchronize)(stream);
+                    for i in 0..2 {
+                        (a.f.cuMemFreeHost)(pinned[i]);
+                        (a.f.cuEventDestroy_v2)(events[i]);
+                    }
+                    (a.f.cuStreamDestroy_v2)(stream);
+                }
+            })
+            .ok();
+        ExpertUploader { tx: Some(tx), done, thread }
+    }
+}
+
+impl Drop for ExpertUploader {
+    fn drop(&mut self) {
+        self.tx = None; // the thread finishes its copies and stops
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Experts of a mixture-of-experts model held in GPU memory: an expert the CPU had to run is copied in (in
+/// the background, up to `uploads_per_token`), over the one picked least recently. Consecutive tokens
+/// reuse many experts, so recency predicts the next picks better than counts. Only layers whose experts
+/// the GPU kernels handle (Q3_K gate and up, Q4_K down) are cached. Placement never changes which experts
+/// run, only where (and the rounding of their sums).
 struct ExpertCache {
+    uploader: ExpertUploader, // first: its thread stops (copies landed) before the slots are freed
     buf: DeviceBuf,
     slot_bytes: usize,
     gate_bytes: usize,                  // repacked gate (= up) matrix; down follows both
     slot_of: Vec<Vec<i32>>,             // [layer][expert] -> slot, or -1
     owner: Vec<Option<(usize, usize)>>, // per slot: (layer, expert)
     free: Vec<usize>,
-    heat: Vec<Vec<f32>>, // [layer][expert]: picks, halved every HEAT_HALF_LIFE tokens
+    used: Vec<u64>,          // per slot: the layer step that last picked its expert (u64::MAX: being copied)
+    clock: u64,              // layer steps so far
+    queued: Vec<Vec<bool>>,  // [layer][expert]: on its way into a slot
+    sent: usize,             // uploads queued this token
     cacheable: Vec<bool>,
-    tokens: usize,
-    promoted_this_token: usize,
-    staging: Vec<u8>,
     pub uploads: usize,
     // prompt batches: every expert runs on the GPU, the uncached ones staged through two pinned buffers
     // into two scratch slots (double-buffered: the next expert's copy overlaps this one's maths)
@@ -4297,17 +4433,18 @@ impl ExpertCache {
             a.check(unsafe { (a.f.cuEventCreate)(&mut events[i], 0) }, "event")?;
         }
         Ok(ExpertCache {
+            uploader: ExpertUploader::new(slot_bytes, gate_bytes),
             buf: DeviceBuf::alloc(slots * slot_bytes)?,
             slot_bytes,
             gate_bytes,
             slot_of: vec![vec![-1; cfg.n_experts]; cfg.n_layers],
             owner: vec![None; slots],
             free: (0..slots).rev().collect(),
-            heat: vec![vec![0.0; cfg.n_experts]; cfg.n_layers],
+            used: vec![0; slots],
+            clock: 0,
+            queued: vec![vec![false; cfg.n_experts]; cfg.n_layers],
+            sent: 0,
             cacheable,
-            tokens: 0,
-            promoted_this_token: 0,
-            staging: vec![0u8; slot_bytes],
             uploads: 0,
             routers,
             pinned,
@@ -4326,8 +4463,12 @@ impl ExpertCache {
     /// blocks as they are.
     fn pack(moe: &CpuMoe, l: usize, e: usize, gate_bytes: usize, out: &mut [u8]) -> usize {
         let ex = moe.expert(l, e);
-        for (m, dst) in [(ex.gate, 0), (ex.up, gate_bytes)] {
-            for (blk, o) in m.data.chunks_exact(110).zip(out[dst..dst + gate_bytes].chunks_exact_mut(Q3K_GPU_BYTES)) {
+        Self::pack_parts(ex.gate.data, ex.up.data, ex.down.data, gate_bytes, out)
+    }
+
+    fn pack_parts(gate: &[u8], up: &[u8], down: &[u8], gate_bytes: usize, out: &mut [u8]) -> usize {
+        for (m, dst) in [(gate, 0), (up, gate_bytes)] {
+            for (blk, o) in m.chunks_exact(110).zip(out[dst..dst + gate_bytes].chunks_exact_mut(Q3K_GPU_BYTES)) {
                 o[..12].copy_from_slice(&blk[96..108]); // scales
                 o[12..14].copy_from_slice(&blk[108..110]); // d
                 o[14..16].fill(0);
@@ -4335,8 +4476,8 @@ impl ExpertCache {
                 o[48..112].copy_from_slice(&blk[32..96]); // 2-bit pairs
             }
         }
-        out[2 * gate_bytes..2 * gate_bytes + ex.down.data.len()].copy_from_slice(ex.down.data);
-        2 * gate_bytes + ex.down.data.len()
+        out[2 * gate_bytes..2 * gate_bytes + down.len()].copy_from_slice(down);
+        2 * gate_bytes + down.len()
     }
 
     /// An uncached expert into the next scratch slot (asynchronously, on the launch stream): returns
@@ -4377,78 +4518,78 @@ impl ExpertCache {
         [base, base + self.gate_bytes as u64, base + 2 * self.gate_bytes as u64]
     }
 
-    /// Copies expert e of layer l into `slot`: gate and up repacked to 112-byte Q3_K blocks (16-byte
-    /// header first), down as its Q4_K blocks.
-    fn upload(&mut self, moe: &CpuMoe, l: usize, e: usize, slot: usize) -> Result<(), String> {
-        Self::pack(moe, l, e, self.gate_bytes, &mut self.staging);
-        let a = api()?;
-        let dst = self.buf.ptr + (slot * self.slot_bytes) as u64;
-        a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(dst, self.staging.as_ptr() as *const c_void, self.slot_bytes) }, "expert upload")?;
-        if let Some((ol, oe)) = self.owner[slot] {
-            self.slot_of[ol][oe] = -1;
+    /// Marks the slots whose copies have landed as holding their experts.
+    fn collect(&mut self) {
+        while let Ok((l, e, slot)) = self.uploader.done.try_recv() {
+            self.slot_of[l][e] = slot as i32;
+            self.queued[l][e] = false;
+            self.used[slot] = self.clock;
+            self.uploads += 1;
         }
-        self.owner[slot] = Some((l, e));
-        self.slot_of[l][e] = slot as i32;
-        self.uploads += 1;
-        // it runs from GPU memory from now on: its file pages need not hold RAM the CPU's experts could use
-        moe.release_expert(l, e);
-        Ok(())
     }
 
-    /// Records layer l's picks and promotes uncached ones: into a free slot, or over the coldest
-    /// resident when clearly hotter (25% + 4 picks, so the cache does not churn).
-    fn note(&mut self, moe: &CpuMoe, l: usize, picks: &[(usize, f32)]) -> Result<(), String> {
-        for &(e, _) in picks {
-            self.heat[l][e] += 1.0;
-        }
+    /// Layer l's picks: the cached ones count as used now; the others are queued for upload (a prompt batch
+    /// only fills free slots; a token may also replace the least recently picked, up to its share).
+    fn note(&mut self, moe: &CpuMoe, l: usize, picks: &[(usize, f32)], prompt: bool) {
+        self.collect();
+        self.clock += 1;
         if !self.cacheable[l] || self.slots() == 0 {
-            return Ok(());
+            return;
         }
         for &(e, _) in picks {
-            if self.slot_of[l][e] >= 0 {
+            let slot = self.slot_of[l][e];
+            if slot >= 0 {
+                self.used[slot as usize] = self.clock;
+            }
+        }
+        for &(e, _) in picks {
+            if self.slot_of[l][e] >= 0 || self.queued[l][e] {
                 continue;
             }
-            // free slots fill without limit (the cache warms up during the first prompt); evictions are rationed
+            let base = moe.mmap.as_ptr() as usize;
+            let ranges = |l: usize, e: usize| moe.tensors[l].map(|t| (base + t.offset + e * t.stride, t.stride));
+            let mut evicted = None;
             let slot = match self.free.pop() {
                 Some(s) => s,
-                None if self.promoted_this_token >= MAX_PROMOTIONS_PER_TOKEN => continue,
+                None if prompt || self.sent >= uploads_per_token() => continue,
                 None => {
-                    let heat = &self.heat;
-                    let (slot, cold) = self
-                        .owner
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(s, o)| o.map(|(ol, oe)| (s, heat[ol][oe])))
-                        .min_by(|a, b| a.1.total_cmp(&b.1))
-                        .unwrap();
-                    if self.heat[l][e] <= cold * 1.25 + 4.0 {
+                    // the least recently picked (nothing picked this step: those may be in use on the GPU)
+                    let (s, &when) = self.used.iter().enumerate().min_by_key(|(_, u)| **u).unwrap();
+                    if when >= self.clock - 1 {
                         continue;
                     }
-                    slot
+                    let (ol, oe) = self.owner[s].unwrap();
+                    self.slot_of[ol][oe] = -1;
+                    evicted = Some(ranges(ol, oe));
+                    s
                 }
             };
-            if self.owner[slot].is_some() {
-                self.promoted_this_token += 1;
+            self.sent += 1;
+            moe_stat(MS_UPLOADS, 1);
+            self.owner[slot] = Some((l, e));
+            self.used[slot] = u64::MAX;
+            self.queued[l][e] = true;
+            let job = UploadJob { l, e, slot, src: ranges(l, e), dst: self.ptrs(slot)[0], evicted };
+            if self.uploader.tx.as_ref().is_none_or(|tx| tx.send(job).is_err()) {
+                // no upload thread: give the slot back
+                self.owner[slot] = None;
+                self.used[slot] = 0;
+                self.queued[l][e] = false;
+                self.free.push(slot);
+                return;
             }
-            self.upload(moe, l, e, slot)?;
         }
-        Ok(())
     }
 
     /// Slots, how many hold an expert, and uploads so far (GHOST_INFER_LOAD_TIMES reports them).
     fn describe(&self) -> String {
-        let used = self.owner.iter().filter(|o| o.is_some()).count();
+        let used = self.slot_of.iter().flatten().filter(|s| **s >= 0).count();
         format!("{} slots ({} MB), {used} in use, {} uploads, {} staged for prompts", self.slots(), self.slots() * self.slot_bytes >> 20, self.uploads, self.staged)
     }
 
-    /// Called once per generated (or prompt) token.
-    fn tick(&mut self, n: usize) {
-        self.promoted_this_token = 0;
-        let before = self.tokens / HEAT_HALF_LIFE;
-        self.tokens += n;
-        if self.tokens / HEAT_HALF_LIFE != before {
-            self.heat.iter_mut().flatten().for_each(|h| *h *= 0.5);
-        }
+    /// Called once per forward pass.
+    fn tick(&mut self, _n: usize) {
+        self.sent = 0;
     }
 }
 
@@ -4459,9 +4600,10 @@ pub struct GpuModel {
     output: Option<GpuMatrix>, // None = tied to the embedding
     output_norm: DeviceBuf,
     layers: Vec<GpuLayer>,
-    moe: Option<CpuMoe>,
-    /// the GPU-resident experts, made on the first forward pass from the memory left then
+    /// the GPU-resident experts, made on the first forward pass from the memory left then (before `moe`:
+    /// its upload thread reads the mapping, so it stops first)
     cache: std::cell::RefCell<Option<ExpertCache>>,
+    moe: Option<CpuMoe>,
     prefill_shared: Option<usize>,
     pub device: String,
     /// Q8_0 weights decode with int8 activations too (for draft models; otherwise exact f32)
@@ -5060,7 +5202,7 @@ impl GpuModel {
         } else {
             k.launch(k.add_rows, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(cpu), Arg::I(len as i32)])?;
         }
-        let noted = cache.note(moe, l, &h.picks);
+        cache.note(moe, l, &h.picks, false);
         if let (Some(t0), Some(t1), Some(t2), Some(t4)) = (t0, t1, t2, t4) {
             let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
             let t3 = t3.unwrap_or(t4);
@@ -5073,7 +5215,7 @@ impl GpuModel {
             moe_stat(MS_BACK, ns(t3, t4));
             moe_stat(MS_NOTE, ns(t4, Instant::now()));
         }
-        noted
+        Ok(())
     }
 
     /// Mixture of experts for a prompt batch, all on the GPU: routed there (f32), grouped by expert on the
@@ -5112,7 +5254,7 @@ impl GpuModel {
             }
             h.picks.extend_from_slice(&h.cpu_picks);
         }
-        cache.note(moe, l, &h.picks)?;
+        cache.note(moe, l, &h.picks, true);
 
         // each expert's tokens, then all their weights, in one table
         let mut lists: Vec<Vec<(i32, f32)>> = vec![Vec::new(); ne];
@@ -5561,8 +5703,9 @@ const MOE_GPU_MIN_BATCH: usize = 32;
 
 /// GHOST_INFER_MOE_STATS=1: where a mixture of experts' one-token steps go. Per layer step: picks found in the
 /// expert cache and not; time waiting for the GPU (the copy to the host), routing, the CPU's experts, the copy
-/// back, and the cache's bookkeeping and uploads.
-static MOE_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// back, and the cache's bookkeeping; uploads queued.
+static MOE_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const MS_UPLOADS: usize = 8;
 const MS_HITS: usize = 0;
 const MS_MISSES: usize = 1;
 const MS_STEPS: usize = 2;
@@ -5587,10 +5730,17 @@ pub fn moe_stats_take(tokens: usize) -> Option<String> {
     let tokens = tokens.max(1) as f64;
     let ms = |i: usize| v[i] as f64 / 1e6 / tokens;
     let hits = v[MS_HITS] as f64 / (v[MS_HITS] + v[MS_MISSES]).max(1) as f64;
+    // page faults of the whole process (the upload thread's included) since the last report
+    static FAULTS: AtomicU64 = AtomicU64::new(0);
+    let (faults, working_set) = os::page_faults();
+    let new_faults = faults.saturating_sub(FAULTS.swap(faults, Ordering::Relaxed));
     Some(format!(
-        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache; per token: waiting for the GPU {:.2} ms, routing {:.2} ms, CPU experts {:.2} ms, copy back {:.2} ms, cache upkeep {:.2} ms]",
+        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache, {:.1} uploads and {:.0} page faults per token (working set {} MB); per token: waiting for the GPU {:.2} ms, routing {:.2} ms, CPU experts {:.2} ms, copy back {:.2} ms, cache upkeep {:.2} ms]",
         v[MS_STEPS],
         100.0 * hits,
+        v[MS_UPLOADS] as f64 / tokens,
+        new_faults as f64 / tokens,
+        working_set >> 20,
         ms(MS_WAIT),
         ms(MS_ROUTE),
         ms(MS_CPU),
