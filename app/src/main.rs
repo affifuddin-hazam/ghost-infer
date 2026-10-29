@@ -463,6 +463,23 @@ fn load_settings() -> Saved {
     }
 }
 
+/// A link from a reply, in the default browser. Only web links: a reply could link to a program or a file.
+/// Handed to Windows as it is (ShellExecuteW): `cmd /C start` would run whatever follows an & in it.
+fn open_link(url: &str) {
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return;
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(hwnd: isize, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
+    }
+    const SW_SHOWNORMAL: i32 = 1;
+    let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (op, file) = (w("open"), w(url.trim()));
+    unsafe { ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+}
+
 /// Whether Windows is set to dark mode for apps (HKCU\...\Personalize\AppsUseLightTheme = 0).
 fn windows_dark() -> bool {
     #[link(name = "advapi32")]
@@ -1177,10 +1194,7 @@ impl App {
                     return iced::clipboard::write(m.answer_text());
                 }
             }
-            Message::Link(url) => {
-                // open in the default browser
-                let _ = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
-            }
+            Message::Link(url) => open_link(&url),
         }
         Task::none()
     }
