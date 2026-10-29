@@ -111,9 +111,10 @@ impl ToolLine {
         ToolLine { id: id.to_string(), name: name.to_string(), arguments: arguments.to_string(), result: None, denied: false, open: false, ask: None, round: 0 }
     }
 
-    /// The harness sending the reply back to check the code it changed, shown as a step (its words inside).
-    fn nudge(text: &str) -> ToolLine {
-        ToolLine { result: Some(text.to_string()), ..ToolLine::new("nudge", "check_work", "{}") }
+    /// The harness sending the reply back, shown as a step (its words inside): to check the code it changed,
+    /// or (`goal`) to carry on with its task list's open steps.
+    fn nudge(text: &str, goal: bool) -> ToolLine {
+        ToolLine { result: Some(text.to_string()), ..ToolLine::new("nudge", if goal { "keep_going" } else { "check_work" }, "{}") }
     }
 
     /// Whether it changed a file (so the reply can be undone).
@@ -159,6 +160,7 @@ struct Msg {
     checkpoint: Option<String>, // where the reply's file changes are kept, for undo
     changed: bool,              // it changed files
     undone: bool,
+    scheduled: bool, // a user message the scheduler sent (a task or the heartbeat), shown by its label
 }
 
 impl Msg {
@@ -174,6 +176,7 @@ impl Msg {
             checkpoint: None,
             changed: false,
             undone: false,
+            scheduled: false,
         }
     }
 
@@ -280,6 +283,10 @@ fn tool_label(t: &ToolLine) -> String {
         "search_chats" => format!("Searched earlier chats for \"{}\"", s("query")),
         "read_chat" => "Read an earlier chat".into(),
         "check_work" => "Asked to check its work".into(),
+        "keep_going" => "Sent back to its open steps".into(),
+        "schedule_task" => format!("Scheduled \"{}\"", if s("name").is_empty() { s("prompt") } else { s("name") }),
+        "list_schedules" => "Listed the scheduled tasks".into(),
+        "cancel_schedule" => format!("Cancelled scheduled task {}", s("id")),
         n if n.starts_with("mcp__") => {
             let (server, tool) = mcp_parts(n);
             format!("Used {tool} ({server} MCP)")
@@ -402,6 +409,7 @@ pub struct ChatItem {
     pub id: String,
     pub title: String,
     pub updated: f64, // milliseconds since 1970
+    pub unread: bool, // a scheduled run wrote to it since the user last opened it
 }
 
 /// The open menu, if any.
@@ -431,6 +439,7 @@ struct Saved {
     rail: bool,                 // the rail is shown
     load_last: bool,            // the launcher starts the server with the last picked model
     last_model: Option<String>, // the model last picked in the app
+    keep_going: bool,           // the goal loop: replies keep at their task list until it is done
 }
 
 fn load_settings() -> Saved {
@@ -450,6 +459,7 @@ fn load_settings() -> Saved {
         rail: j.get("rail").and_then(Json::as_bool).unwrap_or(false),
         load_last: j.get("load_last").and_then(Json::as_bool).unwrap_or(false),
         last_model: j.get("last_model").and_then(Json::as_str).map(String::from),
+        keep_going: j.get("keep_going").and_then(Json::as_bool).unwrap_or(false),
     }
 }
 
@@ -502,6 +512,7 @@ struct App {
     folder: Option<String>,  // the first folder file tools may use, by its name
     folders: Vec<String>,    // every folder file tools may use (the server's harness settings)
     tools: Vec<String>,      // the tool groups that are on
+    keep_going: bool,        // the goal loop is on (the + menu)
     repaint: bool,           // flipped on every change but the ghost's tick: the whole window is drawn again
     maximized: bool,         // the window fills the screen (no resize edges; the button shows "restore")
     window: iced::Size,      // the window's size, to place menus
@@ -520,6 +531,9 @@ struct App {
     skill_choices: Option<(String, Vec<(String, String, String)>)>, // a source with several skills: it, and each one's path, name, description
     mcp: Vec<(String, String, usize)>, // MCP servers: name, state, how many tools
     mcp_config: String,      // where mcp.json is
+    background: Json,        // what runs on its own: the scheduled tasks and the heartbeat (/api/background)
+    polled_at: u64,          // when /api/background was last asked (the clock), while no answer is pending
+    polling: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -555,6 +569,7 @@ enum Message {
     DeleteCurrent,
     ToggleTool(usize, usize), // a reply's tool line opened or closed
     ToggleGroup(&'static str),
+    ToggleKeepGoing,
     Approve(String, &'static str), // a call's id, and "once", "always" or "deny"
     Approved(Result<Json, String>),
     Undo(usize),
@@ -598,12 +613,18 @@ enum Message {
     McpReload,
     McpImport,
     McpEdit,
+    Background(Result<Json, String>),
+    SetHeartbeat(u32), // minutes between checks; 0: off
+    EditHeartbeat,
+    RunScheduled(String), // a task's id, or "heartbeat": now
+    CancelScheduled(String),
+    Read(Result<Json, String>),
 }
 
 impl App {
     fn new(args: Args) -> (App, Task<Message>) {
         let addr = args.addr.clone();
-        let Saved { mode, tools, rail, load_last, last_model } = load_settings();
+        let Saved { mode, tools, rail, load_last, last_model, keep_going } = load_settings();
         let dark = match mode {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
@@ -643,6 +664,7 @@ impl App {
             folder: None,
             folders: Vec::new(),
             tools,
+            keep_going,
             repaint: false,
             maximized: false,
             window: iced::Size::new(1180.0, 780.0),
@@ -661,15 +683,19 @@ impl App {
             skill_choices: None,
             mcp: Vec::new(),
             mcp_config: String::new(),
+            background: Json::Null,
+            polled_at: 0,
+            polling: false,
         };
         (app, Task::perform(blocking(move || connect(&addr)), Message::Connected))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if !matches!(message, Message::Tick | Message::Agent(_) | Message::Hover(_)) {
+        if !matches!(message, Message::Tick | Message::Agent(_) | Message::Hover(_) | Message::Background(_) | Message::Read(_)) {
             self.last_active = Instant::now();
         }
-        if !matches!(message, Message::Tick) {
+        // the background poll repaints only when it brings news (it sets `repaint` itself)
+        if !matches!(message, Message::Tick | Message::Background(_)) {
             self.repaint = !self.repaint;
         }
         match message {
@@ -723,7 +749,20 @@ impl App {
                     return self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded);
                 }
             }
-            Message::ChatLoaded(Ok(chat)) => self.show_chat(&chat),
+            Message::ChatLoaded(Ok(chat)) => {
+                self.show_chat(&chat);
+                // opened with a scheduled run's reply in it: seen now
+                if chat.get("unread").and_then(Json::as_bool).unwrap_or(false) {
+                    let body = obj(vec![("id", chat.get("id").cloned().unwrap_or(Json::Null))]);
+                    return self.call(
+                        move |api| {
+                            api.post("/api/chats/read", &body)?;
+                            api.get("/api/chats")
+                        },
+                        Message::Read,
+                    );
+                }
+            }
             Message::NewChat => {
                 if self.busy.is_none() {
                     self.chat = None;
@@ -786,7 +825,74 @@ impl App {
             Message::ToggleThinking => self.thinking = !self.thinking,
             Message::ShowEarlier => self.shown += SHOWN,
             Message::ToggleSidebar => self.sidebar = !self.sidebar,
-            Message::Tick => self.clock = self.born.elapsed().as_millis() as u64,
+            Message::Tick => {
+                self.clock = self.born.elapsed().as_millis() as u64;
+                // scheduled runs happen on the server on their own: a look every few seconds
+                if !self.polling && self.api.is_some() && self.clock.saturating_sub(self.polled_at) > 4000 {
+                    self.polling = true;
+                    return self.call(|api| api.get("/api/background"), Message::Background);
+                }
+            }
+            Message::Background(r) => {
+                self.polling = false;
+                self.polled_at = self.clock;
+                let Ok(j) = r else { return Task::none() };
+                let seq = |j: &Json| j.get("seq").and_then(Json::as_f64).unwrap_or(0.0);
+                let running = |j: &Json| j.get("running").and_then(Json::as_str).map(String::from);
+                if seq(&j) == seq(&self.background) {
+                    return Task::none();
+                }
+                self.repaint = !self.repaint;
+                let (was, now) = (running(&self.background), running(&j));
+                let first = self.background == Json::Null;
+                self.background = j;
+                if first {
+                    return Task::none();
+                }
+                let mut tasks = vec![self.call(|api| api.get("/api/chats"), Message::Chats)];
+                // a run ended: if it wrote to the open chat, that chat is shown again with it
+                if let Some(c) = was.filter(|_| now.is_none()) {
+                    if self.busy.is_none() && (self.chat.as_deref() == Some(c.as_str()) || c.is_empty()) {
+                        if let Some(id) = self.chat.clone() {
+                            tasks.push(self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded));
+                        }
+                    }
+                    if self.busy.is_none() {
+                        self.status = String::new();
+                    }
+                } else if now.is_some() && self.busy.is_none() {
+                    self.status = "A scheduled task is running".into();
+                }
+                return Task::batch(tasks);
+            }
+            Message::SetHeartbeat(every) => {
+                let body = obj(vec![("every", num(every as f64)), ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())), ("thinking", Json::Bool(self.thinking))]);
+                return self.call(move |api| api.post("/api/schedules/heartbeat", &body), Message::Background);
+            }
+            // the checklist in Notepad, made first when missing (the next check reads it)
+            Message::EditHeartbeat => {
+                let Some(path) = self.background.get("heartbeat").and_then(|h| h.get("file")).and_then(Json::as_str).map(String::from) else { return Task::none() };
+                let file = std::path::Path::new(&path);
+                if !file.exists() {
+                    let note = "<!-- The heartbeat's checklist: while the heartbeat is on, ghost goes through it every so often and tells you only when something needs you (a reply of HEARTBEAT_OK is dropped). Keep it short: it is read on every check. Comments like this one are left out, and a file with only headings is not checked at all. -->\n\n# Heartbeat checklist\n\n- \n";
+                    if let Err(e) = std::fs::write(file, note) {
+                        self.status = format!("Couldn't make {path}: {e}");
+                        return Task::none();
+                    }
+                }
+                let _ = std::process::Command::new("notepad").arg(file).spawn();
+            }
+            Message::RunScheduled(id) => {
+                self.status = "It runs as soon as nothing else is".into();
+                let body = obj(vec![("id", str(&id))]);
+                return self.call(move |api| api.post("/api/schedules/run", &body), Message::Background);
+            }
+            Message::CancelScheduled(id) => {
+                let body = obj(vec![("id", str(&id))]);
+                return self.call(move |api| api.post("/api/schedules/cancel", &body), Message::Background);
+            }
+            Message::Read(Ok(c)) => self.set_chats(&c),
+            Message::Read(Err(_)) => {}
             Message::Menu(m) => self.menu = m,
             Message::ToggleTheme => {
                 self.set_dark(!self.dark);
@@ -813,6 +919,10 @@ impl App {
                     }
                     None => self.tools.push(g.to_string()),
                 }
+                self.save_settings();
+            }
+            Message::ToggleKeepGoing => {
+                self.keep_going = !self.keep_going;
                 self.save_settings();
             }
             Message::Approve(id, decision) => {
@@ -1097,6 +1207,7 @@ impl App {
             ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())),
             ("rail", Json::Bool(self.rail)),
             ("load_last", Json::Bool(self.load_last)),
+            ("keep_going", Json::Bool(self.keep_going)),
         ];
         if let Some(m) = &self.last_model {
             fields.push(("last_model", str(m)));
@@ -1193,6 +1304,7 @@ impl App {
                     id: c.get("id")?.as_str()?.to_string(),
                     title: c.get("title").and_then(Json::as_str).unwrap_or("").to_string(),
                     updated: c.get("updated").and_then(Json::as_f64).unwrap_or(0.0),
+                    unread: c.get("unread").and_then(Json::as_bool).unwrap_or(false),
                 })
             })
             .collect();
@@ -1244,11 +1356,18 @@ impl App {
         for m in chat.get("messages").and_then(Json::as_array).unwrap_or(&[]) {
             let content = m.get("content").and_then(Json::as_str).unwrap_or("");
             match m.get("role").and_then(Json::as_str) {
-                // the harness check-your-work nudge: a step in the reply, not a message of the user
+                // the harness sending the reply back (check your work, keep going): a step in the reply, not
+                // a message of the user
                 Some("user") if m.get("auto").and_then(Json::as_bool).unwrap_or(false) => {
                     if let Some(reply) = self.messages.last_mut().filter(|r| r.role == Role::Assistant) {
-                        reply.add_tool(ToolLine::nudge(content));
+                        reply.add_tool(ToolLine::nudge(content, m.get("goal").and_then(Json::as_bool).unwrap_or(false)));
                     }
+                }
+                // sent by the scheduler: its short label, not the whole prompt the model got
+                Some("user") if m.get("shown").is_some() => {
+                    let mut msg = Msg::user(m.get("shown").and_then(Json::as_str).unwrap_or(content));
+                    msg.scheduled = true;
+                    self.messages.push(msg);
                 }
                 Some("user") => self.messages.push(Msg::user(content)),
                 Some("assistant") => {
@@ -1290,7 +1409,7 @@ impl App {
         if self.busy.is_some() {
             return Task::none();
         }
-        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())), ("max_tokens", num(4096.0))];
+        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())), ("max_tokens", num(4096.0)), ("keep_going", Json::Bool(self.keep_going))];
         if let Some(id) = &self.chat {
             body.push(("chat", str(id)));
         }
@@ -1313,7 +1432,9 @@ impl App {
         self.messages.push(Msg::reply());
         self.started = Some(Instant::now());
         self.chunks = 0;
-        self.status = "Reading".into();
+        // the server holds this message until a scheduled run answering in this chat is done
+        let waits = self.chat.is_some() && self.background.get("running").and_then(Json::as_str) == self.chat.as_deref();
+        self.status = if waits { "Waiting for the scheduled task in this chat to finish".into() } else { "Reading".into() };
         let body = obj(body);
         let (tx, rx) = mpsc::unbounded();
         std::thread::spawn(move || {
@@ -1359,10 +1480,11 @@ impl App {
             }
             "tasks" => self.tasks = tasks_of(ev.get("tasks")),
             "nudge" => {
+                let goal = s("kind") == "goal";
                 if let Some(m) = self.messages.last_mut() {
-                    m.add_tool(ToolLine::nudge(&s("text")));
+                    m.add_tool(ToolLine::nudge(&s("text"), goal));
                 }
-                self.status = "Checking its work".into();
+                self.status = if goal { "Carrying on with its plan".into() } else { "Checking its work".into() };
             }
             "tool_result" => {
                 let id = s("id");

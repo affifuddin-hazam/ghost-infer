@@ -14,11 +14,17 @@
 //!   {"type":"done","finish"} or {"type":"error","message"}
 //!   {"type":"tasks","tasks"}                      the model's task list changed: [{"text","status"}]
 //!   {"type":"title","id","title"}                 after a chat's first reply: the title the model gave it
+//!   {"type":"nudge","kind","text"}                the harness sent the model back: "check" its work, or keep
+//!                                                 going on its task list ("goal")
+//!
+//! Scheduled tasks and the heartbeat (schedule.rs) run here too, with nobody watching: their events go
+//! nowhere, the chat file keeps it all, and the chat is marked unread for the clients.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +45,10 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"remember","description":"Save a lasting fact about the user or this computer for future chats: a preference, where their projects live, how a program runs here. Not for details of one task.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"forget","description":"Forget a remembered fact that is wrong or no longer true.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact as it was saved"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"search_chats","description":"Search the user's earlier chats with you, for when they refer to something you talked about before. Returns matching chats with their id, title, date and the lines that match.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Words to look for"}},"required":["query"]}}},
-  {"type":"function","function":{"name":"read_chat","description":"Read an earlier chat found with search_chats.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The chat's id"}},"required":["id"]}}}
+  {"type":"function","function":{"name":"read_chat","description":"Read an earlier chat found with search_chats.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The chat's id"}},"required":["id"]}}},
+  {"type":"function","function":{"name":"schedule_task","description":"Do something later, or again and again, even while the user is away: remind them, check on something, run a job. At that time the prompt is sent to you in this chat, and you work on it with the same tools (only those the user allows without asking). Give exactly one of in_minutes, at, every_minutes or daily_at.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"What to do then, as an instruction to yourself, with every detail needed (you may not remember this chat by then)"},"name":{"type":"string","description":"A short name for it, a few words"},"in_minutes":{"type":"integer","description":"Once, this many minutes from now"},"at":{"type":"string","description":"Once, at this local time: HH:MM (today, or tomorrow if it has passed) or YYYY-MM-DD HH:MM"},"every_minutes":{"type":"integer","description":"Again and again, this many minutes apart (at least 5)"},"daily_at":{"type":"string","description":"Every day at this local time, HH:MM"},"days":{"type":"string","description":"With daily_at: only on these days, e.g. mon,tue,wed,thu,fri"}},"required":["prompt"]}}},
+  {"type":"function","function":{"name":"list_schedules","description":"The scheduled tasks: id, name, when each runs next, and the time now.","parameters":{"type":"object","properties":{},"required":[]}}},
+  {"type":"function","function":{"name":"cancel_schedule","description":"Cancel a scheduled task by its id from list_schedules.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The task's id"}},"required":["id"]}}}
  ],
  "files": [
   {"type":"function","function":{"name":"read_file","description":"Read a text file, with line numbers. For a big file, read part of it with offset and limit.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"offset":{"type":"integer","description":"First line to read, from 1"},"limit":{"type":"integer","description":"How many lines (default 300)"}},"required":["path"]}}},
@@ -122,6 +131,32 @@ fn is_code(path: &str) -> bool {
 
 /// What the harness says when a reply would end with changed code that nothing has run since.
 const NUDGE: &str = "(Automatic check) You changed code in this reply and have not run anything since. Check your work now: run the code or its tests with run_command. If something fails, fix it and run it again. If it cannot be run here, or the user asked you not to run it, say so in one line.";
+
+/// The goal loop, when the user turns it on ("keep going until done"; scheduled runs always have it): a
+/// reply that stops with steps of its task list still open is sent back to them, up to this many times in a
+/// row without a step getting done. A reply to the nudge with no step done is the model's answer to it (the
+/// user said to wait, or a step cannot be done), so once is enough. Not on by default: told nothing, a model
+/// takes the nudge for the user's word and goes past a "do step 1, then wait for me" about half the time.
+const GOAL_NUDGES: usize = 1;
+
+/// What the harness says when a reply would end with its task list unfinished.
+fn goal_nudge(open: &[String]) -> String {
+    format!("(Automatic check from ghost, not a message from the user) Your reply ended with steps of your task list still open: {}. Look again at what the user asked. If they asked you to stop or wait before these steps, do not do them: reply in one line that they are waiting for the user. If a step cannot be done here, say why in one line. Otherwise their request is not finished: carry on with the next step now.", open.join("; "))
+}
+
+/// The task list's open steps, unless the reply is about to close them: when only the step in progress is
+/// left, the run marks it done (close_last_task), so nothing is open.
+fn open_tasks(chat: &Chat) -> Vec<String> {
+    let tasks = chat.tasks.as_array().unwrap_or(&[]);
+    let status = |t: &Json| t.get("status").and_then(Json::as_str).unwrap_or("").to_string();
+    let open: Vec<&Json> = tasks.iter().filter(|t| status(t) != "done").collect();
+    if let [only] = open[..] {
+        if status(only) == "in_progress" {
+            return Vec::new();
+        }
+    }
+    open.iter().map(|t| t.get("text").and_then(Json::as_str).unwrap_or("").to_string()).collect()
+}
 
 /// Put after the user's message while tools are on: told only in the system prompt, a small model often
 /// starts working without a plan.
@@ -285,7 +320,7 @@ fn fitted_prompt(req: &Request, chat: &mut Chat, at: Option<usize>, tools: &[Jso
 // ---- memory: facts the model saved, kept in %LOCALAPPDATA%\ghost-infer\memory.json for every chat
 
 /// %LOCALAPPDATA%\ghost-infer, made if missing.
-fn data_dir() -> Result<PathBuf, String> {
+pub(super) fn data_dir() -> Result<PathBuf, String> {
     let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer")).ok_or("LOCALAPPDATA is not set")?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     Ok(d)
@@ -489,7 +524,7 @@ pub fn instructions_json(folders: &[PathBuf]) -> Json {
 }
 
 /// A file's text without its <!-- comments --> (notes for whoever edits it, not for the model).
-fn without_comments(text: &str) -> String {
+pub(super) fn without_comments(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
     while let Some(at) = rest.find("<!--") {
@@ -519,6 +554,58 @@ fn instructions_prompt(folders: &[PathBuf]) -> String {
         return String::new();
     }
     format!("The user's instructions, from their GHOST.md files. Follow them:\n\n{}", parts.join("\n\n"))
+}
+
+// ---- runs: how many are going (the API's requests too), when the last one ended, and the chats they hold
+// (two runs in one chat would each save their own copy of it)
+
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+static LAST_END: AtomicU64 = AtomicU64::new(0); // milliseconds since 1970
+
+fn busy_chats() -> &'static Mutex<HashSet<String>> {
+    static B: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    B.get_or_init(Default::default)
+}
+
+/// A run going (or a request to /v1): counted while it lives, and holding its chat once it has one.
+pub(super) struct Going {
+    chat: Option<String>,
+}
+
+impl Going {
+    pub(super) fn new() -> Going {
+        RUNNING.fetch_add(1, Ordering::SeqCst);
+        Going { chat: None }
+    }
+
+    /// Takes the chat, waiting while another run holds it; false if `still_wanted` says to give up.
+    fn hold(&mut self, id: &str, mut still_wanted: impl FnMut() -> bool) -> bool {
+        loop {
+            if busy_chats().lock().unwrap().insert(id.to_string()) {
+                self.chat = Some(id.to_string());
+                return true;
+            }
+            if !still_wanted() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}
+
+impl Drop for Going {
+    fn drop(&mut self) {
+        if let Some(id) = &self.chat {
+            busy_chats().lock().unwrap().remove(id);
+        }
+        LAST_END.store(now_ms() as u64, Ordering::SeqCst);
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Milliseconds since the last run ended, or None while one is going (scheduled runs wait for quiet).
+pub fn idle_ms() -> Option<u64> {
+    (RUNNING.load(Ordering::SeqCst) == 0).then(|| (now_ms() as u64).saturating_sub(LAST_END.load(Ordering::SeqCst)))
 }
 
 // ---- approvals: the run waits on a channel the approve endpoint answers
@@ -551,7 +638,7 @@ fn chat_file(id: &str) -> Result<PathBuf, String> {
     Ok(chats_dir()?.join(format!("{id}.json")))
 }
 
-fn now_ms() -> f64 {
+pub(super) fn now_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0)
 }
 
@@ -564,7 +651,8 @@ pub fn list_chats() -> Result<Json, String> {
         .filter_map(|e| Json::parse(&std::fs::read_to_string(e.path()).ok()?).ok())
         .map(|c| {
             let at = c.get("updated").and_then(Json::as_f64).unwrap_or(0.0);
-            let summary = obj(vec![("id", c.get("id").cloned().unwrap_or(Json::Null)), ("title", c.get("title").cloned().unwrap_or(Json::Null)), ("updated", num(at))]);
+            let unread = Json::Bool(c.get("unread").and_then(Json::as_bool).unwrap_or(false));
+            let summary = obj(vec![("id", c.get("id").cloned().unwrap_or(Json::Null)), ("title", c.get("title").cloned().unwrap_or(Json::Null)), ("updated", num(at)), ("unread", unread)]);
             (at, summary)
         })
         .collect();
@@ -582,14 +670,31 @@ pub fn delete_chat(id: &str) -> Result<(), String> {
     std::fs::remove_file(chat_file(id)?).map_err(|_| format!("no chat {id}"))
 }
 
+/// The user has seen what a scheduled run added to this chat. Left alone while a run holds the chat (it
+/// saves the chat when it ends, unread again).
+pub fn mark_read(id: &str) -> Result<(), String> {
+    let mut going = Going::new();
+    if !going.hold(id, || false) {
+        return Ok(());
+    }
+    let mut chat = Chat::load(id)?;
+    if chat.unread {
+        chat.unread = false;
+        chat.save_as_is()?;
+    }
+    Ok(())
+}
+
 /// A chat in memory: its id, title and messages (OpenAI-style, with a few extra fields the clients read).
 struct Chat {
     id: String,
     title: String,
     created: f64,
+    updated: f64,
     messages: Vec<Json>,
     tokens: f64, // how much of the context the last round used (the clients show it)
     tasks: Json, // the model's task list (update_tasks), as [{"text","status"}]
+    unread: bool, // a scheduled run wrote to it and the user has not opened it since
 }
 
 impl Chat {
@@ -602,7 +707,7 @@ impl Chat {
             h.write_u64(t as u64);
             h.finish() & 0xffff
         };
-        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()) }
+        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, updated: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()), unread: false }
     }
 
     fn load(id: &str) -> Result<Chat, String> {
@@ -611,20 +716,29 @@ impl Chat {
             id: id.to_string(),
             title: j.get("title").and_then(Json::as_str).unwrap_or("").to_string(),
             created: j.get("created").and_then(Json::as_f64).unwrap_or(0.0),
+            updated: j.get("updated").and_then(Json::as_f64).unwrap_or(0.0),
             messages: j.get("messages").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default(),
             tokens: j.get("tokens").and_then(Json::as_f64).unwrap_or(0.0),
             tasks: j.get("tasks").cloned().unwrap_or(Json::Arr(Vec::new())),
+            unread: j.get("unread").and_then(Json::as_bool).unwrap_or(false),
         })
     }
 
-    fn save(&self) -> Result<(), String> {
+    fn save(&mut self) -> Result<(), String> {
+        self.updated = now_ms();
+        self.save_as_is()
+    }
+
+    /// Saved without counting as a change (the chat list is newest first, and reading a chat is not news).
+    fn save_as_is(&self) -> Result<(), String> {
         let j = obj(vec![
             ("id", str(&self.id)),
             ("title", str(&self.title)),
             ("created", num(self.created)),
-            ("updated", num(now_ms())),
+            ("updated", num(self.updated)),
             ("tokens", num(self.tokens)),
             ("tasks", self.tasks.clone()),
+            ("unread", Json::Bool(self.unread)),
             ("messages", Json::Arr(self.messages.clone())),
         ]);
         let path = chat_file(&self.id)?;
@@ -647,6 +761,7 @@ struct Request {
     temperature: f32,
     max_tokens: usize,
     groups: Vec<String>,
+    goal: bool,           // keep going until the task list is done (the goal loop)
     instructions: String, // the GHOST.md files as the reply started
     memory: String, // the remembered facts, likewise
     skills: String, // the installed skills, likewise
@@ -663,6 +778,7 @@ impl Request {
             temperature: f("temperature").map(|t| t as f32).unwrap_or(shared.defaults.0),
             max_tokens: f("max_tokens").map(|n| n.max(1.0) as usize).unwrap_or(shared.defaults.3),
             groups: b.get("tools").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect()).unwrap_or_default(),
+            goal: b.get("keep_going").and_then(Json::as_bool).unwrap_or(false),
             instructions: instructions_prompt(&shared.harness.lock().unwrap().folders.clone()),
             memory: memory_prompt(),
             skills: super::skills::prompt(),
@@ -670,13 +786,29 @@ impl Request {
     }
 }
 
+/// Where a run's events go: the client that asked for it, or nobody (a scheduled run).
+enum Out<'a> {
+    Client(&'a mut TcpStream),
+    Away,
+}
+
+impl Out<'_> {
+    fn away(&self) -> bool {
+        matches!(self, Out::Away)
+    }
+}
+
 /// One event to the client; Err when it has gone away.
-fn emit(conn: &mut TcpStream, ev: Json) -> Result<(), String> {
-    sse(conn, &ev.to_string()).map_err(|_| "the client went away".to_string())
+fn emit(out: &mut Out, ev: Json) -> Result<(), String> {
+    match out {
+        Out::Client(conn) => sse(conn, &ev.to_string()).map_err(|_| "the client went away".to_string()),
+        Out::Away => Ok(()),
+    }
 }
 
 /// A comment line, to notice a client that went away while the run waits on the user.
-fn ping(conn: &mut TcpStream) -> bool {
+fn ping(out: &mut Out) -> bool {
+    let Out::Client(conn) = out else { return true };
     let c = ": waiting\n\n";
     write!(conn, "{:x}\r\n{c}\r\n", c.len()).and_then(|_| conn.flush()).is_ok()
 }
@@ -684,55 +816,136 @@ fn ping(conn: &mut TcpStream) -> bool {
 /// POST /api/agent: runs the agent for one reply, streaming events (see the module comment).
 pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<(), String> {
     let req = Request::parse(body, shared);
-    let mut chat = match &req.chat {
-        Some(id) => Chat::load(id)?,
-        None => Chat::new(),
-    };
-    match &req.message {
-        Some(m) => {
-            if chat.title.is_empty() {
-                let line = m.trim().lines().next().unwrap_or("");
-                chat.title = if line.chars().count() > 60 { format!("{}…", line.chars().take(57).collect::<String>().trim_end()) } else { line.to_string() };
-            }
-            chat.messages.push(obj(vec![("role", str("user")), ("content", str(m))]));
-        }
-        // answer again: drop the reply after the last user message
-        None => {
-            let last_user = chat.messages.iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m)).ok_or("this chat has no message to answer")?;
-            chat.messages.truncate(last_user + 1);
-        }
-    }
-    chat.save()?;
-
+    let mut going = Going::new();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-    let checkpoint = format!("{}-{}", chat.id, now_ms() as u64); // this reply's file changes, for undo
-    emit(conn, obj(vec![("type", str("chat")), ("id", str(&chat.id)), ("title", str(&chat.title)), ("checkpoint", str(&checkpoint))]))?;
-    let first = req.message.is_some() && chat.messages.iter().filter(|m| m.get("role").and_then(Json::as_str) == Some("user")).count() == 1;
-    let result = rounds(conn, &req, &mut chat, &checkpoint, work, shared, loaded);
-    chat.save()?;
-    let named = first && result.is_ok();
-    // the model answered with only its current step left open: that step is done
-    if matches!(result, Ok("stop")) && close_last_task(&mut chat) {
-        chat.save()?;
-        let _ = emit(conn, obj(vec![("type", str("tasks")), ("tasks", chat.tasks.clone())]));
-    }
-    let end = match result {
-        Ok(finish) => obj(vec![("type", str("done")), ("finish", str(finish))]),
-        Err(e) => obj(vec![("type", str("error")), ("message", str(&e))]),
-    };
-    let _ = emit(conn, end);
-    // a chat's first reply: the model names it, after "done" so nobody waits for it
-    if named {
-        if let Some(title) = name_chat(&req, &chat, work, shared, loaded) {
-            chat.title = title;
-            chat.save()?;
-            let _ = emit(conn, obj(vec![("type", str("title")), ("id", str(&chat.id)), ("title", str(&chat.title))]));
+    let mut out = Out::Client(conn);
+    // a scheduled task answering in this chat: this message goes after its reply
+    if let Some(id) = &req.chat {
+        if !going.hold(id, || ping(&mut out)) {
+            return Err("the client went away".into());
         }
+    }
+    let result = (|| {
+        let mut chat = match &req.chat {
+            Some(id) => Chat::load(id)?,
+            None => Chat::new(),
+        };
+        chat.unread = false;
+        match &req.message {
+            Some(m) => {
+                if chat.title.is_empty() {
+                    let line = m.trim().lines().next().unwrap_or("");
+                    chat.title = if line.chars().count() > 60 { format!("{}…", line.chars().take(57).collect::<String>().trim_end()) } else { line.to_string() };
+                }
+                chat.messages.push(obj(vec![("role", str("user")), ("content", str(m))]));
+            }
+            // answer again: drop the reply after the last user message
+            None => {
+                let last_user = chat.messages.iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m)).ok_or("this chat has no message to answer")?;
+                chat.messages.truncate(last_user + 1);
+            }
+        }
+        chat.save()?;
+        let first = req.message.is_some() && chat.messages.iter().filter(|m| m.get("role").and_then(Json::as_str) == Some("user")).count() == 1;
+        reply(&mut out, &req, &mut chat, first, work, shared, loaded)
+    })();
+    if let Err(e) = result {
+        let _ = emit(&mut out, obj(vec![("type", str("error")), ("message", str(&e))]));
     }
     let _ = sse(conn, "[DONE]");
     let _ = conn.write_all(b"0\r\n\r\n");
     Ok(())
+}
+
+/// One reply in a chat whose message is in place: the model's rounds, then "done" (or "error"), and for a
+/// chat's first reply a title. Err only when the chat cannot be saved.
+#[allow(clippy::too_many_arguments)]
+fn reply(out: &mut Out, req: &Request, chat: &mut Chat, first: bool, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<(), String> {
+    let checkpoint = format!("{}-{}", chat.id, now_ms() as u64); // this reply's file changes, for undo
+    emit(out, obj(vec![("type", str("chat")), ("id", str(&chat.id)), ("title", str(&chat.title)), ("checkpoint", str(&checkpoint))]))?;
+    let result = rounds(out, req, chat, &checkpoint, work, shared, loaded);
+    chat.save()?;
+    let named = first && result.is_ok();
+    // the model answered with only its current step left open: that step is done
+    if matches!(result, Ok("stop")) && close_last_task(chat) {
+        chat.save()?;
+        let _ = emit(out, obj(vec![("type", str("tasks")), ("tasks", chat.tasks.clone())]));
+    }
+    let end = match &result {
+        Ok(finish) => obj(vec![("type", str("done")), ("finish", str(finish))]),
+        Err(e) => obj(vec![("type", str("error")), ("message", str(e))]),
+    };
+    let _ = emit(out, end);
+    // a chat's first reply: the model names it, after "done" so nobody waits for it
+    if named {
+        if let Some(title) = name_chat(req, chat, work, shared, loaded) {
+            chat.title = title;
+            chat.save()?;
+            let _ = emit(out, obj(vec![("type", str("title")), ("id", str(&chat.id)), ("title", str(&chat.title))]));
+        }
+    }
+    if out.away() {
+        result.map(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
+/// What a scheduled run is: the message sent to the model (`text`) and the line the clients show for it.
+pub struct Wakeup<'a> {
+    pub chat: Option<&'a str>, // the chat to answer in (None, or one that is gone: a new one, titled `title`)
+    pub title: &'a str,
+    pub text: &'a str,
+    pub shown: &'a str,
+    pub groups: &'a [String],
+    pub thinking: bool,
+}
+
+/// A reply nobody is watching (a scheduled task or the heartbeat), saved in its chat and marked unread
+/// unless `keep` says the reply is not worth the user's time (then the exchange is taken out of the chat).
+/// Returns the chat's id, the reply's text, and whether it was kept.
+pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<(String, String, bool), String> {
+    let mut going = Going::new();
+    let existing = w.chat.filter(|id| load_chat(id).is_ok());
+    let mut chat = Chat::new();
+    let id = existing.map_or_else(|| chat.id.clone(), String::from);
+    if !going.hold(&id, || false) {
+        return Err("a reply is going in that chat".into());
+    }
+    match existing {
+        Some(id) => chat = Chat::load(id)?, // as it is now that it is held
+        None => chat.title = w.title.to_string(),
+    }
+    let req = Request {
+        chat: Some(chat.id.clone()),
+        message: Some(w.text.to_string()),
+        system: String::new(),
+        thinking: w.thinking,
+        temperature: shared.defaults.0,
+        max_tokens: shared.defaults.3.max(4096),
+        groups: w.groups.to_vec(),
+        goal: true, // nobody is there to say "go on"
+        instructions: instructions_prompt(&shared.harness.lock().unwrap().folders.clone()),
+        memory: memory_prompt(),
+        skills: super::skills::prompt(),
+    };
+    let before = chat.messages.len();
+    chat.messages.push(obj(vec![("role", str("user")), ("content", str(w.text)), ("shown", str(w.shown))]));
+    chat.save()?;
+    reply(&mut Out::Away, &req, &mut chat, false, work, shared, loaded)?;
+    let text = chat.messages[before..].iter().rev().find(|m| role(m) == "assistant").and_then(|m| m.get("content").and_then(Json::as_str)).unwrap_or("").to_string();
+    let kept = keep(&text);
+    if kept {
+        chat.unread = true;
+    } else {
+        chat.messages.truncate(before);
+    }
+    chat.save()?;
+    if chat.messages.is_empty() {
+        let _ = delete_chat(&chat.id); // made for this run, and nothing of it kept
+    }
+    Ok((chat.id.clone(), text, kept))
 }
 
 /// The prompt for these messages: the client's system text plus where tools may work, then the chat.
@@ -788,14 +1001,18 @@ fn tool_name(t: &Json) -> &str {
 }
 
 /// The model's rounds for one reply; Ok is how it finished ("stop", "length", or "rounds" at MAX_ROUNDS).
-/// A reply about to end with code it changed and nothing run since is sent back, once, to check it.
-fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<&'static str, String> {
+/// A reply about to end with code it changed and nothing run since is sent back, once, to check it; with
+/// the goal loop on, one about to end with steps of the task list it keeps in this reply still open is sent
+/// back to them.
+fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<&'static str, String> {
     let reply_start = chat.messages.len();
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
     let mut changed = false;
     let can_run = tools.iter().any(|t| tool_name(t) == "run_command");
     let (mut unchecked, mut nudged) = (false, false); // code changed and nothing run since; the nudge sent
     let plans = tools.iter().any(|t| tool_name(t) == "update_tasks");
+    let mut planned = false; // the task list was written in this reply (an old one is not this reply's goal)
+    let (mut goal_nudges, mut done_then) = (0, 0); // goal nudges in a row, and the steps done at the last one
     let asked = chat.messages[..reply_start].iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m));
     for round in 0..MAX_ROUNDS {
         let prompt = fitted_prompt(req, chat, asked.filter(|_| plans), &tools, shared, loaded)?;
@@ -811,16 +1028,16 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
         let (mut text, mut calls) = (String::new(), Vec::new());
         let mut finish = "stop";
         let mut usage = (0usize, 0usize);
-        let take = |parts: Vec<Part>, conn: &mut TcpStream, text: &mut String, calls: &mut Vec<(String, String, String)>| -> Result<(), String> {
+        let take = |parts: Vec<Part>, out: &mut Out, text: &mut String, calls: &mut Vec<(String, String, String)>| -> Result<(), String> {
             for part in parts {
                 match part {
                     Part::Text(t) => {
                         text.push_str(&t);
-                        emit(conn, obj(vec![("type", str("text")), ("text", str(&t))]))?;
+                        emit(out, obj(vec![("type", str("text")), ("text", str(&t))]))?;
                     }
                     Part::Call { name, arguments } => {
                         let id = format!("call_{}_{}", round, calls.len());
-                        emit(conn, obj(vec![("type", str("tool_call")), ("id", str(&id)), ("name", str(&name)), ("arguments", str(&arguments))]))?;
+                        emit(out, obj(vec![("type", str("tool_call")), ("id", str(&id)), ("name", str(&name)), ("arguments", str(&arguments))]))?;
                         calls.push((id, name, arguments));
                     }
                 }
@@ -830,7 +1047,7 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
         for ev in events {
             match ev {
                 // the client going away drops `events`, which stops the generation
-                Event::Text(t) => take(if tools.is_empty() { vec![Part::Text(t)] } else { split.push(&t) }, conn, &mut text, &mut calls)?,
+                Event::Text(t) => take(if tools.is_empty() { vec![Part::Text(t)] } else { split.push(&t) }, out, &mut text, &mut calls)?,
                 Event::Done { finish: f, prompt_tokens, completion_tokens } => {
                     finish = f;
                     usage = (prompt_tokens, completion_tokens);
@@ -839,9 +1056,9 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
                 Event::Error(_, e) => return Err(e),
             }
         }
-        take(split.finish(), conn, &mut text, &mut calls)?;
+        take(split.finish(), out, &mut text, &mut calls)?;
         chat.tokens = (usage.0 + usage.1) as f64;
-        emit(conn, obj(vec![("type", str("context")), ("prompt_tokens", num(usage.0 as f64)), ("completion_tokens", num(usage.1 as f64)), ("context_length", num(loaded.ctx as f64))]))?;
+        emit(out, obj(vec![("type", str("context")), ("prompt_tokens", num(usage.0 as f64)), ("completion_tokens", num(usage.1 as f64)), ("context_length", num(loaded.ctx as f64))]))?;
 
         // the round as the chat keeps it: what the model wrote, and its calls in OpenAI's form
         let mut msg = vec![("role", str("assistant")), ("content", str(text.trim())), ("checkpoint", str(checkpoint))];
@@ -853,10 +1070,27 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
         if calls.is_empty() && unchecked && can_run && !nudged && round + 1 < MAX_ROUNDS {
             nudged = true;
             chat.messages.push(obj(vec![("role", str("user")), ("content", str(NUDGE)), ("auto", Json::Bool(true))]));
-            emit(conn, obj(vec![("type", str("nudge")), ("text", str(NUDGE))]))?;
+            emit(out, obj(vec![("type", str("nudge")), ("kind", str("check")), ("text", str(NUDGE))]))?;
             mark_changed(chat, reply_start, changed);
             chat.save()?;
             continue;
+        }
+        // the goal loop: steps still open go back to the model, while it keeps getting steps done
+        let open = if calls.is_empty() && planned && req.goal { open_tasks(chat) } else { Vec::new() };
+        if !open.is_empty() && round + 1 < MAX_ROUNDS {
+            let done = chat.tasks.as_array().map_or(0, |t| t.iter().filter(|t| t.get("status").and_then(Json::as_str) == Some("done")).count());
+            if done > done_then {
+                goal_nudges = 0;
+            }
+            if goal_nudges < GOAL_NUDGES {
+                (goal_nudges, done_then) = (goal_nudges + 1, done);
+                let say = goal_nudge(&open);
+                chat.messages.push(obj(vec![("role", str("user")), ("content", str(&say)), ("auto", Json::Bool(true)), ("goal", Json::Bool(true))]));
+                emit(out, obj(vec![("type", str("nudge")), ("kind", str("goal")), ("text", str(&say))]))?;
+                mark_changed(chat, reply_start, changed);
+                chat.save()?;
+                continue;
+            }
         }
         if calls.is_empty() {
             mark_changed(chat, reply_start, changed);
@@ -864,7 +1098,8 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
         }
 
         for (id, name, arguments) in calls {
-            let (result, denied) = if name == "update_tasks" { (update_tasks(conn, chat, &arguments)?, false) } else { call(conn, &id, &name, &arguments, chat, reply_start, checkpoint, shared, loaded)? };
+            planned |= name == "update_tasks";
+            let (result, denied) = if name == "update_tasks" { (update_tasks(out, chat, &arguments)?, false) } else { call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)? };
             if !denied && approval_group(&name) == Some("edit") && !result.starts_with("Error") {
                 changed = true;
                 unchecked |= Json::parse(&arguments).ok().and_then(|a| a.get("path").and_then(Json::as_str).map(is_code)).unwrap_or(false);
@@ -872,7 +1107,7 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
             if !denied && approval_group(&name) == Some("cmd") {
                 unchecked = false;
             }
-            emit(conn, obj(vec![("type", str("tool_result")), ("id", str(&id)), ("name", str(&name)), ("result", str(&result)), ("denied", Json::Bool(denied))]))?;
+            emit(out, obj(vec![("type", str("tool_result")), ("id", str(&id)), ("name", str(&name)), ("result", str(&result)), ("denied", Json::Bool(denied))]))?;
             let mut m = vec![("role", str("tool")), ("tool_call_id", str(&id)), ("name", str(&name)), ("content", str(&result))];
             if denied {
                 m.push(("denied", Json::Bool(true)));
@@ -886,7 +1121,7 @@ fn rounds(conn: &mut TcpStream, req: &Request, chat: &mut Chat, checkpoint: &str
 }
 
 /// The update_tasks tool: the chat's new task list, sent to the client as a tasks event. Its result for the model.
-fn update_tasks(conn: &mut TcpStream, chat: &mut Chat, arguments: &str) -> Result<String, String> {
+fn update_tasks(out: &mut Out, chat: &mut Chat, arguments: &str) -> Result<String, String> {
     let args = Json::parse(arguments).unwrap_or(Json::Null);
     let Some(list) = args.get("tasks").and_then(Json::as_array) else {
         return Ok("Error: give tasks, a list of {\"text\", \"status\"}".into());
@@ -905,7 +1140,7 @@ fn update_tasks(conn: &mut TcpStream, chat: &mut Chat, arguments: &str) -> Resul
     let done = tasks.iter().filter(|t| t.get("status").and_then(Json::as_str) == Some("done")).count();
     let total = tasks.len();
     chat.tasks = Json::Arr(tasks);
-    emit(conn, obj(vec![("type", str("tasks")), ("tasks", chat.tasks.clone())]))?;
+    emit(out, obj(vec![("type", str("tasks")), ("tasks", chat.tasks.clone())]))?;
     Ok(format!("Task list updated: {done} of {total} done."))
 }
 
@@ -942,7 +1177,7 @@ fn mark_changed(chat: &mut Chat, reply_start: usize, changed: bool) {
 /// One tool call: refused if it repeats itself, put to the user if its group needs an OK, then run.
 /// Returns its result for the model and whether the user said no.
 #[allow(clippy::too_many_arguments)]
-fn call(conn: &mut TcpStream, id: &str, name: &str, arguments: &str, chat: &Chat, reply_start: usize, checkpoint: &str, shared: &Shared, loaded: &Loaded) -> Result<(String, bool), String> {
+fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply_start: usize, checkpoint: &str, req: &Request, shared: &Shared, loaded: &Loaded) -> Result<(String, bool), String> {
     // the same call a third time in one reply: a small model going round in circles
     let same = chat.messages[reply_start..]
         .iter()
@@ -955,13 +1190,17 @@ fn call(conn: &mut TcpStream, id: &str, name: &str, arguments: &str, chat: &Chat
     }
     if let Some(group) = approval_group(name) {
         if !shared.harness.lock().unwrap().always.iter().any(|g| g == group) {
+            // a scheduled run has nobody to ask: only what the user always allows runs in it
+            if out.away() {
+                return Ok((format!("Not done: this needs the user's OK, and this is a scheduled run with nobody here to give it (they can allow {group} tools always). Do what you can without it, and say in your reply what needs their OK."), true));
+            }
             let (tx, rx) = mpsc::channel();
             pending().lock().unwrap().insert(id.to_string(), tx);
-            emit(conn, obj(vec![("type", str("approval")), ("id", str(id)), ("name", str(name)), ("arguments", str(arguments)), ("group", str(group))]))?;
+            emit(out, obj(vec![("type", str("approval")), ("id", str(id)), ("name", str(name)), ("arguments", str(arguments)), ("group", str(group))]))?;
             let decision = loop {
                 match rx.recv_timeout(Duration::from_secs(2)) {
                     Ok(d) => break d,
-                    Err(mpsc::RecvTimeoutError::Timeout) if ping(conn) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) if ping(out) => continue,
                     _ => {
                         pending().lock().unwrap().remove(id);
                         return Err("the client went away".into());
@@ -990,6 +1229,11 @@ fn call(conn: &mut TcpStream, id: &str, name: &str, arguments: &str, chat: &Chat
         let args = Json::parse(arguments).unwrap_or(Json::Null);
         let s = |k: &str| args.get(k).and_then(Json::as_str).unwrap_or("").to_string();
         return Ok((if name == "search_chats" { search_chats(&s("query"), &chat.id) } else { read_chat(&s("id")) }, false));
+    }
+    if matches!(name, "schedule_task" | "list_schedules" | "cancel_schedule") {
+        let args = Json::parse(arguments).unwrap_or(Json::Null);
+        let always = shared.harness.lock().unwrap().always.clone();
+        return Ok((super::schedule::tool(name, &args, &chat.id, &req.groups, req.thinking, &always), false));
     }
     if name.starts_with("mcp__") {
         let args = if arguments.trim().is_empty() { Json::Obj(Vec::new()) } else { Json::parse(arguments).unwrap_or(Json::Null) };

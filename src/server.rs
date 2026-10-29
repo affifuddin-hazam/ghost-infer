@@ -18,6 +18,7 @@ use crate::{ChatFormat, Engine, Opts};
 
 mod agent;
 mod mcp;
+mod schedule;
 mod skills;
 
 const MAX_BODY: usize = 32 << 20;
@@ -121,6 +122,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     });
     std::thread::spawn(mcp::start_all); // the MCP servers in mcp.json, while the model loads
     let (work, rx) = mpsc::channel::<Work>();
+    schedule::start(work.clone(), shared.clone()); // scheduled tasks and the heartbeat, once a model runs
     let s = shared.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -459,7 +461,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let (defaults, think_default) = (shared.defaults, shared.think_default);
     // the agent tools and their settings: private to the chat page on this computer
     let path = req.path.trim_end_matches('/');
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions"].iter().any(|p| path.starts_with(p)) {
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
@@ -518,6 +520,23 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 Ok(()) => respond_private(&mut conn, 200, &obj(vec![("deleted", Json::Bool(true))])),
                 Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
             },
+            // {"id"}: the user has seen what a scheduled run wrote there
+            ("POST", "/api/chats/read") => match agent::mark_read(body().ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
+                Ok(()) => respond_private(&mut conn, 200, &obj(vec![("read", Json::Bool(true))])),
+                Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
+            },
+            // what runs on its own (schedule.rs): the scheduled tasks and the heartbeat, with a number that
+            // changes whenever they or a chat they wrote to do; the heartbeat on or off {"every", "tools",
+            // "thinking"}; a task (or "heartbeat") run now or cancelled {"id"}
+            ("GET", "/api/background") => respond_private(&mut conn, 200, &schedule::status_json()),
+            ("POST", "/api/schedules/heartbeat") => respond_private(&mut conn, 200, &schedule::set_heartbeat(&body().unwrap_or(Json::Null))),
+            ("POST", "/api/schedules/run") | ("POST", "/api/schedules/cancel") => {
+                let id = body().ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from)).unwrap_or_default();
+                match if path.ends_with("/run") { schedule::run_now(&id) } else { schedule::cancel(&id) } {
+                    Ok(j) => respond_private(&mut conn, 200, &j),
+                    Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
+                }
+            }
             // one reply of the agent, streamed as events (see agent.rs)
             ("POST", "/api/agent") => {
                 let Some(l) = current.clone().filter(|_| loading.is_none()) else {
@@ -701,6 +720,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         _ => return respond(&mut conn, 404, &error_body("not found")),
     }
     let chat = req.path.trim_end_matches('/') == "/v1/chat/completions";
+    let _going = agent::Going::new(); // another client using the model: scheduled runs wait for quiet
     let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
         Ok(b) => b,
         Err(e) => return respond(&mut conn, 400, &error_body(&format!("request body: {e}"))),

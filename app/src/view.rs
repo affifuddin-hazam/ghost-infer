@@ -139,6 +139,7 @@ mod ic {
     pub const CLOCK: char = '\u{E916}';
     pub const UNDO: char = '\u{E7A7}';
     pub const DOWNLOAD: char = '\u{E896}';
+    pub const HEART: char = '\u{EB51}';
 }
 
 fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
@@ -160,6 +161,8 @@ fn tool_icon(name: &str) -> char {
         "search_chats" => ic::SEARCH,
         "read_chat" => ic::CHAT,
         "check_work" => ic::RETRY,
+        "keep_going" => ic::TASKS,
+        "schedule_task" | "list_schedules" | "cancel_schedule" => ic::CLOCK,
         n if n.starts_with("mcp__") => ic::PLUG,
         _ => ic::PC,
     }
@@ -244,6 +247,7 @@ impl App {
             ),
             Menu::Plus => {
                 let mut items: Vec<(char, &str, Message, bool, Option<bool>)> = crate::GROUPS.iter().map(|&(g, label)| (group_icon(g), label, Message::ToggleGroup(g), false, Some(self.tools.iter().any(|t| t == g)))).collect();
+                items.push((ic::TASKS, "Keep going until done", Message::ToggleKeepGoing, false, Some(self.keep_going)));
                 items.push((ic::FOLDER, "Add folder…", Message::AddFolder, false, None));
                 items.push((ic::SKILL, "Install skill…", Message::InstallSkill(false), false, None));
                 items.push((ic::DOWNLOAD, "Install skill from a link…", Message::OpenSkillLink, false, None));
@@ -526,9 +530,68 @@ impl App {
             n => format!("{n} ready"),
         };
 
+        // scheduled: the heartbeat (how often it goes through HEARTBEAT.md) and the tasks the model set
+        let hb = self.background.get("heartbeat").cloned().unwrap_or(Json::Null);
+        let hs = |k: &str| hb.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+        let every = hb.get("every").and_then(Json::as_f64).unwrap_or(0.0) as u32;
+        let gap = |m: u32| if m % 60 == 0 { format!("{} h", m / 60) } else { format!("{m} min") };
+        let mut beat = column![text("Heartbeat").size(13).font(MEDIUM).color(s.text)].width(Fill);
+        let first = match (every, hb.get("checklist").and_then(Json::as_bool).unwrap_or(false)) {
+            (0, _) => "Off. When on, ghost goes through your checklist on its own and tells you only what needs you.".to_string(),
+            (_, false) => format!("Every {}, but the checklist is empty, so it skips", gap(every)),
+            (m, true) => format!("Every {}, next {}", gap(m), hs("next")),
+        };
+        beat = beat.push(text(first).size(12).color(s.faint));
+        if !hs("last").is_empty() && !hs("note").is_empty() {
+            beat = beat.push(text(crate::clip_line(&format!("Last {}: {}", hs("last"), hs("note")), 90)).size(12).color(s.faint));
+        }
+        let mut sched = column![row![icon(ic::HEART, 11).color(if every > 0 { s.accent } else { s.faint }).width(14), beat].spacing(8).padding([3, 0])].spacing(2);
+        // how often: the one in use in plain text, the others to click
+        let mut gaps = row![].spacing(10).padding(Padding { top: 2.0, bottom: 2.0, left: 22.0, right: 0.0 });
+        for (label, m) in [("Off", 0), ("15 min", 15), ("30 min", 30), ("1 h", 60), ("2 h", 120)] {
+            let on = m == every;
+            gaps = gaps.push(button(text(label).size(12.5).color(if on { s.text } else { s.accent }).font(if on { MEDIUM } else { BODY })).on_press_maybe((!on).then_some(Message::SetHeartbeat(m))).padding(0).style(move |_, _| button::Style { background: None, ..Default::default() }));
+        }
+        sched = sched.push(gaps);
+        let mut beat_links = row![link("Edit checklist", Message::EditHeartbeat)];
+        if every > 0 {
+            beat_links = beat_links.push(link("Check now", Message::RunScheduled("heartbeat".into())));
+        }
+        sched = sched.push(container(beat_links).padding(Padding { left: 22.0, ..Padding::ZERO }));
+        let jobs = self.background.get("jobs").and_then(Json::as_array).unwrap_or(&[]);
+        if jobs.is_empty() {
+            sched = sched.push(container(text("No scheduled tasks. Ask for one in a chat, like \"every weekday at 9:00, check the build\".").size(12.5).color(s.faint)).padding(Padding { top: 8.0, ..Padding::ZERO }));
+        }
+        for j in jobs {
+            let f = |k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+            let mut about = column![text(f("name")).size(13).font(MEDIUM).color(s.text), text(format!("{}, next {}", f("when"), f("next"))).size(12).color(s.faint)].width(Fill);
+            if !f("note").is_empty() {
+                about = about.push(text(crate::clip_line(&format!("Last {}: {}", f("last"), f("note")), 90)).size(12).color(s.faint));
+            }
+            sched = sched.push(
+                row![
+                    icon(ic::CLOCK, 11).color(s.faint).width(14),
+                    about,
+                    link("Run", Message::RunScheduled(f("id"))),
+                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::CancelScheduled(f("id"))).padding([4, 5]).style(move |_, st| bare(s, st)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .padding(Padding { top: 8.0, bottom: 3.0, ..Padding::ZERO }),
+            );
+        }
+        let scheduled = match (jobs.len(), every > 0) {
+            (0, false) => String::new(),
+            (0, true) => "heartbeat on".into(),
+            (1, _) => "1 task".into(),
+            (n, _) => format!("{n} tasks"),
+        };
+
         let body = body
             .push(head("Changes", files))
             .push(section(changes_body))
+            .push(head("Scheduled", scheduled))
+            .push(rail_section(s, sched.into()))
             .push(head("Instructions", in_use))
             .push(rail_section(s, instructions.into()))
             .push(head("Memory", facts))
@@ -608,6 +671,10 @@ impl App {
             // which would show as a block on a short one)
             let label: Element<'_, Message> = if c.title.chars().count() > 26 { stack![name, container(veil).width(Fill).height(Fill).align_x(Alignment::End)].into() } else { name.into() };
             let mut line = row![label].align_y(Alignment::Center).spacing(6);
+            // a scheduled run wrote here since it was last opened
+            if c.unread && !on {
+                line = line.push(container(Space::new().width(7).height(7)).style(move |_| container::Style { background: Some(Background::Color(s.accent)), border: border::rounded(99), ..Default::default() }));
+            }
             if hover || on {
                 line = line.push(button(icon(ic::DELETE, 12).color(s.faint)).on_press(Message::DeleteChat(c.id.clone())).padding([3, 5]).style(move |_, st| bare(s, st)));
             }
@@ -815,6 +882,11 @@ impl App {
 
     fn message<'a>(&'a self, i: usize, m: &'a Msg) -> Element<'a, Message> {
         let s = self.skin();
+        if m.role == Role::User && m.scheduled {
+            // sent by the scheduler, not typed: a quiet line instead of a bubble
+            let line = row![icon(ic::CLOCK, 12).color(s.faint), text(m.raw.as_str()).size(13).color(s.muted)].spacing(8).align_y(Alignment::Center);
+            return row![Space::new().width(Fill), container(line).padding([6, 12]).style(move |_| container::Style { border: Border { width: 1.0, color: s.hover, radius: 16.0.into() }, ..Default::default() })].into();
+        }
         if m.role == Role::User {
             let bubble = container(text(m.raw.as_str()).size(15).line_height(1.5).color(s.text)).padding([10, 16]).max_width(560).style(move |_| container::Style {
                 background: Some(Background::Color(s.bubble)),
