@@ -30,23 +30,23 @@
 Most inference engines are built for data centres: many users, big GPUs, batching. ghost-infer is built
 for the other case: **one person, one consumer GPU, one model at a time**, and it is tuned for exactly that.
 
-On an 8 GB RTX 2060 SUPER with Qwen3 8B, measured with [GuideLLM](https://github.com/vllm-project/guidellm)
-on the same GGUF file:
+On an 8 GB RTX 2060 SUPER with 16 GB of RAM, against current llama.cpp (b11747) and Ollama (0.40.13) on
+the same GGUF files:
 
-| | ghost-infer | llama.cpp | Ollama |
+| Generation speed | ghost-infer | llama.cpp | Ollama |
 |---|---|---|---|
-| Generation speed | **64.9 tokens/s** | 52.1 tokens/s | 49.7 tokens/s |
-| Whole reply (256-token prompt, 128-token answer) | **2.29 s** | 2.67 s | 2.88 s |
-| Whole reply (2,048-token prompt, 256-token answer) | **6.01 s** | 6.47 s | 6.84 s |
+| Qwen3-30B-A3B, 13.7 GB: bigger than the GPU | **40–45 tokens/s** | 24 tokens/s | 22–24 tokens/s |
+| Qwen3 8B, 5 GB: fits in the GPU (128-token reply) | **70.3 tokens/s** | 64.8 tokens/s | 66.0 tokens/s |
 
-That is **25% faster generation than llama.cpp and 31% faster than Ollama** (llama.cpp's column takes
-the better of its two setups in each row). Details and method in [Benchmarks](#benchmarks).
+On a mixture-of-experts model bigger than the GPU, that is **about 1.8 times llama.cpp at its best
+setting, and Ollama**. On a model that fits in the GPU, ghost-infer is level with them: 6–8% faster on
+short replies, the same on long prompts. Details and method in [Benchmarks](#benchmarks).
 
 - **One file, nothing to install.** A ~2 MB executable with two Rust dependencies (`memmap2`, `rayon`).
   No CUDA SDK, no Python, no Docker: it loads the NVIDIA driver at runtime and compiles its kernels for
   your GPU on first start.
 - **Bigger models than your GPU.** Mixture-of-experts models keep their experts in RAM and the most used
-  ones in a VRAM cache: Qwen3-30B-A3B runs at 34–44 tokens/s on an 8 GB card with 16 GB of RAM.
+  ones in a VRAM cache: Qwen3-30B-A3B runs at 40–45 tokens/s on an 8 GB card with 16 GB of RAM.
 - **Drop-in server.** OpenAI-compatible `/v1/chat/completions` with streaming and tool calling, so editor
   plugins, chat apps and agent harnesses work unchanged. Switch models from the chat page or the API.
 - **Exact where it matters.** Speculative decoding gives bit-identical output to plain greedy decoding,
@@ -86,9 +86,9 @@ Measured with [GuideLLM](https://github.com/vllm-project/guidellm), vLLM's bench
 | CPU | AMD Ryzen 5 3600, 6 cores / 12 threads |
 | RAM | 16 GB DDR4-2133 (2 × 8 GB) |
 | Storage | models on a USB 3.0 external drive |
-| OS | Windows 10 Pro 22H2 (build 19045) |
-| Engines | ghost-infer (this repo), llama.cpp b9106 (`llama-server`, CUDA 12), Ollama 0.22.1 |
-| Model | Qwen3 8B, Q4_K_M, 5.0 GB (a JOSIEFIED fine-tune: same architecture and size as the base model, so the same speed) |
+| OS | Windows 10 Pro 22H2 (build 19045), nothing else running (12.3 GB of RAM free at the start) |
+| Engines | ghost-infer (this repo), llama.cpp b11747 (`llama-server` and `llama-bench`, CUDA 12.4), Ollama 0.40.13 |
+| Models | Qwen3 8B, Q4_K_M, 5.0 GB (a JOSIEFIED fine-tune: same architecture and size as the base model, so the same speed); Qwen3-30B-A3B-Instruct-2507, Q3_K_M, 13.7 GB |
 
 ### Method
 
@@ -96,50 +96,59 @@ Measured with [GuideLLM](https://github.com/vllm-project/guidellm), vLLM's bench
 - Synthetic prompts from the model's own tokenizer, streamed through `/v1/chat/completions`.
 - Each server runs alone on the GPU with the whole model on it: ghost-infer `serve --gpu`, llama.cpp
   `-ngl 99 -c 8192`, Ollama with its defaults (all 37 layers on the GPU, 4,096-token context, flash
-  attention on). Each uses its default KV cache: int8 for ghost-infer, f16 for llama.cpp and Ollama.
+  attention on auto). Each uses its default KV cache: int8 for ghost-infer, f16 for llama.cpp and Ollama.
 - llama.cpp is shown twice. With its defaults, `llama-server` serves 4 users at once and copies every
   prompt's cache to RAM, which costs time on each request; "1 user" adds `-np 1 --cache-ram 0`, its best
   setup for one person.
 - Two rounds over every engine, averaged, so GPU clock drift does not favour one of them. 21 measured
   requests per round for the chat workload and 10 for the long one, after a warm-up.
-- Reproduce with [`scripts/bench-engines.ps1`](scripts/bench-engines.ps1); the raw GuideLLM results are
+- Reproduce both tables with [`scripts/bench-readme.ps1`](scripts/bench-readme.ps1) (it runs
+  [`scripts/bench-engines.ps1`](scripts/bench-engines.ps1) for this part); the raw GuideLLM results are
   JSON files, summarised by [`scripts/bench-compare.py`](scripts/bench-compare.py).
 
 **Chat**: 256-token prompt, 128-token reply
 
 | | ghost-infer | llama.cpp (1 user) | llama.cpp (defaults) | Ollama |
 |---|---|---|---|---|
-| Generation, tokens/s | **64.9** | 52.1 | 52.0 | 49.7 |
-| Prompt reading, tokens/s | 822 | 1,033 | **1,138** | 816 |
-| Time to first token, ms | 321 | 268 | **232** | 323 |
-| Whole request, s | **2.29** | 2.71 | 2.67 | 2.88 |
+| Generation, tokens/s | **70.3** | 64.8 | 64.7 | 66.0 |
+| Prompt reading, tokens/s | 905 | **1,366** | 1,257 | 1,002 |
+| Time to first token, ms | 292 | **193** | 210 | 264 |
+| Whole request, s | **2.11** | 2.16 | 2.17 | 2.19 |
 
 **Long prompt** (pasted code, a document): 2,048-token prompt, 256-token reply
 
 | | ghost-infer | llama.cpp (1 user) | llama.cpp (defaults) | Ollama |
 |---|---|---|---|---|
-| Generation, tokens/s | **56.4** | 51.9 | 51.2 | 49.3 |
-| Prompt reading, tokens/s | **1,400** | 1,324 | 588 | 1,233 |
-| Time to first token, ms | **1,468** | 1,554 | 3,505 | 1,668 |
-| Whole request, s | **6.01** | 6.47 | 8.51 | 6.84 |
+| Generation, tokens/s | 61.3 | 61.6 | 61.6 | **62.1** |
+| Prompt reading, tokens/s | **1,490** | 1,455 | 1,343 | 1,327 |
+| Time to first token, ms | **1,380** | 1,413 | 1,531 | 1,549 |
+| Whole request, s | 5.56 | **5.55** | 5.67 | 5.65 |
 
 **Generation** is the steady speed while the reply streams (1,000 / mean time between tokens).
 **Prompt reading** is prompt tokens divided by the time to the first token, so it includes each server's
-own overhead. llama.cpp still reads short prompts faster; ghost-infer wins everywhere else, and generation
-is where most of a chat's time goes.
+own overhead. llama.cpp reads short prompts faster; ghost-infer generates short replies 6–8% faster; on
+long prompts all four are within 2% of each other. (Against llama.cpp b9106 from May 2026, ghost-infer
+generated 25% faster; llama.cpp has caught up since on models that fit in the GPU.)
 
 ### Mixture of experts bigger than the GPU
 
 Qwen3-30B-A3B-Instruct-2507 Q3_K_M (13.7 GB) on the same 8 GB card with 16 GB of RAM. ghost-infer keeps
-attention and the router on the GPU, the experts in RAM, and the 2,350 most used experts (5 GB) in VRAM.
-Ollama offloads 22 of 49 layers. Measured with each engine's own timing (`ghost-infer bench`,
-`ollama run --verbose`), tokens per second:
+attention and the router on the GPU, the experts in RAM, and the 2,365 most used experts (5.1 GB) in VRAM.
+llama.cpp runs it the way its users do: every layer on the GPU, with the experts of some layers left in
+RAM (`--n-cpu-moe`); the table shows the best of a sweep from 16 to 48 layers, which was 24. Ollama now
+fits the model the same way by itself (here the experts of 32 of the 49 layers in RAM, 5.5 GB on the GPU).
+Measured with each engine's own timing (`ghost-infer bench`, `llama-bench -fa 1`, Ollama's API with
+`num_predict` 128), tokens per second:
 
-| | ghost-infer | Ollama 0.22.1 |
-|---|---|---|
-| Generation | **34–44** | 14–17 |
-| Prompt, 256 tokens | 220 | **231** |
-| Prompt, 1,024 tokens | **659** | 479 |
+| | ghost-infer | llama.cpp b11747 (`--n-cpu-moe 24`) | Ollama 0.40.13 |
+|---|---|---|---|
+| Generation | **40–45** | 24 | 22–24 |
+| Prompt, 256 tokens | 211 | 33 | **309–313** |
+| Prompt, 1,024 tokens | 547 | 115 | 537–556 |
+
+llama.cpp reads prompts fastest with fewer experts in RAM (`--n-cpu-moe 16`: 49 and 268 tokens/s) but
+then generates at 15 tokens/s. Ollama's first request, which also loads the model, is left out of its
+prompt column.
 
 ### Speculative decoding
 
