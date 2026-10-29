@@ -18,6 +18,7 @@ param(
     [int]$Rounds = 2,
     [int]$Port = 8090,
     [string]$Out = '',
+    [switch]$Quick,  # a smoke test: 3 requests per workload (the numbers mean nothing)
     [int]$Round = 0  # internal: run one engine for this round, in a process of its own
 )
 $ErrorActionPreference = 'Stop'
@@ -27,6 +28,7 @@ $workloads = @(
     @{ name = 'chat'; prompt = 256;  output = 128; requests = 24 },
     @{ name = 'long'; prompt = 2048; output = 256; requests = 12 }
 )
+if ($Quick) { foreach ($w in $workloads) { $w.requests = 3 } }
 $root = Split-Path $PSScriptRoot -Parent
 $ghost = Join-Path $root 'target\release\ghost-infer.exe'
 $Model = (Resolve-Path $Model).Path
@@ -54,12 +56,20 @@ function Wait-GpuFree([int]$belowMiB = 1500) {
         Start-Sleep -Milliseconds 500
     }
 }
-function Stop-Ollama { Get-Process ollama*, 'ollama app' -ErrorAction SilentlyContinue | Stop-Process -Force -Confirm:$false; Start-Sleep 1 }
+# Stops a server this script started, with the processes it started in turn (Ollama runs its models in child
+# processes); only that tree, never another program of the same name.
+function Stop-Tree($proc) {
+    if ($proc -and -not $proc.HasExited) { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null; $proc.WaitForExit(10000) | Out-Null }
+    Start-Sleep 1
+}
+# an Ollama the user runs would compete for the GPU: it is theirs to close, not this script's
+if ($Round -eq 0 -and $Engines -contains 'ollama' -and (Get-Process ollama*, 'ollama app' -ErrorAction SilentlyContinue)) {
+    throw 'Ollama is already running: quit it (its tray icon, Quit Ollama), then run this again.'
+}
 
 # Ollama ignores max_completion_tokens (what GuideLLM sends), so each output length gets a model with num_predict set.
 # The Modelfile also gives a ChatML template, for GGUF files whose template Ollama does not recognise.
 if ($Round -eq 0 -and $Engines -contains 'ollama') {
-    Stop-Ollama
     $env:OLLAMA_MODELS = $OllamaModels
     $env:OLLAMA_HOST = "127.0.0.1:$Port"
     $p = Start-Process -FilePath $Ollama -ArgumentList 'serve' -PassThru -WindowStyle Hidden -RedirectStandardError "$Out\ollama-create.err.log"
@@ -79,9 +89,9 @@ PARAMETER num_predict $n
         $ErrorActionPreference = 'Continue'  # its progress goes to stderr
         & $Ollama create "bench-$($stem.ToLower())-$n" -f $mf *> "$Out\ollama-create-$n.log"
         $ErrorActionPreference = 'Stop'
-        if ($LASTEXITCODE -ne 0) { throw "ollama create failed for $n; see $Out\ollama-create-$n.log" }
+        if ($LASTEXITCODE -ne 0) { Stop-Tree $p; throw "ollama create failed for $n; see $Out\ollama-create-$n.log" }
     }
-    Stop-Ollama
+    Stop-Tree $p
 }
 
 function Start-Engine([string]$engine, [string]$tag) {
@@ -123,6 +133,7 @@ if ($Round -eq 0) {
             $child = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Model', $Model, '-Tokenizer', $Tokenizer,
                 '-GuideLLMPython', $GuideLLMPython, '-Ollama', $Ollama, '-OllamaModels', $OllamaModels, '-Engines', $engine, '-Port', $Port, '-Out', $Out, '-Round', $r)
             if ($LlamaServer) { $child += '-LlamaServer', $LlamaServer }
+            if ($Quick) { $child += '-Quick' }
             & powershell @child
             if ($LASTEXITCODE -ne 0) { throw "$engine round $r failed" }
         }
@@ -159,8 +170,7 @@ foreach ($r in @($Round)) {
                 if ($LASTEXITCODE -ne 0) { throw "$run GuideLLM failed; see $Out\$run.guidellm.log" }
             }
         } finally {
-            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -Confirm:$false; $proc.WaitForExit() }
-            if ($engine -eq 'ollama') { Stop-Ollama }
+            Stop-Tree $proc
             Wait-GpuFree
         }
     }

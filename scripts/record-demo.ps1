@@ -13,7 +13,7 @@
 # changed (cargo build --release -p ghost-infer --target-dir target\glm, and -p ghost-app --target-dir
 # target\app).
 param(
-    [string]$Model = 'C:\models\Qwen3-30B-A3B-Instruct-2507-Q3_K_M.gguf',
+    [string]$Model = '',    # default: models\Qwen3-30B-A3B-Instruct-2507-Q3_K_M.gguf
     [string]$Server = '',   # default: target\glm\release\ghost-infer.exe
     [string]$App = '',      # default: target\app\release\ghost-app.exe
     [string]$FFmpeg = '',   # default: ffmpeg on the PATH, else ImageMagick's
@@ -26,6 +26,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+if (-not $Model) { $Model = Join-Path $root 'models\Qwen3-30B-A3B-Instruct-2507-Q3_K_M.gguf' }
 if (-not $Server) { $Server = Join-Path $root 'target\glm\release\ghost-infer.exe' }
 if (-not $App) { $App = Join-Path $root 'target\app\release\ghost-app.exe' }
 if (-not $FFmpeg) {
