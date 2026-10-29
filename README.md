@@ -38,10 +38,11 @@ the same GGUF files:
 | Qwen3 8B, 5 GB: fits in the GPU (128-token reply) | **70.3 tokens/s** | 64.8 tokens/s | 66.0 tokens/s |
 | Qwen3-30B-A3B, 13.7 GB: bigger than the GPU (varied prompts) | **38.0 tokens/s** (34–46) | 23.7 tokens/s | 21.7 tokens/s |
 
-On a model that fits in the GPU, ghost-infer is 6–8% faster on short replies and level on long prompts;
-llama.cpp generates faster once the context passes about 4,000 tokens. On a mixture-of-experts model
-bigger than the GPU, ghost-infer generates 60% faster than llama.cpp's best setting, though it takes longer
-to the first token of a short prompt. Details and method in [Benchmarks](#benchmarks).
+On a model that fits in the GPU, ghost-infer is 6–8% faster on short replies and level on long prompts,
+and generates faster up to 4,000 tokens of context (at 8,000 llama.cpp catches up). On a
+mixture-of-experts model bigger than the GPU, ghost-infer generates 60% faster than llama.cpp's best
+setting, though it takes longer to the first token of a short prompt. Details and method in
+[Benchmarks](#benchmarks).
 
 - **One file, nothing to install.** A ~2 MB executable with two Rust dependencies (`memmap2`, `rayon`).
   No CUDA SDK, no Python, no Docker: it loads the NVIDIA driver at runtime and compiles its kernels for
@@ -139,13 +140,13 @@ Generation speed of 128 tokens after a prompt already in the cache, without the 
 
 | Generation, tokens/s, after | 256 | 2,000 | 4,000 | 8,000 |
 |---|---|---|---|---|
-| Qwen3 4B Q4_K_M, ghost-infer | **117.4** | **106.2** | 91.1 | 73.6 |
-| Qwen3 4B Q4_K_M, llama.cpp | 107.3 | 99.7 | **93.9** | **83.1** |
-| Qwen3 8B Q4_K_M, ghost-infer | **73.1** | **68.5** | **61.8** | 53.1 |
-| Qwen3 8B Q4_K_M, llama.cpp | 66.2 | 63.1 | 60.6 | **56.0** |
+| Qwen3 4B Q4_K_M, ghost-infer | **118.2** | **111.6** | **98.5** | 80.4 |
+| Qwen3 4B Q4_K_M, llama.cpp | 107.5 | 101.5 | 94.8 | **84.0** |
+| Qwen3 8B Q4_K_M, ghost-infer | **73.3** | **70.6** | **65.1** | 56.5 |
+| Qwen3 8B Q4_K_M, llama.cpp | 67.1 | 63.8 | 61.1 | 56.3 |
 
-ghost-infer is 6–10% faster up to 2,000 positions; from about 4,000, llama.cpp's attention pulls ahead,
-and at 8,000 it is 5% (8B) to 13% (4B) faster.
+ghost-infer is 9–11% faster up to 2,000 positions and 4–7% faster at 4,000; at 8,000 the two are level on
+the 8B, and llama.cpp is 4% faster on the 4B.
 
 ### Mixture of experts bigger than the GPU
 
