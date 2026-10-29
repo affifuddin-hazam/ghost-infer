@@ -284,6 +284,7 @@ fn tool_label(t: &ToolLine) -> String {
         "read_chat" => "Read an earlier chat".into(),
         "check_work" => "Asked to check its work".into(),
         "keep_going" => "Sent back to its open steps".into(),
+        "unreadable_tool_call" => "Wrote a tool call that could not be read".into(),
         "schedule_task" => format!("Scheduled \"{}\"", if s("name").is_empty() { s("prompt") } else { s("name") }),
         "list_schedules" => "Listed the scheduled tasks".into(),
         "cancel_schedule" => format!("Cancelled scheduled task {}", s("id")),

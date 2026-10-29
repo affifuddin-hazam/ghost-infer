@@ -129,6 +129,11 @@ fn is_code(path: &str) -> bool {
     path.rsplit_once('.').is_some_and(|(_, ext)| CODE.iter().any(|c| c.eq_ignore_ascii_case(ext)))
 }
 
+/// A `<tool_call>` block the model wrote that could not be read even mended: it stays in the chat as a call
+/// of this name (its arguments the block as written), and its result asks for the call again.
+const BAD_CALL: &str = "unreadable_tool_call";
+const BAD_CALL_RESULT: &str = "Error: this tool call could not be read, so nothing was run. Send it again inside <tool_call></tool_call> as valid JSON: {\"name\": \"<tool>\", \"arguments\": {...}}, with every brace and bracket closed.";
+
 /// What the harness says when a reply would end with changed code that nothing has run since.
 const NUDGE: &str = "(Automatic check) You changed code in this reply and have not run anything since. Check your work now: run the code or its tests with run_command. If something fails, fix it and run it again. If it cannot be run here, or the user asked you not to run it, say so in one line.";
 
@@ -1040,6 +1045,15 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
                         emit(out, obj(vec![("type", str("tool_call")), ("id", str(&id)), ("name", str(&name)), ("arguments", str(&arguments))]))?;
                         calls.push((id, name, arguments));
                     }
+                    // a call it could not read: kept as a call, so its result tells the model to send it again
+                    Part::Bad(raw) => {
+                        let id = format!("call_{}_{}", round, calls.len());
+                        // what it wrote as a string (the prompt shows calls inside tags of their own)
+                        let written = raw.trim_start_matches(ToolCalls::OPEN).trim_end_matches(ToolCalls::CLOSE).trim();
+                        let arguments = obj(vec![("text", str(written))]).to_string();
+                        emit(out, obj(vec![("type", str("tool_call")), ("id", str(&id)), ("name", str(BAD_CALL)), ("arguments", str(&arguments))]))?;
+                        calls.push((id, BAD_CALL.to_string(), arguments));
+                    }
                 }
             }
             Ok(())
@@ -1099,7 +1113,11 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
 
         for (id, name, arguments) in calls {
             planned |= name == "update_tasks";
-            let (result, denied) = if name == "update_tasks" { (update_tasks(out, chat, &arguments)?, false) } else { call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)? };
+            let (result, denied) = match name.as_str() {
+                "update_tasks" => (update_tasks(out, chat, &arguments)?, false),
+                BAD_CALL => (BAD_CALL_RESULT.to_string(), false),
+                _ => call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)?,
+            };
             if !denied && approval_group(&name) == Some("edit") && !result.starts_with("Error") {
                 changed = true;
                 unchecked |= Json::parse(&arguments).ok().and_then(|a| a.get("path").and_then(Json::as_str).map(is_code)).unwrap_or(false);

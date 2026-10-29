@@ -815,7 +815,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                             let (mut content, mut found) = (String::new(), Vec::new());
                             for part in tc.push(&text).into_iter().chain(tc.finish()) {
                                 match part {
-                                    Part::Text(t) => content.push_str(&t),
+                                    Part::Text(t) | Part::Bad(t) => content.push_str(&t),
                                     Part::Call { name, arguments } => found.push(call_json(found.len(), &name, &arguments)),
                                 }
                             }
@@ -858,7 +858,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let mut send_parts = |conn: &mut TcpStream, parts: Vec<Part>, first: &mut bool| -> Result<(), String> {
         for part in parts {
             let c = match part {
-                Part::Text(t) => choice(Some(&t), None, *first),
+                Part::Text(t) | Part::Bad(t) => choice(Some(&t), None, *first),
                 Part::Call { name, arguments } => {
                     n_calls += 1;
                     obj(vec![("index", num(0)), ("delta", obj(vec![("tool_calls", Json::Arr(vec![call_json(n_calls - 1, &name, &arguments)]))])), ("finish_reason", Json::Null)])
@@ -1122,11 +1122,14 @@ fn chat_prompt_glm(body: &Json, think_default: bool, switch: bool) -> Result<Str
 enum Part {
     Text(String),
     Call { name: String, arguments: String },
+    /// a `<tool_call>` block that could not be read, as written (the API passes it on as text; the agent
+    /// tells the model, so it sends the call again)
+    Bad(String),
 }
 
 /// Splits `<tool_call>{"name": ..., "arguments": ...}</tool_call>` blocks out of streamed text,
-/// holding back what could still become a tag. Whitespace-only text after a call is dropped; a
-/// block that is not valid JSON stays text.
+/// holding back what could still become a tag. Whitespace-only text after a call is dropped; JSON with
+/// its closing braces wrong is mended (mend_json), and a block that still cannot be read is a Bad part.
 #[derive(Default)]
 struct ToolCalls {
     buf: String,
@@ -1147,7 +1150,7 @@ impl ToolCalls {
                 let block: String = self.buf.drain(..end + Self::CLOSE.len()).collect();
                 self.in_call = false;
                 out.push(match self.call(&block[..end]) {
-                    Part::Text(t) => Part::Text(t + Self::CLOSE),
+                    Part::Bad(t) => Part::Bad(t + Self::CLOSE),
                     call => call,
                 });
             } else if let Some(at) = self.buf.find(Self::OPEN) {
@@ -1188,7 +1191,14 @@ impl ToolCalls {
     }
 
     fn call(&mut self, inner: &str) -> Part {
-        let parsed = Json::parse(inner.trim()).ok().and_then(|j| {
+        let json = Json::parse(inner.trim()).ok().or_else(|| {
+            let mended = mend_json(inner.trim());
+            if mended.is_some() {
+                eprintln!("[a tool call's JSON had its closing braces wrong: mended]");
+            }
+            mended
+        });
+        let parsed = json.and_then(|j| {
             let name = j.get("name")?.as_str()?.to_string();
             let arguments = match j.get("arguments") {
                 Some(Json::Str(s)) => s.clone(),
@@ -1203,9 +1213,54 @@ impl ToolCalls {
                 self.calls += 1;
                 p
             }
-            None => Part::Text(format!("{}{inner}", Self::OPEN)),
+            None => Part::Bad(format!("{}{inner}", Self::OPEN)),
         }
     }
+}
+
+/// A tool call's JSON with its closing braces or brackets wrong, as models write it now and then
+/// (Qwen3 drops the last `}` after nested arguments): what is still open is closed, and a closer too
+/// many (or the wrong one) is cut. None if that does not make it valid.
+fn mend_json(s: &str) -> Option<Json> {
+    if !s.starts_with('{') {
+        return None;
+    }
+    let mut open = Vec::new();
+    let (mut in_str, mut escaped, mut end) = (false, false, s.len());
+    for (i, c) in s.char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' => {
+                if open.last() != Some(&c) {
+                    end = i; // not what is open: cut here, then close properly
+                    break;
+                }
+                open.pop();
+                if open.is_empty() {
+                    end = i + 1; // complete: anything after it is extra
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_str {
+        return None;
+    }
+    let mut mended = s[..end].to_string();
+    mended.extend(open.iter().rev());
+    Json::parse(&mended).ok()
 }
 
 /// GLM's tool call: `name<arg_key>k</arg_key><arg_value>v</arg_value>...`. Values that read as JSON
@@ -1312,10 +1367,30 @@ mod tests {
         let calls: Vec<_> = parts.iter().filter(|p| matches!(p, Part::Call { .. })).collect();
         assert_eq!(calls, [&Part::Call { name: "f".into(), arguments: "{\"a\": 1}".into() }, &Part::Call { name: "g".into(), arguments: "{}".into() }]);
 
+        // a block that cannot be read: a Bad part, which the API passes on as text
         let mut tc = ToolCalls::default();
         let mut parts = tc.push("a <tool_call>not json</tool_call> b");
         parts.extend(tc.finish());
-        assert_eq!(parts.iter().map(|p| if let Part::Text(t) = p { t.as_str() } else { "" }).collect::<String>(), "a <tool_call>not json</tool_call> b");
+        assert_eq!(parts.iter().map(|p| match p { Part::Text(t) | Part::Bad(t) => t.as_str(), _ => "" }).collect::<String>(), "a <tool_call>not json</tool_call> b");
+        assert!(parts.contains(&Part::Bad("<tool_call>not json</tool_call>".into())));
+    }
+
+    #[test]
+    fn tool_calls_with_braces_wrong_are_mended() {
+        let calls = |text: &str| {
+            let mut tc = ToolCalls::default();
+            let mut parts = tc.push(text);
+            parts.extend(tc.finish());
+            parts
+        };
+        // as Qwen3-30B-A3B wrote it: the outer object never closed
+        let missing = "<tool_call>\n{\"name\": \"update_tasks\", \"arguments\": {\"tasks\": [{\"text\": \"Fix total()\", \"status\": \"done\"}]}\n</tool_call>";
+        assert_eq!(calls(missing), vec![Part::Call { name: "update_tasks".into(), arguments: "{\"tasks\": [{\"text\": \"Fix total()\", \"status\": \"done\"}]}".into() }]);
+        // one brace too many, and a bracket left open
+        assert_eq!(calls("<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": 1}}}</tool_call>"), vec![Part::Call { name: "f".into(), arguments: "{\"a\": 1}".into() }]);
+        assert_eq!(calls("<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": [1, 2}}</tool_call>"), vec![Part::Call { name: "f".into(), arguments: "{\"a\": [1, 2]}".into() }]);
+        // braces inside strings do not count
+        assert_eq!(calls("<tool_call>{\"name\": \"f\", \"arguments\": {\"s\": \"}{\"}</tool_call>"), vec![Part::Call { name: "f".into(), arguments: "{\"s\": \"}{\"}".into() }]);
     }
 
     #[test]
