@@ -524,6 +524,8 @@ struct App {
     started: Option<Instant>,
     chunks: usize,               // text pieces of this round so far (about one token each)
     writing_since: Option<Instant>, // this round's first text: the speed shown counts from it
+    reply_tokens: f64,           // tokens this reply's rounds have generated (the server's count)
+    reply_writing: (f64, f64),   // over its rounds: tokens after each round's first, and the seconds they took
     context: (f64, f64), // tokens used, context length
     start: Args,         // what the command line asked to open or send once connected
     sidebar: bool,       // the chat list shown (it hides with the pane button)
@@ -677,6 +679,8 @@ impl App {
             started: None,
             chunks: 0,
             writing_since: None,
+            reply_tokens: 0.0,
+            reply_writing: (0.0, 0.0),
             context: (0.0, 0.0),
             start: args,
             sidebar: true,
@@ -1450,6 +1454,7 @@ impl App {
         self.messages.push(Msg::reply());
         self.started = Some(Instant::now());
         (self.chunks, self.writing_since) = (0, None);
+        (self.reply_tokens, self.reply_writing) = (0.0, (0.0, 0.0));
         // the server holds this message until a scheduled run answering in this chat is done
         let waits = self.chat.is_some() && self.background.get("running").and_then(Json::as_str) == self.chat.as_deref();
         self.status = if waits { "Waiting for the scheduled task in this chat to finish".into() } else { "Reading".into() };
@@ -1540,7 +1545,7 @@ impl App {
             "context" => {
                 let f = |k: &str| ev.get(k).and_then(Json::as_f64).unwrap_or(0.0);
                 self.context = (f("prompt_tokens") + f("completion_tokens"), f("context_length"));
-                (self.chunks, self.writing_since) = (0, None);
+                self.end_round(f("completion_tokens"));
             }
             "done" => {
                 self.finish(&s("finish"));
@@ -1560,14 +1565,32 @@ impl App {
         Task::none()
     }
 
+    /// A round of the reply ended, having generated `tokens`: its share of the reply's count and speed.
+    fn end_round(&mut self, tokens: f64) {
+        self.reply_tokens += tokens;
+        if let Some(t) = self.writing_since.take() {
+            self.reply_writing.0 += (tokens - 1.0).max(0.0);
+            self.reply_writing.1 += t.elapsed().as_secs_f64();
+        }
+        self.chunks = 0;
+    }
+
     fn finish(&mut self, how: &str) {
         self.busy = None;
         if how != "stopped" {
             self.happy_until = self.born.elapsed().as_millis() as u64 + 3000;
         }
         let secs = self.started.take().map_or(0.0, |t| t.elapsed().as_secs_f64());
+        if self.writing_since.is_some() {
+            self.end_round(self.chunks as f64); // a round cut short has no count from the server: its text pieces
+        }
+        let (tokens, (after_first, writing)) = (self.reply_tokens, self.reply_writing);
         if let Some(m) = self.messages.last_mut().filter(|m| m.role == Role::Assistant) {
-            m.stats = format!("{secs:.1} s{}", match how {
+            // tokens, the whole wait, and the writing speed (from each round's first token: not counting
+            // reading the prompt or the tools run between rounds)
+            let speed = if writing > 0.0 && after_first > 0.0 { format!(" · {:.1} tok/s", after_first / writing) } else { String::new() };
+            let count = if tokens > 0.0 { format!("{tokens:.0} tokens · ") } else { String::new() };
+            m.stats = format!("{count}{secs:.1} s{speed}{}", match how {
                 "length" => ", stopped at the length limit",
                 "stopped" => ", stopped",
                 _ => "",
