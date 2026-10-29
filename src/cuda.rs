@@ -1201,7 +1201,7 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
                                       float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp,
                                       int n_heads, int n_kv, int hd, float scale, int nsplit, int want) {
     if (posp) pos0 = *posp;
-    __shared__ float sc[ATT_MAX_G][ATT_MAX_CHUNK];
+    __shared__ __align__(16) float sc[ATT_MAX_CHUNK][ATT_MAX_G]; // per position, its G heads together
     __shared__ float red[32];
     int kvh = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
     int G = n_heads / n_kv;
@@ -1237,38 +1237,51 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
             if (g < G) {
                 float d = lane_dot(q[g], k4);
                 for (int o = 16; o > 0; o >>= 1) d = __fadd_rn(d, __shfl_xor_sync(0xffffffff, d, o));
-                if (lane == 0) sc[g][t] = __fmul_rn(d, kscale);
+                if (lane == 0) sc[t][g] = __fmul_rn(d, kscale);
             }
         }
     }
     __syncthreads();
+    // softmax per head; every head in one pass over the positions (each thread's share and the block-wide
+    // reductions are the same per head as one head at a time)
     float mxg[ATT_MAX_G], seg[ATT_MAX_G];
     #pragma unroll
-    for (int g = 0; g < ATT_MAX_G; g++) {
-        if (g < G) {
-            float m = NEG_INF;
-            for (int t = tid; t < len; t += blockDim.x) m = fmaxf(m, sc[g][t]);
-            m = block_max(m, red);
-            float se = 0.f;
-            for (int t = tid; t < len; t += blockDim.x) {
-                float e = expf(__fsub_rn(sc[g][t], m));
-                sc[g][t] = __fmul_rn(e, KV_SCALE(vs, t0 + t, n_kv, kvh)); // the value scale rides on the weight
-                se = __fadd_rn(se, e);
+    for (int g = 0; g < ATT_MAX_G; g++) mxg[g] = NEG_INF, seg[g] = 0.f;
+    for (int t = tid; t < len; t += blockDim.x)
+        #pragma unroll
+        for (int g = 0; g < ATT_MAX_G; g++) if (g < G) mxg[g] = fmaxf(mxg[g], sc[t][g]);
+    #pragma unroll
+    for (int g = 0; g < ATT_MAX_G; g++) if (g < G) mxg[g] = block_max(mxg[g], red);
+    for (int t = tid; t < len; t += blockDim.x) {
+        float vscale = KV_SCALE(vs, t0 + t, n_kv, kvh); // the value scale rides on the weight
+        #pragma unroll
+        for (int g = 0; g < ATT_MAX_G; g++) {
+            if (g < G) {
+                float e = expf(__fsub_rn(sc[t][g], mxg[g]));
+                sc[t][g] = __fmul_rn(e, vscale);
+                seg[g] = __fadd_rn(seg[g], e);
             }
-            se = block_sum(se, red); // barrier: the probabilities are visible to every thread
-            mxg[g] = m;
-            seg[g] = se;
         }
     }
+    #pragma unroll
+    for (int g = 0; g < ATT_MAX_G; g++) if (g < G) seg[g] = block_sum(seg[g], red); // barrier: the weights are visible to every thread
     if (tid < hd) {
         float a[ATT_MAX_G];
         #pragma unroll
         for (int g = 0; g < ATT_MAX_G; g++) a[g] = 0.f;
         const kv_t* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + tid;
+        // positions in order (the sums' order is fixed); unrolled so the loads of several go out together
+        #pragma unroll 8
         for (int t = 0; t < len; t++) {
             float v = kv_load1(vcol + (size_t)t * kv_dim);
+            float4 w0 = *reinterpret_cast<const float4*>(&sc[t][0]);
+            float w[ATT_MAX_G] = {w0.x, w0.y, w0.z, w0.w};
+            if (G > 4) {
+                float4 w1 = *reinterpret_cast<const float4*>(&sc[t][4]);
+                w[4] = w1.x; w[5] = w1.y; w[6] = w1.z; w[7] = w1.w;
+            }
             #pragma unroll
-            for (int g = 0; g < ATT_MAX_G; g++) if (g < G) a[g] = __fmaf_rn(sc[g][t], v, a[g]);
+            for (int g = 0; g < ATT_MAX_G; g++) if (g < G) a[g] = __fmaf_rn(w[g], v, a[g]);
         }
         #pragma unroll
         for (int g = 0; g < ATT_MAX_G; g++) {
