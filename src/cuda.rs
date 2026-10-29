@@ -1189,6 +1189,21 @@ __device__ __forceinline__ float lane_dot(const float* q, const float* k) {
     return __fmaf_rn(q[3], k[3], __fmaf_rn(q[2], k[2], __fmaf_rn(q[1], k[1], __fmul_rn(q[0], k[0]))));
 }
 
+// S1_j of a key row for every head: lane j's and lane j + 16's products of attention_partial_gqa's warp
+// version (groups j and j + 16 of the row, head size 128), summed as its first butterfly step sums them.
+__device__ __forceinline__ void att_s1(const kv_t* kt, const float (*qsh)[ATT_MAX_HD], int G, int j, float* s) {
+    float4 ka = kv_load4(kt + 4 * j), kb = kv_load4(kt + 4 * j + 64);
+    float a4[4] = {ka.x, ka.y, ka.z, ka.w}, b4[4] = {kb.x, kb.y, kb.z, kb.w};
+    #pragma unroll
+    for (int g = 0; g < ATT_MAX_G; g++) {
+        if (g < G) {
+            float4 qa = *reinterpret_cast<const float4*>(&qsh[g][4 * j]), qc = *reinterpret_cast<const float4*>(&qsh[g][4 * j + 64]);
+            float qa4[4] = {qa.x, qa.y, qa.z, qa.w}, qc4[4] = {qc.x, qc.y, qc.z, qc.w};
+            s[g] = __fadd_rn(lane_dot(qa4, a4), lane_dot(qc4, b4));
+        }
+    }
+}
+
 // Flash-decoding attention for grouped-query models, part 1: one block per (kv head, token, slice of
 // `chunk` positions) computes all G = n_heads / n_kv query heads that share the kv head, so each key
 // and value row is read once. A warp scores one position at a time: every lane loads hd/32 consecutive
@@ -1202,6 +1217,7 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
                                       int n_heads, int n_kv, int hd, float scale, int nsplit, int want) {
     if (posp) pos0 = *posp;
     __shared__ __align__(16) float sc[ATT_MAX_CHUNK][ATT_MAX_G]; // per position, its G heads together
+    __shared__ __align__(16) float qsh[ATT_MAX_G][ATT_MAX_HD];   // the scaled queries (head size 128)
     __shared__ float red[32];
     int kvh = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
     int G = n_heads / n_kv;
@@ -1218,6 +1234,50 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
         }
         return;
     }
+    if (hd == 128) {
+        // scores, a thread per position. The warp version below gives lane l the dot product of elements
+        // 4l..4l+3 and sums the 32 by an xor butterfly (offsets 16, 8, 4, 2, 1): every lane ends with
+        // ((S1_0 + S1_8) + (S1_4 + S1_12)) + ... where S1_j = d_j + d_(j+16). The same tree here, from the
+        // same products in the same order, gives each score bit for bit; no shuffles, and a warp scores 32
+        // positions at once instead of one.
+        const float* qb = qkv + (size_t)b * (q_dim + 2 * kv_dim) + kvh * G * 128;
+        for (int i = tid; i < G * 128; i += blockDim.x) qsh[i >> 7][i & 127] = __fmul_rn(qb[i], scale);
+        __syncthreads();
+        for (int t = tid; t < len; t += blockDim.x) {
+            // the queries are read from shared memory as they are needed: hoisted out of the loop, all of them
+            // would take far more registers than there are
+            asm volatile("" ::: "memory");
+            const kv_t* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * 128;
+            // the butterfly's tree: S2_j = S1_j + S1_(j+8), S3_j = S2_j + S2_(j+4), S4_j = S3_j + S3_(j+2),
+            // score = S4_0 + S4_1, walked in bit-reversed j so each level keeps one pending sum per head
+            float s[ATT_MAX_G], l1[ATT_MAX_G], l2[ATT_MAX_G], l3[ATT_MAX_G], l4[ATT_MAX_G];
+            #define ATT_PUT(lv) _Pragma("unroll") for (int g = 0; g < ATT_MAX_G; g++) if (g < G) lv[g] = s[g];
+            #define ATT_UP(lv, from) _Pragma("unroll") for (int g = 0; g < ATT_MAX_G; g++) if (g < G) lv[g] = __fadd_rn(from[g], s[g]);
+            #define ATT_FOLD(dst, lv) _Pragma("unroll") for (int g = 0; g < ATT_MAX_G; g++) if (g < G) s[g] = __fadd_rn(lv[g], s[g]);
+            att_s1(kt, qsh, G, 0, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 8, s);  ATT_UP(l2, l1)                                   // S2_0
+            att_s1(kt, qsh, G, 4, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 12, s); ATT_FOLD(s, l1) ATT_UP(l3, l2)                   // S2_4, S3_0
+            att_s1(kt, qsh, G, 2, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 10, s); ATT_UP(l2, l1)                                   // S2_2
+            att_s1(kt, qsh, G, 6, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 14, s); ATT_FOLD(s, l1) ATT_FOLD(s, l2) ATT_UP(l4, l3)   // S2_6, S3_2, S4_0
+            att_s1(kt, qsh, G, 1, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 9, s);  ATT_UP(l2, l1)                                   // S2_1
+            att_s1(kt, qsh, G, 5, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 13, s); ATT_FOLD(s, l1) ATT_UP(l3, l2)                   // S2_5, S3_1
+            att_s1(kt, qsh, G, 3, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 11, s); ATT_UP(l2, l1)                                   // S2_3
+            att_s1(kt, qsh, G, 7, s);  ATT_PUT(l1)
+            att_s1(kt, qsh, G, 15, s); ATT_FOLD(s, l1) ATT_FOLD(s, l2) ATT_FOLD(s, l3) ATT_FOLD(s, l4) // S2_7 .. score
+            #undef ATT_PUT
+            #undef ATT_UP
+            #undef ATT_FOLD
+            float kscale = KV_SCALE(ks, t0 + t, n_kv, kvh);
+            #pragma unroll
+            for (int g = 0; g < ATT_MAX_G; g++) if (g < G) sc[t][g] = __fmul_rn(s[g], kscale);
+        }
+    } else {
     int per = hd >> 5; // floats per lane: 2 (hd 64) or 4 (hd 128)
     float q[ATT_MAX_G][4];
     const float* qrow = qkv + (size_t)b * (q_dim + 2 * kv_dim) + kvh * G * hd + lane * per;
@@ -1240,6 +1300,7 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
                 if (lane == 0) sc[t][g] = __fmul_rn(d, kscale);
             }
         }
+    }
     }
     __syncthreads();
     // softmax per head; every head in one pass over the positions (each thread's share and the block-wide
@@ -3509,7 +3570,7 @@ impl Kernels {
             };
             // GHOST_INFER_KERNEL_INFO=1: registers and spills of the decode and verify kernels, for tuning
             if std::env::var_os("GHOST_INFER_KERNEL_INFO").is_some() {
-                for name in ["matmul_q4k_dp4a", "matmul_q4k_dp4a8", "matmul_q4k_vfy1", "matmul_q4k_vfy2", "matmul_q4k_vfy4", "matmul_q6k_vfy1", "matmul_q6k_vfy2", "matmul_q6k_vfy4"] {
+                for name in ["attention_partial_gqa", "matmul_q4k_dp4a", "matmul_q4k_dp4a8", "matmul_q4k_vfy1", "matmul_q4k_vfy2", "matmul_q4k_vfy4", "matmul_q6k_vfy1", "matmul_q6k_vfy2", "matmul_q6k_vfy4"] {
                     let f = get(name)?;
                     let (mut regs, mut local) = (0, 0);
                     (a.f.cuFuncGetAttribute)(&mut regs, 4, f);
