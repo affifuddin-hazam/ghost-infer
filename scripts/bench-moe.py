@@ -66,7 +66,9 @@ def one(url, model, text, max_tokens):
             d = json.loads(line[6:])
             usage = d.get("usage") or usage
             for c in d.get("choices") or []:
-                if (c.get("delta") or {}).get("content"):
+                delta = c.get("delta") or {}
+                # a reasoning model's thinking may stream as reasoning_content (llama.cpp's server does)
+                if delta.get("content") or delta.get("reasoning_content"):
                     now = time.perf_counter()
                     chunks += 1
                     first = first or now
