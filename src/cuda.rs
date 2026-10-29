@@ -60,6 +60,14 @@ fn vfy_attention_fits(c: &Config) -> bool {
 const ATT_MAX_HD: usize = 128; // must match ATT_MAX_HD
 const ATT_MAX_G: usize = 8; // query heads per kv head the GQA attention kernel handles (must match ATT_MAX_G)
 const SPLIT_MIN_SPAN: usize = 32; // contexts up to this many positions are not split across blocks (must match ATT_SPLIT_MIN_SPAN)
+/// Most positions per attention block once a context is split (GHOST_INFER_ATT_CAP, 32..ATT_MAX_CHUNK): shorter
+/// slices mean more blocks and shorter sequential sums. Qwen3 4B on an RTX 2060 Super, tok/s at 1K / 2K / 4K /
+/// 8K positions: 256 (up to this commit) - / 94.6 / - / 67.5, 160 110.5 / 101.7 / 87.4 / 71.0, 128 110.3 / 103.3 /
+/// 88.8 / 71.6, 96 110.7 / 99.0 / 86.3 / 70.2, 64 - / 100.1 / - / 67.7.
+fn att_chunk_cap() -> usize {
+    static C: OnceLock<usize> = OnceLock::new();
+    *C.get_or_init(|| std::env::var("GHOST_INFER_ATT_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(128).clamp(32, ATT_MAX_CHUNK))
+}
 const ATT_TARGET_BLOCKS: usize = 96; // aim for a few blocks per SM when splitting attention for one token
 const PREFILL_QT: usize = 32; // query tokens per prompt-attention block (must match PQT)
 const PREFILL_KT: usize = 32; // key positions per shared-memory tile (must match PKT)
@@ -1173,15 +1181,18 @@ __global__ void matmul_q6k_1(KQ_ARGS) { q6k_matvec<1>(w, wd, x, out, rows, cols,
 __global__ void matmul_q6k_4(KQ_ARGS) { q6k_matvec<4>(w, wd, x, out, rows, cols, n, accumulate, out_stride, out_off); }
 
 #define ATT_MAX_CHUNK 256
+#ifndef ATT_CHUNK_CAP
+#define ATT_CHUNK_CAP ATT_MAX_CHUNK // set from the host (att_chunk_cap)
+#endif
 #define ATT_MAX_HD 128
 #define ATT_MAX_G 8
 #define ATT_SPLIT_MIN_SPAN 32
 
 // Context slice per decode-attention block for a token that sees span positions: whole contexts up to
-// ATT_SPLIT_MIN_SPAN, otherwise about want slices of 32..ATT_MAX_CHUNK positions. It depends on the
+// ATT_SPLIT_MIN_SPAN, otherwise about want slices of 32..ATT_CHUNK_CAP positions. It depends on the
 // token's own span only, so a token is attended the same way alone or inside a batch.
 __device__ __forceinline__ int att_chunk_for(int span, int want) {
-    return span <= ATT_SPLIT_MIN_SPAN ? ATT_MAX_CHUNK : min(max((span + want - 1) / want, 32), ATT_MAX_CHUNK);
+    return span <= ATT_SPLIT_MIN_SPAN ? ATT_MAX_CHUNK : min(max((span + want - 1) / want, 32), ATT_CHUNK_CAP);
 }
 
 // A lane's share of a decode attention score: per (<= 4) floats of the query and the key, in this order.
@@ -3496,6 +3507,7 @@ impl Kernels {
             format!("--gpu-architecture=sm_{}{}", a.compute.0, a.compute.1),
             "-std=c++14".into(),
             format!("-DRPW={}", kq_rpw()),
+            format!("-DATT_CHUNK_CAP={}", att_chunk_cap()),
             format!("-DQCH={}", qch()),
             format!("-DDP4A_BATCH_MINB={}", std::env::var("GHOST_INFER_BATCH_MINB").unwrap_or("3".into())),
             format!("-DDP4A_BATCH_RPW={}", batch_rpw()),
@@ -4947,7 +4959,7 @@ impl GpuModel {
         if span <= SPLIT_MIN_SPAN {
             return ATT_MAX_CHUNK;
         }
-        span.div_ceil(want).clamp(32, ATT_MAX_CHUNK)
+        span.div_ceil(want).clamp(32, att_chunk_cap())
     }
 
     /// Most slices any token of a ctx-position session needs: the fixed split grid of graph decoding.
