@@ -1200,10 +1200,21 @@ __device__ __forceinline__ float lane_dot(const float* q, const float* k) {
     return __fmaf_rn(q[3], k[3], __fmaf_rn(q[2], k[2], __fmaf_rn(q[1], k[1], __fmul_rn(q[0], k[0]))));
 }
 
+// Group l (4 values) of a key row: an int8 cache's row is read whole into registers first (kw: 32 words,
+// eight 16-byte loads), an f16 one group by group from memory.
+#ifdef KV8
+__device__ __forceinline__ float4 att_kg(const int* kw, const kv_t*, int l) {
+    int w = kw[l];
+    return make_float4((float)(signed char)w, (float)(signed char)(w >> 8), (float)(signed char)(w >> 16), (float)(w >> 24));
+}
+#else
+__device__ __forceinline__ float4 att_kg(const int*, const kv_t* kt, int l) { return kv_load4(kt + 4 * l); }
+#endif
+
 // S1_j of a key row for every head: lane j's and lane j + 16's products of attention_partial_gqa's warp
 // version (groups j and j + 16 of the row, head size 128), summed as its first butterfly step sums them.
-__device__ __forceinline__ void att_s1(const kv_t* kt, const float (*qsh)[ATT_MAX_HD], int G, int j, float* s) {
-    float4 ka = kv_load4(kt + 4 * j), kb = kv_load4(kt + 4 * j + 64);
+__device__ __forceinline__ void att_s1(const int* kw, const kv_t* kt, const float (*qsh)[ATT_MAX_HD], int G, int j, float* s) {
+    float4 ka = att_kg(kw, kt, j), kb = att_kg(kw, kt, j + 16);
     float a4[4] = {ka.x, ka.y, ka.z, ka.w}, b4[4] = {kb.x, kb.y, kb.z, kb.w};
     #pragma unroll
     for (int g = 0; g < ATT_MAX_G; g++) {
@@ -1259,28 +1270,40 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
             // would take far more registers than there are
             asm volatile("" ::: "memory");
             const kv_t* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * 128;
+#ifdef KV8
+            // the row in eight 16-byte loads: a thread reads its own row, so narrower loads would touch a
+            // warp's 32 rows (cache lines) once per 4 bytes
+            int kw[32];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                int4 v = *reinterpret_cast<const int4*>(kt + 16 * i);
+                kw[4 * i] = v.x, kw[4 * i + 1] = v.y, kw[4 * i + 2] = v.z, kw[4 * i + 3] = v.w;
+            }
+#else
+            int kw[1] = {0};
+#endif
             // the butterfly's tree: S2_j = S1_j + S1_(j+8), S3_j = S2_j + S2_(j+4), S4_j = S3_j + S3_(j+2),
             // score = S4_0 + S4_1, walked in bit-reversed j so each level keeps one pending sum per head
             float s[ATT_MAX_G], l1[ATT_MAX_G], l2[ATT_MAX_G], l3[ATT_MAX_G], l4[ATT_MAX_G];
             #define ATT_PUT(lv) _Pragma("unroll") for (int g = 0; g < ATT_MAX_G; g++) if (g < G) lv[g] = s[g];
             #define ATT_UP(lv, from) _Pragma("unroll") for (int g = 0; g < ATT_MAX_G; g++) if (g < G) lv[g] = __fadd_rn(from[g], s[g]);
             #define ATT_FOLD(dst, lv) _Pragma("unroll") for (int g = 0; g < ATT_MAX_G; g++) if (g < G) s[g] = __fadd_rn(lv[g], s[g]);
-            att_s1(kt, qsh, G, 0, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 8, s);  ATT_UP(l2, l1)                                   // S2_0
-            att_s1(kt, qsh, G, 4, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 12, s); ATT_FOLD(s, l1) ATT_UP(l3, l2)                   // S2_4, S3_0
-            att_s1(kt, qsh, G, 2, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 10, s); ATT_UP(l2, l1)                                   // S2_2
-            att_s1(kt, qsh, G, 6, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 14, s); ATT_FOLD(s, l1) ATT_FOLD(s, l2) ATT_UP(l4, l3)   // S2_6, S3_2, S4_0
-            att_s1(kt, qsh, G, 1, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 9, s);  ATT_UP(l2, l1)                                   // S2_1
-            att_s1(kt, qsh, G, 5, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 13, s); ATT_FOLD(s, l1) ATT_UP(l3, l2)                   // S2_5, S3_1
-            att_s1(kt, qsh, G, 3, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 11, s); ATT_UP(l2, l1)                                   // S2_3
-            att_s1(kt, qsh, G, 7, s);  ATT_PUT(l1)
-            att_s1(kt, qsh, G, 15, s); ATT_FOLD(s, l1) ATT_FOLD(s, l2) ATT_FOLD(s, l3) ATT_FOLD(s, l4) // S2_7 .. score
+            att_s1(kw, kt, qsh, G, 0, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 8, s);  ATT_UP(l2, l1)                                   // S2_0
+            att_s1(kw, kt, qsh, G, 4, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 12, s); ATT_FOLD(s, l1) ATT_UP(l3, l2)                   // S2_4, S3_0
+            att_s1(kw, kt, qsh, G, 2, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 10, s); ATT_UP(l2, l1)                                   // S2_2
+            att_s1(kw, kt, qsh, G, 6, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 14, s); ATT_FOLD(s, l1) ATT_FOLD(s, l2) ATT_UP(l4, l3)   // S2_6, S3_2, S4_0
+            att_s1(kw, kt, qsh, G, 1, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 9, s);  ATT_UP(l2, l1)                                   // S2_1
+            att_s1(kw, kt, qsh, G, 5, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 13, s); ATT_FOLD(s, l1) ATT_UP(l3, l2)                   // S2_5, S3_1
+            att_s1(kw, kt, qsh, G, 3, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 11, s); ATT_UP(l2, l1)                                   // S2_3
+            att_s1(kw, kt, qsh, G, 7, s);  ATT_PUT(l1)
+            att_s1(kw, kt, qsh, G, 15, s); ATT_FOLD(s, l1) ATT_FOLD(s, l2) ATT_FOLD(s, l3) ATT_FOLD(s, l4) // S2_7 .. score
             #undef ATT_PUT
             #undef ATT_UP
             #undef ATT_FOLD
@@ -2106,23 +2129,39 @@ __global__ void __launch_bounds__(128) attention_prefill_tc64(ATT_TC_ARGS) { att
 __global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { attn_prefill_tc<128>(qkv, kc, vc, ks, vs, out, pos0, n, n_heads, n_kv, scale); }
 
 // Flash-decoding attention, part 2: merge the slices of each (head, token) into the normalised output.
+#define COMBINE_MAX 2048 // slices whose weights fit in shared memory (more: computed where used)
 __global__ void attention_combine(const float* __restrict__ part, float* __restrict__ out,
                                   int pos0, const int* __restrict__ posp, int n_heads, int hd, int nsplit, int want) {
+    // one warp per (head, token, 32 output dimensions): the slices' max score, each slice's weight
+    // exp(max_s - max) once, the exp-sums weighted in slice order, then each dimension in slice order
     if (posp) pos0 = *posp;
-    int h = blockIdx.x, b = blockIdx.y;
+    __shared__ float wsh[COMBINE_MAX];
+    __shared__ float inv_sh;
+    int h = blockIdx.x, b = blockIdx.y, lane = threadIdx.x;
     int span = pos0 + b + 1;
     int chunk = att_chunk_for(span, want);
     int used = min(nsplit, (span + chunk - 1) / chunk);
     const float* p = part + ((size_t)b * n_heads + h) * nsplit * (hd + 2);
     float m = NEG_INF;
-    for (int s = 0; s < used; s++) m = fmaxf(m, p[s * (hd + 2) + hd]);
-    float total = 0.f;
-    for (int s = 0; s < used; s++) total += p[s * (hd + 2) + hd + 1] * expf(p[s * (hd + 2) + hd] - m);
-    float inv = 1.f / total;
-    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+    for (int s = lane; s < used; s += 32) m = fmaxf(m, p[s * (hd + 2) + hd]);
+    m = warp_max(m);
+    bool held = used <= COMBINE_MAX;
+    if (held)
+        for (int s = lane; s < used; s += 32) wsh[s] = expf(__fsub_rn(p[s * (hd + 2) + hd], m));
+    __syncwarp();
+    auto weight = [&](int s) { return held ? wsh[s] : expf(__fsub_rn(p[s * (hd + 2) + hd], m)); };
+    if (lane == 0) {
+        float total = 0.f;
+        for (int s = 0; s < used; s++) total = __fmaf_rn(p[s * (hd + 2) + hd + 1], weight(s), total);
+        inv_sh = __fdiv_rn(1.f, total);
+    }
+    __syncwarp();
+    int d = blockIdx.z * 32 + lane;
+    if (d < hd) {
         float acc = 0.f;
-        for (int s = 0; s < used; s++) acc += p[s * (hd + 2) + d] * expf(p[s * (hd + 2) + hd] - m);
-        out[(size_t)b * n_heads * hd + h * hd + d] = acc * inv;
+        #pragma unroll 8
+        for (int s = 0; s < used; s++) acc = __fmaf_rn(p[s * (hd + 2) + d], weight(s), acc);
+        out[(size_t)b * n_heads * hd + h * hd + d] = __fmul_rn(acc, inv_sh);
     }
 }
 
@@ -5052,10 +5091,10 @@ impl GpuModel {
             )?;
             }
             if nsplit > 1 {
-                k.launch(
+                k.launch3(
                     k.attention_combine,
-                    (c.n_heads as u32, m as u32),
-                    128,
+                    (c.n_heads as u32, m as u32, c.head_dim.div_ceil(32) as u32),
+                    32,
                     0,
                     &[Arg::P(s.att_part.ptr), Arg::P(out), Arg::I(pos0 as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.head_dim as i32), Arg::I(nsplit as i32), Arg::I(want as i32)],
                 )?;
