@@ -2,7 +2,7 @@
 //! (dark, neutral greys) and Fog (light). Icons come from Segoe MDL2 Assets, the icon font every Windows 10
 //! and 11 has; text is Instrument Sans, the greeting Georgia.
 
-use iced::widget::{button, canvas, column, container, markdown, mouse_area, opaque, pick_list, rich_text, row, scrollable, stack, text, text_editor, text_input, Space};
+use iced::widget::{button, canvas, column, container, markdown, mouse_area, opaque, pick_list, rich_text, row, scrollable, stack, text, text_editor, text_input, tooltip, Space};
 use iced::{border, keyboard, Alignment, Background, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Theme};
 
 use crate::ghost::{Ghost, Mood};
@@ -118,7 +118,6 @@ mod ic {
     pub const OPEN_PANE: char = '\u{E8A0}';
     pub const UP: char = '\u{E74A}';
     pub const CHEVRON_UP: char = '\u{E70E}';
-    pub const STOP: char = '\u{E71A}';
     pub const RIGHT: char = '\u{E76C}';
     pub const DOWN: char = '\u{E70D}';
     pub const COPY: char = '\u{E8C8}';
@@ -360,12 +359,7 @@ impl App {
         ])
         .width(Fill)
         .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(99), ..Default::default() });
-        let note = match (used > 0.0, self.messages.is_empty()) {
-            (true, _) => format!("{} of {} tokens", thousands(used), thousands(total)),
-            (false, true) => format!("{} tokens free", thousands(total)),
-            (false, false) => "Shown after the next reply".to_string(), // a chat saved before tokens were kept
-        };
-        let context = column![meter, text(note).size(12).color(s.faint)].spacing(8).padding([6, 0]);
+        let context = column![meter, text(self.context_note()).size(12).color(s.faint)].spacing(8).padding([6, 0]);
 
         // changes: the files this chat changed, and undo for all of them
         let changes = self.changes();
@@ -721,9 +715,6 @@ impl App {
             );
         }
         top = top.push(Space::new().width(Fill));
-        if self.context.1 > 0.0 && self.context.0 > 0.0 && !self.messages.is_empty() {
-            top = top.push(text(format!("{:.0}% of context", 100.0 * self.context.0 / self.context.1)).size(12).color(s.faint));
-        }
         // the title bar: drag the window by its empty part, the window's buttons at its right
         // the rail's switch; with the rail open, the window's buttons move to its top
         let on = self.rail;
@@ -795,10 +786,13 @@ impl App {
             .style(move |t, st| editor_style(s, t, st));
         let plus = container(button(container(icon(ic::ADD, 13).color(s.muted)).center(32)).on_press(Message::OpenPlus).padding(0).style(move |_, st| round_style(s, st))).id("plus");
         let busy = self.busy.is_some();
-        let send = button(container(icon(if busy { ic::STOP } else { ic::UP }, 13).color(s.ink)).center(32))
-            .on_press(if busy { Message::Stop } else { Message::Send })
-            .padding(0)
-            .style(move |_, st| send_style(s, st));
+        let send = if busy {
+            // stop: a rounded square with a square in it
+            let mark = container(Space::new()).width(10).height(10).style(move |_| container::Style { background: Some(Background::Color(s.ink)), border: border::rounded(2), ..Default::default() });
+            button(container(mark).center(32)).on_press(Message::Stop).padding(0).style(move |_, st| stop_style(s, st))
+        } else {
+            button(container(icon(ic::UP, 13).color(s.ink)).center(32)).on_press(Message::Send).padding(0).style(move |_, st| send_style(s, st))
+        };
         let card = container(column![editor, row![plus, Space::new().width(Fill), send].align_y(Alignment::Center)].spacing(4))
             .padding(Padding { top: 12.0, right: 12.0, bottom: 10.0, left: 14.0 })
             .style(move |_| container::Style {
@@ -819,7 +813,21 @@ impl App {
             .style(move |t, st| pick_style(s, t, st))
             .menu_style(move |t| menu_style(s, t));
         let folder = row![icon(ic::FOLDER, 12).color(s.muted), text(self.folder_label()).size(13).color(s.muted)].spacing(7).align_y(Alignment::Center);
-        let under = row![container(folder).padding([4, 8]), Space::new().width(Fill), model, think].spacing(2).align_y(Alignment::Center).padding(Padding { top: 8.0, right: 4.0, bottom: 0.0, left: 4.0 });
+        let mut under = row![container(folder).padding([4, 8]), Space::new().width(Fill), model, think].spacing(2).align_y(Alignment::Center).padding(Padding { top: 8.0, right: 4.0, bottom: 0.0, left: 4.0 });
+        // how full the context is, as Claude shows it: a ring, its numbers on hover, the side panel on a click
+        let (used, total) = self.context;
+        if total > 0.0 {
+            let frac = (used / total).clamp(0.0, 1.0) as f32;
+            let ring = canvas(Ring { frac, track: s.line2, fill: s.accent }).width(16).height(16);
+            let ring = button(container(ring).center(24)).on_press(Message::ToggleRail).padding(2).style(move |_, st| row_style(s, st, false));
+            let tip = format!("{:.0}% of context used: {}", 100.0 * frac, self.context_note());
+            let tip = container(text(tip).size(12).color(s.text)).padding([5, 9]).style(move |_| container::Style {
+                background: Some(Background::Color(s.raise)),
+                border: Border { radius: 8.0.into(), width: 1.0, color: s.line2 },
+                ..Default::default()
+            });
+            under = under.push(tooltip(ring, tip, tooltip::Position::Top).gap(6));
+        }
         match self.plan() {
             Some(plan) => column![plan, perch, card, under].into(),
             None => column![perch, card, under].into(),
@@ -870,6 +878,16 @@ impl App {
             ..Default::default()
         });
         Some(container(card).padding(Padding { bottom: 6.0, ..Padding::ZERO }).into())
+    }
+
+    /// The context's tokens in words: used of all, or free in a new chat.
+    fn context_note(&self) -> String {
+        let (used, total) = self.context;
+        match (used > 0.0, self.messages.is_empty()) {
+            (true, _) => format!("{} of {} tokens", thousands(used), thousands(total)),
+            (false, true) => format!("{} tokens free", thousands(total)),
+            (false, false) => "Shown after the next reply".to_string(), // a chat saved before tokens were kept
+        }
     }
 
     fn status_text(&self) -> String {
@@ -1177,6 +1195,10 @@ fn send_style(s: &Skin, st: button::Status) -> button::Style {
     button::Style { background: Some(Background::Color(c)), border: border::rounded(999), ..Default::default() }
 }
 
+fn stop_style(s: &Skin, st: button::Status) -> button::Style {
+    button::Style { border: border::rounded(9), ..send_style(s, st) }
+}
+
 fn card_style(s: &Skin, st: button::Status) -> button::Style {
     button::Style {
         background: Some(Background::Color(if hovered(st) { s.raise } else { s.hover })),
@@ -1221,4 +1243,29 @@ fn scroll_style(s: &Skin, theme: &Theme, st: scrollable::Status) -> scrollable::
         rail.scroller.border = border::rounded(4);
     }
     out
+}
+/// How full the context is: a faint track, and the used part clockwise from the top.
+struct Ring {
+    frac: f32,
+    track: Color,
+    fill: Color,
+}
+
+impl<M> canvas::Program<M> for Ring {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &iced::Renderer, _: &Theme, bounds: iced::Rectangle, _: iced::mouse::Cursor) -> Vec<canvas::Geometry> {
+        use canvas::{path::Arc, LineCap, Path, Stroke};
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let (c, r) = (frame.center(), bounds.width.min(bounds.height) / 2.0 - 1.5);
+        frame.stroke(&Path::circle(c, r), Stroke::default().with_width(2.0).with_color(self.track));
+        if self.frac > 0.0 {
+            let start = -std::f32::consts::FRAC_PI_2;
+            // a sliver at least, so a new chat's few tokens still show
+            let end = start + self.frac.max(0.02) * std::f32::consts::TAU;
+            let arc = Path::new(|b| b.arc(Arc { center: c, radius: r, start_angle: iced::Radians(start), end_angle: iced::Radians(end) }));
+            frame.stroke(&arc, Stroke::default().with_width(2.0).with_color(self.fill).with_line_cap(LineCap::Round));
+        }
+        vec![frame.into_geometry()]
+    }
 }
