@@ -73,7 +73,7 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"stop_process","description":"Stop a background process.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}}
  ],
  "web": [
-  {"type":"function","function":{"name":"web_search","description":"Search the web. Returns titles, addresses and snippets. Answer from what the results say, naming the site each fact comes from, and end the reply with a Sources list of the links you used. To see what a site or page itself says, open it with fetch_url instead.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What to search for"}},"required":["query"]}}},
+  {"type":"function","function":{"name":"web_search","description":"Search the web. Returns titles, addresses and snippets. When your reply uses these results, name the site each fact comes from and end it with a Sources list of the result links you used; a reply that uses no web results has no Sources list. To see what a site or page itself says, open it with fetch_url instead.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What to search for"}},"required":["query"]}}},
   {"type":"function","function":{"name":"fetch_url","description":"Open a web page, or a site the user names (example.com), and read what it says as text. Answer only from what the page says.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"http(s) address"}},"required":["url"]}}}
  ]
 }"#;
@@ -955,6 +955,7 @@ struct Chat {
     cwd: String,  // its working directory, set when it starts (as a Claude Code session's)
     goal: Json,   // its /goal (new_goal), or null
     parts: Json,  // how its last prompt split (prompt_parts), for the clients
+    named: bool,  // the model has named it (after its first request that is more than a greeting)
 }
 
 impl Chat {
@@ -967,7 +968,7 @@ impl Chat {
             h.write_u64(t as u64);
             h.finish() & 0xffff
         };
-        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, updated: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()), unread: false, cwd: String::new(), goal: Json::Null, parts: Json::Null }
+        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, updated: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()), unread: false, cwd: String::new(), goal: Json::Null, parts: Json::Null, named: false }
     }
 
     fn load(id: &str) -> Result<Chat, String> {
@@ -984,6 +985,8 @@ impl Chat {
             cwd: j.get("cwd").and_then(Json::as_str).unwrap_or("").to_string(),
             goal: j.get("goal").cloned().unwrap_or(Json::Null),
             parts: j.get("parts").cloned().unwrap_or(Json::Null),
+            // chats saved before this were named after their first reply
+            named: j.get("named").and_then(Json::as_bool).unwrap_or_else(|| j.get("messages").and_then(Json::as_array).is_some_and(|m| m.iter().any(|m| role(m) == "assistant"))),
         })
     }
 
@@ -1005,6 +1008,7 @@ impl Chat {
             ("cwd", str(&self.cwd)),
             ("goal", self.goal.clone()),
             ("parts", self.parts.clone()),
+            ("named", Json::Bool(self.named)),
             ("messages", Json::Arr(self.messages.clone())),
         ]);
         let path = chat_file(&self.id)?;
@@ -1164,7 +1168,7 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
             }
         }
         chat.save()?;
-        let first = req.message.is_some() && chat.messages.iter().filter(|m| m.get("role").and_then(Json::as_str) == Some("user")).count() == 1;
+        let first = !chat.named && req.message.as_deref().is_some_and(|m| !is_greeting(m));
         reply(&mut out, &req, &mut chat, first, work, shared, loaded)
     })();
     if let Err(e) = result {
@@ -1255,6 +1259,7 @@ fn reply(out: &mut Out, req: &Request, chat: &mut Chat, first: bool, work: &mpsc
     let _ = emit(out, end);
     // a chat's first reply: the model names it, after "done" so nobody waits for it
     if named {
+        chat.named = true;
         if let Some(title) = name_chat(req, chat, work, shared, loaded) {
             chat.title = title;
             chat.save()?;
@@ -1345,7 +1350,7 @@ fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, s
         fields.push(("tools", Json::Arr(tools.to_vec())));
     }
     let body = obj(fields);
-    if loaded.glm { chat_prompt_glm(&body, shared.think_default, loaded.thinking) } else { chat_prompt(&body, loaded.default_system.as_deref(), shared.think_default, loaded.thinking) }
+    if loaded.glm { chat_prompt_glm(&body, shared.think_default, loaded.thinking) } else { chat_prompt(&body, loaded.default_system.as_deref(), shared.think_default, loaded.thinking, loaded.coder) }
 }
 
 /// How an agent prompt begins with these tool groups: everything before the first message (the server reads
@@ -1363,7 +1368,18 @@ pub fn prompt_opening(groups: &[String], shared: &Shared, loaded: &Loaded) -> Op
     (n > 0).then(|| a[..n].to_string())
 }
 
-/// A short title for a chat after its first reply, written by the model; None if it gave nothing usable.
+/// A message that only greets, thanks or asks how things are: a chat is named after the first message that
+/// asks for something, as Claude names one after what the user wants.
+fn is_greeting(m: &str) -> bool {
+    const WORDS: [&str; 34] = [
+        "hi", "hello", "hellow", "helo", "hey", "hai", "hiya", "howdy", "yo", "sup", "greetings", "good", "morning", "afternoon", "evening", "night", "there", "ghost", "thanks", "thank", "you", "ok", "okay", "how", "are", "is", "it", "going", "doing", "what's", "whats", "up", "u", "all",
+    ];
+    let lower = m.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric() && c != '\'').filter(|w| !w.is_empty()).collect();
+    !words.is_empty() && words.len() <= 6 && words.iter().all(|w| WORDS.contains(w))
+}
+
+/// A short title for a chat after its first request, written by the model; None if it gave nothing usable.
 /// The question goes after the chat itself, so the prompt starts as the reply's did and the server's cache
 /// already holds it: only the question is read, and the next message finds the chat still cached.
 fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Option<String> {
@@ -1393,7 +1409,7 @@ fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sha
     let lower = title.to_lowercase();
     let generic = ["", "chat title", "title", "new chat", "chat", "untitled", "conversation"].contains(&lower.as_str()) || ask.to_lowercase().contains(&lower);
     if generic || title.contains('<') || title.split_whitespace().count() > 10 {
-        let first = chat.messages.iter().find(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m))?;
+        let first = chat.messages.iter().rev().find(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m))?;
         let words: Vec<&str> = first.get("content").and_then(Json::as_str)?.split_whitespace().take(6).collect();
         return (!words.is_empty()).then(|| words.join(" ").chars().take(80).collect());
     }
@@ -1747,4 +1763,29 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
     let result = crate::tools::run(name, &args, &settings, checkpoint).unwrap_or_else(|e| format!("Error: {e}"));
     RUN_SECS.with(|c| c.set(t.elapsed().as_secs_f64()));
     Ok((result, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greetings_wait_for_a_request() {
+        for m in ["hi there.", "Hello!", "hey ghost", "good morning", "how are you", "thanks!", "what's up"] {
+            assert!(is_greeting(m), "{m}");
+        }
+        for m in ["write a nursery rhyme song", "Hello from the other side", "what is your name", "hi, check my disk space", ""] {
+            assert!(!is_greeting(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn goal_limits_and_loop_intervals() {
+        assert_eq!(goal_limit("all tests pass, stop after 5 tries"), 5);
+        assert_eq!(goal_limit("the page loads"), GOAL_TRIES);
+        assert_eq!(interval_minutes("10m"), Some(10));
+        assert_eq!(interval_minutes("2h"), Some(120));
+        assert_eq!(interval_minutes("1m"), Some(5));
+        assert_eq!(interval_minutes("soon"), None);
+    }
 }

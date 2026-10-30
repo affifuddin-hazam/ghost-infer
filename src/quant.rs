@@ -115,6 +115,11 @@ impl QuantizedBatch {
         (&self.scales[b * nb..(b + 1) * nb], &self.quants[b * self.cols..(b + 1) * self.cols])
     }
 
+    #[cfg(test)]
+    pub fn row_parts(&self, b: usize) -> (&[f32], &[i8]) {
+        self.row(b)
+    }
+
     fn row3(&self, b: usize) -> XRow<'_> {
         let nb = self.cols / QK8_0;
         XRow { d: &self.scales[b * nb..(b + 1) * nb], q: &self.quants[b * self.cols..(b + 1) * self.cols], s: &self.sums[b * nb..(b + 1) * nb] }
@@ -779,6 +784,7 @@ impl<'a> Matrix<'a> {
             GgmlType::Q4K => kernels::dequant_q4k(row, out),
             GgmlType::Q5K => kernels::dequant_q5k(row, out),
             GgmlType::Q6K => kernels::dequant_q6k(row, out),
+            ty if ty.is_iquant() => crate::iquant::dequant(ty, row, out),
             ty if ty.dequant_only() => dequant_small(ty, row, out),
             _ => panic!("unsupported weight type {}", self.ty.name()),
         }
@@ -828,6 +834,22 @@ impl<'a> Matrix<'a> {
                 }
                 while b < n {
                     emit(b, kernels::kq_row(ty, avx2, w, [xq.row3(b)])[0]);
+                    b += 1;
+                }
+            }
+            ty if crate::iquant::has_dot(ty) && !exact_mode() => {
+                debug_assert_eq!(xq.n, n);
+                let dot = |xs| if avx2 { unsafe { crate::iquant::row_dot_avx2(ty, w, xs) } } else { crate::iquant::row_dot_scalar(ty, w, xs) };
+                let mut b = 0;
+                while b + 4 <= n {
+                    for (i, v) in dot([xq.row(b), xq.row(b + 1), xq.row(b + 2), xq.row(b + 3)]).into_iter().enumerate() {
+                        emit(b + i, v);
+                    }
+                    b += 4;
+                }
+                while b < n {
+                    let one = if avx2 { unsafe { crate::iquant::row_dot_avx2(ty, w, [xq.row(b)]) } } else { crate::iquant::row_dot_scalar(ty, w, [xq.row(b)]) };
+                    emit(b, one[0]);
                     b += 1;
                 }
             }
@@ -909,6 +931,8 @@ fn dot1(m: &Matrix, r: usize, x: XRow, xf: &[f32], avx2: bool) -> f32 {
         ty if ty.is_kquant() => kernels::kq_row(ty, avx2, m.row(r), [x])[0],
         GgmlType::Q8_0 if avx2 => unsafe { kernels::q8_row_avx2(m.row(r), [(x.d, x.q)])[0] },
         GgmlType::Q8_0 => kernels::q8_row_scalar(m.row(r), [(x.d, x.q)])[0],
+        ty if crate::iquant::has_dot(ty) && avx2 => unsafe { crate::iquant::row_dot_avx2(ty, m.row(r), [(x.d, x.q)])[0] },
+        ty if crate::iquant::has_dot(ty) => crate::iquant::row_dot_scalar(ty, m.row(r), [(x.d, x.q)])[0],
         _ => {
             let mut wf = vec![0f32; m.cols];
             m.row_f32(r, &mut wf);

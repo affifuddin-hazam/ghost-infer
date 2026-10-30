@@ -1,6 +1,7 @@
 //! Llama-family transformer on the CPU: Llama 2/3, SmolLM, Mistral-style GQA, Qwen3
-//! (per-head RMSNorm on queries and keys, NEOX-style RoPE), and DeepSeek-style models such as
-//! GLM-4.7-Flash (multi-head latent attention, sigmoid-routed experts beside a shared one).
+//! (per-head RMSNorm on queries and keys, NEOX-style RoPE), DeepSeek-style models such as
+//! GLM-4.7-Flash (multi-head latent attention, sigmoid-routed experts beside a shared one), and
+//! Qwen3-Next (Gated DeltaNet layers, a recurrent kind of attention, between gated attention ones).
 
 use rayon::prelude::*;
 
@@ -43,6 +44,51 @@ pub struct Config {
     pub gating_sigmoid: bool,
     pub expert_weights_norm: bool,
     pub expert_weights_scale: f32,
+    /// qwen3next: Gated DeltaNet in every layer but each `every`-th; None: attention in every layer.
+    pub delta: Option<Delta>,
+    /// qwen3next: every query head's projection has a gate beside it ([q | gate] per head), and each head's
+    /// attention output is scaled by sigmoid(gate).
+    pub attn_gated: bool,
+}
+
+/// Gated DeltaNet sizes (qwen3next). Each layer keeps a `head` x `head` state per value head instead of a
+/// growing cache: every token decays it, corrects what it recalls for the token's key towards the token's
+/// value, and reads it with the token's query. Value heads share key heads, `v_heads / k_heads` each.
+#[derive(Debug, Clone, Copy)]
+pub struct Delta {
+    pub k_heads: usize,
+    pub v_heads: usize,
+    /// key and value width per head
+    pub head: usize,
+    /// causal convolution taps over q, k and v
+    pub conv: usize,
+    /// full attention every this many layers
+    pub every: usize,
+}
+
+impl Delta {
+    pub fn key_dim(&self) -> usize {
+        self.k_heads * self.head
+    }
+
+    pub fn value_dim(&self) -> usize {
+        self.v_heads * self.head
+    }
+
+    /// channels of the convolution: q, k and v side by side
+    pub fn conv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+
+    /// floats of one layer's recurrent state
+    pub fn state_len(&self) -> usize {
+        self.v_heads * self.head * self.head
+    }
+
+    /// floats of one layer's convolution state (the last `conv - 1` inputs of every channel)
+    pub fn conv_len(&self) -> usize {
+        self.conv_dim() * (self.conv - 1)
+    }
 }
 
 /// Multi-head latent attention sizes. Every head's keys and values come from one compressed vector per
@@ -58,7 +104,7 @@ pub struct Mla {
     pub v_head: usize,
 }
 
-pub const SUPPORTED_ARCHS: [&str; 4] = ["llama", "qwen3", "qwen3moe", "deepseek2"];
+pub const SUPPORTED_ARCHS: [&str; 5] = ["llama", "qwen3", "qwen3moe", "deepseek2", "qwen3next"];
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Config, String> {
@@ -94,6 +140,16 @@ impl Config {
         };
         let vocab = u("vocab_size").or_else(|| g.tensor("token_embd.weight").and_then(|t| t.dims.get(1)).map(|&v| v as usize)).ok_or("cannot tell the vocabulary size")?;
         let blocks = need("block_count")?;
+        let next = arch == "qwen3next";
+        let delta = if next {
+            let d = Delta { k_heads: need("ssm.group_count")?, v_heads: need("ssm.time_step_rank")?, head: need("ssm.state_size")?, conv: need("ssm.conv_kernel")?, every: u("full_attention_interval").unwrap_or(4) };
+            if need("ssm.inner_size")? != d.value_dim() || d.v_heads % d.k_heads != 0 || d.conv < 2 {
+                return Err("this qwen3next file's DeltaNet sizes do not fit together".into());
+            }
+            Some(d)
+        } else {
+            None
+        };
         Ok(Config {
             dim,
             // multi-token-prediction blocks come after the real ones; they are not run
@@ -123,11 +179,29 @@ impl Config {
             },
             expert_weights_norm: g.get(&format!("{arch}.expert_weights_norm")).and_then(Value::as_bool).unwrap_or(false),
             expert_weights_scale: f("expert_weights_scale").unwrap_or(1.0),
+            delta,
+            attn_gated: next,
         })
     }
 
     pub fn is_moe(&self) -> bool {
         self.n_experts > 0
+    }
+
+    /// Layer `l` is a Gated DeltaNet one (no attention, so no cache rows).
+    pub fn recurrent(&self, l: usize) -> bool {
+        self.delta.is_some_and(|d| (l + 1) % d.every != 0)
+    }
+
+    /// Layers with attention, which keep cache rows.
+    pub fn n_attn_layers(&self) -> usize {
+        (0..self.n_layers).filter(|&l| !self.recurrent(l)).count()
+    }
+
+    /// Where layer `l` keeps its rows: its place among the attention layers (or among the DeltaNet ones,
+    /// for its states).
+    pub fn slot(&self, l: usize) -> usize {
+        (0..l).filter(|&i| self.recurrent(i) == self.recurrent(l)).count()
     }
 
     fn kv_dim(&self) -> usize {
@@ -161,9 +235,47 @@ impl Config {
 struct Layer<'a> {
     attn_norm: Vec<f32>,
     attn: Attn<'a>,
-    wo: Matrix<'a>,
+    wo: Matrix<'a>, // attn_output, or a DeltaNet layer's ssm_out
     ffn_norm: Vec<f32>,
     ffn: Ffn<'a>,
+}
+
+/// A Gated DeltaNet layer's weights (see `Delta`).
+pub struct DeltaLayer<'a> {
+    /// input to q, k and v side by side (each head's q and k are shared by `v_heads / k_heads` value heads)
+    pub wqkv: Matrix<'a>,
+    /// input to z, the gate of the output norm
+    pub wz: Matrix<'a>,
+    /// input to beta (how far a token corrects the state) and alpha (how fast the state decays), grouped by
+    /// key head: its value heads' betas, then their alphas
+    pub wba: Matrix<'a>,
+    /// per channel of q, k, v: the convolution taps, oldest input first
+    pub conv: Vec<f32>,
+    /// per value head: added to alpha before softplus
+    pub dt_bias: Vec<f32>,
+    /// per value head: -exp(A_log), the decay rate's scale
+    pub a: Vec<f32>,
+    /// RMSNorm weights over each value head's output (used as is, without the +1 of the other norms)
+    pub norm: Vec<f32>,
+}
+
+impl<'a> DeltaLayer<'a> {
+    fn load(g: &'a Gguf, l: usize, d: &Delta) -> Result<DeltaLayer<'a>, String> {
+        let p = |s: &str| format!("blk.{l}.{s}");
+        let layer = DeltaLayer {
+            wqkv: matrix(g, &p("attn_qkv.weight"))?,
+            wz: matrix(g, &p("attn_gate.weight"))?,
+            wba: matrix(g, &p("ssm_ba.weight"))?,
+            conv: vector(g, &p("ssm_conv1d.weight"))?,
+            dt_bias: vector(g, &p("ssm_dt.bias"))?,
+            a: vector(g, &p("ssm_a"))?,
+            norm: vector(g, &p("ssm_norm.weight"))?,
+        };
+        if layer.wqkv.rows != d.conv_dim() || layer.wz.rows != d.value_dim() || layer.wba.rows != 2 * d.v_heads || layer.conv.len() != d.conv_dim() * d.conv || layer.a.len() != d.v_heads || layer.norm.len() != d.head {
+            return Err(format!("layer {l}: DeltaNet tensor shapes do not match the model's sizes (a file with ssm_in instead of attn_qkv needs a newer conversion)"));
+        }
+        Ok(layer)
+    }
 }
 
 enum Attn<'a> {
@@ -183,13 +295,15 @@ enum Attn<'a> {
         k_b: Vec<Matrix<'a>>, // per head: kv_lora rows of nope
         v_b: Vec<Matrix<'a>>, // per head: v_head rows of kv_lora
     },
+    Delta(Box<DeltaLayer<'a>>),
 }
 
 enum Ffn<'a> {
     Dense { gate: Matrix<'a>, up: Matrix<'a>, down: Matrix<'a> },
     /// router: n_experts rows of dim f32 logit weights; bias: deepseek2's per-expert pick bias;
-    /// shared: deepseek2's always-on expert(s), as one SwiGLU block
-    Moe { router: Vec<f32>, bias: Option<Vec<f32>>, experts: Vec<Expert<'a>>, shared: Option<Expert<'a>> },
+    /// shared: the always-on expert(s), as one SwiGLU block; shared_gate: qwen3next scales its output by
+    /// sigmoid(shared_gate · x)
+    Moe { router: Vec<f32>, bias: Option<Vec<f32>>, experts: Vec<Expert<'a>>, shared: Option<Expert<'a>>, shared_gate: Option<Vec<f32>> },
 }
 
 /// One expert's SwiGLU feed-forward, inside the model file.
@@ -341,10 +455,12 @@ impl<'a> Model<'a> {
                         Some(_) => Some(Expert { gate: matrix(g, &p("ffn_gate_shexp"))?, up: matrix(g, &p("ffn_up_shexp"))?, down: matrix(g, &p("ffn_down_shexp"))? }),
                         None => None,
                     },
+                    shared_gate: g.tensor(&p("ffn_gate_inp_shexp")).map(|_| vector(g, &p("ffn_gate_inp_shexp"))).transpose()?,
                 },
                 None => Ffn::Dense { gate: matrix(g, &p("ffn_gate"))?, up: matrix(g, &p("ffn_up"))?, down: matrix(g, &p("ffn_down"))? },
             };
             let attn = match cfg.mla {
+                _ if cfg.recurrent(i) => Attn::Delta(Box::new(DeltaLayer::load(g, i, cfg.delta.as_ref().unwrap())?)),
                 Some(m) => {
                     let (k_b, v_b) = (expert_matrices(g, &p("attn_k_b"))?, expert_matrices(g, &p("attn_v_b"))?);
                     if k_b.len() != cfg.n_heads || k_b[0].cols != m.nope || k_b[0].rows != m.kv_lora || v_b.len() != cfg.n_heads || v_b[0].cols != m.kv_lora || v_b[0].rows != m.v_head {
@@ -367,7 +483,10 @@ impl<'a> Model<'a> {
                     k_norm: g.tensor(&p("attn_k_norm")).map(|_| vector(g, &p("attn_k_norm"))).transpose()?,
                 },
             };
-            layers.push(Layer { attn_norm: vector(g, &p("attn_norm"))?, attn, wo: matrix(g, &p("attn_output"))?, ffn_norm: vector(g, &p("ffn_norm"))?, ffn });
+            let wo = matrix(g, &p(if cfg.recurrent(i) { "ssm_out" } else { "attn_output" }))?;
+            // qwen3next names the norm before the feed-forward after the attention it follows
+            let ffn_norm = if g.tensor(&p("ffn_norm")).is_some() { vector(g, &p("ffn_norm"))? } else { vector(g, &p("post_attention_norm"))? };
+            layers.push(Layer { attn_norm: vector(g, &p("attn_norm"))?, attn, wo, ffn_norm, ffn });
         }
         // small models tie the output projection to the embedding table
         let output = if g.tensor("output.weight").is_some() { matrix(g, "output.weight")? } else { token_embd };
@@ -379,8 +498,20 @@ impl<'a> Model<'a> {
 pub struct Session {
     pub pos: usize,
     pub ctx: usize,
-    k_cache: Vec<f32>, // [layer][pos][k_row]
-    v_cache: Vec<f32>, // [layer][pos][v_row]
+    k_cache: Vec<f32>, // [attention layer][pos][k_row]
+    v_cache: Vec<f32>, // [attention layer][pos][v_row]
+    // Gated DeltaNet layers: [layer][channel][conv - 1] latest inputs (oldest first), and
+    // [layer][value head][value][key] states; and copies of both at earlier positions (`snapshot`)
+    conv_state: Vec<f32>,
+    ssm_state: Vec<f32>,
+    snaps: Vec<(usize, Vec<f32>, Vec<f32>)>,
+    // DeltaNet scratch: q k v (then convolved), z, beta and alpha per token; gated attention: [q | gate] per
+    // head as projected, then the gates
+    dqkv: Vec<f32>,
+    dz: Vec<f32>,
+    dba: Vec<f32>,
+    qg: Vec<f32>,
+    att_gate: Vec<f32>,
     x: Vec<f32>,
     xb: Vec<f32>,
     xq: QuantizedBatch,
@@ -408,11 +539,20 @@ impl Session {
     pub fn new(cfg: &Config, ctx: usize) -> Session {
         let ctx = ctx.min(cfg.max_ctx);
         let half = cfg.rope_dim / 2;
+        let deltas = cfg.n_layers - cfg.n_attn_layers();
         Session {
             pos: 0,
             ctx,
-            k_cache: vec![0.0; cfg.n_layers * ctx * cfg.k_row()],
-            v_cache: vec![0.0; cfg.n_layers * ctx * cfg.v_row()],
+            k_cache: vec![0.0; cfg.n_attn_layers() * ctx * cfg.k_row()],
+            v_cache: vec![0.0; cfg.n_attn_layers() * ctx * cfg.v_row()],
+            conv_state: vec![0.0; cfg.delta.map_or(0, |d| deltas * d.conv_len())],
+            ssm_state: vec![0.0; cfg.delta.map_or(0, |d| deltas * d.state_len())],
+            snaps: Vec::new(),
+            dqkv: Vec::new(),
+            dz: Vec::new(),
+            dba: Vec::new(),
+            qg: Vec::new(),
+            att_gate: Vec::new(),
             x: Vec::new(),
             xb: Vec::new(),
             xq: QuantizedBatch::default(),
@@ -437,18 +577,70 @@ impl Session {
 
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.conv_state.fill(0.0);
+        self.ssm_state.fill(0.0);
+        self.snaps.clear();
+    }
+
+    /// The model keeps a recurrent state (Gated DeltaNet), which cannot be cut back to an earlier position
+    /// like a cache; only a snapshot (or the start) can be gone back to.
+    pub fn recurrent(&self) -> bool {
+        !self.ssm_state.is_empty()
+    }
+
+    /// Keeps a copy of the recurrent state at the current position (the latest two are kept).
+    pub fn snapshot(&mut self) {
+        if !self.recurrent() || self.snaps.iter().any(|s| s.0 == self.pos) {
+            return;
+        }
+        if self.snaps.len() == 2 {
+            self.snaps.remove(1); // the earliest stays: a prompt's shared opening
+        }
+        self.snaps.push((self.pos, self.conv_state.clone(), self.ssm_state.clone()));
+    }
+
+    /// Goes back to at most `pos` tokens and returns how many are kept: all of them for a model without a
+    /// recurrent state, else the latest snapshot at or before `pos` (or none).
+    pub fn truncate(&mut self, pos: usize) -> usize {
+        if pos >= self.pos {
+            return self.pos;
+        }
+        if !self.recurrent() {
+            self.pos = pos;
+            return pos;
+        }
+        self.snaps.retain(|s| s.0 <= pos);
+        match self.snaps.iter().max_by_key(|s| s.0) {
+            Some((at, conv, ssm)) => {
+                self.conv_state.copy_from_slice(conv);
+                self.ssm_state.copy_from_slice(ssm);
+                self.pos = *at;
+            }
+            None => {
+                self.conv_state.fill(0.0);
+                self.ssm_state.fill(0.0);
+                self.pos = 0;
+            }
+        }
+        self.pos
     }
 
     fn size_for(&mut self, cfg: &Config, n: usize) {
         let (kd, vd, _) = cfg.att_dims();
         let m = cfg.mla.unwrap_or(Mla { q_lora: 0, kv_lora: 0, nope: 0, v_head: 0 });
+        let d = cfg.delta.unwrap_or(Delta { k_heads: 0, v_heads: 0, head: 0, conv: 0, every: 1 });
         for (buf, width) in [
             (&mut self.x, cfg.dim),
             (&mut self.xb, cfg.dim),
             (&mut self.q, cfg.q_dim()),
             (&mut self.k, cfg.k_row()),
             (&mut self.v, cfg.kv_dim()),
-            (&mut self.att_out, cfg.n_heads * vd),
+            (&mut self.att_out, (cfg.n_heads * vd).max(d.value_dim())),
+            (&mut self.dqkv, d.conv_dim()),
+            (&mut self.dz, d.value_dim()),
+            (&mut self.dba, 2 * d.v_heads),
+            (&mut self.qg, if cfg.attn_gated { 2 * cfg.q_dim() } else { 0 }),
+            (&mut self.att_gate, if cfg.attn_gated { cfg.q_dim() } else { 0 }),
             (&mut self.proj, cfg.dim),
             (&mut self.gate, cfg.ffn_dim.max(cfg.expert_ffn_dim * cfg.n_shared_experts)),
             (&mut self.lat, m.q_lora),
@@ -609,11 +801,20 @@ impl Model<'_> {
                 rms_norm_rows(&mut s.xb, &s.x, &layer.attn_norm, c.norm_eps);
                 s.xq.quantize(&s.xb, dim);
             });
-            let (k_base, v_base) = (l * s.ctx * c.k_row(), l * s.ctx * c.v_row());
+            let (k_base, v_base) = (c.slot(l) * s.ctx * c.k_row(), c.slot(l) * s.ctx * c.v_row());
             match &layer.attn {
                 Attn::Gqa { wq, wk, wv, q_norm, k_norm } => {
                     profile::time(2, || {
-                        matmul_many(&mut [(wq, &mut s.q), (wk, &mut s.k), (wv, &mut s.v)], &s.xb, &s.xq);
+                        if c.attn_gated {
+                            // [q | gate] per head: the queries to s.q, the gates aside
+                            matmul_many(&mut [(wq, &mut s.qg), (wk, &mut s.k), (wv, &mut s.v)], &s.xb, &s.xq);
+                            for (pair, (q, g)) in s.qg.chunks_exact(2 * hd).zip(s.q.chunks_exact_mut(hd).zip(s.att_gate.chunks_exact_mut(hd))) {
+                                q.copy_from_slice(&pair[..hd]);
+                                g.copy_from_slice(&pair[hd..]);
+                            }
+                        } else {
+                            matmul_many(&mut [(wq, &mut s.q), (wk, &mut s.k), (wv, &mut s.v)], &s.xb, &s.xq);
+                        }
                     });
                     profile::time(3, || {
                         if let Some(w) = q_norm {
@@ -632,12 +833,21 @@ impl Model<'_> {
                     });
                 }
                 Attn::Mla { wq_a, wq, wkv_a, kv_a_norm, k_b, .. } => profile::time(2, || self.mla_in(s, n, k_base, v_base, wq_a.as_ref(), wq, wkv_a, kv_a_norm, k_b)),
+                Attn::Delta(d) => profile::time(2, || self.delta_net(d, s, l, n)),
             }
-            profile::time(4, || self.attention(s, k_base, v_base, n));
+            if !matches!(layer.attn, Attn::Delta(_)) {
+                profile::time(4, || self.attention(s, k_base, v_base, n));
+            }
+            if c.attn_gated && !matches!(layer.attn, Attn::Delta(_)) {
+                for (o, g) in s.att_out[..n * q_dim].iter_mut().zip(&s.att_gate) {
+                    *o *= 1.0 / (1.0 + (-g).exp());
+                }
+            }
 
             profile::time(5, || {
                 let heads = match &layer.attn {
-                    Attn::Gqa { .. } => &s.att_out,
+                    Attn::Gqa { .. } => &s.att_out[..n * q_dim],
+                    Attn::Delta(_) => &s.att_out[..n * layer.wo.cols],
                     Attn::Mla { v_b, .. } => {
                         // every head's latent result out to its values
                         let (m, vd) = (c.mla.unwrap(), c.att_dims().1);
@@ -679,7 +889,7 @@ impl Model<'_> {
                         *x += f;
                     }
                 }
-                Ffn::Moe { router, bias, experts, shared } => {
+                Ffn::Moe { router, bias, experts, shared, shared_gate } => {
                     if c.mla.is_some() {
                         moe_route_deepseek(c, router, bias.as_deref(), &s.xb, &mut s.picks, &mut s.moe);
                     } else {
@@ -692,8 +902,11 @@ impl Model<'_> {
                         gate_up_silu(&sh.gate, &sh.up, &s.xb, &s.xq, h);
                         s.xq.quantize(h, hid);
                         sh.down.matmul(h, &s.xq, &mut s.proj);
-                        for (x, f) in s.x.iter_mut().zip(&s.proj) {
-                            *x += f;
+                        for ((x, f), xb) in s.x.chunks_exact_mut(dim).zip(s.proj.chunks_exact(dim)).zip(s.xb.chunks_exact(dim)) {
+                            let w = shared_gate.as_ref().map_or(1.0, |g| 1.0 / (1.0 + (-dot_f32(g, xb)).exp()));
+                            for (x, f) in x.iter_mut().zip(f) {
+                                *x += w * f;
+                            }
                         }
                     }
                 }
@@ -756,6 +969,67 @@ impl Model<'_> {
                 s.qa[a0..a0 + m.kv_lora].copy_from_slice(&s.head_out[b * m.kv_lora..(b + 1) * m.kv_lora]);
                 s.qa[a0 + m.kv_lora..a0 + kd].copy_from_slice(&s.q[q0..q0 + rd]);
             }
+        }
+    }
+
+    /// A Gated DeltaNet layer over the batch, token by token through its state: the outputs (each value
+    /// head's, after the gated norm) go to `s.att_out`, ready for ssm_out.
+    fn delta_net(&self, d: &DeltaLayer, s: &mut Session, l: usize, n: usize) {
+        let c = &self.cfg;
+        let dc = c.delta.unwrap();
+        let (kd, vd, cd, hk) = (dc.key_dim(), dc.value_dim(), dc.conv_dim(), dc.head);
+        let per = dc.v_heads / dc.k_heads; // value heads per key head
+        matmul_many(&mut [(&d.wqkv, &mut s.dqkv), (&d.wz, &mut s.dz), (&d.wba, &mut s.dba)], &s.xb, &s.xq);
+        let slot = c.slot(l);
+        let taps = dc.conv - 1;
+        let conv_state = &mut s.conv_state[slot * dc.conv_len()..(slot + 1) * dc.conv_len()];
+        let state = &mut s.ssm_state[slot * dc.state_len()..(slot + 1) * dc.state_len()];
+        let (eps, scale) = (c.norm_eps, 1.0 / (hk as f32).sqrt());
+        for b in 0..n {
+            // causal convolution of each channel over its last inputs, then SiLU
+            let x = &mut s.dqkv[b * cd..(b + 1) * cd];
+            for ((v, w), st) in x.iter_mut().zip(d.conv.chunks_exact(dc.conv)).zip(conv_state.chunks_exact_mut(taps)) {
+                let mut acc = w[taps] * *v;
+                for (wk, sv) in w.iter().zip(st.iter()) {
+                    acc += wk * sv;
+                }
+                st.copy_within(1.., 0);
+                st[taps - 1] = *v;
+                *v = acc / (1.0 + (-acc).exp());
+            }
+            // unit-length query and key heads (as ggml's l2_norm: x / max(|x|, eps)), the query scaled
+            let (q, rest) = x.split_at_mut(kd);
+            let (k, v) = rest.split_at_mut(kd);
+            for (h, f) in q.chunks_exact_mut(hk).map(|h| (h, scale)).chain(k.chunks_exact_mut(hk).map(|h| (h, 1.0))) {
+                let inv = f / dot_f32(h, h).sqrt().max(eps);
+                h.iter_mut().for_each(|e| *e *= inv);
+            }
+            let (q, k, v) = (&*q, &*k, &*v);
+            let ba = &s.dba[b * 2 * dc.v_heads..(b + 1) * 2 * dc.v_heads];
+            let z = &s.dz[b * vd..(b + 1) * vd];
+            let out = &mut s.att_out[b * vd..(b + 1) * vd];
+            state.par_chunks_mut(hk * hk).zip(out.par_chunks_mut(hk)).enumerate().for_each(|(h, (st, o))| {
+                let (g, j) = (h / per, h % per);
+                let beta = 1.0 / (1.0 + (-ba[g * 2 * per + j]).exp());
+                let a = ba[g * 2 * per + per + j] + d.dt_bias[h];
+                let softplus = if a > 20.0 { a } else { a.exp().ln_1p() };
+                let decay = (softplus * d.a[h]).exp();
+                let (qh, kh, vh) = (&q[g * hk..(g + 1) * hk], &k[g * hk..(g + 1) * hk], &v[h * hk..(h + 1) * hk]);
+                // each value column of the state: decay, correct what it recalls for k towards v, read with q
+                for ((col, ov), vv) in st.chunks_exact_mut(hk).zip(o.iter_mut()).zip(vh) {
+                    col.iter_mut().for_each(|e| *e *= decay);
+                    let delta = (vv - dot_f32(col, kh)) * beta;
+                    for (e, kv) in col.iter_mut().zip(kh) {
+                        *e += kv * delta;
+                    }
+                    *ov = dot_f32(col, qh);
+                }
+                // gated RMSNorm: norm(o) * w * silu(z)
+                let inv = 1.0 / (dot_f32(o, o) / hk as f32 + eps).sqrt();
+                for ((ov, w), zv) in o.iter_mut().zip(&d.norm).zip(&z[h * hk..(h + 1) * hk]) {
+                    *ov *= inv * w * zv / (1.0 + (-zv).exp());
+                }
+            });
         }
     }
 

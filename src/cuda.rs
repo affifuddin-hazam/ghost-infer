@@ -13,6 +13,17 @@ use crate::profile;
 use crate::quant::f16_to_f32;
 
 const MAX_BATCH: usize = 1024; // prompt tokens per GPU pass: big batches keep the attention kernel busy
+
+/// Prompt tokens per GPU pass for this model. Qwen3-Next's experts (an 80B mixture) never fit in GPU memory or
+/// even RAM: every pass streams nearly all of them, so a pass of 4096 tokens reads a long prompt's experts once
+/// where 1024 would read them several times (for about 400 MB more activations).
+fn max_batch(cfg: &Config) -> usize {
+    if cfg.delta.is_some() {
+        4096
+    } else {
+        MAX_BATCH
+    }
+}
 const MATMUL_TB: usize = 8; // tokens per matmul block row (must match TB in the kernel source)
 /// Rows per warp in the K-quant generation matmuls (passed to the kernels as -DRPW).
 /// GHOST_INFER_RPW overrides it for tuning.
@@ -96,7 +107,7 @@ fn vfy_min() -> usize {
     *V.get_or_init(|| std::env::var("GHOST_INFER_VFY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(3).max(2))
 }
 
-const KERNELS: &str = r#"
+const KERNELS: &str = concat!(include_str!("iq_tables.cu"), r#"
 #define TB 8
 #define NEG_INF __int_as_float(0xff800000) // NVRTC has no <math.h> INFINITY
 extern "C" {
@@ -3209,8 +3220,309 @@ __global__ void mla_combine(const float* __restrict__ part, float* __restrict__ 
     }
 }
 
+// ---- Qwen3-Next: gated attention with 256-wide heads, Gated DeltaNet, the gated shared expert
+
+// The attn_q rows hold [q | gate] per head, then k and v (src, src_stride floats apart): q, k, v to the packed
+// [q | k | v] rows of qkv (as qk_norm_rope reads them) and the gates aside. grid (tokens, n_heads + 2 * n_kv).
+__global__ void next_split_qgate(const float* __restrict__ src, int src_stride, float* __restrict__ qkv, float* __restrict__ gate,
+                                 int n_heads, int n_kv, int hd) {
+    int b = blockIdx.x, h = blockIdx.y;
+    int q_dim = n_heads * hd, kv_dim = n_kv * hd;
+    const float* s = src + (size_t)b * src_stride;
+    float* o = qkv + (size_t)b * (q_dim + 2 * kv_dim);
+    if (h < n_heads) {
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+            o[h * hd + d] = s[2 * h * hd + d];
+            gate[(size_t)b * q_dim + h * hd + d] = s[2 * h * hd + hd + d];
+        }
+    } else {
+        int j = h - n_heads; // the k heads, then the v heads
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) o[q_dim + j * hd + d] = s[2 * q_dim + j * hd + d];
+    }
 }
-"#;
+
+// Causal attention over the cache for heads wider than ATT_MAX_HD (a multiple of 128, up to 256), any
+// number of tokens: a block per (token, query head), whose 8 warps take the positions in turn, each lane
+// holding hd / 32 of the dimensions, with a running softmax per warp merged at the end. out: n x q_dim.
+#define WIDE_WARPS 8
+__global__ void attention_wide(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
+                               const float* __restrict__ ks, const float* __restrict__ vs, float* __restrict__ out,
+                               int pos0, int n_heads, int n_kv, int hd, float scale) {
+    __shared__ float wm[WIDE_WARPS], wl[WIDE_WARPS], wo[WIDE_WARPS][256];
+    int b = blockIdx.x, h = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int q_dim = n_heads * hd, kv_dim = n_kv * hd, kvh = h / (n_heads / n_kv), per = hd >> 5;
+    const float* q = qkv + (size_t)b * (q_dim + 2 * kv_dim) + h * hd + lane * per;
+    float qr[8], acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { qr[i] = i < per ? q[i] * scale : 0.f; acc[i] = 0.f; }
+    float m = NEG_INF, l = 0.f;
+    int span = pos0 + b + 1;
+    for (int t = warp; t < span; t += WIDE_WARPS) {
+        const kv_t* kt = kc + (size_t)t * kv_dim + kvh * hd + lane * per;
+        float s = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 8; i += 4) {
+            if (i < per) { float4 k4 = kv_load4(kt + i); s += qr[i] * k4.x + qr[i + 1] * k4.y + qr[i + 2] * k4.z + qr[i + 3] * k4.w; }
+        }
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+        s *= KV_SCALE(ks, t, n_kv, kvh);
+        float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
+        l = l * c + p;
+        const kv_t* vt = vc + (size_t)t * kv_dim + kvh * hd + lane * per;
+        float pv = p * KV_SCALE(vs, t, n_kv, kvh);
+        #pragma unroll
+        for (int i = 0; i < 8; i += 4) {
+            if (i < per) {
+                float4 v4 = kv_load4(vt + i);
+                acc[i] = acc[i] * c + pv * v4.x; acc[i + 1] = acc[i + 1] * c + pv * v4.y;
+                acc[i + 2] = acc[i + 2] * c + pv * v4.z; acc[i + 3] = acc[i + 3] * c + pv * v4.w;
+            }
+        }
+        m = mn;
+    }
+    if (lane == 0) { wm[warp] = m; wl[warp] = l; }
+    for (int i = 0; i < per; i++) wo[warp][lane * per + i] = acc[i];
+    __syncthreads();
+    float mx = NEG_INF;
+    for (int w = 0; w < WIDE_WARPS; w++) mx = fmaxf(mx, wm[w]);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float v = 0.f, tot = 0.f;
+        for (int w = 0; w < WIDE_WARPS; w++) {
+            if (wm[w] == NEG_INF) continue; // a warp that saw no position
+            float f = __expf(wm[w] - mx);
+            v += wo[w][d] * f;
+            tot += wl[w] * f;
+        }
+        out[(size_t)b * q_dim + h * hd + d] = v / tot;
+    }
+}
+
+// x[i] *= sigmoid(g[i]) over n values: the attention output through its gates
+__global__ void sigmoid_mul(float* __restrict__ x, const float* __restrict__ g, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= 1.f / (1.f + __expf(-g[i]));
+}
+
+// DeltaNet's causal convolution and SiLU, in place on the [q | k | v] part of the projected rows (stride floats
+// apart), token after token; state: each channel's last `taps` inputs (oldest first), carried over. A thread per
+// channel.
+__global__ void delta_conv(float* __restrict__ x, int stride, const float* __restrict__ w, float* __restrict__ state,
+                           int n, int channels, int taps) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float win[7];
+    for (int i = 0; i < taps; i++) win[i] = state[(size_t)c * taps + i];
+    const float* wc = w + (size_t)c * (taps + 1);
+    for (int t = 0; t < n; t++) {
+        float* p = x + (size_t)t * stride + c;
+        float v = *p, acc = wc[taps] * v;
+        for (int i = 0; i < taps; i++) acc += wc[i] * win[i];
+        for (int i = 0; i + 1 < taps; i++) win[i] = win[i + 1];
+        win[taps - 1] = v;
+        *p = acc / (1.f + __expf(-acc));
+    }
+    for (int i = 0; i < taps; i++) state[(size_t)c * taps + i] = win[i];
+}
+
+// Per token: unit-length q and k heads (as ggml's l2_norm, x / max(|x|, eps); q also scaled), and each value
+// head's beta = sigmoid(b) and decay = exp(softplus(a + dt_bias) * A) into gates (pairs), from the ba part of the
+// row (per key head: its value heads' b, then their a). grid (tokens, 2 * k_heads + 1), block = hd.
+__global__ void delta_prep(float* __restrict__ x, int stride, int ba_off, const float* __restrict__ dt_bias, const float* __restrict__ A,
+                           float* __restrict__ gates, int k_heads, int v_heads, int hd, float qscale, float eps) {
+    __shared__ float sh[32];
+    int b = blockIdx.x, j = blockIdx.y;
+    float* row = x + (size_t)b * stride;
+    if (j < 2 * k_heads) {
+        float* v = row + j * hd; // q heads, then k heads
+        float ss = 0.f;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) ss += v[d] * v[d];
+        ss = block_sum(ss, sh);
+        float f = (j < k_heads ? qscale : 1.f) / fmaxf(sqrtf(ss), eps);
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) v[d] *= f;
+        return;
+    }
+    int per = v_heads / k_heads;
+    const float* ba = row + ba_off;
+    for (int h = threadIdx.x; h < v_heads; h += blockDim.x) {
+        int g = h / per, i = h % per;
+        float a = ba[g * 2 * per + per + i] + dt_bias[h];
+        float sp = a > 20.f ? a : log1pf(__expf(a));
+        gates[((size_t)b * v_heads + h) * 2] = 1.f / (1.f + __expf(-ba[g * 2 * per + i]));
+        gates[((size_t)b * v_heads + h) * 2 + 1] = __expf(sp * A[h]);
+    }
+}
+
+// The DeltaNet recurrence, token after token. Each thread owns one value column of a head's state (DN_HD
+// floats, in registers): decay it, correct what it recalls for k towards v by beta, read it with q. state:
+// [v head][key][value] (a warp's columns side by side, so its loads coalesce); out: n x (v_heads * DN_HD).
+// grid (v_heads, DN_HD / 32), block 32.
+#define DN_HD 128
+__global__ void delta_scan(const float* __restrict__ x, int stride, const float* __restrict__ gates, float* __restrict__ state,
+                           float* __restrict__ out, int n, int k_heads, int v_heads) {
+    __shared__ float qs[DN_HD], kk[DN_HD];
+    int h = blockIdx.x, col = blockIdx.y * 32 + threadIdx.x;
+    int g = h / (v_heads / k_heads), kd = k_heads * DN_HD;
+    float* st = state + (size_t)h * DN_HD * DN_HD + col;
+    float s[DN_HD];
+    #pragma unroll
+    for (int i = 0; i < DN_HD; i++) s[i] = st[i * DN_HD];
+    for (int t = 0; t < n; t++) {
+        const float* row = x + (size_t)t * stride;
+        __syncwarp();
+        for (int i = threadIdx.x; i < DN_HD; i += 32) { qs[i] = row[g * DN_HD + i]; kk[i] = row[kd + g * DN_HD + i]; }
+        __syncwarp();
+        float beta = gates[((size_t)t * v_heads + h) * 2], decay = gates[((size_t)t * v_heads + h) * 2 + 1];
+        float sk = 0.f, o = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DN_HD; i++) { s[i] *= decay; sk += s[i] * kk[i]; }
+        float dl = (row[2 * kd + h * DN_HD + col] - sk) * beta;
+        #pragma unroll
+        for (int i = 0; i < DN_HD; i++) { s[i] += kk[i] * dl; o += s[i] * qs[i]; }
+        out[(size_t)t * v_heads * DN_HD + h * DN_HD + col] = o;
+    }
+    #pragma unroll
+    for (int i = 0; i < DN_HD; i++) st[i * DN_HD] = s[i];
+}
+
+// Gated RMSNorm of each value head's output, in place: o / rms(o) * w * silu(z), z from the projected rows
+// (x + z_off, stride floats apart). grid (tokens, v_heads), block = hd.
+__global__ void delta_norm(float* __restrict__ o, const float* __restrict__ x, int stride, int z_off, const float* __restrict__ w,
+                           int v_heads, int hd, float eps) {
+    __shared__ float sh[32];
+    int b = blockIdx.x, h = blockIdx.y;
+    float* v = o + ((size_t)b * v_heads + h) * hd;
+    const float* z = x + (size_t)b * stride + z_off + h * hd;
+    float ss = 0.f;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) ss += v[d] * v[d];
+    ss = block_sum(ss, sh);
+    float inv = rsqrtf(ss / hd + eps);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float zz = z[d];
+        v[d] = v[d] * inv * w[d] * zz / (1.f + __expf(-zz));
+    }
+}
+
+// x[b] += sigmoid(w · xb[b]) * y[b]: the shared expert's output through its gate. grid (tokens), block 256.
+__global__ void gated_add(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ w, const float* __restrict__ xb, int dim) {
+    __shared__ float sh[32];
+    int b = blockIdx.x;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) s += w[i] * xb[(size_t)b * dim + i];
+    s = block_sum(s, sh);
+    float g = 1.f / (1.f + __expf(-s));
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) x[(size_t)b * dim + i] += g * y[(size_t)b * dim + i];
+}
+
+// ---- 2-bit weights (IQ2_XXS: fmt 0, 66-byte blocks; IQ2_S: fmt 1, 82-byte blocks; IQ2_XS: fmt 2, 74-byte blocks;
+// see iquant.rs). Blocks are only 2-byte aligned, so they are read a byte at a time. A lane takes one group of 8
+// values of a 256-value block: 4 groups per 32 (lanes 4*ib .. 4*ib+3 cover 32-value sub-block ib).
+
+__device__ __forceinline__ int iq2_bytes(int fmt) { return fmt == 0 ? 66 : fmt == 1 ? 82 : 74; }
+
+// byte masks: 0xff in byte i where bit i of the 4-bit argument is set
+__device__ __forceinline__ unsigned iq2_mask4(unsigned bits) {
+    return ((bits & 1) ? 0xFFu : 0u) | ((bits & 2) ? 0xFF00u : 0u) | ((bits & 4) ? 0xFF0000u : 0u) | ((bits & 8) ? 0xFF000000u : 0u);
+}
+
+// One group of 8 values of block `blk` (lane's group g = 4 * ib + l): its grid entry, sign byte and scale.
+__device__ __forceinline__ void iq2_group(int fmt, const unsigned char* blk, int g, unsigned long long* grid, unsigned* signs, float* scale) {
+    float d = h2f((unsigned)blk[0] | ((unsigned)blk[1] << 8));
+    int ib = g >> 2, l = g & 3;
+    if (fmt == 0) {
+        const unsigned char* q = blk + 2 + 8 * ib;
+        unsigned aux = (unsigned)q[4] | ((unsigned)q[5] << 8) | ((unsigned)q[6] << 16) | ((unsigned)q[7] << 24);
+        *grid = iq2xxs_grid_d[q[l]];
+        *signs = ksigns_iq2xs_d[(aux >> (7 * l)) & 127];
+        *scale = d * (0.5f + (float)(aux >> 28)) * 0.25f;
+    } else if (fmt == 2) {
+        unsigned q = (unsigned)blk[2 + 2 * g] | ((unsigned)blk[3 + 2 * g] << 8);
+        *grid = iq2xs_grid_d[q & 511];
+        *signs = ksigns_iq2xs_d[q >> 9];
+        *scale = d * (0.5f + (float)((blk[66 + ib] >> (4 * (l >> 1))) & 0xF)) * 0.25f;
+    } else {
+        int idx = blk[2 + 4 * ib + l] | ((blk[66 + ib] << (8 - 2 * l)) & 0x300);
+        *grid = iq2s_grid_d[idx];
+        *signs = blk[34 + 4 * ib + l];
+        *scale = d * (0.5f + (float)((blk[74 + ib] >> (4 * (l >> 1))) & 0xF)) * 0.25f;
+    }
+}
+
+// Lane's share of one row (nblk blocks of 256) dotted with int8 activations (32-value blocks: xq values, xd scales).
+__device__ __forceinline__ float iq2_lane_dot(int fmt, const unsigned char* row, int nblk, const signed char* xq, const float* xd, int lane) {
+    int bytes = iq2_bytes(fmt);
+    float acc = 0.f;
+    for (int b = 0; b < nblk; b++) {
+        unsigned long long grid;
+        unsigned signs;
+        float scale;
+        iq2_group(fmt, row + (size_t)b * bytes, lane, &grid, &signs, &scale);
+        unsigned m0 = iq2_mask4(signs & 15), m1 = iq2_mask4(signs >> 4);
+        // grid levels (<= 43) signed by the mask: (g ^ 0xff) - 0xff = -g per byte
+        int w0 = (int)__vsub4((unsigned)grid ^ m0, m0), w1 = (int)__vsub4((unsigned)(grid >> 32) ^ m1, m1);
+        int xb = b * 8 + (lane >> 2);
+        const int* xv = reinterpret_cast<const int*>(xq + (size_t)xb * 32 + 8 * (lane & 3));
+        acc += scale * xd[xb] * (float)__dp4a(w1, xv[1], __dp4a(w0, xv[0], 0));
+    }
+    return acc;
+}
+
+// Mixture of experts, one token, the 2-bit experts held in GPU memory (the table as moe_gate_up_q3k's):
+// gate / up rows, a warp per row.
+__global__ void moe_gate_up_iq2(const unsigned long long* __restrict__ ptrs, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                                float* __restrict__ out, int rows, int cols, int fmt) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    int nblk = cols >> 8;
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(ptrs[blockIdx.y]) + (size_t)row * nblk * iq2_bytes(fmt);
+    float v = warp_sum(iq2_lane_dot(fmt, w, nblk, xq, xd, lane));
+    if (lane == 0) out[(size_t)blockIdx.y * rows + row] = v;
+}
+
+// down: expert k reads its own activations (row k of xq / xd, written by silu_q8)
+__global__ void moe_down_iq2(const unsigned long long* __restrict__ ptrs, int nk, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                             float* __restrict__ out, int rows, int cols, int fmt) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31, k = blockIdx.y;
+    if (row >= rows) return;
+    int nblk = cols >> 8;
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]) + (size_t)row * nblk * iq2_bytes(fmt);
+    float v = warp_sum(iq2_lane_dot(fmt, w, nblk, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5), lane));
+    if (lane == 0) out[(size_t)k * rows + row] = v;
+}
+
+// A dense 2-bit matrix (decoding): out[t * out_stride + out_off + row] (+)= W[row] · x[t] over n tokens of int8
+// activations. A warp per row; grid (rows / 8, n).
+__global__ void matmul_iq2_dp4a(const unsigned char* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                                float* __restrict__ out, int rows, int cols, int accumulate, int out_stride, int out_off, int fmt) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31, t = blockIdx.y;
+    if (row >= rows) return;
+    int nblk = cols >> 8;
+    float v = warp_sum(iq2_lane_dot(fmt, w + (size_t)row * nblk * iq2_bytes(fmt), nblk, xq + (size_t)t * cols, xd + (size_t)t * (cols >> 5), lane));
+    if (lane == 0) {
+        size_t i = (size_t)t * out_stride + out_off + row;
+        out[i] = accumulate ? out[i] + v : v;
+    }
+}
+
+// 2-bit matrix to Q8 (int8 per value and an f32 scale per 32, requantised) for the prompt-batch matmuls.
+// One warp per 32 values: lane j of group j / 8.
+__global__ void iq2_to_q8(const unsigned char* __restrict__ w, signed char* __restrict__ q, float* __restrict__ d, int blocks32, int fmt) {
+    int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b >= blocks32) return;
+    unsigned long long grid;
+    unsigned signs;
+    float scale;
+    iq2_group(fmt, w + (size_t)(b >> 3) * iq2_bytes(fmt), 4 * (b & 7) + (lane >> 3), &grid, &signs, &scale);
+    int j = lane & 7;
+    float v = scale * (float)((grid >> (8 * j)) & 0xFF) * ((signs >> j) & 1 ? -1.f : 1.f);
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    float dd = amax / 127.f;
+    q[(size_t)b * 32 + lane] = (signed char)__float2int_rn(dd != 0.f ? v / dd : 0.f);
+    if (lane == 0) d[b] = dd;
+}
+
+}
+"#);
 
 // ---------------------------------------------------------------- dynamic loading
 
@@ -3530,6 +3842,20 @@ struct Kernels {
     head_matvec: Ptr,
     mla_attention: Ptr,
     mla_combine: Ptr,
+    // Qwen3-Next
+    next_split_qgate: Ptr,
+    attention_wide: Ptr,
+    sigmoid_mul: Ptr,
+    delta_conv: Ptr,
+    delta_prep: Ptr,
+    delta_scan: Ptr,
+    delta_norm: Ptr,
+    gated_add: Ptr,
+    // 2-bit experts
+    moe_gate_up_iq2: Ptr,
+    moe_down_iq2: Ptr,
+    iq2_to_q8: Ptr,
+    matmul_iq2_dp4a: Ptr,
     /// every launch goes here (a blocking stream: the synchronous copies still order against it); CUDA
     /// graphs need a stream other than the legacy default one
     stream: Ptr,
@@ -3706,6 +4032,18 @@ impl Kernels {
                 head_matvec: get("head_matvec")?,
                 mla_attention: get("mla_attention")?,
                 mla_combine: get("mla_combine")?,
+                next_split_qgate: get("next_split_qgate")?,
+                attention_wide: get("attention_wide")?,
+                sigmoid_mul: get("sigmoid_mul")?,
+                delta_conv: get("delta_conv")?,
+                delta_prep: get("delta_prep")?,
+                delta_scan: get("delta_scan")?,
+                delta_norm: get("delta_norm")?,
+                gated_add: get("gated_add")?,
+                moe_gate_up_iq2: get("moe_gate_up_iq2")?,
+                moe_down_iq2: get("moe_down_iq2")?,
+                iq2_to_q8: get("iq2_to_q8")?,
+                matmul_iq2_dp4a: get("matmul_iq2_dp4a")?,
                 stream: {
                     let mut st: Ptr = std::ptr::null_mut();
                     a.check((f.cuStreamCreate)(&mut st, 0), "stream")?;
@@ -3951,6 +4289,9 @@ enum Fmt {
     Q4K = 1,
     /// 208-byte blocks of 256 (128 low-nibble bytes, 64 high-bit bytes, 16 int8 scales) + f32 d per block
     Q6K = 2,
+    /// 2-bit i-quant blocks as in the file (GpuMatrix::iq says which); decoding reads them as they are, prompt
+    /// batches convert them to Q8 first
+    Iq2 = 3,
 }
 
 /// A weight matrix on the GPU, repacked from its GGUF blocks so every field is naturally aligned and
@@ -3961,6 +4302,10 @@ struct GpuMatrix {
     d: Option<DeviceBuf>, // Q8: scale per 32; Q6K: d per block
     rows: usize,
     cols: usize,
+    /// Q8 converted from a 2-bit i-quant: decoding gives it int8 activations (no finer than its weights need)
+    coarse: bool,
+    /// Fmt::Iq2: the kernels' fmt (0 IQ2_XXS, 1 IQ2_S, 2 IQ2_XS)
+    iq: i32,
 }
 
 impl GpuMatrix {
@@ -3970,13 +4315,29 @@ impl GpuMatrix {
 
     /// A matrix in memory owned elsewhere (an expert slot, a scratch buffer); never freed through this.
     fn view(fmt: Fmt, q: u64, d: Option<u64>, rows: usize, cols: usize) -> std::mem::ManuallyDrop<GpuMatrix> {
-        std::mem::ManuallyDrop::new(GpuMatrix { fmt, q: DeviceBuf { ptr: q, bytes: 0 }, d: d.map(|ptr| DeviceBuf { ptr, bytes: 0 }), rows, cols })
+        std::mem::ManuallyDrop::new(GpuMatrix { fmt, q: DeviceBuf { ptr: q, bytes: 0 }, d: d.map(|ptr| DeviceBuf { ptr, bytes: 0 }), rows, cols, coarse: false, iq: -1 })
+    }
+}
+
+/// The kernels' fmt for 2-bit i-quant weights kept as they are (Fmt::Iq2).
+fn iq2_kernel_fmt(ty: GgmlType) -> Option<i32> {
+    match ty {
+        GgmlType::Iq2Xxs => Some(0),
+        GgmlType::Iq2S => Some(1),
+        GgmlType::Iq2Xs => Some(2),
+        _ => None,
     }
 }
 
 /// Uploads tensors whose rows are concatenated in one output (e.g. Q, K and V). Neighbours of the same
 /// format are merged into one matrix (one launch); returns each matrix with its output row offset.
 fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(GpuMatrix, usize)>, String> {
+    upload_parts_as(g, names, up, true)
+}
+
+/// `upload_parts`; `keep_iq2`: 2-bit i-quants stay as they are (Fmt::Iq2), else they become Q8 like the
+/// rarer formats (the embedding table: its lookup kernel reads Q8 and K-quants only).
+fn upload_parts_as(g: &Gguf, names: &[String], up: &mut Uploader, keep_iq2: bool) -> Result<Vec<(GpuMatrix, usize)>, String> {
     let mut parts = Vec::new();
     let mut i = 0;
     let mut row_off = 0;
@@ -3994,7 +4355,9 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
         }
         let cols = run[0].dims[0] as usize;
         let rows: usize = run.iter().map(|t| t.dims[1] as usize).sum();
+        let iq = iq2_kernel_fmt(ty).filter(|_| keep_iq2 && cols % 256 == 0);
         let (fmt, gpu_bytes) = match ty {
+            _ if iq.is_some() => (Fmt::Iq2, run.iter().map(|t| t.n_bytes).sum()),
             // no 3- or 5-bit GPU kernels yet: requantised to int8 (about 2.4x / 1.5x the memory), as are
             // the rarer formats (Q5_0, IQ4_NL, ...)
             GgmlType::Q8_0 | GgmlType::Q3K | GgmlType::Q5K => (Fmt::Q8, rows * cols),
@@ -4013,7 +4376,7 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
             let dst = q.ptr + off as u64;
             match fmt {
                 // the GGUF blocks as they are, straight from the file
-                Fmt::Q4K => up.put_file(dst, &g.path, t.offset as u64, t.n_bytes)?,
+                Fmt::Q4K | Fmt::Iq2 => up.put_file(dst, &g.path, t.offset as u64, t.n_bytes)?,
                 // 210-byte blocks: the f16 d at the end goes to its own array
                 Fmt::Q6K => up.put_repacked(dst, &g.path, t.offset as u64, t.n_bytes, (210, GPU_Q6K_BYTES), &mut d, |i, o| {
                     o.copy_from_slice(&i[..GPU_Q6K_BYTES]);
@@ -4031,14 +4394,14 @@ fn upload_parts(g: &Gguf, names: &[String], up: &mut Uploader) -> Result<Vec<(Gp
                 })?,
             }
             off += match fmt {
-                Fmt::Q4K => t.n_bytes,
+                Fmt::Q4K | Fmt::Iq2 => t.n_bytes,
                 Fmt::Q6K => t.n_bytes / 210 * GPU_Q6K_BYTES,
                 Fmt::Q8 => t.n_elements() as usize,
             };
             up.file_secs += tf.elapsed().as_secs_f64();
         }
-        let d = if fmt != Fmt::Q4K { Some(up.put_vec(&d)?) } else { None };
-        parts.push((GpuMatrix { fmt, q, d, rows, cols }, row_off));
+        let d = if !matches!(fmt, Fmt::Q4K | Fmt::Iq2) { Some(up.put_vec(&d)?) } else { None };
+        parts.push((GpuMatrix { fmt, q, d, rows, cols, coarse: ty.is_iquant(), iq: iq.unwrap_or(-1) }, row_off));
         row_off += rows;
     }
     Ok(parts)
@@ -4092,6 +4455,15 @@ fn upload_f16(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, Stri
     up.put_vec(&h)
 }
 
+/// A vector of any format as f32 (qwen3next's BF16 shared-expert gate).
+fn upload_f32(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, String> {
+    let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+    let n = t.n_elements() as usize;
+    let mut v = vec![0f32; n];
+    crate::quant::Matrix { data: &g.mmap[t.offset..t.offset + t.n_bytes], ty: t.ty, rows: 1, cols: n }.row_f32(0, &mut v);
+    up.put_vec(&v)
+}
+
 fn upload_vec(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, String> {
     let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     if t.ty != GgmlType::F32 {
@@ -4108,9 +4480,20 @@ struct GpuLayer {
     q_norm: Option<DeviceBuf>,    // Qwen3 per-head norms
     k_norm: Option<DeviceBuf>,
     mla: Option<GpuMla>,
-    wo: GpuMatrix,
+    delta: Option<GpuDelta>,
+    wo: GpuMatrix, // a DeltaNet layer's ssm_out
     ffn_norm: DeviceBuf,
     ffn: GpuFfn,
+}
+
+/// A Gated DeltaNet layer (see model::Delta): one projection to [q k v | z | ba] rows, the convolution taps,
+/// dt_bias, A (-exp(A_log)) and the output norm.
+struct GpuDelta {
+    proj: Vec<(GpuMatrix, usize)>,
+    conv: DeviceBuf,
+    dt_bias: DeviceBuf,
+    a: DeviceBuf,
+    norm: DeviceBuf,
 }
 
 /// Latent attention weights (see model::Mla): the low-rank query step and its norm (if any), the query
@@ -4126,9 +4509,9 @@ struct GpuMla {
 
 enum GpuFfn {
     Dense { gate_up: Vec<(GpuMatrix, usize)>, down: GpuMatrix }, // gate_up: [gate | up]
-    /// mixture of experts: routed and computed on the CPU (GpuModel::moe); deepseek2 adds a shared
-    /// expert, as a dense block on the GPU
-    Moe { shared: Option<(Vec<(GpuMatrix, usize)>, GpuMatrix)> },
+    /// mixture of experts: routed and computed on the CPU (GpuModel::moe); deepseek2 and qwen3next add a
+    /// shared expert, as a dense block on the GPU, which qwen3next scales by sigmoid(gate · x)
+    Moe { shared: Option<(Vec<(GpuMatrix, usize)>, GpuMatrix)>, gate: Option<DeviceBuf> },
 }
 
 /// What the current prompt pass is doing, for the server's /api/progress (the chat page shows it while it
@@ -4386,6 +4769,8 @@ struct UploadJob {
     e: usize,
     slot: usize,
     src: [(usize, usize); 3],
+    gate_bytes: usize, // as the layer's experts sit in a slot (ExpertCache::pack_parts)
+    raw: bool,
     dst: u64,
     evicted: Option<[(usize, usize); 3]>, // the expert the slot held, back to the CPU: its pages are read in
 }
@@ -4400,7 +4785,7 @@ struct ExpertUploader {
 }
 
 impl ExpertUploader {
-    fn new(slot_bytes: usize, gate_bytes: usize) -> ExpertUploader {
+    fn new(slot_bytes: usize) -> ExpertUploader {
         use std::sync::mpsc::{channel, TryRecvError};
         let (tx, rx) = channel::<UploadJob>();
         let (done_tx, done) = channel();
@@ -4453,7 +4838,7 @@ impl ExpertUploader {
                     // SAFETY: the mapping outlives this thread (see GpuModel), and nothing else writes the buffer
                     let src = job.src.map(|(at, n)| unsafe { std::slice::from_raw_parts(at as *const u8, n) });
                     let buf = unsafe { std::slice::from_raw_parts_mut(pinned[b] as *mut u8, slot_bytes) };
-                    let bytes = ExpertCache::pack_parts(src[0], src[1], src[2], gate_bytes, buf);
+                    let bytes = ExpertCache::pack_parts(src[0], src[1], src[2], job.gate_bytes, job.raw, buf);
                     unsafe {
                         (a.f.cuMemcpyHtoDAsync_v2)(job.dst, pinned[b], bytes, stream);
                         (a.f.cuEventRecord)(events[b], stream);
@@ -4512,7 +4897,8 @@ struct ExpertCache {
     addr: Vec<u64>,                  // per slot: its device address
     max_slots: usize,                // one per expert of every layer
     slot_bytes: usize,
-    gate_bytes: usize,                  // repacked gate (= up) matrix; down follows both
+    /// per layer: its gate (= up) matrix as it sits in a slot (Q3_K repacked; 2-bit as in the file), down after both
+    gate_bytes: Vec<usize>,
     slot_of: Vec<Vec<i32>>,             // [layer][expert] -> slot, or -1
     owner: Vec<Option<(usize, usize)>>, // per slot: (layer, expert)
     free: Vec<usize>,
@@ -4521,6 +4907,7 @@ struct ExpertCache {
     queued: Vec<Vec<bool>>,  // [layer][expert]: on its way into a slot
     sent: usize,             // uploads queued this token
     cacheable: Vec<bool>,
+    batch_ok: bool, // every layer's experts are formats the prompt-batch path converts (else batches run on the CPU)
     pub uploads: usize,
     // prompt batches: every expert runs on the GPU, the uncached ones staged through two pinned buffers
     // into two scratch slots (double-buffered: the next expert's copy overlaps this one's maths)
@@ -4550,20 +4937,22 @@ impl ExpertCache {
     /// As many slots as `budget` bytes hold after the prompt-batch buffers (none if no layer is cacheable).
     fn new(moe: &CpuMoe, cfg: &Config, budget: usize) -> Result<ExpertCache, String> {
         let a = api()?;
-        let cacheable: Vec<bool> = moe.tensors.iter().map(|[g, u, d]| g.ty == GgmlType::Q3K && u.ty == GgmlType::Q3K && d.ty == GgmlType::Q4K).collect();
-        let shape = moe.tensors.iter().zip(&cacheable).find(|(_, c)| **c).map(|(t, _)| *t);
-        let [g0, _, _] = *moe.tensors.iter().find(|t| t[0].rows > 0).ok_or("no expert layers")?;
-        let gate_bytes = g0.rows * (g0.cols / 256) * Q3K_GPU_BYTES;
-        let slot_bytes = match shape {
-            Some([_, _, d]) => 2 * gate_bytes + d.stride,
-            None => 1,
-        };
+        let q3k = |[g, u, _]: &[ExpertTensor; 3]| g.ty == GgmlType::Q3K && u.ty == GgmlType::Q3K;
+        let cacheable: Vec<bool> = moe.tensors.iter().map(|t| (q3k(t) && t[2].ty == GgmlType::Q4K) || iq2_fmt(t).is_some()).collect();
+        let batch_ok = moe.tensors.iter().filter(|t| t[0].rows > 0).all(|t| (q3k(t) && matches!(t[2].ty, GgmlType::Q4K | GgmlType::Q5K)) || iq2_fmt(t).is_some());
+        moe.tensors.iter().find(|t| t[0].rows > 0).ok_or("no expert layers")?;
+        let gate_bytes: Vec<usize> = moe.tensors.iter().map(|t| if q3k(t) { t[0].rows * (t[0].cols / 256) * Q3K_GPU_BYTES } else { t[0].stride }).collect();
+        let expert_bytes = |l: usize| 2 * gate_bytes[l] + moe.tensors[l][2].stride;
+        let slot_bytes = (0..moe.tensors.len()).filter(|&l| cacheable[l]).map(expert_bytes).max().unwrap_or(1);
         // a scratch slot holds any layer's expert (some downs are bigger formats than the cached ones)
-        let scratch_bytes = 2 * gate_bytes + moe.tensors.iter().map(|t| t[2].stride).max().unwrap_or(0);
+        let scratch_bytes = (0..moe.tensors.len()).map(expert_bytes).max().unwrap_or(0);
+        let g0 = moe.tensors.iter().find(|t| t[0].rows > 0).unwrap()[0];
         let routers = moe.routers.iter().map(|r| DeviceBuf::alloc(r.len().max(1) * 4).and_then(|b| b.write(r).map(|_| b))).collect::<Result<Vec<_>, _>>()?;
         let conv_elems = (2 * g0.rows * g0.cols).max(g0.rows * g0.cols);
-        let extras = routers.iter().map(|b| b.bytes).sum::<usize>() + 2 * scratch_bytes + conv_elems * 9 / 8 + 8 * MAX_BATCH * 8;
-        let max_slots = if shape.is_some() { cfg.n_layers * cfg.n_experts } else { 0 };
+        // the prompt-batch table: per token and pick, its token index and weight
+        let idx_bytes = 8 * max_batch(cfg) * cfg.n_experts_used.max(8);
+        let extras = routers.iter().map(|b| b.bytes).sum::<usize>() + 2 * scratch_bytes + conv_elems * 9 / 8 + idx_bytes;
+        let max_slots = if cacheable.iter().any(|&c| c) { cfg.n_layers * cfg.n_experts } else { 0 };
         let mut pinned = [std::ptr::null_mut(); 2];
         let mut events = [std::ptr::null_mut(); 2];
         for i in 0..2 {
@@ -4573,7 +4962,7 @@ impl ExpertCache {
             a.check(unsafe { (a.f.cuEventCreate)(&mut events[i], 0) }, "event")?;
         }
         let mut cache = ExpertCache {
-            uploader: ExpertUploader::new(slot_bytes, gate_bytes),
+            uploader: ExpertUploader::new(slot_bytes),
             blocks: Vec::new(),
             addr: Vec::new(),
             max_slots,
@@ -4587,6 +4976,7 @@ impl ExpertCache {
             queued: vec![vec![false; cfg.n_experts]; cfg.n_layers],
             sent: 0,
             cacheable,
+            batch_ok,
             uploads: 0,
             routers,
             pinned,
@@ -4596,7 +4986,7 @@ impl ExpertCache {
             next: 0,
             conv_q: DeviceBuf::alloc(conv_elems)?,
             conv_d: DeviceBuf::alloc(conv_elems / 32 * 4)?,
-            idx: DeviceBuf::alloc(8 * MAX_BATCH * 8)?,
+            idx: DeviceBuf::alloc(idx_bytes)?,
             staged: 0,
         };
         cache.add_blocks(budget.saturating_sub(extras));
@@ -4625,7 +5015,7 @@ impl ExpertCache {
     /// their experts run on the CPU again, their pages read back into RAM ahead of that.
     fn free_blocks(&mut self, moe: &CpuMoe, bytes: usize) {
         // copies on their way into a slot land first
-        let mut old = std::mem::replace(&mut self.uploader, ExpertUploader::new(self.slot_bytes, self.gate_bytes));
+        let mut old = std::mem::replace(&mut self.uploader, ExpertUploader::new(self.slot_bytes));
         old.finish();
         while let Ok(d) = old.done.try_recv() {
             self.landed(d);
@@ -4651,13 +5041,19 @@ impl ExpertCache {
     }
 
     /// Gate and up as GPU Q3_K (112-byte blocks: the 16-byte header first) into `out`, then the down's
-    /// blocks as they are.
-    fn pack(moe: &CpuMoe, l: usize, e: usize, gate_bytes: usize, out: &mut [u8]) -> usize {
+    /// blocks as they are; `raw` (2-bit experts): all three as they are.
+    fn pack(&self, moe: &CpuMoe, l: usize, e: usize, out: &mut [u8]) -> usize {
         let ex = moe.expert(l, e);
-        Self::pack_parts(ex.gate.data, ex.up.data, ex.down.data, gate_bytes, out)
+        Self::pack_parts(ex.gate.data, ex.up.data, ex.down.data, self.gate_bytes[l], iq2_fmt(&moe.tensors[l]).is_some(), out)
     }
 
-    fn pack_parts(gate: &[u8], up: &[u8], down: &[u8], gate_bytes: usize, out: &mut [u8]) -> usize {
+    fn pack_parts(gate: &[u8], up: &[u8], down: &[u8], gate_bytes: usize, raw: bool, out: &mut [u8]) -> usize {
+        if raw {
+            out[..gate.len()].copy_from_slice(gate);
+            out[gate_bytes..gate_bytes + up.len()].copy_from_slice(up);
+            out[2 * gate_bytes..2 * gate_bytes + down.len()].copy_from_slice(down);
+            return 2 * gate_bytes + down.len();
+        }
         for (m, dst) in [(gate, 0), (up, gate_bytes)] {
             for (blk, o) in m.chunks_exact(110).zip(out[dst..dst + gate_bytes].chunks_exact_mut(Q3K_GPU_BYTES)) {
                 o[..12].copy_from_slice(&blk[96..108]); // scales
@@ -4681,7 +5077,7 @@ impl ExpertCache {
         a.check(unsafe { (a.f.cuEventSynchronize)(self.events[i]) }, "staging wait")?;
         let buf = unsafe { std::slice::from_raw_parts_mut(self.pinned[i], self.scratch_bytes) };
         let t = std::time::Instant::now();
-        let bytes = Self::pack(moe, l, e, self.gate_bytes, buf);
+        let bytes = self.pack(moe, l, e, buf);
         // a couple of MB from RAM take well under a millisecond; longer means the weights came off the disk
         let ms = t.elapsed().as_millis() as u64;
         if ms >= 3 {
@@ -4690,7 +5086,7 @@ impl ExpertCache {
         let dst = self.scratch[i].ptr;
         a.check(unsafe { (a.f.cuMemcpyHtoDAsync_v2)(dst, self.pinned[i] as *const c_void, bytes, stream) }, "expert staging copy")?;
         self.staged += 1;
-        let gb = self.gate_bytes as u64;
+        let gb = self.gate_bytes[l] as u64;
         Ok(([dst, dst + gb, dst + 2 * gb], i))
     }
 
@@ -4703,10 +5099,10 @@ impl ExpertCache {
         self.owner.len()
     }
 
-    /// Device addresses of a cached expert's gate, up and down.
-    fn ptrs(&self, slot: usize) -> [u64; 3] {
-        let base = self.addr[slot];
-        [base, base + self.gate_bytes as u64, base + 2 * self.gate_bytes as u64]
+    /// Device addresses of a cached expert's gate, up and down (a layer-`l` expert).
+    fn ptrs(&self, slot: usize, l: usize) -> [u64; 3] {
+        let (base, gb) = (self.addr[slot], self.gate_bytes[l] as u64);
+        [base, base + gb, base + 2 * gb]
     }
 
     /// Marks the slots whose copies have landed as holding their experts.
@@ -4764,7 +5160,7 @@ impl ExpertCache {
             self.owner[slot] = Some((l, e));
             self.used[slot] = u64::MAX;
             self.queued[l][e] = true;
-            let job = UploadJob { l, e, slot, src: ranges(l, e), dst: self.ptrs(slot)[0], evicted };
+            let job = UploadJob { l, e, slot, src: ranges(l, e), gate_bytes: self.gate_bytes[l], raw: iq2_fmt(&moe.tensors[l]).is_some(), dst: self.addr[slot], evicted };
             if self.uploader.tx.as_ref().is_none_or(|tx| tx.send(job).is_err()) {
                 // no upload thread: give the slot back
                 self.owner[slot] = None;
@@ -4788,11 +5184,19 @@ impl ExpertCache {
     }
 }
 
+/// The token embedding table: on the GPU (read by the embed kernel; needed there when the output is tied to it),
+/// or, for a mixture of experts with an output of its own, left in the model file: a pass's rows are looked up on
+/// the CPU and copied up, and its GPU memory (vocab x dim bytes) goes to the expert cache instead.
+enum Embd {
+    Gpu(GpuMatrix),
+    Host { map: memmap2::Mmap, offset: usize, bytes: usize, ty: GgmlType, rows: usize, cols: usize },
+}
+
 pub struct GpuModel {
     pub cfg: Config,
     k: Arc<Kernels>,
-    embd: GpuMatrix,
-    output: Option<GpuMatrix>, // None = tied to the embedding
+    embd: Embd,
+    output: Option<GpuMatrix>, // None = tied to the embedding (then on the GPU)
     output_norm: DeviceBuf,
     layers: Vec<GpuLayer>,
     /// the GPU-resident experts, made on the first forward pass from the memory left then (before `moe`:
@@ -4803,6 +5207,8 @@ pub struct GpuModel {
     pub device: String,
     /// Q8_0 weights decode with int8 activations too (for draft models; otherwise exact f32)
     pub int8_q8: bool,
+    /// 2-bit weights (Fmt::Iq2) as Q8 for prompt batches: int8 values, f32 scales
+    iq_scratch: Option<(DeviceBuf, DeviceBuf)>,
 }
 
 impl GpuModel {
@@ -4810,6 +5216,14 @@ impl GpuModel {
         if let Some(m) = cfg.mla {
             if m.kv_lora != 512 || cfg.n_heads > 32 || (m.kv_lora + cfg.rope_dim) % 32 != 0 || m.kv_lora + cfg.rope_dim > 32 * 24 {
                 return Err(format!("GPU backend: latent attention with {} heads and a {}-wide cache row is not supported (512 + RoPE, up to 32 heads)", cfg.n_heads, m.kv_lora + cfg.rope_dim));
+            }
+        } else if cfg.attn_gated {
+            // wide heads go to attention_wide (a multiple of 128, up to 256); DeltaNet heads to delta_scan
+            if cfg.head_dim % 128 != 0 || cfg.head_dim > 256 || cfg.n_heads % cfg.n_kv_heads != 0 {
+                return Err(format!("GPU backend: gated attention with head size {} is not supported (128 or 256)", cfg.head_dim));
+            }
+            if cfg.delta.is_some_and(|d| d.head != 128 || d.conv > 8) {
+                return Err("GPU backend: Gated DeltaNet heads must be 128 wide".into());
             }
         } else if cfg.head_dim > ATT_MAX_HD || ATT_MAX_HD % cfg.head_dim != 0 || cfg.head_dim % 4 != 0 {
             return Err(format!("GPU backend: head size {} not supported (needs a divisor of {ATT_MAX_HD})", cfg.head_dim));
@@ -4825,7 +5239,20 @@ impl GpuModel {
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
             let attn_norm = upload_vec(g, &p("attn_norm"), up)?;
+            let delta = if cfg.recurrent(i) {
+                let v = |s: &str| format!("blk.{i}.{s}");
+                Some(GpuDelta {
+                    proj: upload_parts(g, &[p("attn_qkv"), p("attn_gate"), p("ssm_ba")], up)?,
+                    conv: upload_vec(g, &v("ssm_conv1d.weight"), up)?,
+                    dt_bias: upload_vec(g, &v("ssm_dt.bias"), up)?,
+                    a: upload_vec(g, &v("ssm_a"), up)?,
+                    norm: upload_vec(g, &v("ssm_norm.weight"), up)?,
+                })
+            } else {
+                None
+            };
             let (qkv, mla) = match cfg.mla {
+                _ if delta.is_some() => (Vec::new(), None),
                 Some(m) => {
                     let q_a = if m.q_lora > 0 { Some((upload_one(g, &p("attn_q_a"), up)?, upload_vec(g, &p("attn_q_a_norm"), up)?)) } else { None };
                     let mla = GpuMla {
@@ -4842,23 +5269,49 @@ impl GpuModel {
             };
             let q_norm = if g.tensor(&p("attn_q_norm")).is_some() { Some(upload_vec(g, &p("attn_q_norm"), up)?) } else { None };
             let k_norm = if g.tensor(&p("attn_k_norm")).is_some() { Some(upload_vec(g, &p("attn_k_norm"), up)?) } else { None };
-            let wo = upload_one(g, &p("attn_output"), up)?;
-            let ffn_norm = upload_vec(g, &p("ffn_norm"), up)?;
+            let wo = upload_one(g, &p(if delta.is_some() { "ssm_out" } else { "attn_output" }), up)?;
+            // qwen3next names the norm before the feed-forward after the attention it follows
+            let ffn_norm = upload_vec(g, &p(if g.tensor(&p("ffn_norm")).is_some() { "ffn_norm" } else { "post_attention_norm" }), up)?;
             let ffn = if cfg.is_moe() && i >= cfg.n_dense_lead {
                 let shared = if g.tensor(&p("ffn_gate_shexp")).is_some() {
                     Some((upload_parts(g, &[p("ffn_gate_shexp"), p("ffn_up_shexp")], up)?, upload_one(g, &p("ffn_down_shexp"), up)?))
                 } else {
                     None
                 };
-                GpuFfn::Moe { shared }
+                let gate = if g.tensor(&p("ffn_gate_inp_shexp")).is_some() { Some(upload_f32(g, &p("ffn_gate_inp_shexp"), up)?) } else { None };
+                GpuFfn::Moe { shared, gate }
             } else {
                 GpuFfn::Dense { gate_up: upload_parts(g, &[p("ffn_gate"), p("ffn_up")], up)?, down: upload_one(g, &p("ffn_down"), up)? }
             };
-            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, mla, wo, ffn_norm, ffn });
+            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, mla, delta, wo, ffn_norm, ffn });
         }
         let moe = if cfg.is_moe() { Some(CpuMoe::load(g, &cfg)?) } else { None };
-        let embd = upload_one(g, "token_embd.weight", up)?;
         let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight", up)?) } else { None };
+        let embd = match g.tensor("token_embd.weight") {
+            Some(t) if cfg.is_moe() && output.is_some() && t.dims.len() == 2 && t.ty.block().is_some() => {
+                let file = std::fs::File::open(&g.path).map_err(|e| format!("cannot open {}: {e}", g.path.display()))?;
+                let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("cannot map {}: {e}", g.path.display()))?;
+                Embd::Host { map, offset: t.offset, bytes: t.n_bytes, ty: t.ty, rows: t.dims[1] as usize, cols: t.dims[0] as usize }
+            }
+            _ => Embd::Gpu(upload_parts_as(g, &["token_embd.weight".to_string()], up, false)?.pop().unwrap().0),
+        };
+        // the conversion scratch of 2-bit weights: the most any one matmul converts
+        let iq2 = |parts: &[(GpuMatrix, usize)]| parts.iter().filter(|(m, _)| m.fmt == Fmt::Iq2).map(|(m, _)| m.rows * m.cols).sum::<usize>();
+        let one = |m: &GpuMatrix| if m.fmt == Fmt::Iq2 { m.rows * m.cols } else { 0 };
+        let most = layers
+            .iter()
+            .map(|l| {
+                let ffn = match &l.ffn {
+                    GpuFfn::Dense { gate_up, down } => iq2(gate_up).max(one(down)),
+                    GpuFfn::Moe { shared: Some((gate_up, down)), .. } => iq2(gate_up).max(one(down)),
+                    GpuFfn::Moe { shared: None, .. } => 0,
+                };
+                iq2(&l.qkv).max(l.delta.as_ref().map_or(0, |d| iq2(&d.proj))).max(one(&l.wo)).max(ffn)
+            })
+            .chain(output.as_ref().map(one))
+            .max()
+            .unwrap_or(0);
+        let iq_scratch = if most > 0 { Some((DeviceBuf::alloc(most)?, DeviceBuf::alloc(most / 32 * 4)?)) } else { None };
 
         // prompt attention: dynamic shared memory above the default 48 KB has to be requested per kernel
         let ld = cfg.head_dim + 1;
@@ -4875,13 +5328,17 @@ impl GpuModel {
 
         let device = format!("{} (sm_{}{}, NVRTC {})", a.device_name, a.compute.0, a.compute.1, std::path::Path::new(&a.nvrtc_path).file_name().and_then(|n| n.to_str()).unwrap_or("?"));
         // the logits buffer is sized from cfg.vocab; a mismatch would write past it
-        let out_rows = output.as_ref().unwrap_or(&embd).rows;
+        let out_rows = match (&output, &embd) {
+            (Some(o), _) => o.rows,
+            (None, Embd::Gpu(e)) => e.rows,
+            (None, Embd::Host { .. }) => unreachable!("a tied output keeps the embedding on the GPU"),
+        };
         if out_rows != cfg.vocab {
             return Err(format!("output layer has {out_rows} rows but the vocabulary has {} tokens", cfg.vocab));
         }
         let output_norm = upload_vec(g, "output_norm.weight", up)?;
         up.finish()?;
-        let model = GpuModel { output_norm, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false };
+        let model = GpuModel { output_norm, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false, iq_scratch };
         if std::env::var_os("GHOST_INFER_LOAD_TIMES").is_some() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
@@ -4892,6 +5349,15 @@ impl GpuModel {
             );
         }
         Ok(model)
+    }
+
+    /// The output projection: its own, or the embedding it is tied to (which then stays on the GPU).
+    fn output_matrix(&self) -> &GpuMatrix {
+        match (&self.output, &self.embd) {
+            (Some(o), _) => o,
+            (None, Embd::Gpu(e)) => e,
+            (None, Embd::Host { .. }) => unreachable!("a tied output keeps the embedding on the GPU"),
+        }
     }
 
     /// With GHOST_INFER_PROFILE set, waits for the GPU after `f` so its time lands in bucket `op`.
@@ -4910,6 +5376,21 @@ impl GpuModel {
     fn matmul(&self, parts: &[(&GpuMatrix, usize)], x: u64, out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
         let cols = parts[0].0.cols;
+        // 2-bit weights outside decoding (prompt batches, exact mode): converted to Q8 in the scratch first
+        if parts.iter().any(|(m, _)| m.fmt == Fmt::Iq2) && !self.dp4a_path(parts, n, s) {
+            let (sq, sd) = self.iq_scratch.as_ref().ok_or("no scratch for 2-bit weights")?;
+            let (mut qo, mut views) = (0usize, Vec::new());
+            for &(m, _) in parts.iter().filter(|(m, _)| m.fmt == Fmt::Iq2) {
+                let blocks = m.rows * m.cols / 32;
+                let (q, d) = (sq.ptr + qo as u64, sd.ptr + (qo / 32 * 4) as u64);
+                k.launch(k.iq2_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(m.q.ptr), Arg::P(q), Arg::P(d), Arg::I(blocks as i32), Arg::I(m.iq)])?;
+                views.push(GpuMatrix::view(Fmt::Q8, q, Some(d), m.rows, m.cols));
+                qo += blocks * 32;
+            }
+            let mut vs = views.iter();
+            let conv: Vec<(&GpuMatrix, usize)> = parts.iter().map(|&(m, off)| if m.fmt == Fmt::Iq2 { (&**vs.next().unwrap(), off) } else { (m, off) }).collect();
+            return self.matmul(&conv, x, out, out_stride, n, accumulate, s);
+        }
         if n >= TILED_MIN_BATCH && !self.dp4a_path(parts, n, s) {
             if let Some(mk) = k.matmul_mma_k.filter(|_| parts.iter().all(|(m, _)| m.fmt != Fmt::Q8)) {
                 // K-quant prompts: one activation scale per 128 (or 256) values keeps the tensor-core epilogue integer
@@ -4960,6 +5441,7 @@ impl GpuModel {
                 Fmt::Q8 => k.launch(k.matmul_q8, (m.rows.div_ceil(8) as u32, n.div_ceil(MATMUL_TB) as u32), 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(m.d_ptr())][..], &tail].concat())?,
                 Fmt::Q4K => k.launch(k.matmul_q4k[variant], kq_grid, 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(0)][..], &tail].concat())?,
                 Fmt::Q6K => k.launch(k.matmul_q6k[variant], kq_grid, 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(m.d_ptr())][..], &tail].concat())?,
+                Fmt::Iq2 => return Err("2-bit weights reached the f32 matmul unconverted".into()),
             }
         }
         Ok(())
@@ -4972,7 +5454,7 @@ impl GpuModel {
         if crate::quant::exact_mode() {
             return false;
         }
-        (n <= DECODE_MAX_BATCH && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8 || self.int8_q8))
+        (n <= DECODE_MAX_BATCH && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8 || m.coarse || self.int8_q8))
             || (s.exact.get() && n <= VERIFY_MAX_BATCH && self.k.matmul_vfy.is_some() && parts.iter().all(|(m, _)| m.fmt != Fmt::Q8))
     }
 
@@ -4982,6 +5464,16 @@ impl GpuModel {
     fn matmul_dp4a(&self, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
         for &(m, off) in parts {
+            if m.fmt == Fmt::Iq2 {
+                k.launch(
+                    k.matmul_iq2_dp4a,
+                    (m.rows.div_ceil(8) as u32, n as u32),
+                    256,
+                    0,
+                    &[Arg::P(m.q.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32), Arg::I(m.iq)],
+                )?;
+                continue;
+            }
             if let Some(vfy) = k.matmul_vfy.filter(|_| m.fmt != Fmt::Q8 && n >= vfy_min() && (s.exact.get() || n > DECODE_MAX_BATCH)) {
                 // 32 tokens per launch at most (the kernels' tiles and shared memory)
                 let nb = m.cols / 32;
@@ -5181,7 +5673,7 @@ impl GpuModel {
         let per_token = self.cfg.is_moe() && tokens.len() > 1 && tokens.len() < MOE_GPU_MIN_BATCH;
         // room for the whole prompt at once (or less room, for a conversation much shorter than the last)
         self.fit_session(s, (s.pos + tokens.len()).min(s.ctx), true)?;
-        let chunks: Vec<&[u32]> = if per_token { tokens.chunks(1).collect() } else { tokens.chunks(MAX_BATCH).collect() };
+        let chunks: Vec<&[u32]> = if per_token { tokens.chunks(1).collect() } else { tokens.chunks(max_batch(&self.cfg)).collect() };
         PROGRESS.start(tokens.len());
         let mut result = Ok(());
         let mut done = 0;
@@ -5228,8 +5720,8 @@ impl GpuModel {
         if n == 0 {
             return Ok(Vec::new());
         }
-        if n > MAX_BATCH {
-            return Err(format!("GPU batch of {n} exceeds {MAX_BATCH}"));
+        if n > max_batch(&self.cfg) {
+            return Err(format!("GPU batch of {n} exceeds {}", max_batch(&self.cfg)));
         }
         if s.pos + n > s.ctx {
             return Err(format!("context full ({} tokens)", s.ctx));
@@ -5241,6 +5733,17 @@ impl GpuModel {
         let a = api()?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         s.tokens.write(&ids)?;
+        if let Embd::Host { map, offset, bytes, ty, rows, cols } = &self.embd {
+            if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= *rows) {
+                return Err(format!("token id {bad} out of range"));
+            }
+            let m = crate::quant::Matrix { data: &map[*offset..*offset + *bytes], ty: *ty, rows: *rows, cols: *cols };
+            let mut xs = vec![0f32; n * cols];
+            for (&t, row) in tokens.iter().zip(xs.chunks_exact_mut(*cols)) {
+                m.row_f32(t as usize, row);
+            }
+            s.x.write(&xs)?; // a blocking copy: ordered before the pass's kernels
+        }
         // checking a draft: every token as a one-token step would compute it
         s.exact.set(matches!(want, Out::Argmax | Out::All));
         // one-token steps replay a CUDA graph captured on the session's first one (GHOST_INFER_NO_GRAPH=1:
@@ -5297,7 +5800,7 @@ impl GpuModel {
             *cache_ref = Some(ExpertCache::new(moe, c, expert_cache_budget()?)?);
         }
         let cache = cache_ref.as_mut().unwrap();
-        if n >= MOE_GPU_MIN_BATCH {
+        if n >= MOE_GPU_MIN_BATCH && cache.batch_ok {
             return self.moe_ffn_batch(l, layer, n, s, cache, moe);
         }
         let on_gpu = n == 1 && cache.cacheable[l] && cache.slots() > 0;
@@ -5344,7 +5847,7 @@ impl GpuModel {
         for &(e, w) in &h.picks {
             match cache.slot_of[l][e] {
                 slot if on_gpu && slot >= 0 => {
-                    let [g, u, d] = cache.ptrs(slot as usize);
+                    let [g, u, d] = cache.ptrs(slot as usize, l);
                     ptrs.extend([g, u]);
                     downs.push(d);
                     wts.push(w);
@@ -5359,9 +5862,19 @@ impl GpuModel {
             tab.extend(wts.iter().flat_map(|w| w.to_le_bytes()));
             s.moe_tab.write(&tab)?;
             let (ex, ffn) = (moe.tensors[l][0], c.expert_ffn_dim);
-            k.launch(k.moe_gate_up_q3k, (ex.rows.div_ceil(8) as u32, (2 * nk) as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
-            k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, nk as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(ffn as i32)])?;
-            k.launch(k.moe_down_q4k, (dim.div_ceil(8) as u32, nk as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::I(nk as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32)])?;
+            let silu = [Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(ffn as i32)];
+            match iq2_fmt(&moe.tensors[l]) {
+                Some(fmt) => {
+                    k.launch(k.moe_gate_up_iq2, (ex.rows.div_ceil(8) as u32, (2 * nk) as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32), Arg::I(fmt)])?;
+                    k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, nk as u32), 256, 0, &silu)?;
+                    k.launch(k.moe_down_iq2, (dim.div_ceil(8) as u32, nk as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::I(nk as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32), Arg::I(fmt)])?;
+                }
+                None => {
+                    k.launch(k.moe_gate_up_q3k, (ex.rows.div_ceil(8) as u32, (2 * nk) as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
+                    k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, nk as u32), 256, 0, &silu)?;
+                    k.launch(k.moe_down_q4k, (dim.div_ceil(8) as u32, nk as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::I(nk as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32)])?;
+                }
+            }
         }
         // the CPU's share, computed while the GPU works on its own
         let cpu_k = if on_gpu { h.cpu_picks.len() } else { c.n_experts_used };
@@ -5474,11 +5987,12 @@ impl GpuModel {
         cache.idx.write(&tab)?;
 
         let [g, _, d] = moe.tensors[l];
+        let fmt = iq2_fmt(&moe.tensors[l]);
         let gate_blocks = g.rows * g.cols / 32;
         for (e, list) in lists.iter().enumerate().filter(|(_, list)| !list.is_empty()) {
             let m = list.len();
             let (ptrs, staged) = match cache.slot_of[l][e] {
-                slot if slot >= 0 => (cache.ptrs(slot as usize), None),
+                slot if slot >= 0 => (cache.ptrs(slot as usize, l), None),
                 _ => {
                     let (p, i) = cache.stage(moe, l, e, k.stream)?;
                     (p, Some(i))
@@ -5487,7 +6001,10 @@ impl GpuModel {
             // gate and up to Q8, one after the other: a single [gate | up] matrix of 2 * ffn rows
             for (j, &p) in ptrs[..2].iter().enumerate() {
                 let (q, dq) = (cache.conv_q.ptr + (j * gate_blocks * 32) as u64, cache.conv_d.ptr + (j * gate_blocks * 4) as u64);
-                k.launch(k.q3k_to_q8, (gate_blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(p), Arg::P(q), Arg::P(dq), Arg::I(gate_blocks as i32)])?;
+                match fmt {
+                    Some(f) => k.launch(k.iq2_to_q8, (gate_blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(p), Arg::P(q), Arg::P(dq), Arg::I(gate_blocks as i32), Arg::I(f)])?,
+                    None => k.launch(k.q3k_to_q8, (gate_blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(p), Arg::P(q), Arg::P(dq), Arg::I(gate_blocks as i32)])?,
+                }
             }
             let idx = cache.idx.ptr + (offs[e] * 4) as u64;
             let wts = cache.idx.ptr + ((w_base + offs[e]) * 4) as u64;
@@ -5496,6 +6013,11 @@ impl GpuModel {
             self.matmul(&[(&gate_up, 0)], s.att.ptr, s.gu.ptr, 2 * ffn, m, false, s)?;
             k.launch(k.silu_mul, ((m * ffn).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(ffn as i32), Arg::I(m as i32)])?;
             let down = match d.ty {
+                _ if fmt.is_some() => {
+                    let blocks = dim * ffn / 32;
+                    k.launch(k.iq2_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(ptrs[2]), Arg::P(cache.conv_q.ptr), Arg::P(cache.conv_d.ptr), Arg::I(blocks as i32), Arg::I(fmt.unwrap())])?;
+                    GpuMatrix::view(Fmt::Q8, cache.conv_q.ptr, Some(cache.conv_d.ptr), dim, ffn)
+                }
                 GgmlType::Q4K => GpuMatrix::view(Fmt::Q4K, ptrs[2], None, dim, ffn),
                 GgmlType::Q5K => {
                     let blocks = dim * ffn / 32;
@@ -5514,16 +6036,46 @@ impl GpuModel {
         Ok(())
     }
 
+    /// A Gated DeltaNet layer (see model::Delta): the [q k v | z | ba] projection of the normed rows into s.gu,
+    /// the convolution, unit q and k with the gates (beta, decay) in s.h, the recurrence through the layer's
+    /// state into s.att, and the gated norm there, ready for ssm_out.
+    fn delta_net(&self, l: usize, layer: &GpuLayer, d: &GpuDelta, n: usize, s: &GpuSession) -> Result<(), String> {
+        let (c, k) = (&self.cfg, &self.k);
+        let dc = c.delta.unwrap();
+        let (cd, vd) = (dc.conv_dim(), dc.value_dim());
+        let stride = cd + vd + 2 * dc.v_heads;
+        let proj: Vec<(&GpuMatrix, usize)> = d.proj.iter().map(|(m, off)| (m, *off)).collect();
+        self.norm_matmul(&layer.attn_norm, &proj, s.gu.ptr, stride, n, s)?;
+        let (conv_state, state) = s.delta_state(c, c.slot(l));
+        k.launch(k.delta_conv, (cd.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::P(d.conv.ptr), Arg::P(conv_state), Arg::I(n as i32), Arg::I(cd as i32), Arg::I(dc.conv as i32 - 1)])?;
+        let qscale = 1.0 / (dc.head as f32).sqrt();
+        k.launch(
+            k.delta_prep,
+            (n as u32, (2 * dc.k_heads + 1) as u32),
+            dc.head as u32,
+            0,
+            &[Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::I((cd + vd) as i32), Arg::P(d.dt_bias.ptr), Arg::P(d.a.ptr), Arg::P(s.h.ptr), Arg::I(dc.k_heads as i32), Arg::I(dc.v_heads as i32), Arg::I(dc.head as i32), Arg::F(qscale), Arg::F(c.norm_eps)],
+        )?;
+        k.launch(k.delta_scan, (dc.v_heads as u32, (dc.head / 32) as u32), 32, 0, &[Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::P(s.h.ptr), Arg::P(state), Arg::P(s.att.ptr), Arg::I(n as i32), Arg::I(dc.k_heads as i32), Arg::I(dc.v_heads as i32)])?;
+        k.launch(k.delta_norm, (n as u32, dc.v_heads as u32), dc.head as u32, 0, &[Arg::P(s.att.ptr), Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::I(cd as i32), Arg::P(d.norm.ptr), Arg::I(dc.v_heads as i32), Arg::I(dc.head as i32), Arg::F(c.norm_eps)])
+    }
+
     /// Layer l's feed-forward, added to s.x.
     fn ffn(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession) -> Result<(), String> {
         match &layer.ffn {
             GpuFfn::Dense { gate_up, down } => self.swiglu(gate_up, down, &layer.ffn_norm, None, n, s),
-            GpuFfn::Moe { shared } => {
+            GpuFfn::Moe { shared, gate } => {
                 self.moe_ffn(l, layer, n, s)?;
-                match shared {
-                    // the shared expert reads the same normed input, still in s.xb
-                    Some((gate_up, down)) => self.swiglu(gate_up, down, &layer.ffn_norm, Some(s.xb.ptr), n, s),
-                    None => Ok(()),
+                match (shared, gate) {
+                    // the shared expert reads the same normed input, still in s.xb; a gated one goes to s.att
+                    // first (free again: the experts' sums have been added), then in through its gate
+                    (Some((gate_up, down)), Some(g)) => {
+                        self.swiglu_to(gate_up, down, &layer.ffn_norm, Some(s.xb.ptr), n, s, s.att.ptr, false)?;
+                        let k = &self.k;
+                        k.launch(k.gated_add, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(s.att.ptr), Arg::P(g.ptr), Arg::P(s.xb.ptr), Arg::I(self.cfg.dim as i32)])
+                    }
+                    (Some((gate_up, down)), None) => self.swiglu(gate_up, down, &layer.ffn_norm, Some(s.xb.ptr), n, s),
+                    (None, _) => Ok(()),
                 }
             }
         }
@@ -5532,6 +6084,12 @@ impl GpuModel {
     /// A SwiGLU block added to s.x: [gate | up] from RMSNorm(s.x) with `norm` (or from `normed`, already
     /// normed input), then down.
     fn swiglu(&self, gate_up: &[(GpuMatrix, usize)], down: &GpuMatrix, norm: &DeviceBuf, normed: Option<u64>, n: usize, s: &GpuSession) -> Result<(), String> {
+        self.swiglu_to(gate_up, down, norm, normed, n, s, s.x.ptr, true)
+    }
+
+    /// `swiglu` into `out` (n rows of dim), added to it if `accumulate`.
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu_to(&self, gate_up: &[(GpuMatrix, usize)], down: &GpuMatrix, norm: &DeviceBuf, normed: Option<u64>, n: usize, s: &GpuSession, out: u64, accumulate: bool) -> Result<(), String> {
         let k = &self.k;
         let hidden = down.cols;
         let gate_up: Vec<(&GpuMatrix, usize)> = gate_up.iter().map(|(m, off)| (m, *off)).collect();
@@ -5544,11 +6102,11 @@ impl GpuModel {
             // decoding: silu(gate) * up straight to int8 for the down projection
             let nv = (hidden / 4) as u32;
             k.launch(k.silu_q8, (nv.div_ceil(256), n as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(hidden as i32)])?;
-            return self.matmul_dp4a(&down, s.x.ptr, self.cfg.dim, n, true, s);
+            return self.matmul_dp4a(&down, out, self.cfg.dim, n, accumulate, s);
         }
         let total = (n * hidden) as u32;
         k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(hidden as i32), Arg::I(n as i32)])?;
-        self.matmul_one(down[0].0, s.h.ptr, s.x.ptr, n, true, s)
+        self.matmul_one(down[0].0, s.h.ptr, out, n, accumulate, s)
     }
 
     /// Latent attention's inputs: the queries (low-rank step if any) to s.qkv, the compressed key-value
@@ -5559,8 +6117,8 @@ impl GpuModel {
         let m = c.mla.unwrap();
         let (h, hd, rd, kd) = (c.n_heads, c.head_dim, c.rope_dim, c.k_row());
         let q_dim = h * hd;
-        // s.qkv: the queries (MAX_BATCH rows of q_dim), then rows of [low-rank query | compressed kv]
-        let (q, lat) = (s.qkv.ptr, s.qkv.at(MAX_BATCH * q_dim * 4));
+        // s.qkv: the queries (max_batch rows of q_dim), then rows of [low-rank query | compressed kv]
+        let (q, lat) = (s.qkv.ptr, s.qkv.at(max_batch(c) * q_dim * 4));
         let lat_w = m.q_lora + kd;
         match &mla.q_a {
             Some((wa, wa_norm)) => {
@@ -5639,9 +6197,10 @@ impl GpuModel {
         let k = &self.k;
 
         // profile buckets match profile::OPS; with profiling off `timed` is a plain call
-        self.timed(0, || {
-            k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(self.embd.fmt as i32), Arg::P(self.embd.q.ptr), Arg::P(self.embd.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)])
-        })?;
+        // (an embedding left in the file: forward has copied the rows into s.x already)
+        if let Embd::Gpu(e) = &self.embd {
+            self.timed(0, || k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(e.fmt as i32), Arg::P(e.q.ptr), Arg::P(e.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)]))?;
+        }
         let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
         for (l, layer) in self.layers.iter().enumerate() {
             if let Some(mla) = &layer.mla {
@@ -5652,10 +6211,27 @@ impl GpuModel {
                 self.timed(6, || self.ffn(l, layer, n, s))?;
                 continue;
             }
-            let (kc, vc) = (s.k_cache.at(l), s.v_cache.at(l));
-            let (ks, vs) = (s.k_scale.at(l), s.v_scale.at(l));
+            if let Some(d) = &layer.delta {
+                self.timed(2, || self.delta_net(l, layer, d, n, s))?;
+                self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
+                self.timed(6, || self.ffn(l, layer, n, s))?;
+                continue;
+            }
+            // the caches hold attention layers only (a DeltaNet layer keeps a state instead)
+            let slot = c.slot(l);
+            let (kc, vc) = (s.k_cache.at(slot), s.v_cache.at(slot));
+            let (ks, vs) = (s.k_scale.at(slot), s.v_scale.at(slot));
             let qkv: Vec<(&GpuMatrix, usize)> = layer.qkv.iter().map(|(m, off)| (m, *off)).collect();
-            self.timed(2, || self.norm_matmul(&layer.attn_norm, &qkv, s.qkv.ptr, qkv_rows, n, s))?;
+            if c.attn_gated {
+                // [q | gate] per head, then k and v, into s.gu; split into the packed rows and the gates (s.h)
+                let rows = 2 * c.n_heads * hd + 2 * c.n_kv_heads * hd;
+                self.timed(2, || {
+                    self.norm_matmul(&layer.attn_norm, &qkv, s.gu.ptr, rows, n, s)?;
+                    k.launch(k.next_split_qgate, (n as u32, (c.n_heads + 2 * c.n_kv_heads) as u32), 128, 0, &[Arg::P(s.gu.ptr), Arg::I(rows as i32), Arg::P(s.qkv.ptr), Arg::P(s.h.ptr), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32)])
+                })?;
+            } else {
+                self.timed(2, || self.norm_matmul(&layer.attn_norm, &qkv, s.qkv.ptr, qkv_rows, n, s))?;
+            }
             self.timed(3, || {
                 let (qn, kn) = match (&layer.q_norm, &layer.k_norm) {
                     (Some(qn), Some(kn)) => (qn.ptr, kn.ptr),
@@ -5669,7 +6245,24 @@ impl GpuModel {
                     &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
                 )
             })?;
-            self.timed(4, || self.attention(s, n, (kc, vc, ks, vs), posp, fixed_split))?;
+            if hd > ATT_MAX_HD {
+                let scale = 1.0 / (hd as f32).sqrt();
+                self.timed(4, || {
+                    k.launch(
+                        k.attention_wide,
+                        (n as u32, c.n_heads as u32),
+                        256,
+                        0,
+                        &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::F(scale)],
+                    )
+                })?;
+            } else {
+                self.timed(4, || self.attention(s, n, (kc, vc, ks, vs), posp, fixed_split))?;
+            }
+            if c.attn_gated {
+                let len = n * c.n_heads * hd;
+                self.timed(4, || k.launch(k.sigmoid_mul, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.att.ptr), Arg::P(s.h.ptr), Arg::I(len as i32)]))?;
+            }
             self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
 
             self.timed(6, || self.ffn(l, layer, n, s))?;
@@ -5681,7 +6274,7 @@ impl GpuModel {
                 let rows = if want == Out::Last { 1 } else { n };
                 let first = s.x.at((n - rows) * dim * 4);
                 k.launch(k.rmsnorm, (rows as u32, 1), 256, 0, &[Arg::P(first), Arg::P(self.output_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
-                self.matmul_one(self.output.as_ref().unwrap_or(&self.embd), s.xb.ptr, s.logits_dev.ptr, rows, false, s)?;
+                self.matmul_one(self.output_matrix(), s.xb.ptr, s.logits_dev.ptr, rows, false, s)?;
                 if want == Out::Argmax {
                     k.launch(k.argmax_rows, (rows as u32, 1), 1024, 0, &[Arg::P(s.logits_dev.ptr), Arg::I(c.vocab as i32), Arg::P(s.picks.ptr)])?;
                 }
@@ -5732,6 +6325,10 @@ pub struct GpuSession {
     graphs: [Ptr; 2],      // captured one-token steps: Last, Argmax
     att_scr: DeviceBuf,    // the tiled verify attention's scores and weights (vfy_attention_fits models)
     exact: std::cell::Cell<bool>, // this pass checks a draft: verify kernels, no prompt kernels
+    /// Gated DeltaNet layers: every layer's convolution state, then every layer's recurrent state (f32); and
+    /// copies of it at earlier positions (see model::Session::snapshot)
+    delta: Option<DeviceBuf>,
+    snaps: Vec<(usize, DeviceBuf)>,
     pub logits: Vec<f32>,
     pub rows: Vec<f32>, // Out::All: a batch's logits, one vocab-long row per token
 }
@@ -5748,7 +6345,7 @@ impl GpuModel {
                 && kq(&l.wo)
                 && matches!(&l.ffn, GpuFfn::Dense { gate_up, down } if gate_up.iter().all(|(m, _)| kq(m)) && kq(down))
         });
-        if self.k.matmul_vfy.is_some() && !crate::quant::exact_mode() && layers && kq(self.output.as_ref().unwrap_or(&self.embd)) {
+        if self.k.matmul_vfy.is_some() && !crate::quant::exact_mode() && layers && kq(self.output_matrix()) {
             VERIFY_MAX_BATCH
         } else {
             DECODE_MAX_BATCH
@@ -5865,10 +6462,19 @@ impl GpuSession {
             att: att?,
             gu: gu?,
             h: h?,
-            k_cache: LayerCache::new(k_row, cfg.n_layers, cap)?,
-            v_cache: LayerCache::new(v_row, cfg.n_layers, cap)?,
-            k_scale: LayerCache::new(ks_row, cfg.n_layers, cap)?,
-            v_scale: LayerCache::new(vs_row, cfg.n_layers, cap)?,
+            k_cache: LayerCache::new(k_row, cfg.n_attn_layers(), cap)?,
+            v_cache: LayerCache::new(v_row, cfg.n_attn_layers(), cap)?,
+            k_scale: LayerCache::new(ks_row, cfg.n_attn_layers(), cap)?,
+            v_scale: LayerCache::new(vs_row, cfg.n_attn_layers(), cap)?,
+            delta: match Self::delta_bytes(cfg) {
+                0 => None,
+                bytes => {
+                    let buf = DeviceBuf::alloc(bytes)?;
+                    zero(&buf)?;
+                    Some(buf)
+                }
+            },
+            snaps: Vec::new(),
             logits_dev: logits_dev?,
             picks: picks?,
             pos_dev: pos_dev?,
@@ -5906,9 +6512,68 @@ impl GpuSession {
         }
     }
 
-    /// Device memory of a session holding `ctx` positions.
+    /// Device memory of a session holding `ctx` positions (with room for the DeltaNet snapshots).
     fn bytes(cfg: &Config, ctx: usize) -> usize {
-        Self::sizes(cfg, ctx).iter().sum::<usize>() + cfg.n_layers * ctx * Self::cache_rows(cfg).iter().sum::<usize>()
+        Self::sizes(cfg, ctx).iter().sum::<usize>() + cfg.n_attn_layers() * ctx * Self::cache_rows(cfg).iter().sum::<usize>() + (1 + MAX_SNAPS) * Self::delta_bytes(cfg)
+    }
+
+    /// Bytes of every DeltaNet layer's states (0 for other models).
+    fn delta_bytes(cfg: &Config) -> usize {
+        cfg.delta.map_or(0, |d| 4 * (cfg.n_layers - cfg.n_attn_layers()) * (d.conv_len() + d.state_len()))
+    }
+
+    /// DeltaNet layer `slot`'s convolution state and recurrent state.
+    fn delta_state(&self, cfg: &Config, slot: usize) -> (u64, u64) {
+        let (d, buf) = (cfg.delta.unwrap(), self.delta.as_ref().unwrap());
+        let layers = cfg.n_layers - cfg.n_attn_layers();
+        (buf.at(4 * slot * d.conv_len()), buf.at(4 * (layers * d.conv_len() + slot * d.state_len())))
+    }
+
+    /// A recurrent model (Gated DeltaNet) cannot cut its state back to an earlier position, only go back to a
+    /// snapshot or to the start.
+    pub fn recurrent(&self) -> bool {
+        self.delta.is_some()
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.pos = 0;
+        self.snaps.clear();
+        self.delta.as_ref().map_or(Ok(()), zero)
+    }
+
+    /// Keeps a copy of the DeltaNet states at the current position (the earliest and the latest are kept).
+    pub fn snapshot(&mut self) -> Result<(), String> {
+        let Some(buf) = &self.delta else { return Ok(()) };
+        if self.snaps.iter().any(|s| s.0 == self.pos) {
+            return Ok(());
+        }
+        let copy = if self.snaps.len() == MAX_SNAPS { self.snaps.remove(MAX_SNAPS - 1).1 } else { DeviceBuf::alloc(buf.bytes)? };
+        let a = api()?;
+        a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(copy.ptr, buf.ptr, buf.bytes) }, "DeltaNet snapshot")?;
+        self.snaps.push((self.pos, copy));
+        Ok(())
+    }
+
+    /// Goes back to at most `pos` positions; returns how many are kept (a recurrent model: the latest snapshot at
+    /// or before `pos`, or none).
+    pub fn truncate(&mut self, pos: usize) -> Result<usize, String> {
+        if pos >= self.pos {
+            return Ok(self.pos);
+        }
+        if !self.recurrent() {
+            self.pos = pos;
+            return Ok(pos);
+        }
+        self.snaps.retain(|s| s.0 <= pos);
+        match self.snaps.iter().max_by_key(|s| s.0) {
+            Some((at, copy)) => {
+                let (a, buf) = (api()?, self.delta.as_ref().unwrap());
+                a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(buf.ptr, copy.ptr, buf.bytes) }, "DeltaNet restore")?;
+                self.pos = *at;
+            }
+            None => self.reset()?,
+        }
+        Ok(self.pos)
     }
 
     /// The most memory `resize` to `ctx` positions holds besides the old caches and the new ones done so
@@ -5934,21 +6599,27 @@ impl GpuSession {
             return Self::sizes_mla(cfg, m);
         }
         let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
-        let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim);
+        // qwen3next: DeltaNet's [q k v | z | ba] rows and gated attention's [q | gate] ones go through s.gu, its
+        // outputs (value heads) through s.att, its gates and the attention gates through s.h
+        let d = cfg.delta.unwrap_or(crate::model::Delta { k_heads: 0, v_heads: 0, head: 0, conv: 0, every: 1 });
+        let gu = (2 * cfg.ffn_dim).max(d.conv_dim() + d.value_dim() + 2 * d.v_heads).max(if cfg.attn_gated { 2 * q_dim + 2 * kv_dim } else { 0 });
+        let att = q_dim.max(d.value_dim());
+        let widest = cfg.dim.max(att).max(cfg.ffn_dim);
         // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 32 positions
         let slices = SPLIT_MAX_BATCH * ctx.div_ceil(32);
         [
-            MAX_BATCH * widest,
-            4 * MAX_BATCH * widest / 32,
-            4 * MAX_BATCH * widest / 32,
-            4 * slices * cfg.n_heads * (cfg.head_dim + 2),
-            4 * MAX_BATCH,
-            4 * MAX_BATCH * cfg.dim,
-            4 * MAX_BATCH * cfg.dim,
-            4 * MAX_BATCH * (q_dim + 2 * kv_dim),
-            4 * MAX_BATCH * q_dim,
-            4 * MAX_BATCH * 2 * cfg.ffn_dim,
-            4 * MAX_BATCH * cfg.ffn_dim,
+            max_batch(cfg) * widest,
+            4 * max_batch(cfg) * widest / 32,
+            4 * max_batch(cfg) * widest / 32,
+            // wide heads (attention_wide) keep no partial results
+            if cfg.head_dim > ATT_MAX_HD { 4 } else { 4 * slices * cfg.n_heads * (cfg.head_dim + 2) },
+            4 * max_batch(cfg),
+            4 * max_batch(cfg) * cfg.dim,
+            4 * max_batch(cfg) * cfg.dim,
+            4 * max_batch(cfg) * (q_dim + 2 * kv_dim),
+            4 * max_batch(cfg) * att,
+            4 * max_batch(cfg) * gu,
+            4 * max_batch(cfg) * cfg.ffn_dim.max(q_dim).max(2 * d.v_heads),
             4 * VERIFY_MAX_BATCH * cfg.vocab,
             4 * VERIFY_MAX_BATCH,
             4,
@@ -5965,17 +6636,17 @@ impl GpuSession {
         let gu = (2 * cfg.ffn_dim.max(cfg.expert_ffn_dim * cfg.n_shared_experts)).max(h * kd);
         let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim).max(att);
         [
-            MAX_BATCH * widest,
-            4 * MAX_BATCH * widest / 32,
-            4 * MAX_BATCH * widest / 32,
+            max_batch(cfg) * widest,
+            4 * max_batch(cfg) * widest / 32,
+            4 * max_batch(cfg) * widest / 32,
             4 * MLA_SPLIT_MAX_BATCH * MLA_MAX_SPLIT * h * (m.kv_lora + 2),
-            4 * MAX_BATCH,
-            4 * MAX_BATCH * cfg.dim,
-            4 * MAX_BATCH * cfg.dim,
-            4 * MAX_BATCH * (q_dim + m.q_lora + kd),
-            4 * MAX_BATCH * att,
-            4 * MAX_BATCH * gu,
-            4 * MAX_BATCH * cfg.ffn_dim,
+            4 * max_batch(cfg),
+            4 * max_batch(cfg) * cfg.dim,
+            4 * max_batch(cfg) * cfg.dim,
+            4 * max_batch(cfg) * (q_dim + m.q_lora + kd),
+            4 * max_batch(cfg) * att,
+            4 * max_batch(cfg) * gu,
+            4 * max_batch(cfg) * cfg.ffn_dim,
             4 * DECODE_MAX_BATCH * cfg.vocab,
             4 * DECODE_MAX_BATCH,
             4,
@@ -6012,6 +6683,24 @@ fn free_memory() -> Result<usize, String> {
 
 /// Experts' slots per block of GPU memory (the expert cache grows and shrinks a block at a time).
 const SLOT_BLOCK: usize = 16;
+
+/// Copies of the DeltaNet states a session keeps (GpuSession::snapshot).
+const MAX_SNAPS: usize = 2;
+
+/// A layer's experts in one 2-bit format (gate, up and down alike): its `fmt` for the IQ2 kernels.
+fn iq2_fmt(t: &[ExpertTensor; 3]) -> Option<i32> {
+    let fmt = match t[0].ty {
+        GgmlType::Iq2Xxs => 0,
+        GgmlType::Iq2S => 1,
+        _ => return None,
+    };
+    t.iter().all(|m| m.ty == t[0].ty && m.cols % 256 == 0).then_some(fmt)
+}
+
+/// Zeroes a device buffer (from the host: the driver API loaded here has no memset).
+fn zero(buf: &DeviceBuf) -> Result<(), String> {
+    buf.write(&vec![0u8; buf.bytes])
+}
 
 /// A mixture of experts' session holds its positions in steps of this many: the memory of positions a
 /// conversation has not reached yet is expert cache meanwhile.

@@ -393,13 +393,13 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | | |
 |---|---|
-| Architectures | Llama, Qwen3, Qwen3-MoE, and DeepSeek-style models such as GLM-4.7-Flash (`general.architecture` `llama`, `qwen3`, `qwen3moe`, `deepseek2`; on the GPU, `deepseek2` with a 512-wide latent and up to 32 heads) |
-| Weight formats | Q8_0, Q3_K, Q4_K, Q5_K, Q6_K (so Q3_K_M, Q4_K_M, Q5_K_M, Q6_K and Q8_0 files), F16/F32 on the CPU; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL and BF16 by dequantising, for the few tensors llama.cpp stores that way |
+| Architectures | Llama, Qwen3, Qwen3-MoE, DeepSeek-style models such as GLM-4.7-Flash, and Qwen3-Next such as Qwen3-Coder-Next (`general.architecture` `llama`, `qwen3`, `qwen3moe`, `deepseek2`, `qwen3next`; on the GPU, `deepseek2` with a 512-wide latent and up to 32 heads, `qwen3next` with 128-wide DeltaNet heads) |
+| Weight formats | Q8_0, Q3_K, Q4_K, Q5_K, Q6_K (so Q3_K_M, Q4_K_M, Q5_K_M, Q6_K and Q8_0 files), IQ2_XXS, IQ2_XS and IQ2_S (the 2-bit IQ2 files), F16/F32 on the CPU; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ3_S and BF16 by dequantising, for the few tensors llama.cpp stores that way |
 | Tokenizer | byte-level BPE (`gpt2`): GPT-2 / Qwen2 / GLM-4 splitting, SmolLM-style digits |
-| Chat template | ChatML (SmolLM2, Qwen) with Qwen3's thinking and tool-call format; GLM-4's format with its XML tool calls |
-| Tested with | [SmolLM2-135M-Instruct](https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF), Qwen3 0.6B and 8B fine-tunes, [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF), [GLM-4.7-Flash (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-GLM-4.7-Flash-abliterated-i1-GGUF) |
+| Chat template | ChatML (SmolLM2, Qwen) with Qwen3's thinking and tool-call format, and Qwen3-Coder's XML tool format; GLM-4's format with its XML tool calls |
+| Tested with | [SmolLM2-135M-Instruct](https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF), Qwen3 0.6B and 8B fine-tunes, [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF), [GLM-4.7-Flash (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-GLM-4.7-Flash-abliterated-i1-GGUF), [Qwen3-Coder-30B-A3B (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated-i1-GGUF), [Qwen3-Coder-Next (Huihui abliterated, IQ2_S)](https://huggingface.co/bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF) |
 
-Not yet: IQ formats other than IQ4_NL, Gemma, Llama 3's tokenizer split, images.
+Not yet: other IQ formats (IQ1, IQ3_XXS, IQ4_XS), Gemma, Llama 3's tokenizer split, images.
 
 ## GPU requirements
 
@@ -444,6 +444,15 @@ it. Remove that file to build a portable binary.
   layer: the memory a long `--ctx` would reserve holds experts until the conversation needs it, and a
   step's memory comes from the expert cache's last blocks of slots (the other experts stay cached). With
   `--ctx 32768`, GLM-4.7-Flash's short replies ran at 21.7 tokens/s instead of 18.4.
+- **Qwen3-Next** (Qwen3-Coder-Next, 80B with 3B active): 36 of its 48 layers are Gated DeltaNet, a recurrent
+  kind of attention whose per-head state is decayed, corrected and read once per token (one GPU thread per state
+  column, its 128 floats in registers), so only the 12 gated-attention layers keep a KV cache. A recurrent state
+  cannot be cut back to an earlier position like a cache, so the end of every prompt is kept as a snapshot, and
+  a conversation that goes on from it resumes there. Its 2-bit IQ2 weights stay 2-bit on the GPU (the
+  experts in the expert cache too), the embedding table stays in the file, and a prompt runs in passes of
+  4,096 tokens, so a long prompt streams the experts that do not fit in VRAM or RAM once. On an RTX 2060
+  Super with 16 GB of RAM (IQ2_S, 22 GB), against llama.cpp b11747 on the same prompts: code at 11.8
+  tokens/s (9.3), a long answer at 14.5 (12.4), and a 2,867-token prompt in about 77 s (167 s).
 - **Multi-head latent attention** (GLM-4.7-Flash, DeepSeek-style): each token caches one compressed
   key-value vector and a shared RoPE key, 54 KB per token where Qwen3-30B-A3B needs 96 KB. Each head's
   query moves into that compressed space and attention runs over the cache as it is, every head scored
@@ -469,6 +478,10 @@ difference in next-token log-probability:
 
 The most likely next token matched the exact result in every test. Full-vocabulary KL divergence against
 exact maths is measured by [`scripts/kld.py`](scripts/kld.py).
+
+Qwen3-Coder-Next (IQ2_S) was checked against llama.cpp b11747: the same prompt token ids, and the same top 10
+next tokens in the same order on the CPU and the GPU (on a prompt with two likely answers, 0.410 / 0.366 on the
+CPU and 0.396 / 0.362 on the GPU with an f16 cache, against llama.cpp's 0.408 / 0.367).
 
 GLM-4.7-Flash (i1-Q3_K_M) was checked against llama.cpp b9106 instead: identical token ids on 12 texts
 (code, Chinese, Malay, emoji), the chat template identical to llama.cpp's rendering of the model's own
@@ -506,7 +519,7 @@ llama.cpp's own CPU and GPU builds differ by up to 0.85 on the same prompts.
 ## Roadmap
 
 - Linux support
-- More architectures (Gemma, Llama 3 tokenizer) and formats (Q4_0, IQ quants)
+- More architectures (Gemma, Llama 3 tokenizer) and formats (Q4_0, the other IQ quants)
 - Prebuilt releases
 - Constrained decoding for tool calls
 

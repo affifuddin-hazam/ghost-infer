@@ -1,5 +1,6 @@
 mod cuda;
 mod gguf;
+mod iquant;
 mod json;
 mod lookup;
 mod model;
@@ -319,7 +320,35 @@ impl<'a> Backend<'a> {
     fn reset(&mut self) {
         match self {
             Backend::Cpu(_, s) => s.reset(),
-            Backend::Gpu(_, s) => s.pos = 0,
+            Backend::Gpu(_, s) => {
+                if let Err(e) = s.reset() {
+                    eprintln!("[could not clear the DeltaNet state: {e}]");
+                }
+            }
+        }
+    }
+
+    /// Goes back to at most `pos` tokens; returns how many the cache keeps (fewer for a recurrent model,
+    /// which can only go back to a snapshot).
+    fn truncate(&mut self, pos: usize) -> usize {
+        match self {
+            Backend::Cpu(_, s) => s.truncate(pos),
+            Backend::Gpu(_, s) => s.truncate(pos).unwrap_or_else(|e| {
+                eprintln!("[could not go back to a DeltaNet snapshot: {e}]");
+                s.reset().map_or(s.pos, |_| 0)
+            }),
+        }
+    }
+
+    /// A recurrent model keeps its state here, to come back to (the end of a prompt is a likely place).
+    fn snapshot(&mut self) {
+        match self {
+            Backend::Cpu(_, s) => s.snapshot(),
+            Backend::Gpu(_, s) => {
+                if let Err(e) = s.snapshot() {
+                    eprintln!("[could not keep a DeltaNet snapshot: {e}]");
+                }
+            }
         }
     }
 }
@@ -463,6 +492,7 @@ impl Engine<'_> {
         let base = self.backend.pos();
         self.hist.truncate(base);
         self.backend.prefill(prompt)?;
+        self.backend.snapshot();
         if let Some(d) = self.draft.as_mut().filter(|_| sampler.is_greedy()) {
             // the draft skips sampled replies; it catches up on whatever it missed, then reads the prompt
             d.sess.pos = d.sess.pos.min(base);
@@ -529,7 +559,6 @@ impl Engine<'_> {
         Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on, ..Default::default() })
     }
 
-    /// Makes the cache hold only its first `pos` tokens (in the draft model too).
     /// Reads `ids` into the cache after what it holds, without replying: the server reading a prompt's
     /// opening in ahead of time.
     fn read_in(&mut self, ids: &[u32]) -> Result<(), String> {
@@ -541,19 +570,20 @@ impl Engine<'_> {
         }
         self.hist.truncate(self.backend.pos());
         self.backend.prefill(ids)?;
+        self.backend.snapshot();
         self.hist.extend_from_slice(ids);
         Ok(())
     }
 
-    fn truncate(&mut self, pos: usize) {
-        self.hist.truncate(pos);
-        match &mut self.backend {
-            Backend::Cpu(_, s) => s.pos = s.pos.min(pos),
-            Backend::Gpu(_, s) => s.pos = s.pos.min(pos),
-        }
+    /// Makes the cache hold at most its first `pos` tokens (in the draft model too); returns how many it
+    /// holds, which is less than `pos` when a recurrent model could only go back to an earlier snapshot.
+    fn truncate(&mut self, pos: usize) -> usize {
+        let kept = self.backend.truncate(pos);
+        self.hist.truncate(kept);
         if let Some(d) = self.draft.as_mut() {
-            d.sess.pos = d.sess.pos.min(pos);
+            d.sess.pos = d.sess.pos.min(kept);
         }
+        kept
     }
 
     fn speculate(&mut self, max_new: usize, honour_stop: bool, emit: Emit) -> Result<(usize, Option<u32>), String> {
@@ -883,6 +913,8 @@ struct ChatFormat {
     thinking: bool,
     /// GLM-4's format ([gMASK]<sop>, <|user|> / <|assistant|> with no newlines) instead of ChatML
     glm: bool,
+    /// ChatML with Qwen3-Coder's tools: listed as XML, called as <function=...> with a <parameter=...> per argument
+    coder: bool,
 }
 
 impl ChatFormat {
@@ -890,7 +922,7 @@ impl ChatFormat {
         let tpl = g.get("tokenizer.chat_template").and_then(Value::as_str).unwrap_or("");
         let glm = tpl.contains("[gMASK]") && tpl.contains("<|assistant|>");
         if glm {
-            return Ok(ChatFormat { default_system: None, thinking: tpl.contains("enable_thinking"), glm });
+            return Ok(ChatFormat { default_system: None, thinking: tpl.contains("enable_thinking"), glm, coder: false });
         }
         if !tpl.contains("<|im_start|>") {
             return Err("this model's chat template is neither ChatML nor GLM's; use --raw".into());
@@ -903,7 +935,8 @@ impl ChatFormat {
             let text = &after[..end];
             (!text.is_empty() && !text.contains("{{") && !text.contains("{%")).then(|| text.to_string())
         });
-        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking"), glm })
+        let coder = tpl.contains("<function=") && tpl.contains("<parameter=");
+        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking"), glm, coder })
     }
 
     fn first_turn(&self, system: Option<&str>, user: &str) -> String {

@@ -118,6 +118,11 @@ pub enum GgmlType {
     Q5_1,
     /// 32-value blocks, f16 scale, 4-bit indices into a fixed non-linear table
     Iq4Nl,
+    /// i-quants (see iquant.rs): 256-value blocks whose values come 8 (or 4) at a time from fixed grids
+    Iq2Xxs,
+    Iq2Xs,
+    Iq2S,
+    Iq3S,
     Other(u32),
 }
 
@@ -137,6 +142,10 @@ impl GgmlType {
             6 => GgmlType::Q5_0,
             7 => GgmlType::Q5_1,
             20 => GgmlType::Iq4Nl,
+            16 => GgmlType::Iq2Xxs,
+            17 => GgmlType::Iq2Xs,
+            21 => GgmlType::Iq3S,
+            22 => GgmlType::Iq2S,
             other => GgmlType::Other(other),
         }
     }
@@ -157,6 +166,10 @@ impl GgmlType {
             GgmlType::Q5_0 => Some((32, 22)),
             GgmlType::Q5_1 => Some((32, 24)),
             GgmlType::Iq4Nl => Some((32, 18)),
+            GgmlType::Iq2Xxs => Some((256, crate::iquant::IQ2_XXS_BYTES)),
+            GgmlType::Iq2Xs => Some((256, crate::iquant::IQ2_XS_BYTES)),
+            GgmlType::Iq2S => Some((256, crate::iquant::IQ2_S_BYTES)),
+            GgmlType::Iq3S => Some((256, crate::iquant::IQ3_S_BYTES)),
             GgmlType::Other(_) => None,
         }
     }
@@ -176,6 +189,10 @@ impl GgmlType {
             GgmlType::Q5_0 => "Q5_0".into(),
             GgmlType::Q5_1 => "Q5_1".into(),
             GgmlType::Iq4Nl => "IQ4_NL".into(),
+            GgmlType::Iq2Xxs => "IQ2_XXS".into(),
+            GgmlType::Iq2Xs => "IQ2_XS".into(),
+            GgmlType::Iq2S => "IQ2_S".into(),
+            GgmlType::Iq3S => "IQ3_S".into(),
             GgmlType::Other(id) => format!("type#{id}"),
         }
     }
@@ -187,7 +204,12 @@ impl GgmlType {
 
     /// Formats with no fast dot product here: their rows are dequantised to f32 and dotted as floats.
     pub fn dequant_only(self) -> bool {
-        matches!(self, GgmlType::Bf16 | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Iq4Nl)
+        matches!(self, GgmlType::Bf16 | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Iq4Nl) || self.is_iquant()
+    }
+
+    /// The grid-based i-quants (iquant.rs).
+    pub fn is_iquant(self) -> bool {
+        matches!(self, GgmlType::Iq2Xxs | GgmlType::Iq2Xs | GgmlType::Iq2S | GgmlType::Iq3S)
     }
 }
 

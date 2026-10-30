@@ -67,6 +67,7 @@ struct Loaded {
     default_system: Option<String>,
     thinking: bool, // the chat template has a thinking switch
     glm: bool,      // GLM-4's chat format instead of ChatML
+    coder: bool,    // Qwen3-Coder's tool format (XML) instead of Qwen3's (JSON)
     backend: String, // where it runs, e.g. "GPU NVIDIA GeForce RTX 2060 SUPER (sm_75, ...)"
     tok: Arc<crate::tokenizer::Tokenizer>, // to count a prompt's tokens before sending it (the agent fits chats to the context)
 }
@@ -236,6 +237,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
                 chat_ok: fmt.is_some(),
                 thinking: fmt.as_ref().is_some_and(|f| f.thinking),
                 glm: fmt.as_ref().is_some_and(|f| f.glm),
+                coder: fmt.as_ref().is_some_and(|f| f.coder),
                 backend: engine.backend.describe(),
                 tok: engine.tok.clone(),
                 default_system: fmt.and_then(|f| f.default_system),
@@ -273,7 +275,7 @@ fn warm_agent(engine: &mut Engine, shared: &Shared) {
     let t = Instant::now();
     let ids = engine.tok.encode(&text);
     let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count();
-    engine.truncate(keep);
+    let keep = engine.truncate(keep);
     match engine.read_in(&ids[keep..]) {
         Ok(()) => eprintln!("[read the agent's opening in ahead: {} tokens in {:.2}s]", ids.len() - keep, t.elapsed().as_secs_f64()),
         Err(e) => eprintln!("[could not read the agent's opening in: {e}]"),
@@ -295,7 +297,7 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
     // reuse the cache for the part of the prompt it already holds (at least one token is read anew,
     // which gives the logits for the first reply token)
     let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
-    engine.truncate(keep);
+    let keep = engine.truncate(keep);
     let max_new = job.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len()).max(1);
     let mut sampler = Sampler::new(job.temperature, job.top_k, job.top_p, job.seed);
 
@@ -757,7 +759,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         _ => {}
     }
     // everything else needs a running model
-    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, .. }) = current.filter(|_| loading.is_none()) else {
+    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, coder, .. }) = current.filter(|_| loading.is_none()) else {
         if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
             let msg = match loading.as_deref() {
                 Some(what) => format!("loading {what}; try again in a moment"),
@@ -803,7 +805,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     };
     let prompt = match (chat, glm) {
         (true, true) => chat_prompt_glm(&body, think_default, thinking),
-        (true, false) => chat_prompt(&body, default_system, think_default, thinking),
+        (true, false) => chat_prompt(&body, default_system, think_default, thinking, coder),
         (false, _) => completion_prompt(&body),
     };
     let prompt = match prompt {
@@ -1006,7 +1008,8 @@ fn request_tools(body: &Json) -> &[Json] {
 /// tool results are written as Qwen's template writes them (`<tools>`, `<tool_call>`,
 /// `<tool_response>`), and the reasoning of turns before the latest user question is left out.
 /// `switch`: the model's template has a thinking switch; without one, thinking settings are ignored.
-fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, switch: bool) -> Result<String, String> {
+/// `coder`: Qwen3-Coder's template, which lists tools, calls and results in its own XML form instead.
+fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, switch: bool, coder: bool) -> Result<String, String> {
     let messages = body.get("messages").and_then(Json::as_array).ok_or("messages must be a list")?;
     if messages.is_empty() {
         return Err("messages is empty".into());
@@ -1026,7 +1029,16 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
 
     let mut s = String::new();
     let system = if roles[0] == "system" { Some(contents[0].as_str()) } else if roles.contains(&"system") { None } else { default_system };
-    if !tools.is_empty() {
+    if !tools.is_empty() && coder {
+        s.push_str("<|im_start|>system\n");
+        s.push_str(system.unwrap_or("You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks."));
+        s.push_str("\n\nYou have access to the following functions:\n\n<tools>");
+        for t in tools {
+            coder_tool(&mut s, t);
+        }
+        s.push_str(CODER_CALLS);
+        s.push_str("<|im_end|>\n");
+    } else if !tools.is_empty() {
         s.push_str("<|im_start|>system\n");
         if let Some(sys) = system {
             s.push_str(sys);
@@ -1050,6 +1062,40 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
         match roles[i] {
             "system" if i == 0 => {}
             r @ ("system" | "user") => s.push_str(&format!("<|im_start|>{r}\n{content}<|im_end|>\n")),
+            "assistant" if coder => {
+                // Qwen3-Coder does not think; a call's arguments go one <parameter=...> each, values that are
+                // not text as JSON (the template writes Python's form; JSON is what coder_call reads back)
+                let content = content.rsplit("</think>").next().unwrap_or(content).trim_start_matches('\n');
+                let calls = m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]);
+                if calls.is_empty() {
+                    s.push_str(&format!("<|im_start|>assistant\n{content}<|im_end|>\n"));
+                } else {
+                    s.push_str("<|im_start|>assistant");
+                    if !content.trim().is_empty() {
+                        s.push_str(&format!("\n{}\n", content.trim()));
+                    }
+                    for call in calls {
+                        let f = call.get("function").unwrap_or(call);
+                        s.push_str(&format!("\n<tool_call>\n<function={}>\n", f.get("name").and_then(Json::as_str).unwrap_or("")));
+                        let args = match f.get("arguments") {
+                            Some(Json::Str(a)) => Json::parse(a).unwrap_or(Json::Null),
+                            Some(a) => a.clone(),
+                            None => Json::Null,
+                        };
+                        if let Json::Obj(fields) = args {
+                            for (k, v) in fields {
+                                let v = match v {
+                                    Json::Str(t) => t,
+                                    other => other.to_python_string(),
+                                };
+                                s.push_str(&format!("<parameter={k}>\n{v}\n</parameter>\n"));
+                            }
+                        }
+                        s.push_str("</function>\n</tool_call>");
+                    }
+                    s.push_str("<|im_end|>\n");
+                }
+            }
             "assistant" => {
                 let (mut reasoning, mut content) = (String::new(), content.to_string());
                 if let Some(r) = m.get("reasoning_content").and_then(Json::as_str) {
@@ -1079,6 +1125,15 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
                 }
                 s.push_str("<|im_end|>\n");
             }
+            "tool" if coder => {
+                if i == 0 || roles[i - 1] != "tool" {
+                    s.push_str("<|im_start|>user\n");
+                }
+                s.push_str(&format!("<tool_response>\n{content}\n</tool_response>\n"));
+                if i + 1 == messages.len() || roles[i + 1] != "tool" {
+                    s.push_str("<|im_end|>\n");
+                }
+            }
             _ => {
                 // tool results: consecutive ones share one user turn
                 if i == 0 || roles[i - 1] != "tool" {
@@ -1101,6 +1156,65 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
         s.push_str("<think>\n\n</think>\n\n");
     }
     Ok(s)
+}
+
+/// The end of Qwen3-Coder's tool list and its instructions for calls, as its template writes them.
+const CODER_CALLS: &str = "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+
+/// One tool in Qwen3-Coder's list, as its template writes it: <function> with its name, description and a
+/// <parameter> per argument; keys the template has no tag of its own for become tags named after them.
+fn coder_tool(s: &mut String, tool: &Json) {
+    let f = tool.get("function").unwrap_or(tool);
+    let text = |j: &Json| j.get("description").map(|v| jinja_str(v).trim().to_string()).unwrap_or_default();
+    s.push_str(&format!("\n<function>\n<name>{}</name>\n<description>{}</description>\n<parameters>", f.get("name").map(jinja_str).unwrap_or_default(), text(f)));
+    let params = f.get("parameters").unwrap_or(&Json::Null);
+    if let Some(Json::Obj(props)) = params.get("properties") {
+        for (name, fields) in props {
+            s.push_str(&format!("\n<parameter>\n<name>{name}</name>"));
+            if let Some(t) = fields.get("type") {
+                s.push_str(&format!("\n<type>{}</type>", jinja_str(t)));
+            }
+            if fields.get("description").is_some() {
+                s.push_str(&format!("\n<description>{}</description>", text(fields)));
+            }
+            coder_list(s, fields.get("enum"), "enum");
+            if let Json::Obj(keys) = fields {
+                for (k, v) in keys.iter().filter(|(k, _)| !matches!(k.as_str(), "type" | "description" | "enum" | "required")) {
+                    let k = k.replace(['-', ' '], "_").replace('$', "");
+                    let v = if matches!(v, Json::Obj(_)) { v.to_python_string() } else { jinja_str(v) };
+                    s.push_str(&format!("\n<{k}>{v}</{k}>"));
+                }
+            }
+            coder_list(s, fields.get("required"), "required");
+            s.push_str("\n</parameter>");
+        }
+    }
+    coder_list(s, params.get("required"), "required");
+    s.push_str("\n</parameters>");
+    if let Some(r) = f.get("return") {
+        s.push_str(&format!("\n<return>{}</return>", if matches!(r, Json::Obj(_)) { r.to_python_string() } else { jinja_str(r) }));
+    }
+    s.push_str("\n</function>");
+}
+
+/// The template's render_item_list: `\n<tag>[`a`, `b`]</tag>` for a list that is not empty, text in backticks.
+fn coder_list(s: &mut String, list: Option<&Json>, tag: &str) {
+    let Some(items) = list.and_then(Json::as_array).filter(|l| !l.is_empty()) else {
+        return;
+    };
+    let items: Vec<String> = items.iter().map(|i| if let Json::Str(t) = i { format!("`{t}`") } else { jinja_str(i) }).collect();
+    s.push_str(&format!("\n<{tag}>[{}]</{tag}>", items.join(", ")));
+}
+
+/// A value as a template's `string` filter writes it: text as it is, True, False and None as Python writes
+/// them, the rest as JSON.
+fn jinja_str(v: &Json) -> String {
+    match v {
+        Json::Str(t) => t.clone(),
+        Json::Bool(b) => (if *b { "True" } else { "False" }).into(),
+        Json::Null => "None".into(),
+        other => other.to_python_string(),
+    }
 }
 
 /// `chat_prompt` for GLM-4 (GLM-4.7-Flash), as its template writes it: `[gMASK]<sop>`, then each message
@@ -1283,7 +1397,7 @@ impl ToolCalls {
             };
             Some(Part::Call { name, arguments })
         });
-        let parsed = parsed.or_else(|| glm_call(inner));
+        let parsed = parsed.or_else(|| glm_call(inner)).or_else(|| coder_call(inner));
         match parsed {
             Some(p) => {
                 self.calls += 1;
@@ -1362,6 +1476,32 @@ fn glm_call(inner: &str) -> Option<Part> {
     Some(Part::Call { name: name.to_string(), arguments: Json::Obj(fields).to_string() })
 }
 
+/// A call in Qwen3-Coder's own form, as it was trained to write them: `<function=name>`, then each argument as
+/// `<parameter=key>` value `</parameter>`, then `</function>`. Values that read as JSON (numbers, true, lists)
+/// are taken as such; the rest is text, without the line breaks the template puts around it.
+fn coder_call(inner: &str) -> Option<Part> {
+    let rest = inner.trim().strip_prefix("<function=")?;
+    let (name, mut body) = rest.split_once('>')?;
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+        return None;
+    }
+    let mut fields = Vec::new();
+    while let Some(at) = body.find("<parameter=") {
+        let (key, after) = body[at + "<parameter=".len()..].split_once('>')?;
+        let (value, after) = after.split_once("</parameter>")?;
+        let value = value.strip_prefix('\n').unwrap_or(value);
+        let value = value.strip_suffix('\n').unwrap_or(value);
+        let v = match Json::parse(value.trim()) {
+            Ok(j @ (Json::Num(_) | Json::Bool(_) | Json::Arr(_) | Json::Obj(_) | Json::Null)) => j,
+            _ => Json::Str(value.to_string()),
+        };
+        fields.push((key.trim().to_string(), v));
+        body = after;
+    }
+    Some(Part::Call { name: name.to_string(), arguments: Json::Obj(fields).to_string() })
+}
+
 fn completion_prompt(body: &Json) -> Result<String, String> {
     match body.get("prompt") {
         Some(Json::Str(s)) => Ok(s.clone()),
@@ -1385,7 +1525,7 @@ mod tests {
     #[test]
     fn chat_template() {
         let body = Json::parse(r#"{"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]}"#).unwrap();
-        assert_eq!(chat_prompt(&body, Some("Be brief."), true, true).unwrap(), "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(chat_prompt(&body, Some("Be brief."), true, true, false).unwrap(), "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
     }
 
     #[test]
@@ -1407,25 +1547,66 @@ mod tests {
             "<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\nx\n</tool_response><|im_end|>\n",
             "<|im_start|>assistant\n",
         );
-        assert_eq!(chat_prompt(&body, None, true, true).unwrap(), want);
+        assert_eq!(chat_prompt(&body, None, true, true, false).unwrap(), want);
     }
 
     #[test]
     fn reasoning_effort_none_turns_thinking_off() {
         let off = Json::parse(r#"{"reasoning_effort":"none","messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&off, None, true, true).unwrap().ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(chat_prompt(&off, None, true, true, false).unwrap().ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
         let on = Json::parse(r#"{"reasoning_effort":"medium","messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&on, None, true, true).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&on, None, true, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
         // an explicit chat_template_kwargs wins over reasoning_effort
         let kw = Json::parse(r#"{"reasoning_effort":"none","chat_template_kwargs":{"enable_thinking":true},"messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&kw, None, true, true).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&kw, None, true, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
         // serve --no-think: off unless the request asks
         let plain = Json::parse(r#"{"messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&plain, None, false, true).unwrap().ends_with("<think>\n\n</think>\n\n"));
-        assert!(chat_prompt(&on, None, false, true).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&plain, None, false, true, false).unwrap().ends_with("<think>\n\n</think>\n\n"));
+        assert!(chat_prompt(&on, None, false, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
         // a model without a thinking switch (Qwen3-2507 Instruct, SmolLM2) never gets the empty block
-        assert!(chat_prompt(&off, None, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
-        assert!(chat_prompt(&plain, None, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&off, None, true, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&plain, None, false, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn coder_tool_template() {
+        // what Qwen3-Coder's chat template (Jinja, in the GGUF) gives for this conversation, rendered as transformers does
+        let body = Json::parse(
+            r#"{"tools":[{"type":"function","function":{"name":"get_time","description":"Current time. ","parameters":{"type":"object",
+            "properties":{"tz":{"type":"string","description":"Time zone","enum":["UTC","MYT"]},"n":{"type":"integer","default":2}},"required":["tz"]}}}],
+            "messages":[{"role":"system","content":"Sys"},{"role":"user","content":"Time?"},
+            {"role":"assistant","content":"Let me check.","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"UTC\", \"n\": 2}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"12:00"},{"role":"tool","tool_call_id":"c2","content":"x"}]}"#,
+        )
+        .unwrap();
+        let want = concat!(
+            "<|im_start|>system\nSys\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_time</name>\n<description>Current time.</description>\n<parameters>",
+            "\n<parameter>\n<name>tz</name>\n<type>string</type>\n<description>Time zone</description>\n<enum>[`UTC`, `MYT`]</enum>\n</parameter>",
+            "\n<parameter>\n<name>n</name>\n<type>integer</type>\n<default>2</default>\n</parameter>\n<required>[`tz`]</required>\n</parameters>\n</function>\n</tools>",
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>",
+            "\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n",
+            "<|im_start|>user\nTime?<|im_end|>\n",
+            "<|im_start|>assistant\nLet me check.\n\n<tool_call>\n<function=get_time>\n<parameter=tz>\nUTC\n</parameter>\n<parameter=n>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\nx\n</tool_response>\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
+        assert_eq!(chat_prompt(&body, None, true, false, true).unwrap(), want);
+    }
+
+    #[test]
+    fn coder_tool_calls() {
+        let mut tc = ToolCalls::default();
+        let text = "Let me run it.\n<tool_call>\n<function=run_command>\n<parameter=command>\necho hi\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>";
+        let mut parts = tc.push(text);
+        parts.extend(tc.finish());
+        let call = parts.iter().find_map(|p| match p {
+            Part::Call { name, arguments } => Some((name.clone(), Json::parse(arguments).unwrap())),
+            _ => None,
+        });
+        let (name, args) = call.expect("a call");
+        assert_eq!(name, "run_command");
+        assert_eq!(args.get("command").and_then(Json::as_str), Some("echo hi"));
+        assert_eq!(args.get("timeout").and_then(Json::as_f64), Some(30.0));
     }
 
     #[test]
