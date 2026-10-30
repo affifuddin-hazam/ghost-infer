@@ -41,8 +41,8 @@ const MAX_ROUNDS: usize = 40;
 const TOOLS: &str = r#"{
  "system": [
   {"type":"function","function":{"name":"get_system_info","description":"Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.","parameters":{"type":"object","properties":{},"required":[]}}},
-  {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for a job of several steps (not for a question or a chat); the user sees it pinned above the message box. Send the whole list every time. Mark one task in_progress while you work on it, and done as soon as it is finished.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
-  {"type":"function","function":{"name":"remember","description":"Save a lasting fact the user tells you about themselves or this computer, for future chats: a preference, where their projects live, how a program runs here. Not what you already remember. Not for details of one task.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
+  {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for the current request; the user sees it pinned above the message box. Use it when the work has 3 or more distinct steps, when the user gives you several things to do, or when they ask for a plan. Do not use it for one simple step, for something done in under 3 easy steps, or for chat and questions: just do or answer those. Send the whole list every time; mark the task you start in_progress before working on it and done as soon as it is finished, and add tasks you discover on the way. Example worth a list: 'add a dark mode toggle and make sure the build passes' -> add the toggle to the settings page; store the choice; style the dark theme; build and fix any errors. Not worth one: 'what does this error mean?' (answer it).","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
+  {"type":"function","function":{"name":"remember","description":"Save a lasting fact for future chats. Use it only when the user tells you something worth keeping: a preference, where their projects live, how a program runs here. Not for details of the current task, and not for what you already remember (listed in the system prompt).","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"forget","description":"Forget a remembered fact that is wrong or no longer true.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact as it was saved"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"search_chats","description":"Search the user's earlier chats with you, for when they refer to something you talked about before. Returns matching chats with their id, title, date and the lines that match.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Words to look for"}},"required":["query"]}}},
   {"type":"function","function":{"name":"read_chat","description":"Read an earlier chat found with search_chats.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The chat's id"}},"required":["id"]}}},
@@ -60,7 +60,7 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"edit_file","description":"Replace exact text in a file. Read the file first; old_string must match exactly once, so include enough surrounding lines.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"old_string":{"type":"string","description":"The exact text to replace"},"new_string":{"type":"string","description":"The text to put in its place"},"replace_all":{"type":"boolean","description":"Replace every match"}},"required":["path","old_string","new_string"]}}}
  ],
  "cmd": [
-  {"type":"function","function":{"name":"run_command","description":"Run a Windows PowerShell command and get its output (stops after 60 s unless timeout is set).","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"timeout":{"type":"integer","description":"Seconds, up to 600"}},"required":["command"]}}},
+  {"type":"function","function":{"name":"run_command","description":"Run programs, builds, tests and scripts: a Windows PowerShell command and its output. To find or read files use list_files, search_files and read_file instead (stops after 60 s unless timeout is set).","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"timeout":{"type":"integer","description":"Seconds, up to 600"}},"required":["command"]}}},
   {"type":"function","function":{"name":"start_process","description":"Start a long-running PowerShell command (a server, a build) in the background. Returns its id.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"}},"required":["command"]}}},
   {"type":"function","function":{"name":"check_process","description":"A background process's state and the output it printed since the last check.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}},
   {"type":"function","function":{"name":"stop_process","description":"Stop a background process.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}}
@@ -83,9 +83,76 @@ const SKILL_TOOLS: [&str; 2] = [
     r#"{"type":"function","function":{"name":"install_skill","description":"Install a skill (a folder with a SKILL.md and any files it uses) so it can be loaded with use_skill. The source can be a GitHub link (a repository, a folder in one, or a SKILL.md in one), a link to a .zip, or a folder or .zip on this computer. Use this, not git or a download, when the user asks to install or add a skill. When the source holds several skills, the result lists them; call again with skill set to the path of the one wanted, or all.","parameters":{"type":"object","properties":{"source":{"type":"string","description":"The link, folder or .zip"},"skill":{"type":"string","description":"Which skill, when the source holds several: its path from the list, or all"}},"required":["source"]}}}"#,
 ];
 
-/// The tools of these groups (and the system one), as the chat template's "tools": with the skill tools, and
-/// the MCP servers' tools when the mcp group is on.
+/// The tools described in full in every prompt, as Claude Code keeps its file and shell tools, and three of
+/// ghost's that small models would not load first: get_system_info ("my PC" questions are common; loading it
+/// cost GLM-4.7-Flash four extra rounds), update_tasks (Qwen3 4B kept no task list even when asked for one) and
+/// remember (Qwen3 4B said it remembered without saving anything). The turned-on groups' other tools are named
+/// in the system prompt only, and tool_search loads a description when the model needs one: a short prompt
+/// reads faster and leaves a small model less to choose from.
+const CORE_TOOLS: [&str; 10] = ["read_file", "list_files", "search_files", "write_file", "edit_file", "run_command", "use_skill", "get_system_info", "update_tasks", "remember"];
+
+const TOOL_SEARCH: &str = r#"{"type":"function","function":{"name":"tool_search","description":"Load the full description of tools that the system prompt lists by name only, so you can call them. Use \"select:<name>,<name>\" for tools you know by name, or a few words saying what you need to find tools by what they do. Call it before using such a tool for the first time in a chat.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"select:<names>, or keywords"},"max_results":{"type":"integer","description":"Most tools to return for keywords (default 5)"}},"required":["query"]}}}"#;
+
+/// The tools the model gets described in the prompt: the core ones of these groups, and tool_search when
+/// others wait to be loaded.
 fn tools_for(groups: &[String]) -> Vec<Json> {
+    let (mut full, deferred): (Vec<Json>, Vec<Json>) = all_tools(groups).into_iter().partition(|t| CORE_TOOLS.contains(&tool_name(t)));
+    if !deferred.is_empty() {
+        full.push(Json::parse(TOOL_SEARCH).expect("valid tool"));
+    }
+    full
+}
+
+/// The turned-on tools named in the prompt only, loaded with tool_search.
+fn deferred_tools(groups: &[String]) -> Vec<Json> {
+    all_tools(groups).into_iter().filter(|t| !CORE_TOOLS.contains(&tool_name(t))).collect()
+}
+
+/// Whether a tool has parameters to get right (one without can be called by its name alone).
+fn takes_arguments(t: &Json) -> bool {
+    t.get("function").and_then(|f| f.get("parameters")).and_then(|p| p.get("properties")).is_some_and(|p| matches!(p, Json::Obj(f) if !f.is_empty()))
+}
+
+/// Whether this chat already holds the tool's description: a tool_search result, or a refused early call.
+fn loaded_in(chat: &Chat, name: &str) -> bool {
+    let needle = format!("\"name\":\"{name}\"");
+    chat.messages.iter().any(|m| m.get("role").and_then(Json::as_str) == Some("tool") && m.get("content").and_then(Json::as_str).is_some_and(|c| c.contains(&needle)))
+}
+
+/// The tool_search tool: deferred tools' full descriptions, by exact name ("select:a,b") or by the words of
+/// the query (ranked by how many a tool's name and description hold, its name counting double).
+fn tool_search(deferred: &[Json], arguments: &str) -> String {
+    let args = Json::parse(arguments).unwrap_or(Json::Null);
+    let query = args.get("query").and_then(Json::as_str).unwrap_or("").trim().to_string();
+    let max = args.get("max_results").and_then(Json::as_f64).map_or(5, |n| (n as usize).clamp(1, 20));
+    // exact names; a name that is no tool's ("select:disk_space") is searched for by its words instead
+    let selected: Vec<&Json> = query.strip_prefix("select:").map_or(Vec::new(), |names| names.split(',').map(str::trim).filter_map(|n| deferred.iter().find(|t| tool_name(t) == n)).collect());
+    let found: Vec<&Json> = match selected.is_empty() {
+        false => selected,
+        true => {
+            let words: Vec<String> = query.trim_start_matches("select:").to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect();
+            let mut scored: Vec<(usize, &Json)> = deferred
+                .iter()
+                .map(|t| {
+                    let (name, all) = (tool_name(t).to_lowercase(), t.to_string().to_lowercase());
+                    (words.iter().map(|w| 2 * name.contains(w.as_str()) as usize + all.contains(w.as_str()) as usize).sum(), t)
+                })
+                .filter(|(s, _)| *s > 0)
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.into_iter().take(max).map(|(_, t)| t).collect()
+        }
+    };
+    if found.is_empty() {
+        let names: Vec<&str> = deferred.iter().map(tool_name).collect();
+        return format!("No tool matches \"{query}\". The tools you can load: {}.", names.join(", "));
+    }
+    format!("Loaded; you can call these now:\n{}", found.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("\n"))
+}
+
+/// Every tool of these groups (and the system one): with the skill tools, and the MCP servers' tools when the
+/// mcp group is on.
+fn all_tools(groups: &[String]) -> Vec<Json> {
     let all = tool_groups();
     let mut tools: Vec<Json> = std::iter::once("system").chain(groups.iter().map(String::as_str)).filter_map(|g| all.get(g).and_then(Json::as_array)).flatten().cloned().collect();
     tools.extend(SKILL_TOOLS.iter().map(|t| Json::parse(t).expect("valid tool")));
@@ -109,7 +176,7 @@ fn approval_group(name: &str) -> Option<&'static str> {
 
 /// Told to the model when tools are on: where it may work, how this computer runs commands, and (when it may
 /// run them) to check what it changes.
-fn tool_prompt(folders: &[PathBuf], can_run: bool) -> String {
+fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String {
     let list: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
     let where_ = if list.is_empty() {
         "No folders are allowed yet, so file tools will fail; if you need files, ask the user to add a folder in Settings.".to_string()
@@ -117,7 +184,13 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool) -> String {
         format!("You may use files in {} (relative paths start in {}).", list.join(", "), list[0])
     };
     let check = if can_run { " After you change code, check it: run it or its tests with run_command. If something fails, fix it and run it again. Say it is done only once it works, and say how you checked." } else { "" };
-    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Answer greetings, chat and questions you can answer yourself directly, without tools. Use tools when the request needs them. For a task of several steps, start by writing a short plan with update_tasks (2 to 6 steps), mark the step you start in_progress and each finished one done, and change the plan when the work shows it should change. Read a file before you edit it. Save a fact with remember only when the user tells you something worth keeping for later chats. When the user refers to an earlier conversation, look it up with search_chats.{check} Use tools until the task is done, then answer briefly.")
+    let more = if deferred.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = deferred.iter().map(tool_name).collect();
+        format!(" These tools are named here without their descriptions: {}. Before calling one of them for the first time in a chat, load it with tool_search (\"select:<name>\").", names.join(", "))
+    };
+    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Answer greetings, chat and questions you can answer yourself directly, without tools. Use tools when the request needs them; calls that do not depend on each other can go together in one turn. To find and read files use list_files, search_files and read_file rather than commands, and read a file before you edit it. For a task of 3 or more steps, keep a task list with update_tasks. Save a fact with remember only when the user tells you something worth keeping for later chats. When the user refers to an earlier conversation, look it up with search_chats.{check}{more} Use tools until the task is done, then answer briefly.")
 }
 
 /// Files whose changes can be checked by running something (a notes file is not).
@@ -163,6 +236,37 @@ fn open_tasks(chat: &Chat) -> Vec<String> {
     open.iter().map(|t| t.get("text").and_then(Json::as_str).unwrap_or("").to_string()).collect()
 }
 
+/// Model replies without a task list update after which a reminder rides on the next message, and again at
+/// most this often (Claude Code waits 10 turns for both).
+const REMINDER_TURNS: usize = 10;
+
+/// The task-list reminder for a new message, when the last REMINDER_TURNS replies neither touched the list
+/// nor got a reminder.
+fn task_reminder(chat: &Chat) -> Option<String> {
+    let mut replies = 0;
+    for m in chat.messages.iter().rev() {
+        let calls = m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]);
+        if m.get("reminder").is_some() || calls.iter().any(|c| c.get("function").and_then(|f| f.get("name")).and_then(Json::as_str) == Some("update_tasks")) {
+            return None;
+        }
+        if m.get("role").and_then(Json::as_str) == Some("assistant") {
+            replies += 1;
+            if replies >= REMINDER_TURNS {
+                break;
+            }
+        }
+    }
+    if replies < REMINDER_TURNS {
+        return None;
+    }
+    let mut note = "(Note from ghost, not from the user: the task list has not been used for a while. If the work ahead has several steps, a task list (update_tasks) helps you and the user follow it; if not, ignore this note. Do not mention it.)".to_string();
+    let open = open_tasks(chat);
+    if !open.is_empty() {
+        note.push_str(&format!(" Open on the current list: {}.", open.join("; ")));
+    }
+    Some(note)
+}
+
 /// The harness's own messages in a chat (the nudge): not the user's, so retrying and searching pass them by.
 fn is_auto(m: &Json) -> bool {
     m.get("auto").and_then(Json::as_bool).unwrap_or(false)
@@ -204,6 +308,12 @@ fn for_model(messages: &[Json]) -> Vec<Json> {
         }
         let (trimmed, clip, note) = (flag(m, "trimmed"), m.get("clip").and_then(Json::as_f64).map(|c| c as usize), left_out && out.is_empty());
         let mut m = m.clone();
+        if let (Some(r), Json::Obj(fields)) = (m.get("reminder").and_then(Json::as_str).map(String::from), &mut m) {
+            if let Some((_, Json::Str(t))) = fields.iter_mut().find(|(k, _)| k == "content") {
+                t.push_str("\n\n");
+                t.push_str(&r);
+            }
+        }
         if let (true, Json::Obj(fields)) = (trimmed || clip.is_some() || note, &mut m) {
             if let Some((_, Json::Str(t))) = fields.iter_mut().find(|(k, _)| k == "content") {
                 if trimmed {
@@ -824,7 +934,11 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
                     let line = m.trim().lines().next().unwrap_or("");
                     chat.title = if line.chars().count() > 60 { format!("{}…", line.chars().take(57).collect::<String>().trim_end()) } else { line.to_string() };
                 }
-                chat.messages.push(obj(vec![("role", str("user")), ("content", str(m))]));
+                let mut msg = vec![("role", str("user")), ("content", str(m))];
+                if let Some(note) = (!req.groups.is_empty()).then(|| task_reminder(&chat)).flatten() {
+                    msg.push(("reminder", str(&note)));
+                }
+                chat.messages.push(obj(msg));
             }
             // answer again: drop the reply after the last user message
             None => {
@@ -937,7 +1051,7 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
 /// The prompt for these messages: the client's system text plus where tools may work, then the chat.
 fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
     let folders = shared.harness.lock().unwrap().folders.clone();
-    let system = [req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders, tools.iter().any(|t| tool_name(t) == "run_command")) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let system = [req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups)) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut messages = Vec::new();
     if !system.is_empty() {
         messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));
@@ -972,11 +1086,11 @@ pub fn prompt_opening(groups: &[String], shared: &Shared, loaded: &Loaded) -> Op
 fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Option<String> {
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
     let mut history = for_model(&chat.messages);
-    let ask = "Give this chat a title of 3 to 6 words that says what it is about. Reply with the title only: no quotes, no full stop, no tool calls.";
+    let ask = "Name this chat for the user's chat list: 3 to 7 words in sentence case (a capital only on the first word and on names) saying what the user wants. Reply with JSON only and no tool calls, like {\"title\": \"Fix the login button on mobile\"} or {\"title\": \"Plan a budget trip to Penang\"}. Too vague: {\"title\": \"Chat\"}. Too long: {\"title\": \"Help me find out why the login button does not work on my phone\"}.";
     history.push(obj(vec![("role", str("user")), ("content", str(ask))]));
     let prompt = prompt_for(req, &history, &tools, false, shared, loaded).ok()?;
     let (tx, events) = mpsc::channel();
-    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(24), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(48), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
     work.send(Work::Job(job)).ok()?;
     let mut out = String::new();
     for ev in events {
@@ -988,10 +1102,13 @@ fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sha
     }
     // the title alone: no thinking, quotes, markdown or "Title:" around it
     let out = out.rsplit("</think>").next().unwrap_or(&out);
-    let line = out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    // {"title": "..."} as asked; else the first line, cleaned
+    let json = out.find('{').zip(out.rfind('}')).filter(|(a, b)| a < b).and_then(|(a, b)| Json::parse(&out[a..=b]).ok());
+    let line = json.as_ref().and_then(|j| j.get("title")).and_then(Json::as_str).unwrap_or_else(|| out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(""));
     let title = clean_title(line);
     // nothing to name (a greeting), or only a label ("Chat Title"): the first message's opening words instead
-    let generic = ["", "chat title", "title", "new chat", "chat", "untitled", "conversation"].contains(&title.to_lowercase().as_str());
+    let lower = title.to_lowercase();
+    let generic = ["", "chat title", "title", "new chat", "chat", "untitled", "conversation"].contains(&lower.as_str()) || ask.to_lowercase().contains(&lower);
     if generic || title.contains('<') || title.split_whitespace().count() > 10 {
         let first = chat.messages.iter().find(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m))?;
         let words: Vec<&str> = first.get("content").and_then(Json::as_str)?.split_whitespace().take(6).collect();
@@ -1025,6 +1142,7 @@ fn tool_name(t: &Json) -> &str {
 fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<&'static str, String> {
     let reply_start = chat.messages.len();
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
+    let deferred = if req.groups.is_empty() { Vec::new() } else { deferred_tools(&req.groups) };
     let mut changed = false;
     let can_run = tools.iter().any(|t| tool_name(t) == "run_command");
     let (mut unchecked, mut nudged) = (false, false); // code changed and nothing run since; the nudge sent
@@ -1124,7 +1242,16 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
 
         for (id, name, arguments) in calls {
             planned |= name == "update_tasks";
+            let known = name == BAD_CALL || tools.iter().chain(&deferred).any(|t| tool_name(t) == name);
+            let unloaded = deferred.iter().find(|t| tool_name(t) == name && takes_arguments(t) && !loaded_in(chat, &name));
             let (result, denied) = match name.as_str() {
+                _ if !known => (format!("Error: there is no tool named {name} here. Use the tools the system prompt lists; the others are not turned on."), false),
+                // as Claude Code refuses a deferred tool called before it was loaded; its description comes with
+                // the refusal, so the next call can be right without a tool_search round
+                _ if unloaded.is_some() => (format!("Error: {name} was called before its description was loaded, so nothing was run. Its description:
+{}
+Call it again with these parameters.", unloaded.unwrap().to_string()), false),
+                "tool_search" => (tool_search(&deferred, &arguments), false),
                 "update_tasks" => (update_tasks(out, chat, &arguments)?, false),
                 BAD_CALL => (BAD_CALL_RESULT.to_string(), false),
                 _ => call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)?,
