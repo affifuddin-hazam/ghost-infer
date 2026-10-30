@@ -110,10 +110,17 @@ fn list_models(dirs: &[PathBuf]) -> Vec<(String, PathBuf, u64)> {
 
 pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
-    let own = o.model.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
-    let dirs = std::iter::once(own).chain(o.models.iter().cloned()).collect();
+    // without a model the server starts with none loaded and waits for one to be picked (chat page, app,
+    // or POST /api/models/load) from the --models folders
+    let start_idle = o.model.as_os_str().is_empty();
+    let own = (!start_idle).then(|| o.model.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf());
+    let mut dirs: Vec<PathBuf> = own.into_iter().chain(o.models.iter().cloned()).collect();
+    if dirs.is_empty() {
+        dirs.push(PathBuf::from("."));
+    }
     let shared = Arc::new(Shared {
-        status: Mutex::new(Status::default()),
+        // a model given at startup shows as loading from the first request on
+        status: Mutex::new(Status { current: None, loading: (!start_idle).then(|| model_id(&o.model)) }),
         dirs,
         defaults: (o.temp, o.top_k, o.top_p, o.max_new),
         think_default: !o.no_think,
@@ -137,15 +144,45 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
 
     // the model thread: the engine (GPU state included) never leaves it. Each turn of this loop loads a
     // model and serves it until a switch is asked for; the engine and its file are dropped before the next.
+    // Started without one, it first waits for a model to be picked, and waits again if that one fails to load.
     let mut path = o.model.clone();
+    let mut idle = start_idle;
     let mut last_good: Option<PathBuf> = None;
     let mut waiting: Option<(mpsc::Sender<Result<(), String>>, Option<String>)> = None; // who asked for this switch, and an error to report
+    if start_idle {
+        eprintln!("[no model loaded: pick one in the chat page or the app]");
+        eprintln!("chat in your browser: http://{host}:{port}/");
+    }
     loop {
+        if idle {
+            shared.status.lock().unwrap().loading = None;
+            let (next, reply) = loop {
+                match rx.recv() {
+                    Err(_) => return Ok(()),
+                    Ok(Work::Job(job)) => {
+                        let _ = job.events.send(Event::Error(503, "no model is loaded; pick one first".into()));
+                    }
+                    Ok(Work::Load(p, reply)) => break (p, reply),
+                }
+            };
+            path = next;
+            waiting = Some((reply, None));
+            idle = false;
+        }
         let id = model_id(&path);
         shared.status.lock().unwrap().loading = Some(id.clone());
         let t = Instant::now();
         // a failed switch goes back to the model that was running; failing at startup (or on the way back) ends the server
         let mut fall_back = |e: String, path: &mut PathBuf| -> Result<(), String> {
+            if start_idle && last_good.is_none() {
+                // nothing ran yet: report it and wait for another pick
+                eprintln!("[could not load {}: {e}]", model_id(path));
+                if let Some((w, _)) = waiting.take() {
+                    let _ = w.send(Err(format!("could not load {}: {e}", model_id(path))));
+                }
+                idle = true;
+                return Ok(());
+            }
             match (&mut waiting, &last_good) {
                 (Some(w), Some(prev)) if prev != path => {
                     eprintln!("[could not load {}: {e}; going back to {}]", model_id(path), model_id(prev));
@@ -181,7 +218,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
             engine.backend.ctx(),
             if engine.draft.is_some() { ", with a draft model for greedy requests" } else { "" }
         );
-        if last_good.is_none() {
+        if last_good.is_none() && !start_idle {
             eprintln!("chat in your browser: http://{host}:{port}/");
             eprintln!("OpenAI-compatible API: http://{host}:{port}/v1 (/v1/chat/completions, /v1/completions, /v1/models)");
         }
@@ -690,8 +727,11 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     // everything else needs a running model
     let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, .. }) = current.filter(|_| loading.is_none()) else {
         if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
-            let what = loading.as_deref().unwrap_or("the model");
-            return respond(&mut conn, 503, &error_body(&format!("loading {what}; try again in a moment")));
+            let msg = match loading.as_deref() {
+                Some(what) => format!("loading {what}; try again in a moment"),
+                None => "no model is loaded: pick one in the chat page, or POST {\"id\": \"<model>\"} to /api/models/load".into(),
+            };
+            return respond(&mut conn, 503, &error_body(&msg));
         }
         if let ("GET", "" | "/index.html") = (req.method.as_str(), req.path.trim_end_matches('/')) {
             return respond_page(&mut conn, &shared.token);

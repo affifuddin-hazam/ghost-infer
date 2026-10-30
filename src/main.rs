@@ -34,7 +34,8 @@ USAGE:
     ghost-infer bench    <model.gguf> [-n <gen tokens>] [--prompt-len <n>] [--threads <n>] [--gpu] [--draft <gguf>]
     ghost-infer run      <model.gguf> -p <prompt> [options]
     ghost-infer chat     <model.gguf> [options]
-    ghost-infer serve    <model.gguf> [--host <addr>] [--port <n>] [options]   (OpenAI-compatible HTTP API)
+    ghost-infer serve    [<model.gguf>] [--host <addr>] [--port <n>] [options]   (OpenAI-compatible HTTP API;
+                         without a model none is loaded until one is picked from the --models folders)
 
 OPTIONS:
     -p, --prompt <text>   prompt (run)
@@ -162,7 +163,12 @@ fn main() -> ExitCode {
         Some("bench") if !rest.is_empty() => parse_opts(rest).and_then(|o| bench(&o)),
         Some("run") if !rest.is_empty() => parse_opts(rest).and_then(|o| run(&o)),
         Some("chat") if !rest.is_empty() => parse_opts(rest).and_then(|o| chat(&o)),
-        Some("serve") if !rest.is_empty() => parse_opts(rest).and_then(|o| server::serve(&o, &o.host, o.port)),
+        // no model file first (options only, or nothing): the server starts with none loaded
+        Some("serve") => {
+            let given = rest.first().is_some_and(|a| !a.starts_with('-'));
+            let args: Vec<String> = if given { rest.to_vec() } else { std::iter::once(String::new()).chain(rest.iter().cloned()).collect() };
+            parse_opts(&args).and_then(|o| server::serve(&o, &o.host, o.port))
+        }
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);

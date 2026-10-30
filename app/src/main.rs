@@ -513,6 +513,7 @@ struct App {
     status: String,
     models: Vec<ModelChoice>,
     model: Option<ModelChoice>,
+    loading: Option<String>, // the model the server is loading (none: idle, or started without one)
     chats: Vec<ChatItem>,
     chat: Option<String>,
     title: Option<String>,
@@ -668,6 +669,7 @@ impl App {
             status: format!("Connecting to {addr}…"),
             models: Vec::new(),
             model: None,
+            loading: None,
             chats: Vec::new(),
             chat: None,
             title: None,
@@ -736,7 +738,7 @@ impl App {
                     _ => None,
                 };
                 if self.model.is_none() {
-                    self.status = "Loading the model…".into();
+                    self.status = self.no_model_status();
                 }
                 // the + menu opens as a click opens it: once the button is on screen
                 let plus = match menu.as_deref() {
@@ -828,7 +830,7 @@ impl App {
             }
             Message::ModelLoaded(Ok(models)) => {
                 self.set_models(&models);
-                self.status = if self.model.is_none() { "Loading the model…".into() } else { String::new() };
+                self.status = if self.model.is_none() { self.no_model_status() } else { String::new() };
                 return Task::batch([self.wait_for_model(), self.refresh_system()]);
             }
             Message::Edit(action) => self.composer.perform(action),
@@ -1250,8 +1252,17 @@ impl App {
     }
 
     /// While the server is still loading its model, asks again every two seconds until one is running.
+    /// The status line while no model runs: the one loading, or a hint to pick one (the server may have
+    /// started without a model).
+    fn no_model_status(&self) -> String {
+        match &self.loading {
+            Some(id) => format!("Loading {}…", short_model(id)),
+            None => "No model loaded: pick one from the model menu".into(),
+        }
+    }
+
     fn wait_for_model(&self) -> Task<Message> {
-        if self.model.is_some() {
+        if self.model.is_some() || self.loading.is_none() {
             return Task::none();
         }
         self.call(
@@ -1312,6 +1323,7 @@ impl App {
         let choice = |id: &str| ModelChoice { id: id.to_string(), label: short_model(id) };
         self.models = j.get("models").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|m| m.get("id").and_then(Json::as_str).map(choice)).collect();
         self.model = j.get("current").and_then(Json::as_str).map(choice);
+        self.loading = j.get("loading").and_then(Json::as_str).map(String::from);
         self.context.1 = j.get("context_length").and_then(Json::as_f64).unwrap_or(0.0);
     }
 
