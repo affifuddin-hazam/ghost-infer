@@ -947,12 +947,17 @@ impl App {
             .align_y(Alignment::End)
             .height(58);
         let mode_menu = self.menu == Some(Menu::Mode);
+        // one line, as Claude's box, until the text needs more (a new line, or more than fits on one line at
+        // about 7.6 px a character): then it grows, to about 10 lines, and scrolls beyond
+        let main = self.window.width - if self.sidebar { 264.0 } else { 0.0 } - if self.rail { 300.0 } else { 0.0 } - if self.tasks_panel { if self.tasks_wide { 600.0 } else { 400.0 } } else { 0.0 };
+        let fits = ((main.min(760.0) - 130.0) / 7.6).max(20.0) as usize;
+        let grown = self.composer.line_count() > 1 || self.composer.text().chars().count() > fits;
         let editor = text_editor(&self.composer)
             .placeholder(if self.messages.is_empty() { "How can I help you today?" } else { "Reply to ghost-infer" })
             .on_action(Message::Edit)
-            .padding(Padding { top: 4.0, right: 6.0, bottom: 10.0, left: 6.0 })
+            .padding(if grown { Padding { top: 4.0, right: 6.0, bottom: 10.0, left: 6.0 } } else { Padding::from([6, 6]) })
             .height(Length::Shrink)
-            .min_height(34)
+            .min_height(22)
             .max_height(240)
             .size(15)
             .key_binding(move |kp| {
@@ -976,19 +981,23 @@ impl App {
         let plus = container(button(container(icon(ic::ADD, 13).color(s.muted)).center(32)).on_press(Message::OpenMenu(Menu::Plus)).padding(0).style(move |_, st| round_style(s, st))).id("plus");
         let busy = self.busy.is_some();
         let send = if busy {
-            // stop: a rounded square, nothing in it
-            button(Space::new().width(32).height(32)).on_press(Message::Stop).padding(0).style(move |_, st| stop_style(s, st))
+            // stop: a small square, as Claude's (the button around it only shows on hover)
+            let mark = container(Space::new()).width(12).height(12).style(move |_| container::Style { background: Some(Background::Color(s.text)), border: border::rounded(3), ..Default::default() });
+            button(container(mark).center(32)).on_press(Message::Stop).padding(0).style(move |_, st| stop_style(s, st))
         } else {
             button(container(icon(ic::UP, 13).color(s.ink)).center(32)).on_press(Message::Send).padding(0).style(move |_, st| send_style(s, st))
         };
-        let card = container(column![editor, row![plus, Space::new().width(Fill), send].align_y(Alignment::Center)].spacing(4))
-            .padding(Padding { top: 12.0, right: 12.0, bottom: 10.0, left: 14.0 })
-            .style(move |_| container::Style {
-                background: Some(Background::Color(s.raise)),
-                // no soft shadow: tiny-skia repaints only the ghost's patch each tick and leaves holes in it
-                border: Border { radius: 18.0.into(), width: 1.0, color: s.line2 },
-                ..Default::default()
-            });
+        let (inside, pad, radius): (Element<'_, Message>, Padding, f32) = if grown {
+            (column![editor, row![plus, Space::new().width(Fill), send].align_y(Alignment::Center)].spacing(4).into(), Padding { top: 12.0, right: 12.0, bottom: 10.0, left: 14.0 }, 18.0)
+        } else {
+            (row![plus, editor, send].spacing(6).align_y(Alignment::Center).into(), Padding::from([6, 8]), 16.0)
+        };
+        let card = container(inside).padding(pad).style(move |_| container::Style {
+            background: Some(Background::Color(s.raise)),
+            // no soft shadow: tiny-skia repaints only the ghost's patch each tick and leaves holes in it
+            border: Border { radius: radius.into(), width: 1.0, color: s.line2 },
+            ..Default::default()
+        });
         let think = button(row![icon(ic::BOLT, 11).color(if self.thinking { s.accent } else { s.faint }), text(if self.thinking { "Think" } else { "Quick" }).size(13).color(s.muted)].spacing(6).align_y(Alignment::Center))
             .on_press(Message::ToggleThinking)
             .padding([4, 8])
@@ -1421,7 +1430,7 @@ fn send_style(s: &Skin, st: button::Status) -> button::Style {
 }
 
 fn stop_style(s: &Skin, st: button::Status) -> button::Style {
-    button::Style { border: border::rounded(9), ..send_style(s, st) }
+    button::Style { background: hovered(st).then_some(Background::Color(s.hover)), border: border::rounded(8), ..Default::default() }
 }
 
 fn card_style(s: &Skin, st: button::Status) -> button::Style {
