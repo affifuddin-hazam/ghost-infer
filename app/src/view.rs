@@ -937,6 +937,9 @@ impl App {
             group.extend(m.tools.iter().enumerate().filter(|(_, t)| t.round == k && t.name != "update_tasks").map(|(j, _)| j));
         }
         flush(&mut group, &mut parts);
+        if !m.plan.is_empty() {
+            parts.push(self.finished_plan(&m.plan));
+        }
         if !live && (m.rounds.iter().any(|r| !r.answer.is_empty()) || m.changed) {
             let mut foot = row![small_button(s, ic::COPY, Message::Copy(i))].spacing(2).align_y(Alignment::Center);
             if i + 1 == self.messages.len() {
@@ -954,6 +957,25 @@ impl App {
             parts.push(foot.into());
         }
         column(parts).spacing(12).into()
+    }
+
+    /// The task list a reply finished, inside the reply: its steps, each checked.
+    fn finished_plan<'a>(&'a self, plan: &'a [(String, String)]) -> Element<'a, Message> {
+        let s = self.skin();
+        let title = if plan.len() == 1 { "The task is done".to_string() } else { format!("All {} tasks done", plan.len()) };
+        let head = row![icon(ic::CHECK, 12).color(s.ok), text(title).size(13).font(MEDIUM).color(s.text)].spacing(10).align_y(Alignment::Center);
+        let steps = column(plan.iter().map(|(task, _)| {
+            row![icon(ic::CHECK, 10).color(s.ok).width(14), text(task.as_str()).size(13).color(s.faint).width(Fill)].spacing(10).align_y(Alignment::Center).padding([3, 0]).into()
+        }));
+        let body = column![head, container(steps).padding(Padding { top: 6.0, left: 0.0, right: 0.0, bottom: 0.0 })].padding([9, 12]);
+        container(body)
+            .width(Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(s.raise)),
+                border: Border { radius: 14.0.into(), width: 1.0, color: s.line2 },
+                ..Default::default()
+            })
+            .into()
     }
 
     /// A box of tool calls (`which`: indexes into the reply's tools), each a line; a click shows what it was

@@ -161,6 +161,7 @@ struct Msg {
     changed: bool,              // it changed files
     undone: bool,
     scheduled: bool, // a user message the scheduler sent (a task or the heartbeat), shown by its label
+    plan: Vec<(String, String)>, // the task list this reply finished: shown in it, no longer pinned above the box
 }
 
 impl Msg {
@@ -177,6 +178,7 @@ impl Msg {
             changed: false,
             undone: false,
             scheduled: false,
+            plan: Vec::new(),
         }
     }
 
@@ -1378,6 +1380,18 @@ impl App {
         iced::Subscription::batch([tick, resized])
     }
 
+    /// A task list with every step done leaves the pin above the message box: it goes into the latest reply,
+    /// as Claude Code does, and scrolls away with the chat.
+    fn settle_plan(&mut self) {
+        if self.tasks.is_empty() || self.tasks.iter().any(|t| t.1 != "done") {
+            return;
+        }
+        if let Some(m) = self.messages.iter_mut().rev().find(|m| m.role == Role::Assistant) {
+            m.plan = std::mem::take(&mut self.tasks);
+            self.plan_open = None;
+        }
+    }
+
     /// A saved chat as messages: each user message, then its reply's rounds folded into one.
     fn show_chat(&mut self, chat: &Json) {
         self.chat = chat.get("id").and_then(Json::as_str).map(String::from);
@@ -1435,6 +1449,7 @@ impl App {
                 _ => {}
             }
         }
+        self.settle_plan();
     }
 
     /// Sends the composer's text (or, for a retry, answers the last message again) and streams the reply.
@@ -1514,7 +1529,10 @@ impl App {
                 }
                 self.status = "Using a tool".into();
             }
-            "tasks" => self.tasks = tasks_of(ev.get("tasks")),
+            "tasks" => {
+                self.tasks = tasks_of(ev.get("tasks"));
+                self.settle_plan();
+            }
             "nudge" => {
                 let goal = s("kind") == "goal";
                 if let Some(m) = self.messages.last_mut() {
