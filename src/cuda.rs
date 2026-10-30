@@ -2144,7 +2144,7 @@ __global__ void attention_combine(const float* __restrict__ part, float* __restr
     const float* p = part + ((size_t)b * n_heads + h) * nsplit * (hd + 2);
     float m = NEG_INF;
     for (int s = lane; s < used; s += 32) m = fmaxf(m, p[s * (hd + 2) + hd]);
-    m = warp_max(m);
+    m = __shfl_sync(0xffffffff, warp_max(m), 0); // warp_max leaves the whole max in lane 0 only
     bool held = used <= COMBINE_MAX;
     if (held)
         for (int s = lane; s < used; s += 32) wsh[s] = expf(__fsub_rn(p[s * (hd + 2) + hd], m));
