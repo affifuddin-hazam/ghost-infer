@@ -267,13 +267,21 @@ target\release\ghost-app                # connects to 127.0.0.1:8080; give anoth
 
 The app runs on the same computer as the server: the agent only answers requests from this computer.
 
-- **Tools, with your OK.** The + menu turns tool groups on: reading files (on by default), changing files,
-  running PowerShell commands, the web, and MCP tools. File tools only work inside the folders you add.
-  Changing files, running commands, the web, MCP tools and installing a skill ask first (once, always, or
-  no), and every reply's file changes can be undone.
+- **A folder per chat.** A new chat works in the folder shown under the message box (click it to pick
+  another), and keeps it, as a Claude Code session does: relative paths and commands start there. Folders
+  added with the + menu are open to every chat as well; file tools work nowhere else.
+- **Permission modes, as Claude Code has them.** The tools (files, PowerShell, the web, MCP) are always
+  there; the mode next to the context ring decides what waits for your OK. **Manual** asks before every
+  change, command and web use; **Accept edits** lets file changes through; **Auto** lets file changes, the
+  web and ordinary commands through and asks about risky ones (deleting, `git push`, installing, system
+  settings); **Plan** changes nothing and answers with a plan; **Bypass permissions** asks nothing.
+  Shift+Tab steps through them. An OK can be once or always, and every reply's file changes can be undone.
 - **Plans and checks.** The model keeps a task list, pinned above the message box. After changing code it
-  is sent back once to run it. With **Keep going until done** on (+ menu), a reply that stops with steps
-  of its list still open is sent back to them.
+  is sent back once to run it.
+- **Loops, as Claude Code has them.** `/goal all tests pass, stop after 5 tries`: when the model stops, a
+  check reads the work against the goal and sends it back with what is missing, until the goal is met or
+  the tries run out (8 unless the goal says). `/loop 10m check the build and fix what fails` repeats a
+  prompt in the chat; `/loop stop` ends it.
 - **Long chats fit.** Before each round, old tool outputs are taken out, then the oldest turns, so a chat
   never outgrows the context; the chat file keeps everything, and the server's cache stays valid.
 - **Instructions and memory.** `GHOST.md` goes into every chat: the one in `%LOCALAPPDATA%\ghost-infer`,
@@ -285,21 +293,18 @@ The app runs on the same computer as the server: the agent only answers requests
 - **Scheduled tasks.** Ask in a chat ("remind me in 20 minutes to…", "every weekday at 9:00, check the
   build"): the model schedules it once, every N minutes or daily at a time, and it runs in that chat even
   while you are away. Its reply waits there, marked unread.
-- **The heartbeat.** Turn it on in the rail (every 15 minutes to 2 hours) and write a checklist in
-  `HEARTBEAT.md`: the model goes through it and tells you only when something needs you. A reply of
-  `HEARTBEAT_OK` is dropped, and a checklist with nothing in it is not checked at all.
 
-Scheduled tasks and the heartbeat wait until nothing else has used the model for 20 seconds, and use only
-the tool groups you set to always allowed, since nobody is there to ask.
+Scheduled tasks and loops wait until nothing else has used the model for 20 seconds, and use only what
+you set to always allowed, since nobody is there to ask.
 
 | In `%LOCALAPPDATA%\ghost-infer` | |
 |---|---|
-| `chats\` | every chat, for the app and any other client of the agent |
-| `harness.json` | the folders tools may use, and the groups always allowed |
+| `chats\` | every chat (with its folder and goal), for the app and any other client of the agent |
+| `harness.json` | the folders every chat may use, and what is always allowed |
 | `GHOST.md`, `memory.json` | instructions and remembered facts, for every chat |
 | `skills\`, `mcp.json` | installed skills and MCP servers |
-| `schedules.json`, `HEARTBEAT.md` | scheduled tasks, and the heartbeat and its checklist |
-| `app.json` | the app's own settings |
+| `schedules.json` | scheduled tasks and loops |
+| `app.json` | the app's own settings (theme, permission mode, the folder new chats work in) |
 
 ## Usage
 

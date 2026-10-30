@@ -1,10 +1,8 @@
-//! The agent working while nobody is chatting: scheduled tasks and the heartbeat.
+//! The agent working while nobody is chatting: scheduled tasks.
 //!
 //! A scheduled task is a prompt sent to the model at a time (once, every N minutes, or daily at a local
-//! time). The model makes them with its schedule_task tool, and each is answered in the chat it was made in.
-//! The heartbeat is the proactive one: every N minutes the model goes through the user's HEARTBEAT.md
-//! checklist, and a reply of HEARTBEAT_OK (nothing needs the user) is dropped; anything else stays in the
-//! Heartbeat chat, unread. (The heartbeat and HEARTBEAT_OK follow OpenClaw's; the job file follows goose's.)
+//! time). The model makes them with its schedule_task tool, or the user with /loop (Claude Code's time-based
+//! loop), and each is answered in the chat it was made in. (The job file follows goose's.)
 //!
 //! Kept in %LOCALAPPDATA%\ghost-infer\schedules.json. A run waits until no reply has been going for a while,
 //! so it never cuts in on the user, and uses only the tools the user always allows (nobody is there to ask).
@@ -22,10 +20,6 @@ const QUIET_MS: u64 = 20_000;
 
 /// The shortest gap between runs of a repeating task, in minutes (each one takes the model a while).
 const MIN_EVERY: u32 = 5;
-
-/// What a heartbeat reply starts or ends with when nothing needs the user, and how much else it may say.
-const OK: &str = "HEARTBEAT_OK";
-const OK_MAX_CHARS: usize = 300;
 
 const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
@@ -98,6 +92,15 @@ fn local(ms: f64) -> Local {
     let t = ms as i64 + offset_ms();
     let day = t.div_euclid(86_400_000);
     Local { day, minute: (t.rem_euclid(86_400_000) / 60_000) as u32, weekday: (day + 4).rem_euclid(7) as usize }
+}
+
+/// Today's local date, as the agent's opening line says it: Thursday 30 October 2026.
+pub fn today() -> String {
+    const NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    let at = local(agent::now_ms());
+    let (y, m, d) = civil_from_days(at.day);
+    format!("{} {d} {} {y}", NAMES[at.weekday], MONTHS[(m as usize).clamp(1, 12) - 1])
 }
 
 /// The moment a local day and minute is, in milliseconds since 1970.
@@ -216,29 +219,12 @@ impl Job {
 }
 
 #[derive(Default)]
-struct Heartbeat {
-    every: u32, // minutes; 0: off
-    chat: String,
-    groups: Vec<String>,
-    thinking: bool,
-    next: f64,
-    last: f64,
-    note: String,
-}
-
-#[derive(Default)]
 struct Store {
     jobs: Vec<Job>,
-    heartbeat: Heartbeat,
 }
 
 fn file() -> Result<std::path::PathBuf, String> {
     Ok(agent::data_dir()?.join("schedules.json"))
-}
-
-/// The checklist the heartbeat goes through.
-pub fn heartbeat_file() -> Result<std::path::PathBuf, String> {
-    Ok(agent::data_dir()?.join("HEARTBEAT.md"))
 }
 
 fn strings(j: Option<&Json>) -> Vec<String> {
@@ -263,17 +249,7 @@ fn load() -> Store {
         last: f(t, "last"),
         note: s(t, "note"),
     }).collect();
-    let h = j.get("heartbeat").cloned().unwrap_or(Json::Null);
-    let heartbeat = Heartbeat {
-        every: f(&h, "every") as u32,
-        chat: s(&h, "chat"),
-        groups: strings(h.get("tools")),
-        thinking: h.get("thinking").and_then(Json::as_bool).unwrap_or(false),
-        next: f(&h, "next"),
-        last: f(&h, "last"),
-        note: s(&h, "note"),
-    };
-    Store { jobs, heartbeat }
+    Store { jobs }
 }
 
 fn save(st: &Store) -> Result<(), String> {
@@ -287,11 +263,9 @@ fn save(st: &Store) -> Result<(), String> {
         f.extend([("tools", tools(&t.groups)), ("thinking", Json::Bool(t.thinking)), ("last", num(t.last)), ("note", str(&t.note))]);
         obj(f)
     });
-    let h = &st.heartbeat;
-    let heartbeat = obj(vec![("every", num(h.every as f64)), ("chat", str(&h.chat)), ("tools", tools(&h.groups)), ("thinking", Json::Bool(h.thinking)), ("next", num(h.next)), ("last", num(h.last)), ("note", str(&h.note))]);
     let path = file()?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, obj(vec![("jobs", Json::Arr(jobs.collect())), ("heartbeat", heartbeat)]).to_string()).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, obj(vec![("jobs", Json::Arr(jobs.collect()))]).to_string()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
@@ -349,9 +323,6 @@ pub fn tool(name: &str, args: &Json, chat: &str, groups: &[String], thinking: bo
             for t in &st.jobs {
                 lines.push(format!("- {}: \"{}\", {}, next {}{}", t.id, t.name, t.when(), when_text(t.next), if t.chat == chat { " (this chat)" } else { "" }));
             }
-            if st.heartbeat.every > 0 {
-                lines.push(format!("The heartbeat (the user's HEARTBEAT.md checklist) runs every {} min.", st.heartbeat.every));
-            }
             lines.join("\n")
         }
         _ => {
@@ -366,6 +337,25 @@ pub fn tool(name: &str, args: &Json, chat: &str, groups: &[String], thinking: bo
             }
         }
     }
+}
+
+/// /loop in a chat (Claude Code's time-based loop): `prompt` sent to it every `every` minutes until
+/// /loop stop. What to tell the user.
+pub fn add_loop(chat: &str, prompt: &str, every: u32, groups: &[String], thinking: bool) -> Result<String, String> {
+    let args = obj(vec![("prompt", str(prompt)), ("every_minutes", num(every as f64))]);
+    let job = new_job(&args, agent::now_ms(), chat, groups, thinking)?;
+    let text = format!("Looping {} in this chat: \"{}\". The first run is {}. /loop stop ends it. Nobody is here to OK tools while it runs, so it uses only what you always allow.", job.when(), job.prompt, when_text(job.next));
+    edit(|st| st.jobs.push(job));
+    Ok(text)
+}
+
+/// /loop stop: the chat's repeating tasks cancelled; how many there were.
+pub fn stop_loops(chat: &str) -> usize {
+    edit(|st| {
+        let before = st.jobs.len();
+        st.jobs.retain(|j| !(j.chat == chat && j.every > 0));
+        before - st.jobs.len()
+    })
 }
 
 fn new_job(args: &Json, now: f64, chat: &str, groups: &[String], thinking: bool) -> Result<Job, String> {
@@ -409,24 +399,6 @@ fn new_job(args: &Json, now: f64, chat: &str, groups: &[String], thinking: bool)
     Ok(job)
 }
 
-// ---- the heartbeat's checklist
-
-/// The checklist as the model gets it, or None when it has nothing to check (only headings, comments and
-/// blank lines): then the heartbeat does not run at all.
-fn checklist() -> Option<String> {
-    let text = std::fs::read_to_string(heartbeat_file().ok()?).ok()?;
-    let text = agent::without_comments(&text);
-    let real = text.lines().map(str::trim).any(|l| !l.is_empty() && !l.starts_with('#') && l.trim_start_matches(['-', '*', ' ']).chars().any(|c| c.is_alphanumeric()));
-    real.then(|| text.trim().to_string())
-}
-
-/// Whether a heartbeat reply says nothing needs the user: HEARTBEAT_OK at its start or end, with little else.
-fn is_ok(reply: &str) -> bool {
-    let reply = reply.rsplit("</think>").next().unwrap_or(reply).trim().trim_matches(['*', '`', '"', '.']);
-    let rest = if let Some(r) = reply.strip_prefix(OK) { r } else if let Some(r) = reply.strip_suffix(OK) { r } else { return false };
-    rest.trim().chars().count() <= OK_MAX_CHARS
-}
-
 /// The first line of a reply worth showing (its thinking left out).
 fn gist(reply: &str) -> String {
     let reply = reply.rsplit("</think>").next().unwrap_or(reply);
@@ -436,46 +408,19 @@ fn gist(reply: &str) -> String {
 
 // ---- for the clients
 
-/// GET /api/background: what runs on its own, and a number that changes whenever any of it does.
+/// GET /api/background: what runs on its own, and a number that changes whenever any of it does; and the
+/// commands the model left running (start_process), which change without it.
 pub fn status_json() -> Json {
     let st = load();
-    let h = &st.heartbeat;
     let at = |ms: f64| if ms > 0.0 { str(&when_text(ms)) } else { Json::Null };
     let jobs = st.jobs.iter().map(|t| obj(vec![("id", str(&t.id)), ("name", str(&t.name)), ("prompt", str(&t.prompt)), ("when", str(&t.when())), ("next", at(t.next)), ("last", at(t.last)), ("note", str(&t.note)), ("chat", str(&t.chat))]));
-    let heartbeat = obj(vec![
-        ("every", num(h.every as f64)),
-        ("next", if h.every > 0 { at(h.next) } else { Json::Null }),
-        ("last", at(h.last)),
-        ("note", str(&h.note)),
-        ("chat", str(&h.chat)),
-        ("file", heartbeat_file().map(|p| str(&p.display().to_string())).unwrap_or(Json::Null)),
-        ("checklist", Json::Bool(checklist().is_some())),
-    ]);
     let running = RUNNING_IN.lock().unwrap().clone().map_or(Json::Null, |c| str(&c));
-    obj(vec![("seq", num(SEQ.load(Ordering::SeqCst) as f64)), ("running", running), ("jobs", Json::Arr(jobs.collect())), ("heartbeat", heartbeat)])
+    obj(vec![("seq", num(SEQ.load(Ordering::SeqCst) as f64)), ("running", running), ("jobs", Json::Arr(jobs.collect())), ("processes", crate::tools::processes())])
 }
 
-/// POST /api/schedules/heartbeat {"every": minutes (0: off), "tools", "thinking"}: the first check comes
-/// after one interval (POST /api/schedules/run {"id": "heartbeat"} for one now).
-pub fn set_heartbeat(b: &Json) -> Json {
-    let every = b.get("every").and_then(Json::as_f64).unwrap_or(0.0).max(0.0) as u32;
-    edit(|st| {
-        let h = &mut st.heartbeat;
-        h.every = if every == 0 { 0 } else { every.max(MIN_EVERY) };
-        h.groups = strings(b.get("tools"));
-        h.thinking = b.get("thinking").and_then(Json::as_bool).unwrap_or(false);
-        h.next = agent::now_ms() + h.every as f64 * 60_000.0;
-    });
-    status_json()
-}
-
-/// POST /api/schedules/run {"id"}: the task (or "heartbeat") runs as soon as things are quiet.
+/// POST /api/schedules/run {"id"}: the task runs as soon as things are quiet.
 pub fn run_now(id: &str) -> Result<Json, String> {
     let found = edit(|st| {
-        if id == "heartbeat" {
-            st.heartbeat.next = 0.0;
-            return true;
-        }
         st.jobs.iter_mut().find(|t| t.id == id).map(|t| t.next = 0.0).is_some()
     });
     if !found {
@@ -503,12 +448,6 @@ pub fn start(work: mpsc::Sender<Work>, shared: Arc<Shared>) {
     });
 }
 
-/// What one look finds due: a task (already moved to its next time, or taken out if it ran its once), or the heartbeat.
-enum Due {
-    Task(Job),
-    Heartbeat(String, Vec<String>, bool), // its chat, tools, thinking
-}
-
 fn tick(work: &mpsc::Sender<Work>, shared: &Shared) {
     if agent::idle_ms().is_none_or(|ms| ms < QUIET_MS) {
         return;
@@ -520,7 +459,7 @@ fn tick(work: &mpsc::Sender<Work>, shared: &Shared) {
         return;
     };
     let now = agent::now_ms();
-    // moved on before it runs, so a run that fails or a server stopped mid-run does not repeat it at once
+    // the task due first, moved on before it runs (or taken out if it ran its once), so a run that fails or a server stopped mid-run does not repeat it at once
     let due = edit(|st| {
         if let Some(i) = st.jobs.iter().enumerate().filter(|(_, t)| t.next <= now).min_by(|a, b| a.1.next.total_cmp(&b.1.next)).map(|(i, _)| i) {
             let job = st.jobs[i].clone();
@@ -530,19 +469,12 @@ fn tick(work: &mpsc::Sender<Work>, shared: &Shared) {
                     st.jobs.remove(i);
                 }
             }
-            return Some(Due::Task(job));
-        }
-        let h = &mut st.heartbeat;
-        if h.every > 0 && h.next <= now {
-            h.next = now + h.every as f64 * 60_000.0;
-            return Some(Due::Heartbeat(h.chat.clone(), h.groups.clone(), h.thinking));
+            return Some(job);
         }
         None
     });
-    match due {
-        Some(Due::Task(job)) => run_task(job, now, work, shared, &loaded),
-        Some(Due::Heartbeat(chat, groups, thinking)) => run_heartbeat(&chat, &groups, thinking, now, work, shared, &loaded),
-        None => {}
+    if let Some(job) = due {
+        run_task(job, now, work, shared, &loaded);
     }
 }
 
@@ -565,41 +497,6 @@ fn run_task(job: Job, now: f64, work: &mpsc::Sender<Work>, shared: &Shared, load
     edit(|st| {
         if let Some(t) = st.jobs.iter_mut().find(|t| t.id == job.id) {
             (t.last, t.note, t.chat) = (now, note, chat);
-        }
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_heartbeat(chat: &str, groups: &[String], thinking: bool, now: f64, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &super::Loaded) {
-    let Some(list) = checklist() else {
-        edit(|st| (st.heartbeat.last, st.heartbeat.note) = (now, "skipped: HEARTBEAT.md has nothing to check".into()));
-        return;
-    };
-    eprintln!("[heartbeat]");
-    let text = format!(
-        "(Heartbeat, {}.) This is your regular check while the user may be away. Go through the checklist below now, using your tools where they help. If nothing needs the user's attention, reply with {OK} and nothing else. Otherwise reply only with what needs their attention, briefly, and leave {OK} out.\n\nChecklist (HEARTBEAT.md):\n{list}",
-        when_text(now)
-    );
-    let w = Wakeup { chat: Some(chat).filter(|c| !c.is_empty()), title: "Heartbeat", text: &text, shown: "Heartbeat check", groups, thinking };
-    *RUNNING_IN.lock().unwrap() = Some(chat.to_string());
-    SEQ.fetch_add(1, Ordering::SeqCst);
-    let result = agent::run_away(&w, |reply| !is_ok(reply), work, shared, loaded);
-    *RUNNING_IN.lock().unwrap() = None;
-    edit(|st| {
-        let h = &mut st.heartbeat;
-        h.last = now;
-        match result {
-            Ok((id, _, false)) => {
-                h.note = "nothing needs you".into();
-                if agent::load_chat(&id).is_ok() {
-                    h.chat = id;
-                }
-            }
-            Ok((id, text, true)) => {
-                h.note = gist(&text);
-                h.chat = id;
-            }
-            Err(e) => h.note = format!("failed: {e}"),
         }
     });
 }
@@ -633,14 +530,5 @@ mod tests {
         // daily at 09:00 on Mondays, from Thursday: the next Monday
         assert_eq!(next_daily(now, 9 * 60, &[1]), moment(days_from_civil(2026, 11, 2), 9 * 60));
         assert_eq!(next_daily(now, 15 * 60, &[]), moment(days_from_civil(2026, 10, 29), 15 * 60));
-    }
-
-    #[test]
-    fn heartbeat_ok_replies() {
-        assert!(is_ok("HEARTBEAT_OK"));
-        assert!(is_ok("<think>all fine</think>\nHEARTBEAT_OK"));
-        assert!(is_ok("Nothing new. HEARTBEAT_OK"));
-        assert!(!is_ok("The build failed: 3 tests broke."));
-        assert!(!is_ok(&format!("HEARTBEAT_OK {}", "x".repeat(400))));
     }
 }

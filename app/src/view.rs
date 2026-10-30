@@ -2,12 +2,12 @@
 //! (dark, neutral greys) and Fog (light). Icons come from Segoe MDL2 Assets, the icon font every Windows 10
 //! and 11 has; text is Instrument Sans, the greeting Georgia.
 
-use iced::widget::{button, canvas, column, container, markdown, mouse_area, opaque, pick_list, rich_text, row, scrollable, stack, text, text_editor, text_input, tooltip, Space};
+use iced::widget::{button, canvas, column, container, markdown, mouse_area, opaque, rich_text, row, scrollable, stack, text, text_editor, text_input, tooltip, Space};
 use iced::{border, keyboard, Alignment, Background, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Theme};
 
 use crate::ghost::{Ghost, Mood};
 use crate::json::Json;
-use crate::{approval_text, group_name, tool_detail, tool_label, App, Menu, Message, Msg, Role};
+use crate::{approval_text, group_name, tool_detail, tool_label, App, Menu, Message, Msg, Role, TaskState};
 
 /// A skin: the colours every part of the app is drawn with.
 #[derive(Debug)]
@@ -138,7 +138,6 @@ mod ic {
     pub const CLOCK: char = '\u{E916}';
     pub const UNDO: char = '\u{E7A7}';
     pub const DOWNLOAD: char = '\u{E896}';
-    pub const HEART: char = '\u{EB51}';
 }
 
 fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
@@ -167,15 +166,51 @@ fn tool_icon(name: &str) -> char {
     }
 }
 
-/// The icon for a tool group in the + menu.
-fn group_icon(group: &str) -> char {
-    match group {
-        "files" => ic::FILE,
-        "mcp" => ic::PLUG,
-        "edit" => ic::EDIT,
-        "cmd" => ic::TERMINAL,
-        _ => ic::GLOBE,
+/// The context breakdown's colours (the other parts are greys of the theme's muted text).
+const PART_BLUE: Color = rgb(0x5b, 0x8d, 0xef);
+const PART_ORANGE: Color = rgb(0xe0, 0x7b, 0x39);
+const PART_GREEN: Color = rgb(0x4c, 0xb0, 0x8c);
+
+/// A stop button as Claude's background tasks have it: a small square.
+fn stop_button(s: &'static Skin, msg: Message) -> Element<'static, Message> {
+    button(container(Space::new().width(8).height(8)).style(move |_| container::Style { background: Some(Background::Color(s.text)), border: border::rounded(2), ..Default::default() }))
+        .on_press(msg)
+        .padding(5)
+        .style(move |_, st| bare(s, st))
+        .into()
+}
+
+/// How long something has run, as Claude's background tasks show it: 16s, 2m 5s, 1h 3m.
+fn duration(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
     }
+}
+
+/// A token count as Claude's rail writes it: 400, 9.7k, 534.9k, 1M.
+fn tokens_k(n: f64) -> String {
+    if n >= 1_000_000.0 {
+        format!("{:.1}M", n / 1_000_000.0).replace(".0M", "M")
+    } else if n >= 1000.0 {
+        format!("{:.1}k", n / 1000.0).replace(".0k", "k")
+    } else {
+        format!("{n:.0}")
+    }
+}
+
+/// A menu line: its icon, name and a line under it, what it does, drawn in red, a check (shown when on), and
+/// a key at its right.
+struct Item {
+    icon: Option<char>,
+    label: String,
+    detail: Option<String>,
+    hint: Option<String>,
+    msg: Message,
+    danger: bool,
+    check: Option<bool>,
 }
 
 /// "Good morning" etc., from the computer's clock.
@@ -222,6 +257,9 @@ impl App {
             body = body.push(self.sidebar());
         }
         body = body.push(self.main());
+        if self.tasks_panel {
+            body = body.push(self.tasks_panel());
+        }
         if self.rail {
             body = body.push(self.rail());
         }
@@ -229,50 +267,92 @@ impl App {
         let Some(menu) = self.menu else { return self.framed(body) };
         // an open menu: a click anywhere else closes it
         let shade = mouse_area(container(Space::new()).width(Fill).height(Fill)).on_press(Message::Menu(None));
-        // each item: icon, label, what it does, drawn in red, and for a switch whether it is on
-        let (items, pad): (Vec<(char, &str, Message, bool, Option<bool>)>, Padding) = match menu {
+        let item = |c: char, label: &str, msg: Message| Item { icon: Some(c), label: label.to_string(), detail: None, hint: None, msg, danger: false, check: None };
+        // a menu above its button: its left edge with the button's, or (right) its right edge
+        let above = |right: bool| match self.menu_at {
+            Some(at) if right => Padding { right: (self.window.width - at.x - at.width).max(0.0), bottom: (self.window.height - at.y + 6.0).max(0.0), ..Padding::ZERO },
+            Some(at) => Padding { left: at.x, bottom: (self.window.height - at.y + 6.0).max(0.0), ..Padding::ZERO },
+            None => Padding { left: if self.sidebar { 264.0 + 60.0 } else { 60.0 }, bottom: 130.0, ..Padding::ZERO },
+        };
+        let (title, items, pad, width, right): (Option<&str>, Vec<Item>, Padding, f32, bool) = match menu {
             Menu::Chat => (
-                vec![(ic::COPY, "Copy as Markdown", Message::CopyChat, false, None), (ic::DELETE, "Delete", Message::DeleteCurrent, true, None)],
+                None,
+                vec![item(ic::COPY, "Copy as Markdown", Message::CopyChat), Item { danger: true, ..item(ic::DELETE, "Delete", Message::DeleteCurrent) }],
                 Padding { top: 44.0, left: if self.sidebar { 264.0 + 16.0 } else { 56.0 }, ..Padding::ZERO },
+                232.0,
+                false,
             ),
             Menu::Settings => (
+                None,
                 vec![
-                    (if s.dark { ic::SUN } else { ic::MOON }, if s.dark { "Light theme (Fog)" } else { "Dark theme (Graphite)" }, Message::ToggleTheme, false, None),
-                    (ic::SETTINGS, "Follow Windows' theme", Message::SystemTheme, false, None),
-                    (ic::BOLT, "Start with the last model", Message::ToggleLoadLast, false, Some(self.load_last)),
-                    (ic::POWER, "Quit and stop the model", Message::Quit, false, None),
+                    item(if s.dark { ic::SUN } else { ic::MOON }, if s.dark { "Light theme (Fog)" } else { "Dark theme (Graphite)" }, Message::ToggleTheme),
+                    item(ic::SETTINGS, "Follow Windows' theme", Message::SystemTheme),
+                    Item { check: Some(self.load_last), ..item(ic::BOLT, "Start with the last model", Message::ToggleLoadLast) },
+                    item(ic::POWER, "Quit and stop the model", Message::Quit),
                 ],
                 Padding { left: 12.0, bottom: 60.0, ..Padding::ZERO },
+                232.0,
+                false,
             ),
-            Menu::Plus => {
-                let mut items: Vec<(char, &str, Message, bool, Option<bool>)> = crate::GROUPS.iter().map(|&(g, label)| (group_icon(g), label, Message::ToggleGroup(g), false, Some(self.tools.iter().any(|t| t == g)))).collect();
-                items.push((ic::TASKS, "Keep going until done", Message::ToggleKeepGoing, false, Some(self.keep_going)));
-                items.push((ic::FOLDER, "Add folder…", Message::AddFolder, false, None));
-                items.push((ic::SKILL, "Install skill…", Message::InstallSkill(false), false, None));
-                items.push((ic::DOWNLOAD, "Install skill from a link…", Message::OpenSkillLink, false, None));
-                // just above the + button, its left edge with the button's
-                let pad = match self.plus_at {
-                    Some(at) => Padding { left: at.x, bottom: (self.window.height - at.y + 6.0).max(0.0), ..Padding::ZERO },
-                    None => Padding { left: if self.sidebar { 264.0 + 60.0 } else { 60.0 }, bottom: 130.0, ..Padding::ZERO },
-                };
-                (items, pad)
+            // adding things; the tools themselves are always there, and the mode decides what needs an OK
+            Menu::Plus => (
+                None,
+                vec![item(ic::FOLDER, "Add folder…", Message::AddFolder), item(ic::SKILL, "Install skill…", Message::InstallSkill(false)), item(ic::DOWNLOAD, "Install skill from a link…", Message::OpenSkillLink)],
+                above(false),
+                232.0,
+                false,
+            ),
+            Menu::Model => {
+                let current = self.model.as_ref().map(|m| m.id.as_str());
+                let items = self.models.iter().map(|m| Item { icon: None, check: Some(current == Some(m.id.as_str())), ..item(ic::BOLT, &m.label, Message::PickModel(m.clone())) }).collect();
+                (Some("Model"), items, above(true), 260.0, true)
+            }
+            Menu::Mode => {
+                let items = crate::MODES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, name, what))| Item { icon: None, detail: Some(what.to_string()), hint: Some((i + 1).to_string()), check: Some(i == self.perm), ..item(ic::BOLT, name, Message::SetMode(i)) })
+                    .collect();
+                (Some("Mode"), items, above(true), 300.0, true)
+            }
+            Menu::Folder => {
+                let current = self.new_chat_dir();
+                let mut dirs: Vec<&str> = self.folders.iter().map(String::as_str).collect();
+                if let Some(w) = self.workdir.as_deref().filter(|w| !dirs.contains(w)) {
+                    dirs.insert(0, w);
+                }
+                let mut items: Vec<Item> = dirs
+                    .into_iter()
+                    .map(|d| Item { detail: Some(d.to_string()), check: Some(current == Some(d)), ..item(ic::FOLDER, &crate::folder_name(d), Message::SetWorkdir(Some(d.to_string()))) })
+                    .collect();
+                items.push(item(ic::ADD, "Choose a folder…", Message::PickWorkdir));
+                (Some("Work in"), items, above(false), 300.0, false)
             }
         };
-        let list = column(items.into_iter().map(|(c, label, msg, danger, on)| {
-            let color = if danger { s.bad } else { s.text };
-            let mut line = row![icon(c, 13).color(if danger { s.bad } else { s.muted }), text(label).size(14).color(color).width(Fill)].spacing(12).align_y(Alignment::Center);
-            if let Some(on) = on {
+        let mut list = column![].spacing(1);
+        if let Some(title) = title {
+            list = list.push(container(text(title).size(12.5).font(MEDIUM).color(s.faint)).padding(Padding { top: 4.0, right: 10.0, bottom: 4.0, left: 10.0 }));
+        }
+        for it in items {
+            let color = if it.danger { s.bad } else { s.text };
+            let mut name = column![text(it.label).size(14).color(color)].spacing(2).width(Fill);
+            if let Some(d) = it.detail {
+                name = name.push(text(d).size(12).color(s.faint));
+            }
+            let mut line = row![].spacing(12).align_y(Alignment::Center);
+            if let Some(c) = it.icon {
+                line = line.push(icon(c, 13).color(if it.danger { s.bad } else { s.muted }));
+            }
+            line = line.push(name);
+            if let Some(on) = it.check {
                 line = line.push(icon(ic::CHECK, 12).color(if on { s.accent } else { Color::TRANSPARENT }));
             }
-            button(line)
-                .on_press(msg)
-                .width(Fill)
-                .padding([7, 10])
-                .style(move |_, st| row_style(s, st, false))
-                .into()
-        }))
-        .spacing(1);
-        let card = container(list).padding(6).width(232).style(move |_| container::Style {
+            if let Some(h) = it.hint {
+                line = line.push(text(h).size(12).color(s.faint));
+            }
+            list = list.push(button(line).on_press(it.msg).width(Fill).padding([7, 10]).style(move |_, st| row_style(s, st, false)));
+        }
+        let card = container(list).padding(6).width(width).style(move |_| container::Style {
             background: Some(Background::Color(s.menu)),
             border: Border { radius: 12.0.into(), width: 1.0, color: s.line2 },
             ..Default::default()
@@ -281,6 +361,7 @@ impl App {
             .padding(pad)
             .width(Fill)
             .height(Fill)
+            .align_x(if right { Alignment::End } else { Alignment::Start })
             .align_y(if matches!(menu, Menu::Chat) { Alignment::Start } else { Alignment::End });
         self.framed(stack![body, opaque(shade), placed].into())
     }
@@ -305,89 +386,208 @@ impl App {
     /// chat changed (with undo), the model's task list, and what it remembers across chats.
     fn rail(&self) -> Element<'_, Message> {
         let s = self.skin();
-        let head = |title: &'static str, right: String| -> Element<'static, Message> {
-            row![text(title).size(13).font(MEDIUM).color(s.text), Space::new().width(Fill), text(right).size(12).color(s.faint)].align_y(Alignment::Center).padding(Padding { top: 14.0, right: 4.0, bottom: 6.0, left: 4.0 }).into()
+        let open = |k: &str| self.rail_open.iter().any(|o| o == k);
+        // a row as Claude's rail has them: an icon, a label that clips, a value at the right
+        let line = |c: char, label: String, right: String| -> Element<'static, Message> {
+            row![icon(c, 13).color(s.faint).width(18), container(text(label).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true), text(right).size(12.5).color(s.faint)]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .padding([5, 0])
+                .into()
         };
-        let section = |content: Element<'static, Message>| -> Element<'static, Message> {
-            container(content).width(Fill).padding([8, 12]).style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(12), ..Default::default() }).into()
+        let link = |label: &'static str, msg: Message| -> Element<'static, Message> {
+            button(text(label).size(12.5).color(s.accent)).on_press(msg).padding(Padding { top: 4.0, right: 10.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }).into()
         };
-        let line = |c: char, plain: String, strong: String| -> Element<'static, Message> {
-            // one piece of text, so a long model name wraps with its words
-            let words: [text::Span<'static, (), Font>; 2] = [iced::widget::span(strong).font(MEDIUM).color(s.text), iced::widget::span(plain).color(s.muted)];
-            row![icon(c, 13).color(s.faint).width(18), rich_text(words).size(13).width(Fill)].spacing(6).align_y(Alignment::Center).padding([4, 0]).into()
+        // a small outlined button, as Claude's "Create PR"
+        let action = |label: &'static str, msg: Option<Message>| -> Element<'static, Message> {
+            let on = msg.is_some();
+            button(text(label).size(12.5).color(if on { s.text } else { s.faint }))
+                .on_press_maybe(msg)
+                .padding([4, 10])
+                .style(move |_, st| button::Style {
+                    background: Some(Background::Color(if on && hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                    border: Border { radius: 8.0.into(), width: 1.0, color: s.line2 },
+                    ..Default::default()
+                })
+                .into()
         };
+        let remove = |msg: Message| -> Element<'static, Message> { button(icon(ic::CANCEL, 9).color(s.faint)).on_press(msg).padding([4, 5]).style(move |_, st| bare(s, st)).into() };
+        // a list inside a card that folds: a chevron, its name, how many
+        let fold = |key: &'static str, label: &'static str, count: String| -> Element<'static, Message> {
+            let chevron = if open(key) { ic::DOWN } else { ic::RIGHT };
+            button(row![icon(chevron, 8).color(s.faint).width(18), text(label).size(13).color(s.muted).width(Fill), text(count).size(12.5).color(s.faint)].spacing(8).align_y(Alignment::Center))
+                .on_press(Message::ToggleCard(key))
+                .width(Fill)
+                .padding([5, 0])
+                .style(move |_, _| button::Style { background: None, ..Default::default() })
+                .into()
+        };
+        // a card: its title and a chevron (a click folds it), what it holds at the right while folded, its body
+        let card = |key: &'static str, title: &'static str, folded: Element<'static, Message>, body: Element<'static, Message>| -> Element<'static, Message> {
+            let on = open(key);
+            let mut head = row![text(title).size(13).font(MEDIUM).color(s.text), icon(if on { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint), Space::new().width(Fill)].spacing(8).align_y(Alignment::Center);
+            if !on {
+                head = head.push(folded);
+            }
+            let head = button(head).on_press(Message::ToggleCard(key)).width(Fill).padding(0).style(move |_, _| button::Style { background: None, ..Default::default() });
+            let mut col = column![head].spacing(10);
+            if on {
+                col = col.push(body);
+            }
+            container(col)
+                .width(Fill)
+                .padding([12, 14])
+                .style(move |_| container::Style { background: Some(Background::Color(s.bg)), border: Border { radius: 12.0.into(), width: 1.0, color: s.line2 }, ..Default::default() })
+                .into()
+        };
+        let faint = |t: String| -> Element<'static, Message> { text(t).size(12.5).color(s.faint).into() };
+        // a name and, fainter, what goes with it, on one line that clips
+        let pair = |name: String, more: String, c: char| -> Element<'static, Message> {
+            let words: [text::Span<'static, (), Font>; 2] = [iced::widget::span(name).color(s.text), iced::widget::span(more).color(s.faint)];
+            row![icon(c, 12).color(s.faint).width(18), container(rich_text(words).size(13).wrapping(text::Wrapping::None)).width(Fill).clip(true)].spacing(8).align_y(Alignment::Center).into()
+        };
+
+        // environment: the GPU, the memory, the model, and the folder the chat works in
         let sys = &self.system;
         let f = |j: &Json, k: &str| j.get(k).and_then(Json::as_f64).unwrap_or(0.0);
         let gpu = sys.get("gpus").and_then(Json::as_array).and_then(|g| g.first()).cloned().unwrap_or(Json::Null);
-
-        // environment: the computer, the model and where it runs, the folder
         let mut env = column![];
         if let Some(name) = gpu.get("name").and_then(Json::as_str) {
             let name = name.trim_start_matches("NVIDIA ").trim_start_matches("GeForce ").to_string();
-            env = env.push(line(ic::PC, format!(", {:.0} of {:.0} GB used", f(&gpu, "vram_used_gb"), f(&gpu, "vram_total_gb")), name));
+            env = env.push(line(ic::PC, name, format!("{:.1} / {:.0} GB", f(&gpu, "vram_used_gb"), f(&gpu, "vram_total_gb"))));
         }
         if f(sys, "ram_total_gb") > 0.0 {
-            env = env.push(line(ic::CHIP, format!(" of {:.0} GB RAM in use", f(sys, "ram_total_gb")), format!("{:.1} GB", f(sys, "ram_total_gb") - f(sys, "ram_available_gb"))));
+            env = env.push(line(ic::CHIP, "Memory".into(), format!("{:.1} / {:.0} GB", f(sys, "ram_total_gb") - f(sys, "ram_available_gb"), f(sys, "ram_total_gb"))));
         }
         let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "No model".into());
-        let runs = sys.get("model_runs_on").and_then(Json::as_str).map(|b| if b.starts_with("GPU") { " on the GPU" } else { " on the CPU" }).unwrap_or("");
-        env = env.push(line(ic::BOLT, runs.to_string(), model));
-        // the folders file tools may use, each with a remove button, and a way to add one
-        for (i, f) in self.folders.iter().enumerate() {
-            let name = f.rsplit(['\\', '/']).find(|p| !p.is_empty()).unwrap_or(f).to_string();
-            env = env.push(
-                row![
-                    icon(ic::FOLDER, 13).color(s.faint).width(18),
-                    container(text(name).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
-                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::RemoveFolder(i)).padding([4, 5]).style(move |_, st| bare(s, st)),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .padding([2, 0]),
-            );
+        let runs = sys.get("model_runs_on").and_then(Json::as_str).map(|b| if b.starts_with("GPU") { "GPU" } else { "CPU" }).unwrap_or("");
+        env = env.push(line(ic::BOLT, model.clone(), runs.into()));
+        let dir = if self.messages.is_empty() { self.new_chat_dir() } else { self.chat_cwd.as_deref().or(self.folders.first().map(String::as_str)) };
+        env = env.push(match dir {
+            Some(d) => {
+                let place = std::path::Path::new(d).parent().map(|p| format!(" · {}", p.display())).unwrap_or_default();
+                container(pair(crate::folder_name(d), place, ic::FOLDER)).padding([5, 0]).into()
+            }
+            None => line(ic::FOLDER, "No folder".into(), String::new()),
+        });
+        // the folders every chat may use besides its own
+        env = env.push(fold("environment.folders", "Other folders", self.folders.len().to_string()));
+        if open("environment.folders") {
+            for (i, d) in self.folders.iter().enumerate() {
+                env = env.push(row![Space::new().width(18), container(text(d.clone()).size(12.5).color(s.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true), remove(Message::RemoveFolder(i))].spacing(8).align_y(Alignment::Center));
+            }
+            env = env.push(row![Space::new().width(18), link("Add folder", Message::AddFolder)].spacing(8));
         }
-        let add = if self.folders.is_empty() { "Add a folder the model may use" } else { "Add folder" };
-        env = env.push(button(row![icon(ic::ADD, 10).color(s.accent).width(18), text(add).size(12.5).color(s.accent)].spacing(6).align_y(Alignment::Center)).on_press(Message::AddFolder).padding(Padding { top: 4.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }));
+        let environment = card("environment", "Environment", faint(model), env.into());
 
-        // context: a meter and the token count
+        // context: how full it is, and what fills it, as Claude's rail breaks it down
         let (used, total) = self.context;
         let pct = if total > 0.0 { (100.0 * used / total).clamp(0.0, 100.0) } else { 0.0 };
-        let fill = (pct.round() as u16).max(1);
-        let meter = container(row![
-            container(Space::new()).width(Length::FillPortion(fill)).height(6).style(move |_| container::Style { background: Some(Background::Color(s.accent)), border: border::rounded(99), ..Default::default() }),
-            Space::new().width(Length::FillPortion(100 - fill.min(99))),
-        ])
-        .width(Fill)
-        .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(99), ..Default::default() });
-        let context = column![meter, text(self.context_note()).size(12).color(s.faint)].spacing(8).padding([6, 0]);
-
-        // changes: the files this chat changed, and undo for all of them
-        let changes = self.changes();
-        let changes_body: Element<'static, Message> = if changes.is_empty() {
-            text("No file changes in this chat").size(12.5).color(s.faint).into()
+        let part = |k: &str| self.parts.get(k).and_then(Json::as_f64).unwrap_or(0.0);
+        let counted = ["system", "tools", "skills", "instructions", "memory"].iter().map(|k| part(k)).sum::<f64>();
+        let grey = |a: f32| Color { a, ..s.muted };
+        let parts: Vec<(&str, f64, Color)> = if self.parts != Json::Null && used > 0.0 {
+            vec![
+                ("Messages", (used - counted).max(0.0), PART_BLUE),
+                ("Tools", part("tools"), PART_ORANGE),
+                ("Skills", part("skills"), PART_GREEN),
+                ("System prompt", part("system"), grey(0.85)),
+                ("Instructions", part("instructions"), grey(0.6)),
+                ("Memory", part("memory"), grey(0.4)),
+            ]
         } else {
-            let mut col = column(changes.iter().map(|(path, add, del)| {
-                let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
-                row![
-                    container(text(name).size(13).color(s.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true),
-                    text(format!("+{add}")).size(12).font(MONO).color(s.ok),
-                    text(format!("-{del}")).size(12).font(MONO).color(s.bad),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .padding([3, 0])
-                .into()
-            }));
-            col = col.push(button(text("Undo all").size(12.5).color(s.accent)).on_press(Message::UndoAll).padding(Padding { top: 4.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }));
-            col.into()
+            vec![("Used", used, PART_BLUE)]
         };
-        let files = match changes.len() {
-            0 => String::new(),
-            1 => "1 file".into(),
-            n => format!("{n} files"),
+        let free = (total - used).max(0.0);
+        let portion = |n: f64| if total > 0.0 { ((n / total) * 1000.0).round().max(1.0) as u16 } else { 1 };
+        let mut bar = row![].spacing(2).height(6);
+        for (_, n, c) in parts.iter().filter(|p| p.1 > 0.0) {
+            let c = *c;
+            bar = bar.push(container(Space::new()).width(Length::FillPortion(portion(*n))).height(6).style(move |_| container::Style { background: Some(Background::Color(c)), border: border::rounded(2), ..Default::default() }));
+        }
+        bar = bar.push(container(Space::new()).width(Length::FillPortion(portion(free))).height(6).style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(2), ..Default::default() }));
+        let share = |n: f64| if total > 0.0 { format!("{:.1}%", 100.0 * n / total) } else { String::new() };
+        let entry = |label: &str, n: f64, c: Color| -> Element<'static, Message> {
+            row![
+                container(Space::new().width(9).height(9)).style(move |_| container::Style { background: Some(Background::Color(c)), border: border::rounded(2), ..Default::default() }),
+                text(label.to_string()).size(13).color(s.muted).width(Fill),
+                text(tokens_k(n)).size(12.5).color(s.faint).width(52).align_x(Alignment::End),
+                text(share(n)).size(12.5).color(s.text).width(48).align_x(Alignment::End),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .padding([3, 0])
+            .into()
         };
+        let mut ctx = column![].spacing(8);
+        if total == 0.0 {
+            ctx = ctx.push(faint("No model".into()));
+        } else {
+            ctx = ctx.push(row![text(format!("{pct:.0}% used")).size(13).font(MEDIUM).color(s.text), Space::new().width(Fill), text(format!("{} / {}", tokens_k(used), tokens_k(total))).size(12.5).color(s.faint)].align_y(Alignment::Center));
+            ctx = ctx.push(bar);
+            let mut rows = column![];
+            for (label, n, c) in parts.iter().filter(|_| used > 0.0) {
+                rows = rows.push(entry(label, *n, *c));
+            }
+            rows = rows.push(entry("Free space", free, s.raise2));
+            ctx = ctx.push(rows);
+        }
+        // the GHOST.md files and the remembered facts, as Claude's memory files
+        let in_use = self.instructions.iter().filter(|f| f.1).count();
+        let mut lists = column![fold("context.instructions", "Instructions", in_use.to_string())];
+        if open("context.instructions") {
+            for (path, exists, global) in &self.instructions {
+                let file = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+                let note = if *global { "every chat".to_string() } else { path.rsplit(['\\', '/']).nth(1).unwrap_or("").to_string() };
+                let words: [text::Span<'static, (), Font>; 2] = [iced::widget::span(file).color(if *exists { s.text } else { s.faint }), iced::widget::span(format!(" · {note}")).color(s.faint)];
+                lists = lists.push(row![Space::new().width(18), container(rich_text(words).size(12.5).wrapping(text::Wrapping::None)).width(Fill).clip(true), link(if *exists { "Edit" } else { "Add" }, Message::EditInstructions(path.clone()))].spacing(8).align_y(Alignment::Center));
+            }
+        }
+        lists = lists.push(fold("context.memory", "Memory", self.memory.len().to_string()));
+        if open("context.memory") {
+            for (i, fact) in self.memory.iter().enumerate() {
+                lists = lists.push(row![Space::new().width(18), text(fact.clone()).size(12.5).color(s.muted).width(Fill), remove(Message::Forget(i))].spacing(8).align_y(Alignment::Center));
+            }
+            let add_memory = text_input("Add a memory", &self.memory_draft).on_input(Message::MemoryDraft).on_submit(Message::AddMemory).size(12.5).padding([5, 8]).style(move |t, st| input_style(s, t, st));
+            lists = lists.push(row![Space::new().width(18), add_memory].spacing(8).padding(Padding { top: 4.0, ..Padding::ZERO }));
+        }
+        ctx = ctx.push(lists);
+        // when old output starts being taken out (the server keeps the reply's length free, at most a quarter)
+        if total > 0.0 && self.chat.is_some() {
+            let room = (total - 4096f64.min(total / 4.0) - used).max(0.0);
+            let can_trim = self.busy.is_none().then_some(Message::TrimChat);
+            let until = container(text(format!("{} until old output is trimmed", tokens_k(room))).size(12).color(s.faint).wrapping(text::Wrapping::None)).width(Fill).clip(true);
+            ctx = ctx.push(row![until, action("Trim now", can_trim)].spacing(8).align_y(Alignment::Center));
+        }
+        let filled = (pct.round() as u16).clamp(1, 99);
+        let mini = container(row![
+            container(Space::new()).width(Length::FillPortion(filled)).height(4).style(move |_| container::Style { background: Some(Background::Color(PART_BLUE)), border: border::rounded(99), ..Default::default() }),
+            Space::new().width(Length::FillPortion(100 - filled)),
+        ])
+        .width(26)
+        .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(99), ..Default::default() });
+        let folded: Element<'static, Message> = if total > 0.0 { row![faint(format!("{pct:.0}%")), mini].spacing(8).align_y(Alignment::Center).into() } else { Space::new().into() };
+        let context = card("context", "Context", folded, ctx.into());
 
-        // tasks: the model's list for this job, when it keeps one
+        // changes: the files this chat changed, their lines, and undo for all of them
+        let changes = self.changes();
+        let (adds, dels) = changes.iter().fold((0, 0), |(a, d), c| (a + c.1, d + c.2));
+        let counts = |a: usize, d: usize| -> Element<'static, Message> { row![text(format!("+{a}")).size(12.5).font(MONO).color(s.ok), text(format!("−{d}")).size(12.5).font(MONO).color(s.bad)].spacing(6).into() };
+        let mut ch = column![];
+        if changes.is_empty() {
+            ch = ch.push(faint("No changes".into()));
+        }
+        for (path, add, del) in &changes {
+            let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+            ch = ch.push(row![icon(ic::FILE, 12).color(s.faint).width(18), container(text(name).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true), counts(*add, *del)].spacing(8).align_y(Alignment::Center).padding([4, 0]));
+        }
+        if !changes.is_empty() {
+            ch = ch.push(row![icon(ic::EDIT, 12).color(s.faint).width(18), counts(adds, dels), Space::new().width(Fill), action("Undo all", Some(Message::UndoAll))].spacing(8).align_y(Alignment::Center).padding(Padding { top: 6.0, ..Padding::ZERO }));
+        }
+        let changed: Element<'static, Message> = if changes.is_empty() { Space::new().into() } else { counts(adds, dels) };
+        let changes = card("changes", "Changes", changed, ch.into());
+
+        // the model's task list, while it keeps one
         let done = self.tasks.iter().filter(|t| t.1 == "done").count();
         let tasks = column(self.tasks.iter().map(|(task, status)| {
             let (mark, mc, tc) = match status.as_str() {
@@ -395,210 +595,187 @@ impl App {
                 "in_progress" => (ic::NOW, s.accent, s.text),
                 _ => (ic::TODO, s.faint, s.muted),
             };
-            row![icon(mark, 10).color(mc).width(14), text(task.clone()).size(13).color(tc).width(Fill)].spacing(8).align_y(Alignment::Center).padding([3, 0]).into()
+            row![icon(mark, 10).color(mc).width(18), text(task.clone()).size(13).color(tc).width(Fill)].spacing(8).align_y(Alignment::Center).padding([3, 0]).into()
         }));
+        let tasks = card("tasks", "Tasks", faint(format!("{done} of {}", self.tasks.len())), tasks.into());
 
-        // memory: what the model keeps across chats, each with a remove button
-        let memory: Element<'static, Message> = if self.memory.is_empty() {
-            text("Nothing remembered yet").size(12.5).color(s.faint).into()
-        } else {
-            column(self.memory.iter().enumerate().map(|(i, fact)| {
-                row![
-                    icon(ic::MEMORY, 11).color(s.faint).width(14),
-                    text(fact.clone()).size(13).color(s.muted).width(Fill),
-                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::Forget(i)).padding([4, 5]).style(move |_, st| bare(s, st)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .padding([2, 0])
-                .into()
-            }))
-            .into()
-        };
-        let facts = match self.memory.len() {
-            0 => String::new(),
-            1 => "1 fact".into(),
-            n => format!("{n} facts"),
-        };
-
-        let mut body = column![
-            head("Environment", String::new()),
-            section(env.into()),
-            head("Context", if total > 0.0 && used > 0.0 { format!("{pct:.0}%") } else { String::new() }),
-            section(context.into()),
-        ];
-        if !self.tasks.is_empty() {
-            body = body.push(head("Tasks", format!("{done} of {}", self.tasks.len()))).push(section(tasks.into()));
+        // background tasks, as Claude's: the chat's commands running now, each with its time and a stop button,
+        // and how many finished; a click opens the panel with all of them
+        let list = self.bg_tasks();
+        let mut bt = column![];
+        for t in list.iter().filter(|t| t.state == TaskState::Running) {
+            let title = button(container(text(t.title.clone()).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true)).on_press(Message::ShowTasks).width(Fill).padding(0).style(move |_, _| button::Style { background: None, ..Default::default() });
+            let mut r = row![icon(ic::TERMINAL, 12).color(s.faint).width(18), title].spacing(8).align_y(Alignment::Center).padding([2, 0]);
+            if let Some(secs) = t.secs {
+                r = r.push(text(duration(secs)).size(12.5).color(s.faint));
+            }
+            if let Some(id) = t.process {
+                r = r.push(stop_button(s, Message::StopProcess(id)));
+            }
+            bt = bt.push(r);
         }
-        // memory: the facts, and a field to add one
-        let add_memory = text_input("Add a memory", &self.memory_draft).on_input(Message::MemoryDraft).on_submit(Message::AddMemory).size(13).padding([6, 8]).style(move |t, st| input_style(s, t, st));
-        let memory = rail_section(s, column![memory, add_memory].spacing(8).into());
-
-        // skills: installed ones with remove, and installing
-        let link = |label: &'static str, msg: Message| -> Element<'static, Message> {
-            button(text(label).size(12.5).color(s.accent)).on_press(msg).padding(Padding { top: 4.0, right: 10.0, ..Padding::ZERO }).style(move |_, _| button::Style { background: None, ..Default::default() }).into()
-        };
-        // instructions: the global GHOST.md, and each folder's (GHOST.md, or a CLAUDE.md / AGENTS.md it has)
-        let mut instructions = column![].spacing(2);
-        for (path, exists, global) in &self.instructions {
-            let file = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
-            let note = if *global { "Every chat".to_string() } else { path.rsplit(['\\', '/']).nth(1).unwrap_or("").to_string() };
-            instructions = instructions.push(
-                row![
-                    icon(ic::FILE, 11).color(s.faint).width(14),
-                    column![text(file).size(13).font(MEDIUM).color(if *exists { s.text } else { s.faint }), text(note).size(12).color(s.faint)].width(Fill),
-                    link(if *exists { "Edit" } else { "Add" }, Message::EditInstructions(path.clone())),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .padding([3, 0]),
-            );
+        let finished = list.iter().filter(|t| t.state != TaskState::Running).count();
+        if finished > 0 {
+            bt = bt.push(button(row![icon(ic::TASKS, 12).color(s.faint).width(18), text(format!("{finished} finished")).size(13).color(s.text)].spacing(8).align_y(Alignment::Center)).on_press(Message::ShowTasks).width(Fill).padding([2, 0]).style(move |_, _| button::Style { background: None, ..Default::default() }));
         }
-        let in_use = match self.instructions.iter().filter(|f| f.1).count() {
-            0 => String::new(),
-            n => format!("{n} in use"),
-        };
+        let running_now = list.len() - finished;
+        let tasks_note = if running_now > 0 { format!("{running_now} running") } else { format!("{finished} finished") };
+        let background = (!list.is_empty()).then(|| card("background", "Background tasks", faint(tasks_note), bt.into()));
 
-        let mut skills = column![].spacing(2);
-        if self.skills.is_empty() {
-            skills = skills.push(text("No skills installed").size(12.5).color(s.faint));
+        // scheduled: the tasks the model set and the /loop ones, and the one running now
+        let jobs = self.background.get("jobs").and_then(Json::as_array).unwrap_or(&[]);
+        let running = self.background.get("running").and_then(Json::as_str).is_some();
+        let mut sc = column![];
+        if running {
+            sc = sc.push(line(ic::NOW, "Running one now".into(), String::new()));
         }
+        for j in jobs {
+            let g = |k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+            sc = sc.push(row![pair(g("name"), format!(" · {}, next {}", g("when"), g("next")), ic::CLOCK), link("Run", Message::RunScheduled(g("id"))), remove(Message::CancelScheduled(g("id")))].spacing(4).align_y(Alignment::Center).padding([3, 0]));
+        }
+        let due = match (running, jobs.len()) {
+            (true, _) => "running".to_string(),
+            (false, 0) => String::new(),
+            (false, n) => n.to_string(),
+        };
+        let scheduled = (running || !jobs.is_empty()).then(|| card("scheduled", "Scheduled", faint(due), sc.into()));
+
+        // skills: installed ones, and installing
+        let mut sk = column![];
         for (name, desc) in &self.skills {
-            skills = skills.push(
-                row![
-                    icon(ic::SKILL, 11).color(s.faint).width(14),
-                    column![text(name.clone()).size(13).font(MEDIUM).color(s.text), text(crate::clip_line(desc, 90)).size(12).color(s.faint)].width(Fill),
-                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::RemoveSkill(name.clone())).padding([4, 5]).style(move |_, st| bare(s, st)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .padding([3, 0]),
-            );
+            sk = sk.push(row![pair(name.clone(), format!(" · {desc}"), ic::SKILL), remove(Message::RemoveSkill(name.clone()))].spacing(8).align_y(Alignment::Center).padding([2, 0]));
         }
-        skills = skills.push(row![link("Install from folder", Message::InstallSkill(false)), link("From .zip", Message::InstallSkill(true))]);
-        let skill_link = text_input("Paste a skill link (GitHub or .zip)", &self.skill_link).id("skill-link").on_input(Message::SkillLink).on_submit(Message::InstallLink).size(13).padding([6, 8]).style(move |t, st| input_style(s, t, st));
-        skills = skills.push(container(skill_link).padding(Padding { top: 6.0, ..Padding::ZERO }));
+        sk = sk.push(row![link("Install from folder", Message::InstallSkill(false)), link("From .zip", Message::InstallSkill(true))]);
+        let skill_link = text_input("Skill link (GitHub or .zip)", &self.skill_link).id("skill-link").on_input(Message::SkillLink).on_submit(Message::InstallLink).size(12.5).padding([5, 8]).style(move |t, st| input_style(s, t, st));
+        sk = sk.push(container(skill_link).padding(Padding { top: 4.0, ..Padding::ZERO }));
         // a link or folder with several skills: which to install
         if let Some((_, choices)) = &self.skill_choices {
-            skills = skills.push(container(text(format!("It has {} skills. Install which?", choices.len())).size(12.5).color(s.faint)).padding(Padding { top: 8.0, ..Padding::ZERO }));
+            sk = sk.push(container(faint(format!("It has {} skills. Install which?", choices.len()))).padding(Padding { top: 6.0, ..Padding::ZERO }));
             for (path, name, desc) in choices {
                 let place = if path.is_empty() { desc.clone() } else { format!("{path} · {desc}") };
-                skills = skills.push(
-                    row![
-                        icon(ic::SKILL, 11).color(s.faint).width(14),
-                        column![text(name.clone()).size(13).font(MEDIUM).color(s.text), text(crate::clip_line(&place, 90)).size(12).color(s.faint)].width(Fill),
-                        link("Install", Message::InstallChoice(Some(path.clone()))),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center)
-                    .padding([3, 0]),
-                );
+                sk = sk.push(row![pair(name.clone(), format!(" · {place}"), ic::SKILL), link("Install", Message::InstallChoice(Some(path.clone())))].spacing(8).align_y(Alignment::Center));
             }
-            skills = skills.push(row![link("Install all", Message::InstallChoice(None)), link("Cancel", Message::CancelChoice)]);
+            sk = sk.push(row![link("Install all", Message::InstallChoice(None)), link("Cancel", Message::CancelChoice)]);
         }
+        let skills = card("skills", "Skills", faint(if self.skills.is_empty() { String::new() } else { self.skills.len().to_string() }), sk.into());
 
         // MCP servers: each with its state, and editing the list
-        let mut mcp = column![].spacing(2);
-        if self.mcp.is_empty() {
-            mcp = mcp.push(text("No MCP servers yet").size(12.5).color(s.faint));
-        }
+        let mut mc = column![];
         for (name, state, tools) in &self.mcp {
             let (dot, note) = match state.as_str() {
                 "ready" => (s.ok, format!("{tools} tools")),
                 "starting" => (s.warn, "starting".to_string()),
-                other => (s.bad, crate::clip_line(other, 80)),
+                other => (s.bad, crate::clip_line(other, 40)),
             };
-            mcp = mcp.push(
+            mc = mc.push(
                 row![
-                    container(Space::new().width(7).height(7)).style(move |_| container::Style { background: Some(Background::Color(dot)), border: border::rounded(99), ..Default::default() }).padding(0),
-                    column![text(name.clone()).size(13).font(MEDIUM).color(s.text), text(note).size(12).color(s.faint)].width(Fill),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center)
-                .padding([3, 0]),
-            );
-        }
-        mcp = mcp.push(row![link("Edit servers", Message::McpEdit), link("Reload", Message::McpReload), link("From Claude", Message::McpImport)]);
-        let servers = match self.mcp.iter().filter(|m| m.1 == "ready").count() {
-            0 => String::new(),
-            n => format!("{n} ready"),
-        };
-
-        // scheduled: the heartbeat (how often it goes through HEARTBEAT.md) and the tasks the model set
-        let hb = self.background.get("heartbeat").cloned().unwrap_or(Json::Null);
-        let hs = |k: &str| hb.get(k).and_then(Json::as_str).unwrap_or("").to_string();
-        let every = hb.get("every").and_then(Json::as_f64).unwrap_or(0.0) as u32;
-        let gap = |m: u32| if m % 60 == 0 { format!("{} h", m / 60) } else { format!("{m} min") };
-        let mut beat = column![text("Heartbeat").size(13).font(MEDIUM).color(s.text)].width(Fill);
-        let first = match (every, hb.get("checklist").and_then(Json::as_bool).unwrap_or(false)) {
-            (0, _) => "Off. When on, ghost goes through your checklist on its own and tells you only what needs you.".to_string(),
-            (_, false) => format!("Every {}, but the checklist is empty, so it skips", gap(every)),
-            (m, true) => format!("Every {}, next {}", gap(m), hs("next")),
-        };
-        beat = beat.push(text(first).size(12).color(s.faint));
-        if !hs("last").is_empty() && !hs("note").is_empty() {
-            beat = beat.push(text(crate::clip_line(&format!("Last {}: {}", hs("last"), hs("note")), 90)).size(12).color(s.faint));
-        }
-        let mut sched = column![row![icon(ic::HEART, 11).color(if every > 0 { s.accent } else { s.faint }).width(14), beat].spacing(8).padding([3, 0])].spacing(2);
-        // how often: the one in use in plain text, the others to click
-        let mut gaps = row![].spacing(10).padding(Padding { top: 2.0, bottom: 2.0, left: 22.0, right: 0.0 });
-        for (label, m) in [("Off", 0), ("15 min", 15), ("30 min", 30), ("1 h", 60), ("2 h", 120)] {
-            let on = m == every;
-            gaps = gaps.push(button(text(label).size(12.5).color(if on { s.text } else { s.accent }).font(if on { MEDIUM } else { BODY })).on_press_maybe((!on).then_some(Message::SetHeartbeat(m))).padding(0).style(move |_, _| button::Style { background: None, ..Default::default() }));
-        }
-        sched = sched.push(gaps);
-        let mut beat_links = row![link("Edit checklist", Message::EditHeartbeat)];
-        if every > 0 {
-            beat_links = beat_links.push(link("Check now", Message::RunScheduled("heartbeat".into())));
-        }
-        sched = sched.push(container(beat_links).padding(Padding { left: 22.0, ..Padding::ZERO }));
-        let jobs = self.background.get("jobs").and_then(Json::as_array).unwrap_or(&[]);
-        if jobs.is_empty() {
-            sched = sched.push(container(text("No scheduled tasks. Ask for one in a chat, like \"every weekday at 9:00, check the build\".").size(12.5).color(s.faint)).padding(Padding { top: 8.0, ..Padding::ZERO }));
-        }
-        for j in jobs {
-            let f = |k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
-            let mut about = column![text(f("name")).size(13).font(MEDIUM).color(s.text), text(format!("{}, next {}", f("when"), f("next"))).size(12).color(s.faint)].width(Fill);
-            if !f("note").is_empty() {
-                about = about.push(text(crate::clip_line(&format!("Last {}: {}", f("last"), f("note")), 90)).size(12).color(s.faint));
-            }
-            sched = sched.push(
-                row![
-                    icon(ic::CLOCK, 11).color(s.faint).width(14),
-                    about,
-                    link("Run", Message::RunScheduled(f("id"))),
-                    button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::CancelScheduled(f("id"))).padding([4, 5]).style(move |_, st| bare(s, st)),
+                    container(container(Space::new().width(7).height(7)).style(move |_| container::Style { background: Some(Background::Color(dot)), border: border::rounded(99), ..Default::default() })).width(18).align_x(Alignment::Center),
+                    container(text(name.clone()).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+                    text(note).size(12.5).color(s.faint),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
-                .padding(Padding { top: 8.0, bottom: 3.0, ..Padding::ZERO }),
+                .padding([4, 0]),
             );
         }
-        let scheduled = match (jobs.len(), every > 0) {
-            (0, false) => String::new(),
-            (0, true) => "heartbeat on".into(),
-            (1, _) => "1 task".into(),
-            (n, _) => format!("{n} tasks"),
+        mc = mc.push(row![link("Edit servers", Message::McpEdit), link("Reload", Message::McpReload), link("From Claude", Message::McpImport)]);
+        let ready = self.mcp.iter().filter(|m| m.1 == "ready").count();
+        let broken = self.mcp.iter().filter(|m| m.1 != "ready" && m.1 != "starting").count();
+        let mcp_note = match (ready, broken) {
+            (_, b) if b > 0 => format!("{b} not working"),
+            (0, _) => String::new(),
+            (r, _) => format!("{r} ready"),
         };
+        let mcp = card("mcp", "MCP servers", faint(mcp_note), mc.into());
 
-        let body = body
-            .push(head("Changes", files))
-            .push(section(changes_body))
-            .push(head("Scheduled", scheduled))
-            .push(rail_section(s, sched.into()))
-            .push(head("Instructions", in_use))
-            .push(rail_section(s, instructions.into()))
-            .push(head("Memory", facts))
-            .push(memory)
-            .push(head("Skills", if self.skills.is_empty() { String::new() } else { self.skills.len().to_string() }))
-            .push(rail_section(s, skills.into()))
-            .push(head("MCP servers", servers))
-            .push(rail_section(s, mcp.into()));
+        let mut body = column![environment, context, changes].spacing(10);
+        if !self.tasks.is_empty() {
+            body = body.push(tasks);
+        }
+        for c in [background, scheduled].into_iter().flatten() {
+            body = body.push(c);
+        }
+        let body = body.push(skills).push(mcp);
         let top = row![drag_area(container(Space::new()).width(Fill).height(32)), self.window_controls()];
         container(column![top, scrollable(container(body).padding(Padding { top: 0.0, right: 14.0, bottom: 14.0, left: 14.0 })).id("rail").height(Fill).style(move |t, st| scroll_style(s, t, st))])
-            .width(292)
+            .width(300)
             .height(Fill)
             .style(move |_| container::Style { background: Some(Background::Color(s.side)), border: Border { width: 0.0, ..Default::default() }, ..Default::default() })
+            .into()
+    }
+
+    /// The background tasks panel beside the rail, as Claude's: the running commands, then the finished ones
+    /// (newest first), each unfolding to its command and what it printed.
+    fn tasks_panel(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let list = self.bg_tasks();
+        let tool = |c: char, msg: Message| -> Element<'static, Message> { button(icon(c, 12).color(s.muted)).on_press(msg).padding(7).style(move |_, st| bare(s, st)).into() };
+        let finished: Vec<String> = list.iter().filter(|t| t.state != TaskState::Running).map(|t| t.key.clone()).collect();
+        let head = row![
+            text("Background tasks").size(14).font(MEDIUM).color(s.text),
+            Space::new().width(Fill),
+            tool(ic::DELETE, Message::ClearFinished(finished.clone())),
+            tool(if self.tasks_wide { ic::RESTORE } else { ic::MAXIMIZE }, Message::WideTasks),
+            tool(ic::CANCEL, Message::CloseTasks),
+        ]
+        .spacing(2)
+        .align_y(Alignment::Center)
+        .padding(Padding { top: 8.0, right: 8.0, bottom: 8.0, left: 16.0 });
+        let item = |t: &crate::BgTask| -> Element<'static, Message> {
+            let open = t.state == TaskState::Running || self.task_open.contains(&t.key);
+            let (right, color) = match (t.state, t.secs) {
+                (TaskState::Failed, _) => ("Failed".to_string(), s.bad),
+                (TaskState::Stopped, Some(n)) => (format!("Stopped · {}", duration(n)), s.faint),
+                (TaskState::Stopped, None) => ("Stopped".to_string(), s.faint),
+                (_, Some(n)) => (duration(n), s.faint),
+                (_, None) => (String::new(), s.faint),
+            };
+            let mut top = row![
+                icon(if open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint).width(14),
+                container(text(t.title.clone()).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+                text(right).size(12.5).color(color),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+            if let (TaskState::Running, Some(id)) = (t.state, t.process) {
+                top = top.push(stop_button(s, Message::StopProcess(id)));
+            }
+            let top = button(top).on_press(Message::ToggleTask(t.key.clone())).width(Fill).padding(0).style(move |_, _| button::Style { background: None, ..Default::default() });
+            let mut body = column![top].spacing(8);
+            if open {
+                let shown = if t.output.is_empty() { format!("$ {}", t.command) } else { format!("$ {}\n{}", t.command, t.output) };
+                let out = scrollable(container(text(shown).size(12).font(MONO).color(s.muted)).width(Fill).padding(Padding { right: 10.0, ..Padding::ZERO })).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st));
+                body = body.push(container(out).max_height(260).padding(Padding { left: 22.0, ..Padding::ZERO }));
+            }
+            container(body).width(Fill).padding([10, 12]).style(move |_| container::Style { background: Some(Background::Color(s.raise)), border: border::rounded(10), ..Default::default() }).into()
+        };
+        let mut col = column![].spacing(6);
+        for t in list.iter().filter(|t| t.state == TaskState::Running) {
+            col = col.push(item(t));
+        }
+        if !finished.is_empty() {
+            let group = button(row![icon(if self.finished_open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint).width(14), text("Finished").size(12.5).color(s.faint), text(finished.len().to_string()).size(12.5).color(s.faint)].spacing(6).align_y(Alignment::Center))
+                .on_press(Message::ToggleFinished)
+                .padding(Padding { top: 10.0, right: 0.0, bottom: 4.0, left: 2.0 })
+                .style(move |_, _| button::Style { background: None, ..Default::default() });
+            col = col.push(group);
+            if self.finished_open {
+                for t in list.iter().filter(|t| t.state != TaskState::Running).take(self.tasks_shown) {
+                    col = col.push(item(t));
+                }
+                if finished.len() > self.tasks_shown {
+                    col = col.push(button(text("Show more").size(12.5).color(s.muted)).on_press(Message::MoreTasks).padding([6, 4]).style(move |_, st| bare(s, st)));
+                }
+            }
+        }
+        if list.is_empty() {
+            col = col.push(text("None").size(12.5).color(s.faint));
+        }
+        let body = scrollable(container(col).padding(Padding { top: 0.0, right: 12.0, bottom: 12.0, left: 12.0 })).height(Fill).style(move |t, st| scroll_style(s, t, st));
+        container(column![head, body])
+            .width(if self.tasks_wide { 600 } else { 400 })
+            .height(Fill)
+            .style(move |_| container::Style { background: Some(Background::Color(s.side)), border: Border { width: 1.0, color: s.line, radius: 0.0.into() }, ..Default::default() })
             .into()
     }
 
@@ -707,14 +884,15 @@ impl App {
             top = top.push(icon_button(s, ic::OPEN_PANE, Message::ToggleSidebar));
         }
         if let (Some(title), false) = (&self.title, self.messages.is_empty()) {
-            top = top.push(
-                button(row![text(title.as_str()).size(14).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None), icon(ic::DOWN, 9).color(s.muted)].spacing(8).align_y(Alignment::Center))
-                    .on_press(Message::Menu(Some(Menu::Chat)))
-                    .padding([5, 8])
-                    .style(move |_, st| row_style(s, st, false)),
-            );
+            // a long title clips rather than running under what is beside the chat
+            let title = button(row![text(title.as_str()).size(14).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None), icon(ic::DOWN, 9).color(s.muted)].spacing(8).align_y(Alignment::Center))
+                .on_press(Message::Menu(Some(Menu::Chat)))
+                .padding([5, 8])
+                .style(move |_, st| row_style(s, st, false));
+            top = top.push(container(row![title, Space::new().width(Fill)]).width(Fill).clip(true));
+        } else {
+            top = top.push(Space::new().width(Fill));
         }
-        top = top.push(Space::new().width(Fill));
         // the title bar: drag the window by its empty part, the window's buttons at its right
         // the rail's switch; with the rail open, the window's buttons move to its top
         let on = self.rail;
@@ -768,6 +946,7 @@ impl App {
         let perch = row![Space::new().width(18), container(ghost).height(58).clip(true), container(text(say).size(13).color(s.muted)).padding(Padding { bottom: 22.0, left: 10.0, ..Padding::ZERO })]
             .align_y(Alignment::End)
             .height(58);
+        let mode_menu = self.menu == Some(Menu::Mode);
         let editor = text_editor(&self.composer)
             .placeholder(if self.messages.is_empty() { "How can I help you today?" } else { "Reply to ghost-infer" })
             .on_action(Message::Edit)
@@ -776,20 +955,29 @@ impl App {
             .min_height(34)
             .max_height(240)
             .size(15)
-            .key_binding(|kp| {
+            .key_binding(move |kp| {
                 // Enter sends; Shift+Enter starts a new line
                 if matches!(kp.key, keyboard::Key::Named(keyboard::key::Named::Enter)) && !kp.modifiers.shift() {
                     return Some(text_editor::Binding::Custom(Message::Send));
                 }
+                // Shift+Tab goes to the next permission mode, as in Claude Code
+                if matches!(kp.key, keyboard::Key::Named(keyboard::key::Named::Tab)) && kp.modifiers.shift() {
+                    return Some(text_editor::Binding::Custom(Message::CycleMode));
+                }
+                // the mode menu open: its number keys pick a mode
+                if let (true, keyboard::Key::Character(c)) = (mode_menu, &kp.key) {
+                    if let Some(m) = crate::mode_key(c) {
+                        return Some(text_editor::Binding::Custom(m));
+                    }
+                }
                 text_editor::Binding::from_key_press(kp)
             })
             .style(move |t, st| editor_style(s, t, st));
-        let plus = container(button(container(icon(ic::ADD, 13).color(s.muted)).center(32)).on_press(Message::OpenPlus).padding(0).style(move |_, st| round_style(s, st))).id("plus");
+        let plus = container(button(container(icon(ic::ADD, 13).color(s.muted)).center(32)).on_press(Message::OpenMenu(Menu::Plus)).padding(0).style(move |_, st| round_style(s, st))).id("plus");
         let busy = self.busy.is_some();
         let send = if busy {
-            // stop: a rounded square with a square in it
-            let mark = container(Space::new()).width(10).height(10).style(move |_| container::Style { background: Some(Background::Color(s.ink)), border: border::rounded(2), ..Default::default() });
-            button(container(mark).center(32)).on_press(Message::Stop).padding(0).style(move |_, st| stop_style(s, st))
+            // stop: a rounded square, nothing in it
+            button(Space::new().width(32).height(32)).on_press(Message::Stop).padding(0).style(move |_, st| stop_style(s, st))
         } else {
             button(container(icon(ic::UP, 13).color(s.ink)).center(32)).on_press(Message::Send).padding(0).style(move |_, st| send_style(s, st))
         };
@@ -805,15 +993,19 @@ impl App {
             .on_press(Message::ToggleThinking)
             .padding([4, 8])
             .style(move |_, st| row_style(s, st, false));
-        let model = pick_list(self.models.clone(), self.model.clone(), Message::PickModel)
-            .placeholder("Model")
-            .text_size(13)
-            .font(MEDIUM)
-            .padding([4, 8])
-            .style(move |t, st| pick_style(s, t, st))
-            .menu_style(move |t| menu_style(s, t));
+        // the model by name, as Claude shows it: a label that opens the model menu
+        let name = self.model.as_ref().map_or("Model", |m| m.label.as_str());
+        let model = container(button(text(name).size(13).color(s.text)).on_press(Message::OpenMenu(Menu::Model)).padding([4, 8]).style(move |_, st| row_style(s, st, false))).id("model");
+        let mode = crate::MODES[self.perm].1;
+        let mode = container(button(text(mode).size(13).color(s.text)).on_press(Message::OpenMenu(Menu::Mode)).padding([4, 8]).style(move |_, st| row_style(s, st, true))).id("mode");
+        // where the chat works: picked for a new chat, then kept (as a Claude Code session keeps its folder)
         let folder = row![icon(ic::FOLDER, 12).color(s.muted), text(self.folder_label()).size(13).color(s.muted)].spacing(7).align_y(Alignment::Center);
-        let mut under = row![container(folder).padding([4, 8]), Space::new().width(Fill), model, think].spacing(2).align_y(Alignment::Center).padding(Padding { top: 8.0, right: 4.0, bottom: 0.0, left: 4.0 });
+        let folder: Element<'_, Message> = if self.messages.is_empty() {
+            container(button(folder).on_press(Message::OpenMenu(Menu::Folder)).padding([4, 8]).style(move |_, st| row_style(s, st, false))).id("folder").into()
+        } else {
+            container(folder).padding([4, 8]).into()
+        };
+        let mut under = row![folder, Space::new().width(Fill), model, think, mode].spacing(2).align_y(Alignment::Center).padding(Padding { top: 8.0, right: 4.0, bottom: 0.0, left: 4.0 });
         // how full the context is, as Claude shows it: a ring, its numbers on hover, the side panel on a click
         let (used, total) = self.context;
         if total > 0.0 {
@@ -828,10 +1020,47 @@ impl App {
             });
             under = under.push(tooltip(ring, tip, tooltip::Position::Top).gap(6));
         }
-        match self.plan() {
-            Some(plan) => column![plan, perch, card, under].into(),
-            None => column![perch, card, under].into(),
+        let mut dock = column![];
+        if let Some(goal) = self.goal_pin() {
+            dock = dock.push(goal);
         }
+        if let Some(plan) = self.plan() {
+            dock = dock.push(plan);
+        }
+        dock.push(perch).push(card).push(under).into()
+    }
+
+    /// The chat's /goal pinned above the message box: what done looks like, and how the checks went.
+    fn goal_pin(&self) -> Option<Element<'_, Message>> {
+        let g = self.goal.as_ref()?;
+        let s = self.skin();
+        let (mark, color, state) = match g.state.as_str() {
+            _ if g.checking => (ic::NOW, s.accent, "checking…".to_string()),
+            "met" => (ic::CHECK, s.ok, "met".to_string()),
+            "stopped" => (ic::TODO, s.faint, format!("stopped after {} checks", g.limit)),
+            _ if g.tries == 0 => (ic::NOW, s.accent, "working on it".to_string()),
+            _ => (ic::NOW, s.accent, format!("not met yet · {} of {} checks", g.tries, g.limit)),
+        };
+        let mut head = row![
+            icon(mark, 12).color(color),
+            container(text(format!("Goal: {}", g.text)).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+            text(state).size(12.5).color(s.faint),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        if g.state == "active" && self.busy.is_none() {
+            head = head.push(button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::ClearGoal).padding([4, 5]).style(move |_, st| bare(s, st)));
+        }
+        let mut body = column![head].spacing(4);
+        if !g.reason.is_empty() && !g.checking {
+            body = body.push(container(text(g.reason.clone()).size(12).color(s.faint)).padding(Padding { left: 22.0, ..Padding::ZERO }));
+        }
+        let card = container(body).padding([8, 12]).width(Fill).style(move |_| container::Style {
+            background: Some(Background::Color(s.raise)),
+            border: Border { radius: 14.0.into(), width: 1.0, color: s.line2 },
+            ..Default::default()
+        });
+        Some(container(card).padding(Padding { bottom: 6.0, ..Padding::ZERO }).into())
     }
 
     /// The model's task list pinned above the message box: the step it is on and how far along it is, and the
@@ -1121,10 +1350,6 @@ impl<'a> markdown::Viewer<'a, Message> for Md {
 }
 
 /// A box in the rail.
-fn rail_section<'a>(s: &'static Skin, content: Element<'a, Message>) -> Element<'a, Message> {
-    container(content).width(Fill).padding([8, 12]).style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(12), ..Default::default() }).into()
-}
-
 /// A count with thousands separators: 16384 -> "16,384".
 fn thousands(n: f64) -> String {
     let digits = (n.max(0.0).round() as u64).to_string();
@@ -1215,23 +1440,6 @@ fn editor_style(s: &Skin, theme: &Theme, st: text_editor::Status) -> text_editor
 
 fn input_style(s: &Skin, _: &Theme, _: text_input::Status) -> text_input::Style {
     text_input::Style { background: Background::Color(s.hover), border: Border { radius: 8.0.into(), width: 1.0, color: s.line2 }, placeholder: s.faint, value: s.text, selection: Color { a: 0.3, ..s.accent }, icon: s.faint }
-}
-
-fn pick_style(s: &Skin, _: &Theme, st: pick_list::Status) -> pick_list::Style {
-    let hover = matches!(st, pick_list::Status::Hovered | pick_list::Status::Opened { .. });
-    pick_list::Style { background: Background::Color(if hover { s.hover } else { Color::TRANSPARENT }), border: Border { radius: 8.0.into(), width: 0.0, color: Color::TRANSPARENT }, text_color: s.muted, placeholder_color: s.faint, handle_color: s.faint }
-}
-
-fn menu_style(s: &Skin, theme: &Theme) -> iced::overlay::menu::Style {
-    let base = iced::overlay::menu::default(theme);
-    iced::overlay::menu::Style {
-        background: Background::Color(s.menu),
-        border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
-        text_color: s.text,
-        selected_text_color: s.text,
-        selected_background: Background::Color(s.hover),
-        ..base
-    }
 }
 
 fn scroll_style(s: &Skin, theme: &Theme, st: scrollable::Status) -> scrollable::Style {

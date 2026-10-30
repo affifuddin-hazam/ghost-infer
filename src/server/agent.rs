@@ -3,21 +3,28 @@
 //! back, round after round. Every step streams to the client as an event, and the chat is saved as it goes
 //! in %LOCALAPPDATA%\ghost-infer\chats, so every client sees the same chats.
 //!
+//! A request: {"chat"?, "message"?, "mode"?, "cwd"?, "thinking"?, "max_tokens"?, "tools"?, "keep_going"?}.
+//! "mode" is the permission mode (auto, manual, accept_edits, plan, bypass; default manual), "cwd" a new
+//! chat's working directory (kept with the chat), "tools" the tool groups (default: all of them). A message
+//! may be a command: /goal <what done looks like> (or /goal clear), /loop <interval> <prompt> (or /loop stop).
+//!
 //! Events, one JSON object per server-sent event:
 //!   {"type":"chat","id","title","checkpoint"}     the chat this run belongs to (new chats get an id here), and
 //!                                                 the checkpoint its file changes go under (POST /api/tools/undo)
 //!   {"type":"text","text"}                        reply text as it streams (a thinking reply starts with <think>)
 //!   {"type":"tool_call","id","name","arguments"}  the model called a tool
 //!   {"type":"approval","id","name","arguments","group"}  waiting for POST /api/agent/approve {"id","decision"}
-//!   {"type":"tool_result","id","name","result","denied"}
+//!   {"type":"tool_result","id","name","result","denied","secs"?}  ("secs": how long it ran)
 //!   {"type":"context","prompt_tokens","completion_tokens","context_length"}  after each round
 //!   {"type":"done","finish"} or {"type":"error","message"}
 //!   {"type":"tasks","tasks"}                      the model's task list changed: [{"text","status"}]
 //!   {"type":"title","id","title"}                 after a chat's first reply: the title the model gave it
 //!   {"type":"nudge","kind","text"}                the harness sent the model back: "check" its work, or keep
-//!                                                 going on its task list ("goal")
+//!                                                 going ("goal": a /goal not met, or a task list left open)
+//!   {"type":"goal","goal","checking"?}            the chat's /goal: {"text","limit","tries","state","reason"}
+//!                                                 (state active, met or stopped; null once cleared)
 //!
-//! Scheduled tasks and the heartbeat (schedule.rs) run here too, with nobody watching: their events go
+//! Scheduled tasks (schedule.rs) run here too, with nobody watching: their events go
 //! nowhere, the chat file keeps it all, and the chat is marked unread for the clients.
 
 use std::collections::{HashMap, HashSet};
@@ -60,14 +67,14 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"edit_file","description":"Replace exact text in a file. Read the file first; old_string must match exactly once, so include enough surrounding lines.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"old_string":{"type":"string","description":"The exact text to replace"},"new_string":{"type":"string","description":"The text to put in its place"},"replace_all":{"type":"boolean","description":"Replace every match"}},"required":["path","old_string","new_string"]}}}
  ],
  "cmd": [
-  {"type":"function","function":{"name":"run_command","description":"Run programs, builds, tests and scripts: a Windows PowerShell command and its output. To find or read files use list_files, search_files and read_file instead (stops after 60 s unless timeout is set).","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"timeout":{"type":"integer","description":"Seconds, up to 600"}},"required":["command"]}}},
-  {"type":"function","function":{"name":"start_process","description":"Start a long-running PowerShell command (a server, a build) in the background. Returns its id.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"}},"required":["command"]}}},
+  {"type":"function","function":{"name":"run_command","description":"Run programs, builds, tests and scripts: a Windows PowerShell command and its output. To find or read files use list_files, search_files and read_file instead (stops after 60 s unless timeout is set).","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"timeout":{"type":"integer","description":"Seconds, up to 600"},"description":{"type":"string","description":"A few words saying what it does, for the user: Run the unit tests"}},"required":["command"]}}},
+  {"type":"function","function":{"name":"start_process","description":"Start a long-running PowerShell command (a server, a build) in the background. Returns its id.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"description":{"type":"string","description":"A few words saying what it does, for the user: Run the unit tests"}},"required":["command"]}}},
   {"type":"function","function":{"name":"check_process","description":"A background process's state and the output it printed since the last check.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}},
   {"type":"function","function":{"name":"stop_process","description":"Stop a background process.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}}
  ],
  "web": [
-  {"type":"function","function":{"name":"web_search","description":"Search the web. Returns titles, addresses and snippets.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What to search for"}},"required":["query"]}}},
-  {"type":"function","function":{"name":"fetch_url","description":"Read a web page as text.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"http(s) address"}},"required":["url"]}}}
+  {"type":"function","function":{"name":"web_search","description":"Search the web. Returns titles, addresses and snippets. Answer from what the results say, naming the site each fact comes from, and end the reply with a Sources list of the links you used. To see what a site or page itself says, open it with fetch_url instead.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What to search for"}},"required":["query"]}}},
+  {"type":"function","function":{"name":"fetch_url","description":"Open a web page, or a site the user names (example.com), and read what it says as text. Answer only from what the page says.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"http(s) address"}},"required":["url"]}}}
  ]
 }"#;
 
@@ -89,9 +96,9 @@ const SKILL_TOOLS: [&str; 2] = [
 /// remember (Qwen3 4B said it remembered without saving anything). The turned-on groups' other tools are named
 /// in the system prompt only, and tool_search loads a description when the model needs one: a short prompt
 /// reads faster and leaves a small model less to choose from.
-const CORE_TOOLS: [&str; 10] = ["read_file", "list_files", "search_files", "write_file", "edit_file", "run_command", "use_skill", "get_system_info", "update_tasks", "remember"];
+const CORE_TOOLS: [&str; 12] = ["read_file", "list_files", "search_files", "write_file", "edit_file", "run_command", "web_search", "fetch_url", "use_skill", "get_system_info", "update_tasks", "remember"];
 
-const TOOL_SEARCH: &str = r#"{"type":"function","function":{"name":"tool_search","description":"Load the full description of tools that the system prompt lists by name only, so you can call them. Use \"select:<name>,<name>\" for tools you know by name, or a few words saying what you need to find tools by what they do. Call it before using such a tool for the first time in a chat.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"select:<names>, or keywords"},"max_results":{"type":"integer","description":"Most tools to return for keywords (default 5)"}},"required":["query"]}}}"#;
+const TOOL_SEARCH: &str = r#"{"type":"function","function":{"name":"tool_search","description":"Load the full description of tools that the system prompt lists by name only, so you can call them. Use \"select:<name>,<name>\" for tools you know by name, or a few words saying what you need to find tools by what they do. Call it before using such a tool for the first time in a chat. Not for telling the user what you can do: every tool is already named in the system prompt.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"select:<names>, or keywords"},"max_results":{"type":"integer","description":"Most tools to return for keywords (default 5)"}},"required":["query"]}}}"#;
 
 /// The tools the model gets described in the prompt: the core ones of these groups, and tool_search when
 /// others wait to be loaded.
@@ -125,6 +132,15 @@ fn tool_search(deferred: &[Json], arguments: &str) -> String {
     let args = Json::parse(arguments).unwrap_or(Json::Null);
     let query = args.get("query").and_then(Json::as_str).unwrap_or("").trim().to_string();
     let max = args.get("max_results").and_then(Json::as_f64).map_or(5, |n| (n as usize).clamp(1, 20));
+    // asked for tools that are described already (a model showing what it can do): nothing to load, and no
+    // search on their words either, which would load unrelated ones
+    if let Some(names) = query.strip_prefix("select:") {
+        let names: Vec<&str> = names.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+        let loaded = |n: &&str| CORE_TOOLS.contains(n) || *n == "tool_search";
+        if !names.is_empty() && names.iter().all(loaded) {
+            return format!("Nothing to load: {} are described in your prompt already, so call them directly. To tell the user what you can do, answer from the system prompt.", names.join(", "));
+        }
+    }
     // exact names; a name that is no tool's ("select:disk_space") is searched for by its words instead
     let selected: Vec<&Json> = query.strip_prefix("select:").map_or(Vec::new(), |names| names.split(',').map(str::trim).filter_map(|n| deferred.iter().find(|t| tool_name(t) == n)).collect());
     let found: Vec<&Json> = match selected.is_empty() {
@@ -162,6 +178,62 @@ fn all_tools(groups: &[String]) -> Vec<Json> {
     tools
 }
 
+/// Every tool group. A reply gets them all unless the client names some (as in Claude Code, the tools are
+/// always there): the permission mode decides which calls need the user's OK.
+const ALL_GROUPS: [&str; 5] = ["files", "edit", "cmd", "web", "mcp"];
+
+/// The permission modes, as Claude Code has them: auto (ghost decides, asking only about risky commands,
+/// MCP tools and skill installs), manual (ask before every change), accept_edits (file changes go ahead,
+/// the rest is asked), plan (nothing is changed or run: the model reads, then proposes a plan) and bypass
+/// (nothing is asked).
+const MODES: [&str; 5] = ["auto", "manual", "accept_edits", "plan", "bypass"];
+
+/// What a call needs under a permission mode: to run, the user's OK, or nothing done (the reason why).
+enum Gate {
+    Run,
+    Ask,
+    Refuse(&'static str),
+}
+
+/// Told to the model when plan mode refuses a change.
+const PLAN_REFUSAL: &str = "Not done: plan mode is on, so nothing is changed or run. Read and search what you need, then reply with your plan, and ask the user to switch out of plan mode to carry it out.";
+
+/// Rides on each message sent in plan mode.
+const PLAN_NOTE: &str = "(Note from ghost, not from the user: plan mode is on. Do not change files or run commands. Read and search what you need, then reply with a short numbered plan, and ask the user to switch out of plan mode to carry it out.)";
+
+fn gate(mode: &str, group: &str, args: &Json) -> Gate {
+    match (mode, group) {
+        ("bypass", _) => Gate::Run,
+        ("plan", "edit" | "cmd" | "skills") => Gate::Refuse(PLAN_REFUSAL),
+        ("accept_edits", "edit") | ("auto", "edit" | "web") => Gate::Run,
+        ("auto", "cmd") if !risky_command(args.get("command").and_then(Json::as_str).unwrap_or("")) => Gate::Run,
+        _ => Gate::Ask,
+    }
+}
+
+/// A command auto mode still asks about: one that deletes, rewrites or publishes history, installs, changes
+/// the system's settings or stops other programs.
+fn risky_command(cmd: &str) -> bool {
+    let c = format!(" {} ", cmd.to_lowercase().replace(['\n', '\r', '\t', ';', '|', '&', '(', ')', '{', '}'], " "));
+    const WORDS: [&str; 26] = [
+        "remove-item", "rm", "del", "erase", "rd", "ri", "rmdir", "clear-content", "format", "format-volume", "diskpart", "shutdown", "restart-computer", "stop-computer", "stop-process", "kill", "taskkill", "set-executionpolicy", "reg", "set-itemproperty", "new-itemproperty", "remove-itemproperty", "takeown", "icacls", "invoke-expression", "iex",
+    ];
+    const PHRASES: [&str; 14] = ["git push", "git reset --hard", "git clean", "git checkout --", "git branch -d", "npm publish", "cargo publish", "pip install", "npm install -g", "npm i -g", "winget ", "choco ", "msiexec", "-verb runas"];
+    WORDS.iter().any(|w| c.contains(&format!(" {w} "))) || PHRASES.iter().any(|p| c.contains(p))
+}
+
+/// The folders a chat's tools may use: its working directory first (relative paths and commands start
+/// there), then the other folders the user allows.
+fn run_folders(cwd: &str, allowed: &[PathBuf]) -> Vec<PathBuf> {
+    let mut folders: Vec<PathBuf> = Vec::new();
+    for f in std::iter::once(PathBuf::from(cwd)).filter(|_| !cwd.is_empty()).chain(allowed.iter().cloned()) {
+        if !folders.contains(&f) {
+            folders.push(f);
+        }
+    }
+    folders
+}
+
 /// The group whose calls need the user's OK, if any.
 fn approval_group(name: &str) -> Option<&'static str> {
     match name {
@@ -178,10 +250,10 @@ fn approval_group(name: &str) -> Option<&'static str> {
 /// run them) to check what it changes.
 fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String {
     let list: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
-    let where_ = if list.is_empty() {
-        "No folders are allowed yet, so file tools will fail; if you need files, ask the user to add a folder in Settings.".to_string()
-    } else {
-        format!("You may use files in {} (relative paths start in {}).", list.join(", "), list[0])
+    let where_ = match list.split_first() {
+        None => "No working directory is set, so file tools will fail; if you need files, ask the user to pick a folder for this chat.".to_string(),
+        Some((cwd, [])) => format!("Your working directory is {cwd}: relative paths and commands start there."),
+        Some((cwd, more)) => format!("Your working directory is {cwd}: relative paths and commands start there. You may also use files in {}.", more.join(", ")),
     };
     let check = if can_run { " After you change code, check it: run it or its tests with run_command. If something fails, fix it and run it again. Say it is done only once it works, and say how you checked." } else { "" };
     let more = if deferred.is_empty() {
@@ -190,7 +262,7 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String 
         let names: Vec<&str> = deferred.iter().map(tool_name).collect();
         format!(" These tools are named here without their descriptions: {}. Before calling one of them for the first time in a chat, load it with tool_search (\"select:<name>\").", names.join(", "))
     };
-    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Answer greetings, chat and questions you can answer yourself directly, without tools. Use tools when the request needs them; calls that do not depend on each other can go together in one turn. To find and read files use list_files, search_files and read_file rather than commands, and read a file before you edit it. For a task of 3 or more steps, keep a task list with update_tasks. Save a fact with remember only when the user tells you something worth keeping for later chats. When the user refers to an earlier conversation, look it up with search_chats.{check}{more} Use tools until the task is done, then answer briefly.")
+    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Answer greetings, chat and questions you can answer yourself directly, without tools; that includes questions about what you can do, which the tools below answer. Use tools when the request needs them; calls that do not depend on each other can go together in one turn. Before saying you cannot do something, check whether one of your tools can. Report what tools show faithfully: if a command failed or a search did not answer the question, say so, and never present a guess as a finding. To find and read files use list_files, search_files and read_file rather than commands, and read a file before you edit it. For a task of 3 or more steps, keep a task list with update_tasks. Save a fact with remember only when the user tells you something worth keeping for later chats. When the user refers to an earlier conversation, look it up with search_chats.{check}{more} Use tools until the task is done, then answer briefly.")
 }
 
 /// Files whose changes can be checked by running something (a notes file is not).
@@ -216,6 +288,96 @@ const NUDGE: &str = "(Automatic check) You changed code in this reply and have n
 /// user said to wait, or a step cannot be done), so once is enough. Not on by default: told nothing, a model
 /// takes the nudge for the user's word and goes past a "do step 1, then wait for me" about half the time.
 const GOAL_NUDGES: usize = 1;
+
+/// Times a /goal sends the model back when the goal gives no limit of its own ("stop after 5 tries").
+const GOAL_TRIES: usize = 8;
+
+/// A /goal: what done looks like in the user's words (Claude Code's goal-based loop). When the model stops,
+/// a check reads the chat against it; not met, the model goes back to work with what is missing, until it is
+/// met or `limit` checks have said no.
+fn new_goal(text: &str) -> Json {
+    obj(vec![("text", str(text)), ("limit", num(goal_limit(text) as f64)), ("tries", num(0.0)), ("state", str("active")), ("reason", str(""))])
+}
+
+/// The limit a goal sets itself: a number before tries, attempts, turns, times or rounds.
+fn goal_limit(text: &str) -> usize {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    words.windows(2).find_map(|w| ["try", "tries", "attempts", "turns", "times", "rounds"].contains(&w[1]).then(|| w[0].parse::<usize>().ok()).flatten()).map_or(GOAL_TRIES, |n| n.clamp(1, 20))
+}
+
+fn goal_active(chat: &Chat) -> bool {
+    chat.goal.get("state").and_then(Json::as_str) == Some("active")
+}
+
+/// Whether the chat's goal is met, asked as Claude Code's evaluator asks when Claude tries to stop: a question
+/// after the chat (so what the model has read stays read), without thinking, a JSON verdict back. No verdict
+/// counts as not met.
+fn check_goal(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> (bool, String) {
+    let goal = chat.goal.get("text").and_then(Json::as_str).unwrap_or("");
+    let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
+    let mut history = for_model(&chat.messages);
+    let ask = format!("(Check from ghost, not a message from the user.) The user's goal for this chat: {goal}\nJudge whether it is met from what the tool results above show; a reply saying it is done is not proof. Reply with JSON only and no tool calls: {{\"met\": true, \"reason\": \"the result that shows it\"}} or {{\"met\": false, \"reason\": \"what is still missing\"}}.");
+    history.push(obj(vec![("role", str("user")), ("content", str(&ask))]));
+    let Ok(prompt) = prompt_for(req, &history, &tools, false, shared, loaded) else { return (false, "the check could not be made".into()) };
+    let (tx, events) = mpsc::channel();
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(120), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
+    if work.send(Work::Job(job)).is_err() {
+        return (false, "the check could not be made".into());
+    }
+    let mut out = String::new();
+    for ev in events {
+        match ev {
+            Event::Text(t) => out.push_str(&t),
+            Event::Done { .. } | Event::Error(..) => break,
+        }
+    }
+    let out = out.rsplit("</think>").next().unwrap_or(&out);
+    let verdict = out.find('{').zip(out.rfind('}')).filter(|(a, b)| a < b).and_then(|(a, b)| Json::parse(&out[a..=b]).ok());
+    let met = verdict.as_ref().and_then(|v| v.get("met")).and_then(Json::as_bool).unwrap_or(false);
+    let reason = verdict.as_ref().and_then(|v| v.get("reason")).and_then(Json::as_str).unwrap_or("no verdict").trim().to_string();
+    (met, reason.chars().take(300).collect())
+}
+
+/// A message that is a command rather than words for the model.
+enum Command {
+    Goal(String),       // /goal <what done looks like>
+    ClearGoal,          // /goal clear
+    Loop(u32, String),  // /loop <interval> <prompt>: Claude Code's time-based loop, in this chat
+    StopLoops,          // /loop stop
+}
+
+fn command(m: &str) -> Option<Result<Command, String>> {
+    let m = m.trim();
+    let (head, rest) = m.split_once(char::is_whitespace).map_or((m, ""), |(h, r)| (h, r.trim()));
+    match head {
+        "/goal" if rest.is_empty() => Some(Err("Give the goal: /goal <what done looks like>, for example /goal all tests pass, stop after 5 tries. /goal clear ends one.".into())),
+        "/goal" if matches!(rest.to_lowercase().as_str(), "clear" | "off" | "stop" | "none") => Some(Ok(Command::ClearGoal)),
+        "/goal" => Some(Ok(Command::Goal(rest.to_string()))),
+        "/loop" if matches!(rest.to_lowercase().as_str(), "stop" | "off" | "clear") => Some(Ok(Command::StopLoops)),
+        "/loop" => {
+            let (every, prompt) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(e, p)| (e, p.trim()));
+            match (interval_minutes(every), prompt.is_empty()) {
+                (Some(n), false) => Some(Ok(Command::Loop(n, prompt.to_string()))),
+                _ => Some(Err("Give how often and what to do: /loop 10m check the build and fix what fails (m for minutes, h for hours; at least 5m). /loop stop ends this chat's loops.".into())),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// "10m", "10min", "2h", "90" (minutes): minutes, at least the scheduler's 5.
+fn interval_minutes(s: &str) -> Option<u32> {
+    let s = s.to_lowercase();
+    let digits = s.trim_end_matches(|c: char| c.is_alphabetic());
+    let n: f64 = digits.parse().ok().filter(|n: &f64| *n > 0.0)?;
+    let minutes = match &s[digits.len()..] {
+        "" | "m" | "min" | "mins" | "minute" | "minutes" => n,
+        "h" | "hr" | "hrs" | "hour" | "hours" => n * 60.0,
+        _ => return None,
+    };
+    Some((minutes.round() as u32).max(5))
+}
 
 /// What the harness says when a reply would end with its task list unfinished.
 fn goal_nudge(open: &[String]) -> String {
@@ -790,6 +952,9 @@ struct Chat {
     tokens: f64, // how much of the context the last round used (the clients show it)
     tasks: Json, // the model's task list (update_tasks), as [{"text","status"}]
     unread: bool, // a scheduled run wrote to it and the user has not opened it since
+    cwd: String,  // its working directory, set when it starts (as a Claude Code session's)
+    goal: Json,   // its /goal (new_goal), or null
+    parts: Json,  // how its last prompt split (prompt_parts), for the clients
 }
 
 impl Chat {
@@ -802,7 +967,7 @@ impl Chat {
             h.write_u64(t as u64);
             h.finish() & 0xffff
         };
-        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, updated: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()), unread: false }
+        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, updated: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()), unread: false, cwd: String::new(), goal: Json::Null, parts: Json::Null }
     }
 
     fn load(id: &str) -> Result<Chat, String> {
@@ -816,6 +981,9 @@ impl Chat {
             tokens: j.get("tokens").and_then(Json::as_f64).unwrap_or(0.0),
             tasks: j.get("tasks").cloned().unwrap_or(Json::Arr(Vec::new())),
             unread: j.get("unread").and_then(Json::as_bool).unwrap_or(false),
+            cwd: j.get("cwd").and_then(Json::as_str).unwrap_or("").to_string(),
+            goal: j.get("goal").cloned().unwrap_or(Json::Null),
+            parts: j.get("parts").cloned().unwrap_or(Json::Null),
         })
     }
 
@@ -834,6 +1002,9 @@ impl Chat {
             ("tokens", num(self.tokens)),
             ("tasks", self.tasks.clone()),
             ("unread", Json::Bool(self.unread)),
+            ("cwd", str(&self.cwd)),
+            ("goal", self.goal.clone()),
+            ("parts", self.parts.clone()),
             ("messages", Json::Arr(self.messages.clone())),
         ]);
         let path = chat_file(&self.id)?;
@@ -848,6 +1019,7 @@ impl Chat {
 
 /// What the client asks for: the chat (none: a new one), a new user message (none: answer the last one
 /// again), and the reply's settings.
+#[derive(Clone)]
 struct Request {
     chat: Option<String>,
     message: Option<String>,
@@ -857,6 +1029,9 @@ struct Request {
     max_tokens: usize,
     groups: Vec<String>,
     goal: bool,           // keep going until the task list is done (the goal loop)
+    mode: String,         // the permission mode (MODES)
+    cwd: Option<String>,  // a new chat's working directory
+    folders: Vec<PathBuf>, // where its tools may work, the working directory first (in_chat)
     instructions: String, // the GHOST.md files as the reply started
     memory: String, // the remembered facts, likewise
     skills: String, // the installed skills, likewise
@@ -865,6 +1040,7 @@ struct Request {
 impl Request {
     fn parse(b: &Json, shared: &Shared) -> Request {
         let f = |k: &str| b.get(k).and_then(Json::as_f64);
+        let folders = shared.harness.lock().unwrap().folders.clone();
         Request {
             chat: b.get("chat").and_then(Json::as_str).map(String::from),
             message: b.get("message").and_then(Json::as_str).map(String::from),
@@ -872,12 +1048,24 @@ impl Request {
             thinking: b.get("thinking").and_then(Json::as_bool).unwrap_or(shared.think_default),
             temperature: f("temperature").map(|t| t as f32).unwrap_or(shared.defaults.0),
             max_tokens: f("max_tokens").map(|n| n.max(1.0) as usize).unwrap_or(shared.defaults.3),
-            groups: b.get("tools").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect()).unwrap_or_default(),
+            groups: match b.get("tools").and_then(Json::as_array) {
+                Some(a) => a.iter().filter_map(Json::as_str).map(String::from).collect(),
+                None => ALL_GROUPS.iter().map(|g| g.to_string()).collect(),
+            },
             goal: b.get("keep_going").and_then(Json::as_bool).unwrap_or(false),
-            instructions: instructions_prompt(&shared.harness.lock().unwrap().folders.clone()),
+            mode: b.get("mode").and_then(Json::as_str).filter(|m| MODES.contains(m)).unwrap_or("manual").to_string(),
+            cwd: b.get("cwd").and_then(Json::as_str).map(str::trim).filter(|c| !c.is_empty()).map(String::from),
+            instructions: instructions_prompt(&folders),
+            folders,
             memory: memory_prompt(),
             skills: super::skills::prompt(),
         }
+    }
+
+    /// For a reply in `chat`: its working directory, then the other allowed folders, and their GHOST.md files.
+    fn in_chat(&self, chat: &Chat, shared: &Shared) -> Request {
+        let folders = run_folders(&chat.cwd, &shared.harness.lock().unwrap().folders);
+        Request { instructions: instructions_prompt(&folders), folders, ..self.clone() }
     }
 }
 
@@ -928,15 +1116,44 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
             None => Chat::new(),
         };
         chat.unread = false;
+        // a new chat works in the folder the client picked (else the first allowed one), from then on
+        if chat.cwd.is_empty() {
+            let picked = req.cwd.clone().filter(|c| std::path::Path::new(c).is_dir());
+            chat.cwd = picked.or_else(|| shared.harness.lock().unwrap().folders.first().map(|f| f.display().to_string())).unwrap_or_default();
+        }
+        let req = req.in_chat(&chat, shared);
         match &req.message {
             Some(m) => {
                 if chat.title.is_empty() {
                     let line = m.trim().lines().next().unwrap_or("");
                     chat.title = if line.chars().count() > 60 { format!("{}…", line.chars().take(57).collect::<String>().trim_end()) } else { line.to_string() };
                 }
+                // a command: /goal sets the chat's goal and goes on to the model; the others are answered here
+                let done = match command(m) {
+                    None => None,
+                    Some(Ok(Command::Goal(goal))) => {
+                        chat.goal = new_goal(&goal);
+                        None
+                    }
+                    Some(Ok(Command::ClearGoal)) => {
+                        chat.goal = Json::Null;
+                        Some("Goal cleared.".to_string())
+                    }
+                    Some(Ok(Command::Loop(every, prompt))) => Some(super::schedule::add_loop(&chat.id, &prompt, every, &req.groups, req.thinking).unwrap_or_else(|e| format!("Not looping: {e}."))),
+                    Some(Ok(Command::StopLoops)) => Some(match super::schedule::stop_loops(&chat.id) {
+                        0 => "This chat has no loop running.".to_string(),
+                        1 => "Loop stopped.".to_string(),
+                        n => format!("{n} loops stopped."),
+                    }),
+                    Some(Err(help)) => Some(help),
+                };
+                if let Some(text) = done {
+                    return answer_here(&mut out, &mut chat, m, &text);
+                }
                 let mut msg = vec![("role", str("user")), ("content", str(m))];
-                if let Some(note) = (!req.groups.is_empty()).then(|| task_reminder(&chat)).flatten() {
-                    msg.push(("reminder", str(&note)));
+                let notes: Vec<String> = (req.mode == "plan").then(|| PLAN_NOTE.to_string()).into_iter().chain((!req.groups.is_empty()).then(|| task_reminder(&chat)).flatten()).collect();
+                if !notes.is_empty() {
+                    msg.push(("reminder", str(&notes.join("\n\n"))));
                 }
                 chat.messages.push(obj(msg));
             }
@@ -958,12 +1175,71 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
     Ok(())
 }
 
+/// How a reply's prompt splits, in tokens: the system prompt's pieces and the tools' descriptions (the chat
+/// is the rest), as Claude Code's context breakdown shows it.
+fn prompt_parts(req: &Request, loaded: &Loaded) -> Json {
+    let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
+    let n = |s: &str| if s.trim().is_empty() { 0.0 } else { loaded.tok.encode(s).len() as f64 };
+    let (schemas, guide) = if tools.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let schemas = tools.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("\n");
+        (schemas, tool_prompt(&req.folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups)))
+    };
+    obj(vec![
+        ("system", num(n(&req.system) + n(&guide))),
+        ("tools", num(n(&schemas))),
+        ("skills", num(if tools.is_empty() { 0.0 } else { n(&req.skills) })),
+        ("instructions", num(n(&req.instructions))),
+        ("memory", num(n(&req.memory))),
+    ])
+}
+
+/// POST /api/chats/trim {"id"}: the chat's tool outputs taken out now, all but the last 3, as Claude Code's
+/// "Compact session" (the chat file keeps them; the model gets a note in their place). How many went.
+pub fn trim_chat(id: &str) -> Result<usize, String> {
+    let mut going = Going::new();
+    if !going.hold(id, || false) {
+        return Err("a reply is going in that chat".into());
+    }
+    let mut chat = Chat::load(id)?;
+    let outputs: Vec<usize> = (0..chat.messages.len()).filter(|&i| role(&chat.messages[i]) == "tool" && !flag(&chat.messages[i], "trimmed") && !flag(&chat.messages[i], "dropped")).collect();
+    let mut n = 0;
+    for &i in &outputs[..outputs.len().saturating_sub(3)] {
+        if chat.messages[i].get("content").and_then(Json::as_str).is_some_and(|c| c.len() > 400) {
+            mark(&mut chat.messages[i], "trimmed", Json::Bool(true));
+            n += 1;
+        }
+    }
+    if n > 0 {
+        chat.save_as_is()?;
+    }
+    Ok(n)
+}
+
+/// A command's answer, from the harness rather than the model: the message and the answer kept in the chat,
+/// and sent as a reply's events.
+fn answer_here(out: &mut Out, chat: &mut Chat, message: &str, text: &str) -> Result<(), String> {
+    chat.messages.push(obj(vec![("role", str("user")), ("content", str(message))]));
+    chat.messages.push(obj(vec![("role", str("assistant")), ("content", str(text))]));
+    chat.save()?;
+    emit(out, obj(vec![("type", str("chat")), ("id", str(&chat.id)), ("title", str(&chat.title)), ("checkpoint", str(""))]))?;
+    if chat.goal != Json::Null || text == "Goal cleared." {
+        emit(out, obj(vec![("type", str("goal")), ("goal", chat.goal.clone())]))?;
+    }
+    emit(out, obj(vec![("type", str("text")), ("text", str(text))]))?;
+    emit(out, obj(vec![("type", str("done")), ("finish", str("stop"))]))
+}
+
 /// One reply in a chat whose message is in place: the model's rounds, then "done" (or "error"), and for a
 /// chat's first reply a title. Err only when the chat cannot be saved.
 #[allow(clippy::too_many_arguments)]
 fn reply(out: &mut Out, req: &Request, chat: &mut Chat, first: bool, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<(), String> {
     let checkpoint = format!("{}-{}", chat.id, now_ms() as u64); // this reply's file changes, for undo
     emit(out, obj(vec![("type", str("chat")), ("id", str(&chat.id)), ("title", str(&chat.title)), ("checkpoint", str(&checkpoint))]))?;
+    if chat.goal != Json::Null {
+        emit(out, obj(vec![("type", str("goal")), ("goal", chat.goal.clone())]))?;
+    }
     let result = rounds(out, req, chat, &checkpoint, work, shared, loaded);
     chat.save()?;
     let named = first && result.is_ok();
@@ -1002,7 +1278,7 @@ pub struct Wakeup<'a> {
     pub thinking: bool,
 }
 
-/// A reply nobody is watching (a scheduled task or the heartbeat), saved in its chat and marked unread
+/// A reply nobody is watching (a scheduled task), saved in its chat and marked unread
 /// unless `keep` says the reply is not worth the user's time (then the exchange is taken out of the chat).
 /// Returns the chat's id, the reply's text, and whether it was kept.
 pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<(String, String, bool), String> {
@@ -1017,6 +1293,10 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         Some(id) => chat = Chat::load(id)?, // as it is now that it is held
         None => chat.title = w.title.to_string(),
     }
+    if chat.cwd.is_empty() {
+        chat.cwd = shared.harness.lock().unwrap().folders.first().map(|f| f.display().to_string()).unwrap_or_default();
+    }
+    let folders = run_folders(&chat.cwd, &shared.harness.lock().unwrap().folders);
     let req = Request {
         chat: Some(chat.id.clone()),
         message: Some(w.text.to_string()),
@@ -1025,8 +1305,11 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         temperature: shared.defaults.0,
         max_tokens: shared.defaults.3.max(4096),
         groups: w.groups.to_vec(),
-        goal: true, // nobody is there to say "go on"
-        instructions: instructions_prompt(&shared.harness.lock().unwrap().folders.clone()),
+        goal: true,                // nobody is there to say "go on"
+        mode: "manual".to_string(), // nobody is there to ask either: only what the user always allows runs
+        cwd: None,
+        instructions: instructions_prompt(&folders),
+        folders,
         memory: memory_prompt(),
         skills: super::skills::prompt(),
     };
@@ -1050,8 +1333,8 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
 
 /// The prompt for these messages: the client's system text plus where tools may work, then the chat.
 fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
-    let folders = shared.harness.lock().unwrap().folders.clone();
-    let system = [req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups)) }, if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let me = format!("You are ghost, an assistant running on the user's own computer through ghost-infer, with the {} model. Today is {}.", loaded.id, super::schedule::today());
+    let system = [me, req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&req.folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups)) },if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut messages = Vec::new();
     if !system.is_empty() {
         messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));
@@ -1141,6 +1424,7 @@ fn tool_name(t: &Json) -> &str {
 /// back to them.
 fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<&'static str, String> {
     let reply_start = chat.messages.len();
+    let parts = prompt_parts(req, loaded);
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
     let deferred = if req.groups.is_empty() { Vec::new() } else { deferred_tools(&req.groups) };
     let mut changed = false;
@@ -1201,7 +1485,8 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
         }
         take(split.finish(), out, &mut text, &mut calls)?;
         chat.tokens = (usage.0 + usage.1) as f64;
-        emit(out, obj(vec![("type", str("context")), ("prompt_tokens", num(usage.0 as f64)), ("completion_tokens", num(usage.1 as f64)), ("context_length", num(loaded.ctx as f64))]))?;
+        chat.parts = parts.clone();
+        emit(out, obj(vec![("type", str("context")), ("prompt_tokens", num(usage.0 as f64)), ("completion_tokens", num(usage.1 as f64)), ("context_length", num(loaded.ctx as f64)), ("parts", parts.clone())]))?;
 
         // the round as the chat keeps it: what the model wrote, and its calls in OpenAI's form
         let mut msg = vec![("role", str("assistant")), ("content", str(text.trim())), ("checkpoint", str(checkpoint))];
@@ -1218,7 +1503,30 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
             chat.save()?;
             continue;
         }
-        // the goal loop: steps still open go back to the model, while it keeps getting steps done
+        // the goal-based loop (/goal): stopping is checked against the user's goal; not met, back to work
+        if calls.is_empty() && goal_active(chat) && round + 1 < MAX_ROUNDS {
+            emit(out, obj(vec![("type", str("goal")), ("goal", chat.goal.clone()), ("checking", Json::Bool(true))]))?;
+            let (met, reason) = check_goal(req, chat, work, shared, loaded);
+            let f = |k: &str| chat.goal.get(k).and_then(Json::as_f64).unwrap_or(0.0) as usize;
+            let (tries, limit) = (f("tries") + 1, f("limit").max(1));
+            let state = if met { "met" } else if tries >= limit { "stopped" } else { "active" };
+            mark(&mut chat.goal, "tries", num(tries as f64));
+            mark(&mut chat.goal, "state", str(state));
+            mark(&mut chat.goal, "reason", str(&reason));
+            emit(out, obj(vec![("type", str("goal")), ("goal", chat.goal.clone())]))?;
+            if state == "active" {
+                let goal = chat.goal.get("text").and_then(Json::as_str).unwrap_or("").to_string();
+                let say = format!("(Check from ghost, not a message from the user) The goal is not met yet: {reason}. Keep working toward it: {goal}");
+                chat.messages.push(obj(vec![("role", str("user")), ("content", str(&say)), ("auto", Json::Bool(true)), ("goal", Json::Bool(true))]));
+                emit(out, obj(vec![("type", str("nudge")), ("kind", str("goal")), ("text", str(&say))]))?;
+                mark_changed(chat, reply_start, changed);
+                chat.save()?;
+                continue;
+            }
+            chat.save()?;
+        }
+        // the task-list loop (scheduled runs, nobody there to say go on): open steps go back to the model,
+        // while it keeps getting steps done
         let open = if calls.is_empty() && planned && req.goal { open_tasks(chat) } else { Vec::new() };
         if !open.is_empty() && round + 1 < MAX_ROUNDS {
             let done = chat.tasks.as_array().map_or(0, |t| t.iter().filter(|t| t.get("status").and_then(Json::as_str) == Some("done")).count());
@@ -1254,8 +1562,13 @@ Call it again with these parameters.", unloaded.unwrap().to_string()), false),
                 "tool_search" => (tool_search(&deferred, &arguments), false),
                 "update_tasks" => (update_tasks(out, chat, &arguments)?, false),
                 BAD_CALL => (BAD_CALL_RESULT.to_string(), false),
-                _ => call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)?,
+                _ => {
+                    RUN_SECS.with(|c| c.set(-1.0));
+                    call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)?
+                }
             };
+            let secs = RUN_SECS.with(|c| c.replace(-1.0));
+            let secs = (secs >= 0.0).then(|| num((secs * 10.0).round() / 10.0));
             if !denied && approval_group(&name) == Some("edit") && !result.starts_with("Error") {
                 changed = true;
                 unchecked |= Json::parse(&arguments).ok().and_then(|a| a.get("path").and_then(Json::as_str).map(is_code)).unwrap_or(false);
@@ -1263,8 +1576,13 @@ Call it again with these parameters.", unloaded.unwrap().to_string()), false),
             if !denied && approval_group(&name) == Some("cmd") {
                 unchecked = false;
             }
-            emit(out, obj(vec![("type", str("tool_result")), ("id", str(&id)), ("name", str(&name)), ("result", str(&result)), ("denied", Json::Bool(denied))]))?;
+            let mut ev = vec![("type", str("tool_result")), ("id", str(&id)), ("name", str(&name)), ("result", str(&result)), ("denied", Json::Bool(denied))];
             let mut m = vec![("role", str("tool")), ("tool_call_id", str(&id)), ("name", str(&name)), ("content", str(&result))];
+            if let Some(secs) = secs {
+                ev.push(("secs", secs.clone()));
+                m.push(("secs", secs));
+            }
+            emit(out, obj(ev))?;
             if denied {
                 m.push(("denied", Json::Bool(true)));
             }
@@ -1330,6 +1648,12 @@ fn mark_changed(chat: &mut Chat, reply_start: usize, changed: bool) {
     }
 }
 
+thread_local! {
+    /// How long the last tool `call` took to run (not counting the wait for the user's OK); negative: it ran
+    /// nothing. The clients show it for commands, as Claude's background tasks do.
+    static RUN_SECS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
+}
+
 /// One tool call: refused if it repeats itself, put to the user if its group needs an OK, then run.
 /// Returns its result for the model and whether the user said no.
 #[allow(clippy::too_many_arguments)]
@@ -1345,7 +1669,12 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
         return Ok(("You already made this exact call twice; its result is above. Do something different, or answer with what you have.".into(), false));
     }
     if let Some(group) = approval_group(name) {
-        if !shared.harness.lock().unwrap().always.iter().any(|g| g == group) {
+        let ask = match gate(&req.mode, group, &Json::parse(arguments).unwrap_or(Json::Null)) {
+            Gate::Run => false,
+            Gate::Refuse(why) => return Ok((why.to_string(), true)),
+            Gate::Ask => !shared.harness.lock().unwrap().always.iter().any(|g| g == group),
+        };
+        if ask {
             // a scheduled run has nobody to ask: only what the user always allows runs in it
             if out.away() {
                 return Ok((format!("Not done: this needs the user's OK, and this is a scheduled run with nobody here to give it (they can allow {group} tools always). Do what you can without it, and say in your reply what needs their OK."), true));
@@ -1411,7 +1740,11 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
     if args == Json::Null {
         return Ok((format!("Error: invalid arguments for {name}: not valid JSON. Arguments given: {}. Fix them and call the tool again.", crate::tools::clip(arguments, 300)), false));
     }
-    // a copy of the settings: a command may run for minutes, and the settings must stay usable meanwhile
-    let settings = shared.harness.lock().unwrap().clone();
-    Ok((crate::tools::run(name, &args, &settings, checkpoint).unwrap_or_else(|e| format!("Error: {e}")), false))
+    // a copy of the settings: a command may run for minutes, and the settings must stay usable meanwhile;
+    // the chat's own folders, its working directory first
+    let settings = crate::tools::Settings { folders: req.folders.clone(), ..shared.harness.lock().unwrap().clone() };
+    let t = std::time::Instant::now();
+    let result = crate::tools::run(name, &args, &settings, checkpoint).unwrap_or_else(|e| format!("Error: {e}"));
+    RUN_SECS.with(|c| c.set(t.elapsed().as_secs_f64()));
+    Ok((result, false))
 }

@@ -104,11 +104,12 @@ pub struct ToolLine {
     open: bool,          // its arguments and result shown
     ask: Option<String>, // waiting for the user's OK: the group it needs ("edit", "cmd", "web")
     pub round: usize,    // the reply's round that called it
+    secs: Option<f64>,   // how long it ran
 }
 
 impl ToolLine {
     fn new(id: &str, name: &str, arguments: &str) -> ToolLine {
-        ToolLine { id: id.to_string(), name: name.to_string(), arguments: arguments.to_string(), result: None, denied: false, open: false, ask: None, round: 0 }
+        ToolLine { id: id.to_string(), name: name.to_string(), arguments: arguments.to_string(), result: None, denied: false, open: false, ask: None, round: 0, secs: None }
     }
 
     /// The harness sending the reply back, shown as a step (its words inside): to check the code it changed,
@@ -123,8 +124,63 @@ impl ToolLine {
     }
 }
 
-/// The tool groups the app can turn on, with their menu labels; "files" (reading) is on by default.
-pub const GROUPS: [(&str, &str); 5] = [("files", "Read files"), ("edit", "Change files"), ("cmd", "Run commands"), ("web", "Use the web"), ("mcp", "Use MCP tools")];
+/// A command of the open chat, as Claude's background tasks list shows it: one it ran (run_command), or one
+/// it left running (start_process).
+pub struct BgTask {
+    pub key: String,
+    pub title: String, // the model's description of it, else the command
+    pub command: String,
+    pub output: String,
+    pub secs: Option<f64>,
+    pub state: TaskState,
+    pub process: Option<usize>, // a background process: its id (it can be stopped, its output read)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum TaskState {
+    Running,
+    Done,
+    Failed,
+    Stopped,
+}
+
+/// A chat's /goal as the pin above the message box shows it.
+#[derive(Debug, Clone)]
+pub struct Goal {
+    pub text: String,
+    pub state: String, // active, met or stopped
+    pub tries: usize,  // checks that said not met (or, met: the checks made)
+    pub limit: usize,
+    pub reason: String, // the last check's
+    pub checking: bool, // a check is running
+}
+
+fn goal_of(j: Option<&Json>) -> Option<Goal> {
+    let j = j.filter(|j| **j != Json::Null)?;
+    let s = |k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+    let n = |k: &str| j.get(k).and_then(Json::as_f64).unwrap_or(0.0) as usize;
+    Some(Goal { text: s("text"), state: s("state"), tries: n("tries"), limit: n("limit"), reason: s("reason"), checking: false })
+}
+
+/// Claude Code's permission modes: the id the server takes, the name, and what it does. Every tool is always
+/// there; the mode decides which calls wait for the user's OK.
+pub const MODES: [(&str, &str, &str); 5] = [
+    ("auto", "Auto", "Ghost handles permission decisions"),
+    ("manual", "Manual", "Always ask before making changes"),
+    ("accept_edits", "Accept edits", "Automatically accept all file edits"),
+    ("plan", "Plan", "Create a plan before making changes"),
+    ("bypass", "Bypass permissions", "Accepts all permissions"),
+];
+
+/// The mode a number key picks in the mode menu ("1" is the first).
+fn mode_key(c: &str) -> Option<Message> {
+    c.parse::<usize>().ok().filter(|n| (1..=MODES.len()).contains(n)).map(|n| Message::SetMode(n - 1))
+}
+
+/// A folder's last part, for a label.
+fn folder_name(path: &str) -> String {
+    path.rsplit(['\\', '/']).find(|p| !p.is_empty()).unwrap_or(path).to_string()
+}
 
 /// What "Always allow" covers, by approval group.
 fn group_name(group: &str) -> &'static str {
@@ -160,7 +216,7 @@ struct Msg {
     checkpoint: Option<String>, // where the reply's file changes are kept, for undo
     changed: bool,              // it changed files
     undone: bool,
-    scheduled: bool, // a user message the scheduler sent (a task or the heartbeat), shown by its label
+    scheduled: bool, // a user message the scheduler sent (a task), shown by its label
     plan: Vec<(String, String)>, // the task list this reply finished: shown in it, no longer pinned above the box
 }
 
@@ -285,7 +341,7 @@ fn tool_label(t: &ToolLine) -> String {
         "search_chats" => format!("Searched earlier chats for \"{}\"", s("query")),
         "read_chat" => "Read an earlier chat".into(),
         "check_work" => "Asked to check its work".into(),
-        "keep_going" => "Sent back to its open steps".into(),
+        "keep_going" => "Sent back to work".into(),
         "unreadable_tool_call" => "Wrote a tool call that could not be read".into(),
         "schedule_task" => format!("Scheduled \"{}\"", if s("name").is_empty() { s("prompt") } else { s("name") }),
         "list_schedules" => "Listed the scheduled tasks".into(),
@@ -421,6 +477,22 @@ pub enum Menu {
     Chat,
     Settings,
     Plus,
+    Model,  // under the message box: the models to switch to
+    Mode,   // the permission modes
+    Folder, // a new chat's working directory
+}
+
+impl Menu {
+    /// The widget a menu opens above, if it opens above one.
+    fn anchor(self) -> Option<&'static str> {
+        match self {
+            Menu::Plus => Some("plus"),
+            Menu::Model => Some("model"),
+            Menu::Mode => Some("mode"),
+            Menu::Folder => Some("folder"),
+            Menu::Chat | Menu::Settings => None,
+        }
+    }
 }
 
 /// Light or dark: Windows' own setting unless the user picked one (kept in %LOCALAPPDATA%\ghost-infer\app.json).
@@ -438,11 +510,12 @@ fn app_file() -> Option<std::path::PathBuf> {
 /// The app's own settings, kept in app.json (start-ghost-app reads load_last and last_model from it too).
 struct Saved {
     mode: ThemeMode,
-    tools: Vec<String>,         // the tool groups that are on
+    perm: usize,                // the permission mode (MODES)
+    workdir: Option<String>,    // the folder new chats work in
     rail: bool,                 // the rail is shown
+    rail_open: Vec<String>,     // its cards (and their inner lists) that are open
     load_last: bool,            // the launcher starts the server with the last picked model
     last_model: Option<String>, // the model last picked in the app
-    keep_going: bool,           // the goal loop: replies keep at their task list until it is done
 }
 
 fn load_settings() -> Saved {
@@ -452,17 +525,18 @@ fn load_settings() -> Saved {
         Some("light") => ThemeMode::Light,
         _ => ThemeMode::System,
     };
-    let tools = match j.get("tools").and_then(Json::as_array) {
-        Some(a) => a.iter().filter_map(Json::as_str).filter(|g| GROUPS.iter().any(|(k, _)| k == g)).map(String::from).collect(),
-        None => vec!["files".to_string()],
-    };
+    let perm = j.get("permission_mode").and_then(Json::as_str).and_then(|m| MODES.iter().position(|(id, _, _)| *id == m));
     Saved {
         mode,
-        tools,
+        perm: perm.unwrap_or(1), // manual, as Claude Code starts
+        workdir: j.get("workdir").and_then(Json::as_str).map(String::from),
         rail: j.get("rail").and_then(Json::as_bool).unwrap_or(false),
+        rail_open: match j.get("rail_open").and_then(Json::as_array) {
+            Some(a) => a.iter().filter_map(Json::as_str).map(String::from).collect(),
+            None => ["environment", "context", "changes", "tasks", "background"].map(String::from).to_vec(),
+        },
         load_last: j.get("load_last").and_then(Json::as_bool).unwrap_or(false),
         last_model: j.get("last_model").and_then(Json::as_str).map(String::from),
-        keep_going: j.get("keep_going").and_then(Json::as_bool).unwrap_or(false),
     }
 }
 
@@ -533,15 +607,18 @@ struct App {
     start: Args,         // what the command line asked to open or send once connected
     sidebar: bool,       // the chat list shown (it hides with the pane button)
     hovered: Option<String>, // the chat row under the pointer (its delete button shows)
-    folder: Option<String>,  // the first folder file tools may use, by its name
-    folders: Vec<String>,    // every folder file tools may use (the server's harness settings)
-    tools: Vec<String>,      // the tool groups that are on
-    keep_going: bool,        // the goal loop is on (the + menu)
-    repaint: bool,           // flipped on every change but the ghost's tick: the whole window is drawn again
+    folders: Vec<String>,    // the other folders file tools may use (the server's harness settings)
+    workdir: Option<String>, // the folder a new chat works in (None: the first of `folders`)
+    chat_cwd: Option<String>, // the open chat's working directory
+    perm: usize,             // the permission mode (MODES)
+    goal: Option<Goal>,      // the open chat's /goal
+    repaint: bool,          // flipped on every change but the ghost's tick: the whole window is drawn again
     maximized: bool,         // the window fills the screen (no resize edges; the button shows "restore")
     window: iced::Size,      // the window's size, to place menus
-    plus_at: Option<iced::Rectangle>, // where the + button is (the + menu opens above it)
+    menu_at: Option<iced::Rectangle>, // where the open menu's button is (the menu opens above it)
     rail: bool,              // the session rail on the right is shown
+    rail_open: Vec<String>,  // its cards (and their inner lists) that are open
+    parts: Json,             // how the open chat's last prompt split ({"system","tools","skills","instructions","memory"})
     load_last: bool,         // start with the last picked model (the launcher reads it)
     last_model: Option<String>, // the model last picked here
     system: Json,            // this computer, as /api/system reports it (for the rail)
@@ -555,8 +632,16 @@ struct App {
     skill_choices: Option<(String, Vec<(String, String, String)>)>, // a source with several skills: it, and each one's path, name, description
     mcp: Vec<(String, String, usize)>, // MCP servers: name, state, how many tools
     mcp_config: String,      // where mcp.json is
-    background: Json,        // what runs on its own: the scheduled tasks and the heartbeat (/api/background)
+    background: Json,        // what runs on its own: the scheduled tasks (/api/background)
     polled_at: u64,          // when /api/background was last asked (the clock), while no answer is pending
+    processes: Json,         // the commands the model left running (start_process), from the same poll
+    tasks_panel: bool,       // the background tasks panel beside the rail is open
+    tasks_wide: bool,        // and wider
+    task_open: Vec<String>,  // its tasks unfolded (BgTask keys)
+    tasks_hidden: Vec<String>, // finished ones cleared from it
+    tasks_shown: usize,      // how many finished ones it lists
+    finished_open: bool,     // its finished group unfolded
+    proc_output: std::collections::HashMap<usize, String>, // running processes' output, while the panel shows them
     polling: bool,
 }
 
@@ -592,8 +677,23 @@ enum Message {
     CopyChat,
     DeleteCurrent,
     ToggleTool(usize, usize), // a reply's tool line opened or closed
-    ToggleGroup(&'static str),
-    ToggleKeepGoing,
+    SetMode(usize),           // a permission mode (MODES)
+    ClearGoal,                // the goal pin's x: sends /goal clear
+    ToggleCard(&'static str), // a rail card (or a list inside one) opened or closed
+    TrimChat,                 // the chat's old tool outputs taken out now
+    StopProcess(usize),       // a background process ended (the rail's stop button)
+    ShowTasks,                // the background tasks panel
+    CloseTasks,
+    WideTasks,
+    ToggleTask(String),       // a task in the panel unfolded or folded
+    ToggleFinished,
+    ClearFinished(Vec<String>),
+    MoreTasks,
+    ProcOutput(usize, Result<Json, String>),
+    Trimmed(Result<Json, String>),
+    CycleMode,                // Shift+Tab, as in Claude Code
+    PickWorkdir,              // a new chat's folder, from Windows' folder dialog
+    SetWorkdir(Option<String>),
     Approve(String, &'static str), // a call's id, and "once", "always" or "deny"
     Approved(Result<Json, String>),
     Undo(usize),
@@ -605,8 +705,8 @@ enum Message {
     CloseWindow,
     ResizeWindow(iced::window::Direction),
     WindowResized(iced::Size),
-    OpenPlus,
-    PlusAt(Option<iced::Rectangle>),
+    OpenMenu(Menu), // a menu that opens above its button: found first
+    MenuAt(Menu, Option<iced::Rectangle>),
     Maximized(bool),
     ToggleRail,
     TogglePlan,
@@ -638,9 +738,7 @@ enum Message {
     McpImport,
     McpEdit,
     Background(Result<Json, String>),
-    SetHeartbeat(u32), // minutes between checks; 0: off
-    EditHeartbeat,
-    RunScheduled(String), // a task's id, or "heartbeat": now
+    RunScheduled(String), // a task's id: now
     CancelScheduled(String),
     Read(Result<Json, String>),
 }
@@ -648,7 +746,7 @@ enum Message {
 impl App {
     fn new(args: Args) -> (App, Task<Message>) {
         let addr = args.addr.clone();
-        let Saved { mode, tools, rail, load_last, last_model, keep_going } = load_settings();
+        let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model } = load_settings();
         let dark = match mode {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
@@ -689,15 +787,18 @@ impl App {
             start: args,
             sidebar: true,
             hovered: None,
-            folder: None,
             folders: Vec::new(),
-            tools,
-            keep_going,
+            workdir,
+            chat_cwd: None,
+            perm,
+            goal: None,
             repaint: false,
             maximized: false,
             window: iced::Size::new(1180.0, 780.0),
-            plus_at: None,
+            menu_at: None,
             rail,
+            rail_open,
+            parts: Json::Null,
             load_last,
             last_model,
             system: Json::Null,
@@ -713,6 +814,14 @@ impl App {
             mcp_config: String::new(),
             background: Json::Null,
             polled_at: 0,
+            processes: Json::Null,
+            tasks_panel: false,
+            tasks_wide: false,
+            task_open: Vec::new(),
+            tasks_hidden: Vec::new(),
+            tasks_shown: 12,
+            finished_open: true,
+            proc_output: Default::default(),
             polling: false,
         };
         (app, Task::perform(blocking(move || connect(&addr)), Message::Connected))
@@ -744,7 +853,10 @@ impl App {
                 }
                 // the + menu opens as a click opens it: once the button is on screen
                 let plus = match menu.as_deref() {
-                    Some("plus") => Task::done(Message::OpenPlus),
+                    Some("plus") => Task::done(Message::OpenMenu(Menu::Plus)),
+                    Some("model") => Task::done(Message::OpenMenu(Menu::Model)),
+                    Some("mode") => Task::done(Message::OpenMenu(Menu::Mode)),
+                    Some("tasks") => Task::done(Message::ShowTasks),
                     Some("skill-link") => Task::done(Message::OpenSkillLink),
                     _ => Task::none(),
                 };
@@ -795,6 +907,9 @@ impl App {
                 if self.busy.is_none() {
                     self.chat = None;
                     self.title = None;
+                    self.chat_cwd = None;
+                    self.goal = None;
+                    self.parts = Json::Null;
                     self.messages.clear();
                     self.shown = window();
                     self.context.0 = 0.0;
@@ -817,6 +932,7 @@ impl App {
                 );
             }
             Message::PickModel(choice) => {
+                self.menu = None;
                 let id = choice.id;
                 self.last_model = Some(id.clone());
                 self.save_settings();
@@ -866,19 +982,26 @@ impl App {
                 self.polling = false;
                 self.polled_at = self.clock;
                 let Ok(j) = r else { return Task::none() };
+                // background processes change on their own (their running time too): drawn again when they do
+                let procs = j.get("processes").cloned().unwrap_or(Json::Null);
+                if procs != self.processes {
+                    self.processes = procs;
+                    self.repaint = !self.repaint;
+                }
+                let outputs = self.fetch_outputs();
                 let seq = |j: &Json| j.get("seq").and_then(Json::as_f64).unwrap_or(0.0);
                 let running = |j: &Json| j.get("running").and_then(Json::as_str).map(String::from);
                 if seq(&j) == seq(&self.background) {
-                    return Task::none();
+                    return outputs;
                 }
                 self.repaint = !self.repaint;
                 let (was, now) = (running(&self.background), running(&j));
                 let first = self.background == Json::Null;
                 self.background = j;
                 if first {
-                    return Task::none();
+                    return outputs;
                 }
-                let mut tasks = vec![self.call(|api| api.get("/api/chats"), Message::Chats)];
+                let mut tasks = vec![outputs, self.call(|api| api.get("/api/chats"), Message::Chats)];
                 // a run ended: if it wrote to the open chat, that chat is shown again with it
                 if let Some(c) = was.filter(|_| now.is_none()) {
                     if self.busy.is_none() && (self.chat.as_deref() == Some(c.as_str()) || c.is_empty()) {
@@ -893,23 +1016,6 @@ impl App {
                     self.status = "A scheduled task is running".into();
                 }
                 return Task::batch(tasks);
-            }
-            Message::SetHeartbeat(every) => {
-                let body = obj(vec![("every", num(every as f64)), ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())), ("thinking", Json::Bool(self.thinking))]);
-                return self.call(move |api| api.post("/api/schedules/heartbeat", &body), Message::Background);
-            }
-            // the checklist in Notepad, made first when missing (the next check reads it)
-            Message::EditHeartbeat => {
-                let Some(path) = self.background.get("heartbeat").and_then(|h| h.get("file")).and_then(Json::as_str).map(String::from) else { return Task::none() };
-                let file = std::path::Path::new(&path);
-                if !file.exists() {
-                    let note = "<!-- The heartbeat's checklist: while the heartbeat is on, ghost goes through it every so often and tells you only when something needs you (a reply of HEARTBEAT_OK is dropped). Keep it short: it is read on every check. Comments like this one are left out, and a file with only headings is not checked at all. -->\n\n# Heartbeat checklist\n\n- \n";
-                    if let Err(e) = std::fs::write(file, note) {
-                        self.status = format!("Couldn't make {path}: {e}");
-                        return Task::none();
-                    }
-                }
-                let _ = std::process::Command::new("notepad").arg(file).spawn();
             }
             Message::RunScheduled(id) => {
                 self.status = "It runs as soon as nothing else is".into();
@@ -941,19 +1047,81 @@ impl App {
                 }
             }
             // the menu stays open, so several groups can be switched at once
-            Message::ToggleGroup(g) => {
-                match self.tools.iter().position(|t| t == g) {
-                    Some(k) => {
-                        self.tools.remove(k);
+            Message::SetMode(i) => {
+                self.perm = i.min(MODES.len() - 1);
+                self.menu = None;
+                self.save_settings();
+            }
+            Message::ToggleCard(key) => {
+                match self.rail_open.iter().position(|k| k == key) {
+                    Some(i) => {
+                        self.rail_open.remove(i);
                     }
-                    None => self.tools.push(g.to_string()),
+                    None => self.rail_open.push(key.to_string()),
                 }
                 self.save_settings();
             }
-            Message::ToggleKeepGoing => {
-                self.keep_going = !self.keep_going;
+            Message::ShowTasks => {
+                self.tasks_panel = true;
+                return self.fetch_outputs();
+            }
+            Message::CloseTasks => self.tasks_panel = false,
+            Message::WideTasks => self.tasks_wide = !self.tasks_wide,
+            Message::ToggleTask(key) => match self.task_open.iter().position(|k| *k == key) {
+                Some(i) => {
+                    self.task_open.remove(i);
+                }
+                None => self.task_open.push(key),
+            },
+            Message::ToggleFinished => self.finished_open = !self.finished_open,
+            Message::ClearFinished(keys) => self.tasks_hidden.extend(keys),
+            Message::MoreTasks => self.tasks_shown += 12,
+            Message::ProcOutput(id, Ok(j)) => {
+                if let Some(out) = j.get("output").and_then(Json::as_str) {
+                    self.proc_output.insert(id, out.to_string());
+                }
+            }
+            Message::ProcOutput(_, Err(_)) => {}
+            Message::StopProcess(id) => {
+                let body = obj(vec![("name", str("stop_process")), ("arguments", obj(vec![("id", num(id as f64))]))]);
+                return self.call(
+                    move |api| {
+                        api.post("/api/tools/run", &body)?;
+                        api.get("/api/background")
+                    },
+                    Message::Background,
+                );
+            }
+            Message::TrimChat => {
+                let Some(id) = self.chat.clone() else { return Task::none() };
+                let body = obj(vec![("id", str(&id))]);
+                return self.call(move |api| api.post("/api/chats/trim", &body), Message::Trimmed);
+            }
+            Message::Trimmed(Ok(j)) => {
+                self.status = match j.get("trimmed").and_then(Json::as_f64).unwrap_or(0.0) as usize {
+                    0 => "Nothing to trim: only the last 3 tool outputs are left".into(),
+                    n => format!("Trimmed {n} old tool output{}; the next reply reads the chat again", if n == 1 { "" } else { "s" }),
+                };
+            }
+            Message::Trimmed(Err(e)) => self.status = format!("Couldn't trim: {e}"),
+            Message::ClearGoal => {
+                self.composer = text_editor::Content::with_text("/goal clear");
+                return self.send(None);
+            }
+            Message::CycleMode => {
+                self.perm = (self.perm + 1) % MODES.len();
                 self.save_settings();
             }
+            Message::PickWorkdir => {
+                self.menu = None;
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose the folder this chat works in").pick_folder().map(|p| p.display().to_string())), Message::SetWorkdir);
+            }
+            Message::SetWorkdir(Some(f)) => {
+                self.workdir = Some(f);
+                self.menu = None;
+                self.save_settings();
+            }
+            Message::SetWorkdir(None) => {}
             Message::Approve(id, decision) => {
                 if let Some(t) = self.messages.last_mut().and_then(|m| m.tools.iter_mut().find(|t| t.id == id)) {
                     t.ask = None;
@@ -1014,10 +1182,13 @@ impl App {
                 return iced::window::latest().and_then(iced::window::is_maximized).map(Message::Maximized);
             }
             // the + menu: find the button on screen first, then open the menu above it
-            Message::OpenPlus => return iced::widget::selector::find(iced::widget::selector::id("plus")).map(|t| Message::PlusAt(t.map(|t| t.bounds()))),
-            Message::PlusAt(at) => {
-                self.plus_at = at;
-                self.menu = Some(Menu::Plus);
+            Message::OpenMenu(menu) => match menu.anchor() {
+                Some(id) => return iced::widget::selector::find(iced::widget::selector::id(id)).map(move |t| Message::MenuAt(menu, t.map(|t| t.bounds()))),
+                None => self.menu = Some(menu),
+            },
+            Message::MenuAt(menu, at) => {
+                self.menu_at = at;
+                self.menu = Some(menu);
             }
             Message::Maximized(m) => self.maximized = m,
             Message::ToggleLoadLast => {
@@ -1230,13 +1401,16 @@ impl App {
         }
         let mut fields = vec![
             ("theme", str(v)),
-            ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())),
+            ("permission_mode", str(MODES[self.perm].0)),
             ("rail", Json::Bool(self.rail)),
+            ("rail_open", Json::Arr(self.rail_open.iter().map(|k| str(k)).collect())),
             ("load_last", Json::Bool(self.load_last)),
-            ("keep_going", Json::Bool(self.keep_going)),
         ];
         if let Some(m) = &self.last_model {
             fields.push(("last_model", str(m)));
+        }
+        if let Some(w) = &self.workdir {
+            fields.push(("workdir", str(w)));
         }
         let _ = std::fs::write(p, obj(fields).to_string());
     }
@@ -1244,7 +1418,6 @@ impl App {
     /// The server's harness settings: the folders file tools may use.
     fn set_harness(&mut self, j: &Json) {
         self.folders = j.get("folders").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
-        self.folder = self.folders.first().map(|f| f.rsplit(['\\', '/']).find(|p| !p.is_empty()).unwrap_or(f).to_string());
     }
 
     /// Sends the new folder list to the server (it checks each one is a folder).
@@ -1259,7 +1432,7 @@ impl App {
     fn no_model_status(&self) -> String {
         match &self.loading {
             Some(id) => format!("Loading {}…", short_model(id)),
-            None => "No model loaded: pick one from the model menu".into(),
+            None => "No model loaded".into(),
         }
     }
 
@@ -1359,9 +1532,74 @@ impl App {
         self.last_active.elapsed().as_secs_f64()
     }
 
-    /// Where file tools work, for the label under the message box (the server's first allowed folder).
+    /// The open chat's commands, as the background tasks list shows them: running ones first, then the
+    /// finished ones newest first (those cleared from the panel left out).
+    pub fn bg_tasks(&self) -> Vec<BgTask> {
+        let Some(chat) = self.chat.as_deref() else { return Vec::new() };
+        let mut tasks = Vec::new();
+        // in the order the chat ran them: a command, or a process it started (by the number its result gave,
+        // the chat and the command, so a process from before the server restarted is not taken for a new one)
+        for (i, m) in self.messages.iter().enumerate() {
+            for (j, t) in m.tools.iter().enumerate().filter(|(_, t)| matches!(t.name.as_str(), "run_command" | "start_process") && !t.denied) {
+                let a = Json::parse(&t.arguments).unwrap_or(Json::Null);
+                let s = |k: &str| a.get(k).and_then(Json::as_str).unwrap_or("").trim().to_string();
+                let title = if s("description").is_empty() { s("command") } else { s("description") };
+                if t.name == "start_process" {
+                    let Some(id) = t.result.as_deref().and_then(|r| r.strip_prefix("started as process ")).and_then(|r| r.split(';').next()).and_then(|n| n.trim().parse::<usize>().ok()) else { continue };
+                    let p = self.processes.as_array().unwrap_or(&[]).iter().find(|p| {
+                        p.get("id").and_then(Json::as_f64) == Some(id as f64) && p.get("chat").and_then(Json::as_str) == Some(chat) && p.get("command").and_then(Json::as_str) == Some(s("command").as_str())
+                    });
+                    let state = match p.map(|p| (p.get("running").and_then(Json::as_bool).unwrap_or(false), p.get("stopped").and_then(Json::as_bool).unwrap_or(false), p.get("exit_code").and_then(Json::as_f64))) {
+                        Some((true, _, _)) => TaskState::Running,
+                        Some((_, true, _)) => TaskState::Stopped,
+                        Some((_, _, Some(c))) if c != 0.0 => TaskState::Failed,
+                        _ => TaskState::Done,
+                    };
+                    let output = self.proc_output.get(&id).cloned().unwrap_or_default();
+                    let secs = p.and_then(|p| p.get("secs")).and_then(Json::as_f64);
+                    tasks.push(BgTask { key: format!("c{i}.{j}"), title, command: s("command"), output, secs, state, process: p.map(|_| id) });
+                    continue;
+                }
+                let (state, output) = match &t.result {
+                    None => (TaskState::Running, String::new()),
+                    Some(r) => {
+                        let (head, rest) = r.split_once('\n').unwrap_or((r.as_str(), ""));
+                        let ok = head.trim() == "exit code 0";
+                        (if ok { TaskState::Done } else { TaskState::Failed }, if head.starts_with("exit code") { rest.trim().to_string() } else { r.clone() })
+                    }
+                };
+                tasks.push(BgTask { key: format!("c{i}.{j}"), title, command: s("command"), output, secs: t.secs, state, process: None });
+            }
+        }
+        tasks.retain(|t| t.state == TaskState::Running || !self.tasks_hidden.contains(&t.key));
+        let (mut running, mut done): (Vec<BgTask>, Vec<BgTask>) = tasks.into_iter().partition(|t| t.state == TaskState::Running);
+        done.reverse();
+        running.append(&mut done);
+        running
+    }
+
+    /// The running processes' output, asked for while the panel shows them.
+    fn fetch_outputs(&self) -> Task<Message> {
+        if !self.tasks_panel {
+            return Task::none();
+        }
+        let ids: Vec<usize> = self.bg_tasks().iter().filter(|t| t.state == TaskState::Running).filter_map(|t| t.process).collect();
+        Task::batch(ids.into_iter().map(|id| {
+            let body = obj(vec![("id", num(id as f64))]);
+            self.call(move |api| api.post("/api/background/output", &body), move |r| Message::ProcOutput(id, r))
+        }))
+    }
+
+    /// The folder a new chat will work in: the one picked, else the server's first allowed folder.
+    pub fn new_chat_dir(&self) -> Option<&str> {
+        self.workdir.as_deref().or(self.folders.first().map(String::as_str))
+    }
+
+    /// The folder under the message box: where the open chat works (it keeps the one it started in, as a
+    /// Claude Code session does), or where a new one will.
     pub fn folder_label(&self) -> String {
-        self.folder.clone().unwrap_or_else(|| "No folder".into())
+        let dir = if self.messages.is_empty() { self.new_chat_dir() } else { self.chat_cwd.as_deref().or(self.folders.first().map(String::as_str)) };
+        dir.map(folder_name).unwrap_or_else(|| "Choose a folder".into())
     }
 
     /// The ghost's clock: a tick a few times a second (the sprite moves in steps, so no more is needed).
@@ -1377,7 +1615,16 @@ impl App {
             });
             rx.map(|_| Message::Tick)
         });
-        iced::Subscription::batch([tick, resized])
+        // the mode menu's number keys, as Claude's (typed into the message box, the box's own binding takes them)
+        let keys = if self.menu == Some(Menu::Mode) {
+            iced::keyboard::listen().filter_map(|e| match e {
+                iced::keyboard::Event::KeyPressed { key: iced::keyboard::Key::Character(c), .. } => mode_key(&c),
+                _ => None,
+            })
+        } else {
+            iced::Subscription::none()
+        };
+        iced::Subscription::batch([tick, resized, keys])
     }
 
     /// A task list with every step done leaves the pin above the message box: it goes into the latest reply,
@@ -1396,6 +1643,9 @@ impl App {
     fn show_chat(&mut self, chat: &Json) {
         self.chat = chat.get("id").and_then(Json::as_str).map(String::from);
         self.title = chat.get("title").and_then(Json::as_str).map(String::from);
+        self.chat_cwd = chat.get("cwd").and_then(Json::as_str).filter(|c| !c.is_empty()).map(String::from);
+        self.goal = goal_of(chat.get("goal"));
+        self.parts = chat.get("parts").cloned().unwrap_or(Json::Null);
         self.context.0 = chat.get("tokens").and_then(Json::as_f64).unwrap_or(0.0); // chats saved before this have none
         self.tasks = tasks_of(chat.get("tasks"));
         self.plan_open = None;
@@ -1443,6 +1693,7 @@ impl App {
                         if let Some(t) = k.map(|k| &mut reply.tools[k]) {
                             t.result = Some(content.to_string());
                             t.denied = m.get("denied").and_then(Json::as_bool).unwrap_or(false);
+                            t.secs = m.get("secs").and_then(Json::as_f64);
                         }
                     }
                 }
@@ -1458,9 +1709,16 @@ impl App {
         if self.busy.is_some() {
             return Task::none();
         }
-        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("tools", Json::Arr(self.tools.iter().map(|g| str(g)).collect())), ("max_tokens", num(4096.0)), ("keep_going", Json::Bool(self.keep_going))];
-        if let Some(id) = &self.chat {
-            body.push(("chat", str(id)));
+        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("mode", str(MODES[self.perm].0)), ("max_tokens", num(4096.0))];
+        match &self.chat {
+            Some(id) => body.push(("chat", str(id))),
+            // a new chat: the folder it works in from now on
+            None => {
+                self.chat_cwd = self.new_chat_dir().map(String::from);
+                if let Some(dir) = &self.chat_cwd {
+                    body.push(("cwd", str(dir)));
+                }
+            }
         }
         match retry {
             None => {
@@ -1538,7 +1796,17 @@ impl App {
                 if let Some(m) = self.messages.last_mut() {
                     m.add_tool(ToolLine::nudge(&s("text"), goal));
                 }
-                self.status = if goal { "Carrying on with its plan".into() } else { "Checking its work".into() };
+                self.status = if goal { "Back to work on the goal".into() } else { "Checking its work".into() };
+            }
+            // the chat's /goal: set, checked, met or given up on (null: cleared)
+            "goal" => {
+                self.goal = goal_of(ev.get("goal"));
+                if ev.get("checking").and_then(Json::as_bool).unwrap_or(false) {
+                    self.status = "Checking the goal".into();
+                    if let Some(g) = &mut self.goal {
+                        g.checking = true;
+                    }
+                }
             }
             "tool_result" => {
                 let id = s("id");
@@ -1546,6 +1814,7 @@ impl App {
                     if let Some(t) = m.tools.iter_mut().find(|t| t.id == id) {
                         t.result = Some(s("result"));
                         t.denied = ev.get("denied").and_then(Json::as_bool).unwrap_or(false);
+                        t.secs = ev.get("secs").and_then(Json::as_f64);
                         t.ask = None;
                         let changed = t.changed_files();
                         m.changed |= changed;
@@ -1575,6 +1844,7 @@ impl App {
             "context" => {
                 let f = |k: &str| ev.get(k).and_then(Json::as_f64).unwrap_or(0.0);
                 self.context = (f("prompt_tokens") + f("completion_tokens"), f("context_length"));
+                self.parts = ev.get("parts").cloned().unwrap_or(Json::Null);
                 self.end_round(f("completion_tokens"));
             }
             "done" => {

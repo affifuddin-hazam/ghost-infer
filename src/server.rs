@@ -133,7 +133,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     });
     std::thread::spawn(mcp::start_all); // the MCP servers in mcp.json, while the model loads
     let (work, rx) = mpsc::channel::<Work>();
-    schedule::start(work.clone(), shared.clone()); // scheduled tasks and the heartbeat, once a model runs
+    schedule::start(work.clone(), shared.clone()); // scheduled tasks, once a model runs
     let s = shared.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -587,11 +587,22 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 Ok(()) => respond_private(&mut conn, 200, &obj(vec![("read", Json::Bool(true))])),
                 Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
             },
-            // what runs on its own (schedule.rs): the scheduled tasks and the heartbeat, with a number that
-            // changes whenever they or a chat they wrote to do; the heartbeat on or off {"every", "tools",
-            // "thinking"}; a task (or "heartbeat") run now or cancelled {"id"}
+            // {"id"}: the chat's old tool outputs taken out now (all but the last 3)
+            ("POST", "/api/chats/trim") => match agent::trim_chat(body().ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
+                Ok(n) => respond_private(&mut conn, 200, &obj(vec![("trimmed", num(n as f64))])),
+                Err(e) => respond_private(&mut conn, 409, &error_body(&e)),
+            },
+            // what runs on its own (schedule.rs): the scheduled tasks, with a number that changes whenever they
+            // or a chat they wrote to do; a task run now or cancelled {"id"}
             ("GET", "/api/background") => respond_private(&mut conn, 200, &schedule::status_json()),
-            ("POST", "/api/schedules/heartbeat") => respond_private(&mut conn, 200, &schedule::set_heartbeat(&body().unwrap_or(Json::Null))),
+            // {"id"}: what a background process has printed lately
+            ("POST", "/api/background/output") => {
+                let id = body().ok().and_then(|b| b.get("id").and_then(Json::as_f64)).unwrap_or(0.0) as usize;
+                match crate::tools::process_output(id) {
+                    Some(out) => respond_private(&mut conn, 200, &obj(vec![("output", str(&out))])),
+                    None => respond_private(&mut conn, 404, &error_body(&format!("no process {id}"))),
+                }
+            }
             ("POST", "/api/schedules/run") | ("POST", "/api/schedules/cancel") => {
                 let id = body().ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from)).unwrap_or_default();
                 match if path.ends_with("/run") { schedule::run_now(&id) } else { schedule::cancel(&id) } {

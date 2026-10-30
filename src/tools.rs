@@ -176,11 +176,16 @@ pub fn run(name: &str, args: &Json, s: &Settings, checkpoint: &str) -> Result<St
             let secs = count("timeout").unwrap_or(COMMAND_SECS).min(MAX_COMMAND_SECS);
             run_command(need("command")?, &s.resolve_read(text("cwd").unwrap_or("."))?, secs)?
         }
-        "start_process" => start_process(need("command")?, &s.resolve_read(text("cwd").unwrap_or("."))?)?,
+        // the chat that started it: a checkpoint is the chat's id and a time
+        "start_process" => start_process(need("command")?, &s.resolve_read(text("cwd").unwrap_or("."))?, text("description").unwrap_or(""), checkpoint.rsplit_once('-').map_or("", |(c, _)| c))?,
         "check_process" => check_process(count("id").ok_or("check_process needs \"id\"")?)?,
         "stop_process" => stop_process(count("id").ok_or("stop_process needs \"id\"")?)?,
         "web_search" => web_search(need("query")?)?,
-        "fetch_url" => fetch_url(need("url")?)?,
+        // a site by its name alone (penipu.my) is its https address
+        "fetch_url" => {
+            let url = need("url")?.trim();
+            fetch_url(&if url.contains("://") { url.to_string() } else { format!("https://{url}") })?
+        }
         _ => return Err(format!("no tool named {name}")),
     };
     Ok(clip(&out, MAX_RESULT))
@@ -569,6 +574,23 @@ struct Background {
     child: std::process::Child,
     out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     seen: usize,
+    started: std::time::Instant,
+    ended: Option<(std::time::Duration, Option<i32>)>, // how long it ran, and its exit code, once seen to end
+    stopped: bool,                                       // ended by stop_process
+    title: String,                                       // what it does, in the model's words (its description)
+    chat: String,                                        // the chat that started it
+}
+
+impl Background {
+    /// Whether it still runs, noting when it is first seen to have ended.
+    fn running(&mut self) -> bool {
+        if self.ended.is_none() {
+            if let Ok(Some(st)) = self.child.try_wait() {
+                self.ended = Some((self.started.elapsed(), st.code()));
+            }
+        }
+        self.ended.is_none()
+    }
 }
 
 fn background() -> &'static std::sync::Mutex<Vec<Option<Background>>> {
@@ -576,11 +598,11 @@ fn background() -> &'static std::sync::Mutex<Vec<Option<Background>>> {
     BG.get_or_init(Default::default)
 }
 
-fn start_process(command: &str, cwd: &Path) -> Result<String, String> {
+fn start_process(command: &str, cwd: &Path, title: &str, chat: &str) -> Result<String, String> {
     let mut child = shell(command, cwd)?;
     let out = collect(&mut child, BG_KEEP);
     let mut bg = background().lock().unwrap();
-    bg.push(Some(Background { command: command.to_string(), child, out, seen: 0 }));
+    bg.push(Some(Background { command: command.to_string(), child, out, seen: 0, started: std::time::Instant::now(), ended: None, stopped: false, title: title.trim().to_string(), chat: chat.to_string() }));
     Ok(format!("started as process {}; read its output with check_process, end it with stop_process", bg.len()))
 }
 
@@ -589,9 +611,10 @@ fn check_process(id: usize) -> Result<String, String> {
     let mut bg = background().lock().unwrap();
     let p = bg.get_mut(id - 1).and_then(Option::as_mut).ok_or_else(|| format!("no process {id}"))?;
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let state = match p.child.try_wait().map_err(|e| e.to_string())? {
-        Some(st) => format!("finished, exit code {}", st.code().map_or("?".into(), |c| c.to_string())),
-        None => "still running".into(),
+    let state = match (p.running(), p.ended) {
+        (true, _) => "still running".to_string(),
+        (false, _) if p.stopped => "stopped".to_string(),
+        (false, end) => format!("finished, exit code {}", end.and_then(|e| e.1).map_or("?".into(), |c| c.to_string())),
     };
     let out = p.out.lock().unwrap();
     // `seen` counts bytes of the kept tail; if old output was dropped since, start from what is left
@@ -601,28 +624,46 @@ fn check_process(id: usize) -> Result<String, String> {
     Ok(format!("process {id} ({}): {state}\n{}", p.command, if new.is_empty() { "(no new output)".into() } else { new }))
 }
 
+/// Ends a background process (it stays listed, as stopped, for the clients).
 fn stop_process(id: usize) -> Result<String, String> {
     let mut bg = background().lock().unwrap();
-    let mut p = bg.get_mut(id - 1).and_then(Option::take).ok_or_else(|| format!("no process {id}"))?;
-    if p.child.try_wait().ok().flatten().is_none() {
-        kill_tree(p.child.id());
-        let _ = p.child.wait();
+    let p = bg.get_mut(id - 1).and_then(Option::as_mut).ok_or_else(|| format!("no process {id}"))?;
+    if !p.running() {
+        return Ok(format!("process {id} had already ended"));
     }
+    kill_tree(p.child.id());
+    let _ = p.child.wait();
+    (p.stopped, p.ended) = (true, Some((p.started.elapsed(), None)));
     let buf = p.out.lock().unwrap();
     let out = text_of(&buf[p.seen.min(buf.len())..]);
     Ok(format!("process {id} stopped{}", if out.is_empty() { String::new() } else { format!("; its last output:\n{out}") }))
 }
 
-/// The background processes, for the chat page (running ones first).
+/// The background processes, for the clients: each one's command, whether it runs, for how long it has (or
+/// had), and how it ended (its exit code, or stopped).
 pub fn processes() -> Json {
     let mut bg = background().lock().unwrap();
     let list = bg
         .iter_mut()
         .enumerate()
         .filter_map(|(i, p)| p.as_mut().map(|p| (i + 1, p)))
-        .map(|(id, p)| obj(vec![("id", num(id as f64)), ("command", str(&p.command)), ("running", Json::Bool(p.child.try_wait().ok().flatten().is_none()))]))
+        .map(|(id, p)| {
+            let running = p.running();
+            let secs = p.ended.map_or(p.started.elapsed(), |e| e.0).as_secs_f64().floor();
+            let code = p.ended.and_then(|e| e.1).map_or(Json::Null, |c| num(c as f64));
+            obj(vec![("id", num(id as f64)), ("command", str(&p.command)), ("title", str(&p.title)), ("chat", str(&p.chat)), ("running", Json::Bool(running)), ("secs", num(secs)), ("exit_code", code), ("stopped", Json::Bool(p.stopped))])
+        })
         .collect();
     Json::Arr(list)
+}
+
+/// What a background process has printed lately (the kept tail), for the clients; reading it does not count
+/// as the model's check.
+pub fn process_output(id: usize) -> Option<String> {
+    let bg = background().lock().unwrap();
+    let p = bg.get(id.checked_sub(1)?)?.as_ref()?;
+    let out = p.out.lock().unwrap();
+    Some(clip(&text_of(&out), MAX_RESULT))
 }
 
 // ---- web (through Windows' own curl.exe: no TLS library here)
