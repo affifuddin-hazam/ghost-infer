@@ -3336,6 +3336,7 @@ api! {
     cuMemGetInfo_v2: fn(*mut usize, *mut usize) -> CuResult;
     cuMemcpyHtoD_v2: fn(u64, *const c_void, usize) -> CuResult;
     cuMemcpyDtoH_v2: fn(*mut c_void, u64, usize) -> CuResult;
+    cuMemcpyDtoD_v2: fn(u64, u64, usize) -> CuResult;
     cuLaunchKernel: fn(Ptr, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> CuResult;
     cuFuncSetAttribute: fn(Ptr, i32, i32) -> CuResult;
     cuFuncGetAttribute: fn(*mut i32, i32, Ptr) -> CuResult;
@@ -4432,7 +4433,12 @@ impl ExpertUploader {
                 loop {
                     let job = match rx.try_recv() {
                         Ok(j) => j,
-                        Err(TryRecvError::Disconnected) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            // stopping (finish): the last copies are reported too
+                            land(0, &mut inflight);
+                            land(1, &mut inflight);
+                            break;
+                        }
                         Err(TryRecvError::Empty) => {
                             // nothing waiting: let the copies in flight land, then sleep until there is
                             land(0, &mut inflight);
@@ -4479,12 +4485,19 @@ impl ExpertUploader {
     }
 }
 
-impl Drop for ExpertUploader {
-    fn drop(&mut self) {
-        self.tx = None; // the thread finishes its copies and stops
+impl ExpertUploader {
+    /// The thread finishes the copies queued and stops; `done` still holds their slots.
+    fn finish(&mut self) {
+        self.tx = None;
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+impl Drop for ExpertUploader {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -4495,7 +4508,9 @@ impl Drop for ExpertUploader {
 /// run, only where (and the rounding of their sums).
 struct ExpertCache {
     uploader: ExpertUploader, // first: its thread stops (copies landed) before the slots are freed
-    buf: DeviceBuf,
+    blocks: Vec<(DeviceBuf, usize)>, // the slots' memory, SLOT_BLOCK slots a block: (buffer, its first slot)
+    addr: Vec<u64>,                  // per slot: its device address
+    max_slots: usize,                // one per expert of every layer
     slot_bytes: usize,
     gate_bytes: usize,                  // repacked gate (= up) matrix; down follows both
     slot_of: Vec<Vec<i32>>,             // [layer][expert] -> slot, or -1
@@ -4548,7 +4563,7 @@ impl ExpertCache {
         let routers = moe.routers.iter().map(|r| DeviceBuf::alloc(r.len().max(1) * 4).and_then(|b| b.write(r).map(|_| b))).collect::<Result<Vec<_>, _>>()?;
         let conv_elems = (2 * g0.rows * g0.cols).max(g0.rows * g0.cols);
         let extras = routers.iter().map(|b| b.bytes).sum::<usize>() + 2 * scratch_bytes + conv_elems * 9 / 8 + 8 * MAX_BATCH * 8;
-        let slots = if shape.is_some() { (budget.saturating_sub(extras) / slot_bytes).min(cfg.n_layers * cfg.n_experts) } else { 0 };
+        let max_slots = if shape.is_some() { cfg.n_layers * cfg.n_experts } else { 0 };
         let mut pinned = [std::ptr::null_mut(); 2];
         let mut events = [std::ptr::null_mut(); 2];
         for i in 0..2 {
@@ -4557,15 +4572,17 @@ impl ExpertCache {
             pinned[i] = p as *mut u8;
             a.check(unsafe { (a.f.cuEventCreate)(&mut events[i], 0) }, "event")?;
         }
-        Ok(ExpertCache {
+        let mut cache = ExpertCache {
             uploader: ExpertUploader::new(slot_bytes, gate_bytes),
-            buf: DeviceBuf::alloc(slots * slot_bytes)?,
+            blocks: Vec::new(),
+            addr: Vec::new(),
+            max_slots,
             slot_bytes,
             gate_bytes,
             slot_of: vec![vec![-1; cfg.n_experts]; cfg.n_layers],
-            owner: vec![None; slots],
-            free: (0..slots).rev().collect(),
-            used: vec![0; slots],
+            owner: Vec::new(),
+            free: Vec::new(),
+            used: Vec::new(),
             clock: 0,
             queued: vec![vec![false; cfg.n_experts]; cfg.n_layers],
             sent: 0,
@@ -4581,7 +4598,56 @@ impl ExpertCache {
             conv_d: DeviceBuf::alloc(conv_elems / 32 * 4)?,
             idx: DeviceBuf::alloc(8 * MAX_BATCH * 8)?,
             staged: 0,
-        })
+        };
+        cache.add_blocks(budget.saturating_sub(extras));
+        Ok(cache)
+    }
+
+    /// More slots, a block at a time, in up to `bytes` of GPU memory.
+    fn add_blocks(&mut self, mut bytes: usize) {
+        while self.slots() < self.max_slots {
+            let n = (bytes / self.slot_bytes).min(SLOT_BLOCK).min(self.max_slots - self.slots());
+            if n == 0 {
+                break;
+            }
+            let Ok(buf) = DeviceBuf::alloc(n * self.slot_bytes) else { break };
+            let first = self.slots();
+            self.addr.extend((0..n).map(|i| buf.ptr + (i * self.slot_bytes) as u64));
+            self.owner.resize(first + n, None);
+            self.used.resize(first + n, 0);
+            self.free.extend((first..first + n).rev());
+            self.blocks.push((buf, first));
+            bytes -= n * self.slot_bytes;
+        }
+    }
+
+    /// Frees the last blocks of slots until `bytes` of GPU memory are given back (or no slots are left):
+    /// their experts run on the CPU again, their pages read back into RAM ahead of that.
+    fn free_blocks(&mut self, moe: &CpuMoe, bytes: usize) {
+        // copies on their way into a slot land first
+        let mut old = std::mem::replace(&mut self.uploader, ExpertUploader::new(self.slot_bytes, self.gate_bytes));
+        old.finish();
+        while let Ok(d) = old.done.try_recv() {
+            self.landed(d);
+        }
+        let base = moe.mmap.as_ptr() as usize;
+        let mut freed = 0;
+        while freed < bytes {
+            let Some((buf, first)) = self.blocks.pop() else { break };
+            for (l, e) in self.owner.drain(first..).flatten() {
+                self.slot_of[l][e] = -1;
+                os::prefetch(&moe.tensors[l].map(|t| (base + t.offset + e * t.stride, t.stride)));
+            }
+            self.addr.truncate(first);
+            self.used.truncate(first);
+            self.free.retain(|&s| s < first);
+            freed += buf.bytes;
+        }
+    }
+
+    /// GPU memory the slots take.
+    fn bytes(&self) -> usize {
+        self.blocks.iter().map(|(b, _)| b.bytes).sum()
     }
 
     /// Gate and up as GPU Q3_K (112-byte blocks: the 16-byte header first) into `out`, then the down's
@@ -4639,18 +4705,22 @@ impl ExpertCache {
 
     /// Device addresses of a cached expert's gate, up and down.
     fn ptrs(&self, slot: usize) -> [u64; 3] {
-        let base = self.buf.ptr + (slot * self.slot_bytes) as u64;
+        let base = self.addr[slot];
         [base, base + self.gate_bytes as u64, base + 2 * self.gate_bytes as u64]
     }
 
     /// Marks the slots whose copies have landed as holding their experts.
     fn collect(&mut self) {
-        while let Ok((l, e, slot)) = self.uploader.done.try_recv() {
-            self.slot_of[l][e] = slot as i32;
-            self.queued[l][e] = false;
-            self.used[slot] = self.clock;
-            self.uploads += 1;
+        while let Ok(d) = self.uploader.done.try_recv() {
+            self.landed(d);
         }
+    }
+
+    fn landed(&mut self, (l, e, slot): (usize, usize, usize)) {
+        self.slot_of[l][e] = slot as i32;
+        self.queued[l][e] = false;
+        self.used[slot] = self.clock;
+        self.uploads += 1;
     }
 
     /// Layer l's picks: the cached ones count as used now; the others are queued for upload (a prompt batch
@@ -4709,7 +4779,7 @@ impl ExpertCache {
     /// Slots, how many hold an expert, and uploads so far (GHOST_INFER_LOAD_TIMES reports them).
     fn describe(&self) -> String {
         let used = self.slot_of.iter().flatten().filter(|s| **s >= 0).count();
-        format!("{} slots ({} MB), {used} in use, {} uploads, {} staged for prompts", self.slots(), self.slots() * self.slot_bytes >> 20, self.uploads, self.staged)
+        format!("{} slots ({} MB), {used} in use, {} uploads, {} staged for prompts", self.slots(), self.bytes() >> 20, self.uploads, self.staged)
     }
 
     /// Called once per forward pass.
@@ -5053,11 +5123,11 @@ impl GpuModel {
                 // the tiled kernels: as many tokens as their (token, head, slice) rows fit, in part and in scr
                 let all = n - b0;
                 let slices = (pos0 + 1..=pos0 + all).map(|span| span.div_ceil(Self::att_chunk(span, want))).max().unwrap_or(1);
-                m = ((SPLIT_MAX_BATCH * s.ctx.div_ceil(32)).min(AV_SCR_ROWS) / slices).clamp(1, all);
+                m = ((SPLIT_MAX_BATCH * s.cap.div_ceil(32)).min(AV_SCR_ROWS) / slices).clamp(1, all);
             }
             // the grid covers the token needing the most slices; the others' extra slices are empty
             let nsplit = if fixed_split {
-                self.max_splits(s.ctx)
+                self.max_splits(s.cap)
             } else {
                 (pos0 + 1..=pos0 + m).map(|span| span.div_ceil(Self::att_chunk(span, want))).max().unwrap_or(1)
             };
@@ -5109,6 +5179,8 @@ impl GpuModel {
         // memory there, while a small batch would run every expert on the CPU, reading even the GPU-held
         // ones back from RAM (or, when RAM is short, from the disk)
         let per_token = self.cfg.is_moe() && tokens.len() > 1 && tokens.len() < MOE_GPU_MIN_BATCH;
+        // room for the whole prompt at once (or less room, for a conversation much shorter than the last)
+        self.fit_session(s, (s.pos + tokens.len()).min(s.ctx), true)?;
         let chunks: Vec<&[u32]> = if per_token { tokens.chunks(1).collect() } else { tokens.chunks(MAX_BATCH).collect() };
         PROGRESS.start(tokens.len());
         let mut result = Ok(());
@@ -5161,6 +5233,9 @@ impl GpuModel {
         }
         if s.pos + n > s.ctx {
             return Err(format!("context full ({} tokens)", s.ctx));
+        }
+        if s.pos + n > s.cap {
+            self.fit_session(s, s.pos + n, false)?;
         }
         let k = &self.k;
         let a = api()?;
@@ -5522,7 +5597,7 @@ impl GpuModel {
         let (c, k) = (&self.cfg, &self.k);
         let m = c.mla.unwrap();
         let (h, rd) = (c.n_heads, c.rope_dim);
-        let span = if fixed_split { s.ctx } else { s.pos + n };
+        let span = if fixed_split { s.cap } else { s.pos + n };
         let nsplit = if n > MLA_SPLIT_MAX_BATCH { 1 } else { span.div_ceil(MLA_SPLIT_SPAN).clamp(1, MLA_MAX_SPLIT) };
         let shared = (h * (m.kv_lora + rd) + h * MLA_T + 3 * h) * 4;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
@@ -5561,27 +5636,24 @@ impl GpuModel {
     fn launches(&self, n: usize, s: &GpuSession, want: Out, posp: u64, fixed_split: bool) -> Result<(), String> {
         let c = &self.cfg;
         let (dim, hd) = (c.dim, c.head_dim);
-        let kv_dim = c.n_kv_heads * hd;
         let k = &self.k;
 
         // profile buckets match profile::OPS; with profiling off `timed` is a plain call
         self.timed(0, || {
             k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(self.embd.fmt as i32), Arg::P(self.embd.q.ptr), Arg::P(self.embd.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)])
         })?;
-        let layer_kv = s.ctx * kv_dim * kv_bytes();
-        let layer_scales = s.ctx * c.n_kv_heads * 4;
         let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
         for (l, layer) in self.layers.iter().enumerate() {
             if let Some(mla) = &layer.mla {
-                let cache = s.k_cache.at(l * s.ctx * c.k_row() * 2);
+                let cache = s.k_cache.at(l);
                 self.timed(2, || self.mla_in(layer, mla, cache, n, s, posp))?;
                 self.timed(4, || self.mla_attention(cache, n, s, posp, fixed_split))?;
                 self.timed(5, || self.mla_out(layer, mla, n, s))?;
                 self.timed(6, || self.ffn(l, layer, n, s))?;
                 continue;
             }
-            let (kc, vc) = (s.k_cache.at(l * layer_kv), s.v_cache.at(l * layer_kv));
-            let (ks, vs) = if kv_int8() { (s.k_scale.at(l * layer_scales), s.v_scale.at(l * layer_scales)) } else { (0, 0) };
+            let (kc, vc) = (s.k_cache.at(l), s.v_cache.at(l));
+            let (ks, vs) = (s.k_scale.at(l), s.v_scale.at(l));
             let qkv: Vec<(&GpuMatrix, usize)> = layer.qkv.iter().map(|(m, off)| (m, *off)).collect();
             self.timed(2, || self.norm_matmul(&layer.attn_norm, &qkv, s.qkv.ptr, qkv_rows, n, s))?;
             self.timed(3, || {
@@ -5634,7 +5706,9 @@ enum Out {
 
 pub struct GpuSession {
     pub pos: usize,
-    pub ctx: usize,
+    pub ctx: usize, // the most positions it may hold
+    cap: usize,     // the positions its caches hold now (ctx, unless it grows: session_grows)
+    grows: bool,
     tokens: DeviceBuf,
     x: DeviceBuf,
     xb: DeviceBuf,
@@ -5642,11 +5716,11 @@ pub struct GpuSession {
     att: DeviceBuf,
     gu: DeviceBuf,
     h: DeviceBuf,
-    k_cache: DeviceBuf,
-    v_cache: DeviceBuf,
-    k_scale: DeviceBuf,  // int8 cache: f32 scale per (layer, position, kv head)
-    v_scale: DeviceBuf,
-    xq: DeviceBuf,       // int8 activations for the tiled matmul
+    k_cache: LayerCache,
+    v_cache: LayerCache,
+    k_scale: LayerCache, // int8 cache: f32 scale per (layer, position, kv head)
+    v_scale: LayerCache,
+    xq: DeviceBuf,      // int8 activations for the tiled matmul
     xd: DeviceBuf,       // their per-32 scales
     xsum: DeviceBuf,     // and per-32 sums of the int8 values
     att_part: DeviceBuf, // flash-decoding partial results
@@ -5685,15 +5759,79 @@ impl GpuModel {
     pub fn expert_cache(&self) -> Option<String> {
         self.cache.borrow().as_ref().map(ExpertCache::describe)
     }
+
+    /// A session that grows gets room for `need` positions, in CTX_STEP steps: the memory it takes comes
+    /// from the expert cache's last blocks, the memory it gives back goes to the cache. `shrink`: also give
+    /// memory back, when the conversation needs two steps less than the session holds (a new one after a
+    /// long one; not for every prompt that is a little shorter than the last).
+    fn fit_session(&self, s: &mut GpuSession, need: usize, shrink: bool) -> Result<(), String> {
+        if !s.grows {
+            return Ok(());
+        }
+        let cap = (need.div_ceil(CTX_STEP).max(1) * CTX_STEP).min(s.ctx);
+        if cap == s.cap || (cap < s.cap && !(shrink && cap + 2 * CTX_STEP <= s.cap)) {
+            return Ok(());
+        }
+        let a = api()?;
+        a.check(unsafe { (a.f.cuCtxSynchronize)() }, "synchronize")?; // no kernel queued still reads the old caches
+        let c = &self.cfg;
+        let mut cache = self.cache.borrow_mut();
+        let sized = fixed_expert_cache().is_none();
+        if let (Some(cache), Some(moe), true) = (cache.as_mut(), self.moe.as_ref(), sized) {
+            let more = GpuSession::bytes(c, cap).saturating_sub(GpuSession::bytes(c, s.cap));
+            let short = (more + GpuSession::resize_peak(c, cap) + FIT_RESERVE).saturating_sub(free_memory()?);
+            if short > 0 {
+                cache.free_blocks(moe, short);
+            }
+        }
+        let from = s.cap;
+        s.resize(c, cap)?;
+        if let (Some(cache), true) = (cache.as_mut(), sized) {
+            cache.add_blocks(free_memory()?.saturating_sub(FIT_RESERVE));
+        }
+        let slots = cache.as_ref().map_or(String::new(), |c| format!(", expert cache {} slots", c.slots()));
+        eprintln!("[context memory {from} -> {cap} tokens{slots}]");
+        Ok(())
+    }
 }
 
 impl Drop for GpuSession {
     fn drop(&mut self) {
-        if let Ok(a) = api() {
-            for g in self.graphs.iter().filter(|g| !g.is_null()) {
-                unsafe { (a.f.cuGraphExecDestroy)(*g) };
+        self.drop_graphs();
+    }
+}
+
+/// A cache of every position, per layer: a buffer of `cap` rows of `row` bytes for each layer (none when
+/// the model keeps no such cache), so that it can grow or shrink a layer at a time.
+struct LayerCache {
+    row: usize,
+    layers: Vec<DeviceBuf>,
+}
+
+impl LayerCache {
+    fn new(row: usize, n_layers: usize, cap: usize) -> Result<LayerCache, String> {
+        let layers = if row == 0 { Vec::new() } else { (0..n_layers).map(|_| DeviceBuf::alloc(cap * row)).collect::<Result<_, _>>()? };
+        Ok(LayerCache { row, layers })
+    }
+
+    /// Layer l's first row (0 when there is no cache).
+    fn at(&self, l: usize) -> u64 {
+        self.layers.get(l).map_or(0, |b| b.ptr)
+    }
+
+    /// To `cap` rows a layer, keeping the first `keep`.
+    fn resize(&mut self, cap: usize, keep: usize) -> Result<(), String> {
+        let a = api()?;
+        for b in &mut self.layers {
+            let fresh = DeviceBuf::alloc(cap * self.row)?;
+            if keep > 0 {
+                a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(fresh.ptr, b.ptr, keep * self.row) }, "context cache copy")?;
+                // the copy does not wait for the host: it is done before the old buffer is freed
+                a.check(unsafe { (a.f.cuCtxSynchronize)() }, "synchronize")?;
             }
+            *b = fresh;
         }
+        Ok(())
     }
 }
 
@@ -5707,7 +5845,10 @@ fn graphs_enabled() -> bool {
 impl GpuSession {
     pub fn new(cfg: &Config, ctx: usize) -> Result<GpuSession, String> {
         let ctx = ctx.min(cfg.max_ctx);
-        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, k_cache, v_cache, k_scale, v_scale, logits_dev, picks, pos_dev, att_scr] = Self::sizes(cfg, ctx).map(DeviceBuf::alloc);
+        let grows = session_grows(cfg);
+        let cap = if grows { ctx.min(CTX_STEP) } else { ctx };
+        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, logits_dev, picks, pos_dev, att_scr] = Self::sizes(cfg, cap).map(DeviceBuf::alloc);
+        let [k_row, v_row, ks_row, vs_row] = Self::cache_rows(cfg);
         Ok(GpuSession {
             xq: xq?,
             xd: xd?,
@@ -5715,6 +5856,8 @@ impl GpuSession {
             att_part: att_part?,
             pos: 0,
             ctx,
+            cap,
+            grows,
             tokens: tokens?,
             x: x?,
             xb: xb?,
@@ -5722,10 +5865,10 @@ impl GpuSession {
             att: att?,
             gu: gu?,
             h: h?,
-            k_cache: k_cache?,
-            v_cache: v_cache?,
-            k_scale: k_scale?,
-            v_scale: v_scale?,
+            k_cache: LayerCache::new(k_row, cfg.n_layers, cap)?,
+            v_cache: LayerCache::new(v_row, cfg.n_layers, cap)?,
+            k_scale: LayerCache::new(ks_row, cfg.n_layers, cap)?,
+            v_scale: LayerCache::new(vs_row, cfg.n_layers, cap)?,
             logits_dev: logits_dev?,
             picks: picks?,
             pos_dev: pos_dev?,
@@ -5739,17 +5882,61 @@ impl GpuSession {
         })
     }
 
-    /// Bytes of each device buffer, in the order `new` takes them.
-    fn sizes(cfg: &Config, ctx: usize) -> [usize; 19] {
+    /// To caches of `cap` positions, keeping the first `pos`.
+    fn resize(&mut self, cfg: &Config, cap: usize) -> Result<(), String> {
+        let keep = self.pos.min(cap);
+        for c in [&mut self.k_cache, &mut self.v_cache, &mut self.k_scale, &mut self.v_scale] {
+            c.resize(cap, keep)?;
+        }
+        let part = Self::sizes(cfg, cap)[3];
+        if part != self.att_part.bytes {
+            self.att_part = DeviceBuf::alloc(part)?;
+        }
+        self.drop_graphs(); // they hold the old addresses
+        self.cap = cap;
+        Ok(())
+    }
+
+    fn drop_graphs(&mut self) {
+        if let Ok(a) = api() {
+            for g in self.graphs.iter_mut().filter(|g| !g.is_null()) {
+                unsafe { (a.f.cuGraphExecDestroy)(*g) };
+                *g = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Device memory of a session holding `ctx` positions.
+    fn bytes(cfg: &Config, ctx: usize) -> usize {
+        Self::sizes(cfg, ctx).iter().sum::<usize>() + cfg.n_layers * ctx * Self::cache_rows(cfg).iter().sum::<usize>()
+    }
+
+    /// The most memory `resize` to `ctx` positions holds besides the old caches and the new ones done so
+    /// far: one new buffer.
+    fn resize_peak(cfg: &Config, ctx: usize) -> usize {
+        Self::cache_rows(cfg).iter().map(|r| r * ctx).max().unwrap_or(0).max(Self::sizes(cfg, ctx)[3])
+    }
+
+    /// Bytes per position and layer of the caches: keys, values, and the int8 cache's key and value scales.
+    /// Latent attention keeps one f16 (kl + rd)-wide row (no separate values, no int8 option).
+    fn cache_rows(cfg: &Config) -> [usize; 4] {
+        if cfg.mla.is_some() {
+            return [2 * cfg.k_row(), 0, 0, 0];
+        }
+        let kv = cfg.n_kv_heads * cfg.head_dim * kv_bytes();
+        let scales = if kv_int8() { 4 * cfg.n_kv_heads } else { 0 };
+        [kv, kv, scales, scales]
+    }
+
+    /// Bytes of each device buffer besides the caches, in the order `new` takes them.
+    fn sizes(cfg: &Config, ctx: usize) -> [usize; 15] {
         if let Some(m) = cfg.mla {
-            return Self::sizes_mla(cfg, m, ctx);
+            return Self::sizes_mla(cfg, m);
         }
         let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
         let widest = cfg.dim.max(q_dim).max(cfg.ffn_dim);
         // split attention runs at most SPLIT_MAX_BATCH tokens at a time, with slices of >= 32 positions
         let slices = SPLIT_MAX_BATCH * ctx.div_ceil(32);
-        let kv = cfg.n_layers * ctx * kv_dim * kv_bytes();
-        let scales = if kv_int8() { 4 * cfg.n_layers * ctx * cfg.n_kv_heads } else { 0 };
         [
             MAX_BATCH * widest,
             4 * MAX_BATCH * widest / 32,
@@ -5762,10 +5949,6 @@ impl GpuSession {
             4 * MAX_BATCH * q_dim,
             4 * MAX_BATCH * 2 * cfg.ffn_dim,
             4 * MAX_BATCH * cfg.ffn_dim,
-            kv,
-            kv,
-            scales,
-            scales,
             4 * VERIFY_MAX_BATCH * cfg.vocab,
             4 * VERIFY_MAX_BATCH,
             4,
@@ -5773,10 +5956,9 @@ impl GpuSession {
         ]
     }
 
-    /// `sizes` for latent attention: an f16 cache of one (kl + rd)-wide row per position and layer (no
-    /// separate values, no int8 option); s.qkv holds the queries then [low-rank query | compressed kv]
-    /// rows; s.att a token's heads x kl outputs; s.gu also the queries moved into the latent space.
-    fn sizes_mla(cfg: &Config, m: crate::model::Mla, ctx: usize) -> [usize; 19] {
+    /// `sizes` for latent attention: s.qkv holds the queries then [low-rank query | compressed kv] rows;
+    /// s.att a token's heads x kl outputs; s.gu also the queries moved into the latent space.
+    fn sizes_mla(cfg: &Config, m: crate::model::Mla) -> [usize; 15] {
         let (h, kd) = (cfg.n_heads, cfg.k_row());
         let q_dim = h * cfg.head_dim;
         let att = (h * m.kv_lora).max(q_dim);
@@ -5794,10 +5976,6 @@ impl GpuSession {
             4 * MAX_BATCH * att,
             4 * MAX_BATCH * gu,
             4 * MAX_BATCH * cfg.ffn_dim,
-            2 * cfg.n_layers * ctx * kd,
-            4,
-            4,
-            4,
             4 * DECODE_MAX_BATCH * cfg.vocab,
             4 * DECODE_MAX_BATCH,
             4,
@@ -5814,13 +5992,36 @@ const FIT_RESERVE: usize = 384 << 20;
 /// GPU memory for the expert cache: what is free when it is made (after the weights and the session),
 /// less FIT_RESERVE. GHOST_INFER_EXPERT_CACHE_MB sets it instead (0: every expert on the CPU).
 fn expert_cache_budget() -> Result<usize, String> {
-    if let Some(mb) = std::env::var("GHOST_INFER_EXPERT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
-        return Ok(mb << 20);
+    match fixed_expert_cache() {
+        Some(bytes) => Ok(bytes),
+        None => Ok(free_memory()?.saturating_sub(FIT_RESERVE)),
     }
+}
+
+/// GHOST_INFER_EXPERT_CACHE_MB's size, in bytes.
+fn fixed_expert_cache() -> Option<usize> {
+    std::env::var("GHOST_INFER_EXPERT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20)
+}
+
+fn free_memory() -> Result<usize, String> {
     let a = api()?;
     let (mut free, mut _total) = (0usize, 0usize);
     a.check(unsafe { (a.f.cuMemGetInfo_v2)(&mut free, &mut _total) }, "memory info")?;
-    Ok(free.saturating_sub(FIT_RESERVE))
+    Ok(free)
+}
+
+/// Experts' slots per block of GPU memory (the expert cache grows and shrinks a block at a time).
+const SLOT_BLOCK: usize = 16;
+
+/// A mixture of experts' session holds its positions in steps of this many: the memory of positions a
+/// conversation has not reached yet is expert cache meanwhile.
+const CTX_STEP: usize = 4096;
+
+/// Sessions that grow with the conversation: a mixture of experts' (on the GPU, its expert cache wants every
+/// byte), unless GHOST_INFER_FULL_CTX is set.
+fn session_grows(cfg: &Config) -> bool {
+    static FULL: OnceLock<bool> = OnceLock::new();
+    cfg.is_moe() && !*FULL.get_or_init(|| std::env::var_os("GHOST_INFER_FULL_CTX").is_some())
 }
 
 /// Prompt batches of at least this many tokens run every expert on the GPU (smaller ones on the CPU).
@@ -5884,7 +6085,7 @@ pub fn fit_ctx(cfgs: &[&Config]) -> Result<usize, String> {
     let a = api()?;
     let (mut free, mut _total) = (0usize, 0usize);
     a.check(unsafe { (a.f.cuMemGetInfo_v2)(&mut free, &mut _total) }, "memory info")?;
-    let need = |ctx: usize| cfgs.iter().map(|c| GpuSession::sizes(c, ctx).iter().sum::<usize>()).sum::<usize>() + FIT_RESERVE;
+    let need = |ctx: usize| cfgs.iter().map(|c| GpuSession::bytes(c, ctx)).sum::<usize>() + FIT_RESERVE;
     let limit = cfgs.iter().map(|c| c.max_ctx).min().unwrap_or(2048);
     let mut ctx = 1024.min(limit);
     while ctx + 1024 <= limit && need(ctx + 1024) <= free {

@@ -435,6 +435,10 @@ it. Remove that file to build a portable binary.
   page shows that it is loading weights from disk. Experts copied into GPU memory give their RAM back, and
   short prompts run a token at a time so the GPU-held experts are never read from RAM again: with 16 GB
   of RAM, a new chat's first token came after 20 s instead of 56 s, and replies ran at 14 tokens/s instead of 3.
+  The KV cache holds only the positions a conversation has reached, in 4,096-token steps, one buffer per
+  layer: the memory a long `--ctx` would reserve holds experts until the conversation needs it, and a
+  step's memory comes from the expert cache's last blocks of slots (the other experts stay cached). With
+  `--ctx 32768`, GLM-4.7-Flash's short replies ran at 21.7 tokens/s instead of 18.4.
 - **Multi-head latent attention** (GLM-4.7-Flash, DeepSeek-style): each token caches one compressed
   key-value vector and a shared RoPE key, 54 KB per token where Qwen3-30B-A3B needs 96 KB. Each head's
   query moves into that compressed space and attention runs over the cache as it is, every head scored
@@ -483,6 +487,7 @@ llama.cpp's own CPU and GPU builds differ by up to 0.85 on the same prompts.
 | `GHOST_INFER_NO_TC_ATT=1` | GPU prompts: f32 attention instead of f16 tensor cores (more exact, much slower on long prompts) |
 | `GHOST_INFER_NO_Q8K=1` | K-quant GPU prompts: the older per-32 activation-scale kernel (more exact, ~1.7× slower) |
 | `GHOST_INFER_EXPERT_CACHE_MB=n` | mixture of experts on the GPU: VRAM for the expert cache (default: what is free; 0 = every expert on the CPU) |
+| `GHOST_INFER_FULL_CTX=1` | mixture of experts on the GPU: the whole context's KV cache at load, instead of growing with the conversation |
 | `GHOST_INFER_NO_PREFETCH=1` | mixture of experts on the GPU: read expert weights by page faults instead of the prefetch thread's large reads |
 | `GHOST_INFER_MOE_CHECK=1` | mixture of experts on the GPU: also compute each GPU-resident expert on the CPU and print the difference |
 | `GHOST_INFER_LOGITS_OUT=file` | `top`: write every next-token logit (f32, little-endian) for accuracy tooling |
