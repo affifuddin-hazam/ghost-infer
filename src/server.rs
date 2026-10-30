@@ -84,6 +84,9 @@ struct Shared {
     defaults: (f32, usize, f32, usize),
     think_default: bool,
     harness: Mutex<crate::tools::Settings>,
+    /// the tool groups of the last agent request: after a model loads, the agent prompt's opening with these is
+    /// read in ahead of time
+    agent_groups: Mutex<Vec<String>>,
     /// made at startup and written into the chat page: the agent tools answer only requests carrying it
     token: String,
 }
@@ -125,6 +128,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         defaults: (o.temp, o.top_k, o.top_p, o.max_new),
         think_default: !o.no_think,
         harness: Mutex::new(crate::tools::Settings::load()),
+        agent_groups: Mutex::new(vec!["files".to_string()]),
         token: new_token(),
     });
     std::thread::spawn(mcp::start_all); // the MCP servers in mcp.json, while the model loads
@@ -242,6 +246,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
             let _ = w.send(err.map_or(Ok(()), Err));
         }
         last_good = Some(path.clone());
+        warm_agent(&mut engine, &shared);
 
         let (next, reply) = loop {
             match rx.recv() {
@@ -256,6 +261,22 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         eprintln!("[switching from {id} to {}]", model_id(&next));
         path = next;
         waiting = Some((reply, None));
+    }
+}
+
+/// Reads the agent prompt's opening (instructions, memory, tool descriptions: a few thousand tokens) into the
+/// cache right after a model loads, while the user types: a chat's first reply then reads only its message.
+fn warm_agent(engine: &mut Engine, shared: &Shared) {
+    let Some(loaded) = shared.status.lock().unwrap().current.clone() else { return };
+    let groups = shared.agent_groups.lock().unwrap().clone();
+    let Some(text) = agent::prompt_opening(&groups, shared, &loaded) else { return };
+    let t = Instant::now();
+    let ids = engine.tok.encode(&text);
+    let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count();
+    engine.truncate(keep);
+    match engine.read_in(&ids[keep..]) {
+        Ok(()) => eprintln!("[read the agent's opening in ahead: {} tokens in {:.2}s]", ids.len() - keep, t.elapsed().as_secs_f64()),
+        Err(e) => eprintln!("[could not read the agent's opening in: {e}]"),
     }
 }
 

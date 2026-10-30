@@ -530,6 +530,21 @@ impl Engine<'_> {
     }
 
     /// Makes the cache hold only its first `pos` tokens (in the draft model too).
+    /// Reads `ids` into the cache after what it holds, without replying: the server reading a prompt's
+    /// opening in ahead of time.
+    fn read_in(&mut self, ids: &[u32]) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if self.backend.pos() + ids.len() >= self.backend.ctx() {
+            return Err(format!("{} tokens do not fit in the context", ids.len()));
+        }
+        self.hist.truncate(self.backend.pos());
+        self.backend.prefill(ids)?;
+        self.hist.extend_from_slice(ids);
+        Ok(())
+    }
+
     fn truncate(&mut self, pos: usize) {
         self.hist.truncate(pos);
         match &mut self.backend {

@@ -41,8 +41,8 @@ const MAX_ROUNDS: usize = 40;
 const TOOLS: &str = r#"{
  "system": [
   {"type":"function","function":{"name":"get_system_info","description":"Get the specs of the user's computer: CPU, RAM, GPU and VRAM, operating system, free disk space, and what is running on it right now.","parameters":{"type":"object","properties":{},"required":[]}}},
-  {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for any job of more than one step; the user sees it pinned above the message box. Send the whole list every time. Mark one task in_progress while you work on it, and done as soon as it is finished.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
-  {"type":"function","function":{"name":"remember","description":"Save a lasting fact about the user or this computer for future chats: a preference, where their projects live, how a program runs here. Not for details of one task.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
+  {"type":"function","function":{"name":"update_tasks","description":"Keep a task list for a job of several steps (not for a question or a chat); the user sees it pinned above the message box. Send the whole list every time. Mark one task in_progress while you work on it, and done as soon as it is finished.","parameters":{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","description":"The step, in a few words"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text","status"]}}},"required":["tasks"]}}},
+  {"type":"function","function":{"name":"remember","description":"Save a lasting fact the user tells you about themselves or this computer, for future chats: a preference, where their projects live, how a program runs here. Not what you already remember. Not for details of one task.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact, in one short sentence"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"forget","description":"Forget a remembered fact that is wrong or no longer true.","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"The fact as it was saved"}},"required":["fact"]}}},
   {"type":"function","function":{"name":"search_chats","description":"Search the user's earlier chats with you, for when they refer to something you talked about before. Returns matching chats with their id, title, date and the lines that match.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Words to look for"}},"required":["query"]}}},
   {"type":"function","function":{"name":"read_chat","description":"Read an earlier chat found with search_chats.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The chat's id"}},"required":["id"]}}},
@@ -117,7 +117,7 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool) -> String {
         format!("You may use files in {} (relative paths start in {}).", list.join(", "), list[0])
     };
     let check = if can_run { " After you change code, check it: run it or its tests with run_command. If something fails, fix it and run it again. Say it is done only once it works, and say how you checked." } else { "" };
-    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Read a file before you edit it. Unless the task is one quick step, start by writing a short plan with update_tasks (2 to 6 steps), mark the step you start in_progress and each finished one done, and change the plan when the work shows it should change. Save lasting facts with remember. When the user refers to an earlier conversation, look it up with search_chats.{check} Use tools until the task is done, then answer briefly.")
+    format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Answer greetings, chat and questions you can answer yourself directly, without tools. Use tools when the request needs them. For a task of several steps, start by writing a short plan with update_tasks (2 to 6 steps), mark the step you start in_progress and each finished one done, and change the plan when the work shows it should change. Read a file before you edit it. Save a fact with remember only when the user tells you something worth keeping for later chats. When the user refers to an earlier conversation, look it up with search_chats.{check} Use tools until the task is done, then answer briefly.")
 }
 
 /// Files whose changes can be checked by running something (a notes file is not).
@@ -161,23 +161,6 @@ fn open_tasks(chat: &Chat) -> Vec<String> {
         }
     }
     open.iter().map(|t| t.get("text").and_then(Json::as_str).unwrap_or("").to_string()).collect()
-}
-
-/// Put after the user's message while tools are on: told only in the system prompt, a small model often
-/// starts working without a plan.
-const PLAN_REMINDER: &str = "(Reminder from ghost: unless this takes one quick step, first call update_tasks with a short plan, then keep it up to date as you work.)";
-
-/// The chat as the model reads it for this reply: the user's message with the plan reminder after it. The
-/// chat keeps the message as written, so the reminder is never shown or saved.
-fn with_reminder(messages: &[Json], at: usize) -> Vec<Json> {
-    let mut out = messages.to_vec();
-    if let Some(Json::Obj(fields)) = out.get_mut(at) {
-        if let Some((_, Json::Str(text))) = fields.iter_mut().find(|(k, _)| k == "content") {
-            text.push_str("\n\n");
-            text.push_str(PLAN_REMINDER);
-        }
-    }
-    out
 }
 
 /// The harness's own messages in a chat (the nudge): not the user's, so retrying and searching pass them by.
@@ -295,14 +278,10 @@ fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) ->
 /// This round's prompt, made to fit: when it would leave the reply less room than it asks for (up to a
 /// quarter of the context), make_room takes out enough that it fills at most 3/4 of the rest, so the next
 /// rounds fit too and start the same way (the server's cache still holds them).
-fn fitted_prompt(req: &Request, chat: &mut Chat, at: Option<usize>, tools: &[Json], shared: &Shared, loaded: &Loaded) -> Result<String, String> {
+fn fitted_prompt(req: &Request, chat: &mut Chat, tools: &[Json], shared: &Shared, loaded: &Loaded) -> Result<String, String> {
     let limit = loaded.ctx - req.max_tokens.min(loaded.ctx / 4);
     for _ in 0..8 {
-        let history = match at {
-            Some(at) => with_reminder(&chat.messages, at),
-            None => chat.messages.clone(),
-        };
-        let prompt = prompt_for(req, &for_model(&history), tools, req.thinking, shared, loaded)?;
+        let prompt = prompt_for(req, &for_model(&chat.messages), tools, req.thinking, shared, loaded)?;
         // a token is at least one byte, so a prompt this short fits without counting
         if prompt.len() <= limit {
             return Ok(prompt);
@@ -657,7 +636,8 @@ pub fn list_chats() -> Result<Json, String> {
         .map(|c| {
             let at = c.get("updated").and_then(Json::as_f64).unwrap_or(0.0);
             let unread = Json::Bool(c.get("unread").and_then(Json::as_bool).unwrap_or(false));
-            let summary = obj(vec![("id", c.get("id").cloned().unwrap_or(Json::Null)), ("title", c.get("title").cloned().unwrap_or(Json::Null)), ("updated", num(at)), ("unread", unread)]);
+            let title = c.get("title").and_then(Json::as_str).map(|t| str(clean_title(t))).unwrap_or(Json::Null);
+            let summary = obj(vec![("id", c.get("id").cloned().unwrap_or(Json::Null)), ("title", title), ("updated", num(at)), ("unread", unread)]);
             (at, summary)
         })
         .collect();
@@ -719,7 +699,7 @@ impl Chat {
         let j = load_chat(id)?;
         Ok(Chat {
             id: id.to_string(),
-            title: j.get("title").and_then(Json::as_str).unwrap_or("").to_string(),
+            title: clean_title(j.get("title").and_then(Json::as_str).unwrap_or("")).to_string(),
             created: j.get("created").and_then(Json::as_f64).unwrap_or(0.0),
             updated: j.get("updated").and_then(Json::as_f64).unwrap_or(0.0),
             messages: j.get("messages").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default(),
@@ -821,6 +801,7 @@ fn ping(out: &mut Out) -> bool {
 /// POST /api/agent: runs the agent for one reply, streaming events (see the module comment).
 pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<(), String> {
     let req = Request::parse(body, shared);
+    *shared.agent_groups.lock().unwrap() = req.groups.clone(); // what to read in ahead after the next model load
     let mut going = Going::new();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
@@ -970,6 +951,21 @@ fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, s
     if loaded.glm { chat_prompt_glm(&body, shared.think_default, loaded.thinking) } else { chat_prompt(&body, loaded.default_system.as_deref(), shared.think_default, loaded.thinking) }
 }
 
+/// How an agent prompt begins with these tool groups: everything before the first message (the server reads
+/// it in after loading a model, so a chat's first reply does not wait for it). The longest start that two
+/// prompts with different messages share.
+pub fn prompt_opening(groups: &[String], shared: &Shared, loaded: &Loaded) -> Option<String> {
+    let body = obj(vec![("tools", Json::Arr(groups.iter().map(|g| str(g)).collect()))]);
+    let req = Request::parse(&body, shared);
+    let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
+    let with = |m: &str| prompt_for(&req, &[obj(vec![("role", str("user")), ("content", str(m))])], &tools, req.thinking, shared, loaded).ok();
+    let (a, b) = (with("a")?, with("b")?);
+    let n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    // a whole character, not half of one
+    let n = (0..=n).rev().find(|&i| a.is_char_boundary(i))?;
+    (n > 0).then(|| a[..n].to_string())
+}
+
 /// A short title for a chat after its first reply, written by the model; None if it gave nothing usable.
 /// The question goes after the chat itself, so the prompt starts as the reply's did and the server's cache
 /// already holds it: only the question is read, and the next message finds the chat still cached.
@@ -992,13 +988,30 @@ fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sha
     }
     // the title alone: no thinking, quotes, markdown or "Title:" around it
     let out = out.rsplit("</think>").next().unwrap_or(&out);
-    let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let line = line.trim_start_matches("Title:").trim_start_matches("title:");
-    let title = line.trim_matches(|c: char| c == '"' || c == '\'' || c == '*' || c == '#' || c == '`' || c.is_whitespace()).trim_end_matches('.');
-    if title.is_empty() || title.contains('<') || title.split_whitespace().count() > 10 {
-        return None;
+    let line = out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let title = clean_title(line);
+    // nothing to name (a greeting), or only a label ("Chat Title"): the first message's opening words instead
+    let generic = ["", "chat title", "title", "new chat", "chat", "untitled", "conversation"].contains(&title.to_lowercase().as_str());
+    if generic || title.contains('<') || title.split_whitespace().count() > 10 {
+        let first = chat.messages.iter().find(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m))?;
+        let words: Vec<&str> = first.get("content").and_then(Json::as_str)?.split_whitespace().take(6).collect();
+        return (!words.is_empty()).then(|| words.join(" ").chars().take(80).collect());
     }
     Some(title.chars().take(80).collect())
+}
+
+/// A title as shown: without a label the model put before it ("Chat Title: ...", "**Title:** ..."), quotes,
+/// markdown or a full stop.
+fn clean_title(s: &str) -> &str {
+    let bare = |s: &str| -> usize { s.len() - s.trim_start_matches(|c: char| c == '*' || c == '#' || c == '"' || c.is_whitespace()).len() };
+    let mut s = &s[bare(s)..];
+    if let Some(at) = s.to_lowercase().find("title:") {
+        // a label of a few words only, so a title that has "title:" in it later stays whole
+        if s[..at].split_whitespace().count() <= 2 {
+            s = &s[at + "title:".len()..];
+        }
+    }
+    s.trim_matches(|c: char| c == '"' || c == '\'' || c == '*' || c == '#' || c == '`' || c.is_whitespace()).trim_end_matches('.')
 }
 
 fn tool_name(t: &Json) -> &str {
@@ -1015,12 +1028,10 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
     let mut changed = false;
     let can_run = tools.iter().any(|t| tool_name(t) == "run_command");
     let (mut unchecked, mut nudged) = (false, false); // code changed and nothing run since; the nudge sent
-    let plans = tools.iter().any(|t| tool_name(t) == "update_tasks");
     let mut planned = false; // the task list was written in this reply (an old one is not this reply's goal)
     let (mut goal_nudges, mut done_then) = (0, 0); // goal nudges in a row, and the steps done at the last one
-    let asked = chat.messages[..reply_start].iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m));
     for round in 0..MAX_ROUNDS {
-        let prompt = fitted_prompt(req, chat, asked.filter(|_| plans), &tools, shared, loaded)?;
+        let prompt = fitted_prompt(req, chat, &tools, shared, loaded)?;
         let lead = if loaded.glm && prompt.ends_with("<think>") { "<think>" } else { "" };
 
         let (tx, events) = mpsc::channel();
