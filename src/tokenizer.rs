@@ -18,6 +18,8 @@ enum PreTokenizer {
     Qwen2,
     /// GLM-4 ("glm4"): the Qwen2 regex with numbers in runs of up to three digits (`\p{N}{1,3}`), as in Llama 3.
     Glm4,
+    /// Qwen3.5 ("qwen35"): the Qwen2 regex with combining marks (`\p{M}`) counted with the letters.
+    Qwen35,
 }
 
 pub struct Tokenizer {
@@ -54,6 +56,14 @@ fn byte_level_table() -> [char; 256] {
 fn is_letter(c: char) -> bool { c.is_alphabetic() }
 fn is_number(c: char) -> bool { c.is_numeric() }
 fn is_other(c: char) -> bool { !c.is_whitespace() && !is_letter(c) && !is_number(c) }
+
+include!("unicode_marks.rs");
+
+/// A combining mark (\p{M}).
+fn is_mark(c: char) -> bool {
+    let c = c as u32;
+    MARKS.binary_search_by(|&(a, b)| if b < c { std::cmp::Ordering::Less } else if a > c { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }).is_ok()
+}
 
 /// Splits text the way the GPT-2 regex does:
 /// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
@@ -123,10 +133,13 @@ fn split_gpt2(text: &str, out: &mut Vec<String>) {
 
 /// Splits text the way the Qwen2 regex does:
 /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
-/// with numbers in runs of up to `digits` (1 for Qwen, 3 for GLM-4).
-fn split_qwen2(text: &str, digits: usize, out: &mut Vec<String>) {
+/// with numbers in runs of up to `digits` (1 for Qwen, 3 for GLM-4), and with `marks` (Qwen3.5) combining
+/// marks counted with the letters (`[\p{L}\p{M}]+`, and not among the symbols).
+fn split_qwen2(text: &str, digits: usize, marks: bool, out: &mut Vec<String>) {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
+    let is_letter = |c: char| is_letter(c) || marks && is_mark(c);
+    let is_other = |c: char| is_other(c) && !(marks && is_mark(c));
     let is_nl = |c: char| c == '\r' || c == '\n';
     let run = |mut j: usize, pred: &dyn Fn(char) -> bool| {
         while j < n && pred(chars[j]) {
@@ -191,6 +204,7 @@ impl Tokenizer {
             "smollm" | "starcoder" | "refact" => PreTokenizer::Gpt2IsolatedDigits,
             "qwen2" => PreTokenizer::Qwen2,
             "glm4" => PreTokenizer::Glm4,
+            "qwen35" => PreTokenizer::Qwen35,
             _ => PreTokenizer::Gpt2,
         };
 
@@ -298,8 +312,9 @@ impl Tokenizer {
         let mut pieces = Vec::new();
         match self.pre {
             PreTokenizer::Gpt2 => split_gpt2(text, &mut pieces),
-            PreTokenizer::Qwen2 => split_qwen2(text, 1, &mut pieces),
-            PreTokenizer::Glm4 => split_qwen2(text, 3, &mut pieces),
+            PreTokenizer::Qwen2 => split_qwen2(text, 1, false, &mut pieces),
+            PreTokenizer::Glm4 => split_qwen2(text, 3, false, &mut pieces),
+            PreTokenizer::Qwen35 => split_qwen2(text, 1, true, &mut pieces),
             PreTokenizer::Gpt2IsolatedDigits => {
                 let mut chunk = String::new();
                 for c in text.chars() {
@@ -424,7 +439,7 @@ mod tests {
     fn qwen2_split_matches_regex() {
         let split = |s: &str| {
             let mut v = Vec::new();
-            split_qwen2(s, 1, &mut v);
+            split_qwen2(s, 1, false, &mut v);
             v
         };
         assert_eq!(split("Hello world"), ["Hello", " world"]);
@@ -441,8 +456,22 @@ mod tests {
     #[test]
     fn glm4_split_groups_digits_by_three() {
         let mut v = Vec::new();
-        split_qwen2("(x) 1234567 a1", 3, &mut v);
+        split_qwen2("(x) 1234567 a1", 3, false, &mut v);
         assert_eq!(v, ["(x", ")", " ", "123", "456", "7", " a", "1"]);
+    }
+
+    #[test]
+    fn qwen35_split_keeps_marks_with_letters() {
+        let split = |s: &str, marks: bool| {
+            let mut v = Vec::new();
+            split_qwen2(s, 1, marks, &mut v);
+            v
+        };
+        // e and a combining acute (U+0301), then a mark alone after a space
+        let text = "cafe\u{301} x \u{301}\u{301}!";
+        assert_eq!(split(text, true), ["cafe\u{301}", " x", " \u{301}\u{301}", "!"]);
+        assert_eq!(split(text, false), ["cafe", "\u{301}", " x", " \u{301}\u{301}!"]);
+        assert!(is_mark('\u{301}') && is_mark('\u{94d}') && !is_mark('e') && !is_mark('\u{2ff}'));
     }
 
     #[test]

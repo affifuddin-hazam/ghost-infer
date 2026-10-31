@@ -3326,9 +3326,10 @@ __global__ void delta_conv(float* __restrict__ x, int stride, const float* __res
 
 // Per token: unit-length q and k heads (as ggml's l2_norm, x / max(|x|, eps); q also scaled), and each value
 // head's beta = sigmoid(b) and decay = exp(softplus(a + dt_bias) * A) into gates (pairs), from the ba part of the
-// row (per key head: its value heads' b, then their a). grid (tokens, 2 * k_heads + 1), block = hd.
+// row (per key head: its value heads' b, then their a; tiled: every head's b, then every head's a). grid
+// (tokens, 2 * k_heads + 1), block = hd.
 __global__ void delta_prep(float* __restrict__ x, int stride, int ba_off, const float* __restrict__ dt_bias, const float* __restrict__ A,
-                           float* __restrict__ gates, int k_heads, int v_heads, int hd, float qscale, float eps) {
+                           float* __restrict__ gates, int k_heads, int v_heads, int hd, float qscale, float eps, int tiled) {
     __shared__ float sh[32];
     int b = blockIdx.x, j = blockIdx.y;
     float* row = x + (size_t)b * stride;
@@ -3344,10 +3345,10 @@ __global__ void delta_prep(float* __restrict__ x, int stride, int ba_off, const 
     int per = v_heads / k_heads;
     const float* ba = row + ba_off;
     for (int h = threadIdx.x; h < v_heads; h += blockDim.x) {
-        int g = h / per, i = h % per;
-        float a = ba[g * 2 * per + per + i] + dt_bias[h];
+        int bi = tiled ? h : h / per * 2 * per + h % per, ai = tiled ? v_heads + h : bi + per;
+        float a = ba[ai] + dt_bias[h];
         float sp = a > 20.f ? a : log1pf(__expf(a));
-        gates[((size_t)b * v_heads + h) * 2] = 1.f / (1.f + __expf(-ba[g * 2 * per + i]));
+        gates[((size_t)b * v_heads + h) * 2] = 1.f / (1.f + __expf(-ba[bi]));
         gates[((size_t)b * v_heads + h) * 2 + 1] = __expf(sp * A[h]);
     }
 }
@@ -3355,13 +3356,14 @@ __global__ void delta_prep(float* __restrict__ x, int stride, int ba_off, const 
 // The DeltaNet recurrence, token after token. Each thread owns one value column of a head's state (DN_HD
 // floats, in registers): decay it, correct what it recalls for k towards v by beta, read it with q. state:
 // [v head][key][value] (a warp's columns side by side, so its loads coalesce); out: n x (v_heads * DN_HD).
-// grid (v_heads, DN_HD / 32), block 32.
+// Value head h reads key head h % k_heads if tiled, else h / (v_heads / k_heads). grid (v_heads, DN_HD / 32),
+// block 32.
 #define DN_HD 128
 __global__ void delta_scan(const float* __restrict__ x, int stride, const float* __restrict__ gates, float* __restrict__ state,
-                           float* __restrict__ out, int n, int k_heads, int v_heads) {
+                           float* __restrict__ out, int n, int k_heads, int v_heads, int tiled) {
     __shared__ float qs[DN_HD], kk[DN_HD];
     int h = blockIdx.x, col = blockIdx.y * 32 + threadIdx.x;
-    int g = h / (v_heads / k_heads), kd = k_heads * DN_HD;
+    int g = tiled ? h % k_heads : h / (v_heads / k_heads), kd = k_heads * DN_HD;
     float* st = state + (size_t)h * DN_HD * DN_HD + col;
     float s[DN_HD];
     #pragma unroll
@@ -5241,8 +5243,15 @@ impl GpuModel {
             let attn_norm = upload_vec(g, &p("attn_norm"), up)?;
             let delta = if cfg.recurrent(i) {
                 let v = |s: &str| format!("blk.{i}.{s}");
+                // [q k v | z | ba]: beta and alpha from one tensor or (tiled) two, side by side either way
+                let mut parts = vec![p("attn_qkv"), p("attn_gate")];
+                if cfg.delta.is_some_and(|d| d.tiled) {
+                    parts.extend([p("ssm_beta"), p("ssm_alpha")]);
+                } else {
+                    parts.push(p("ssm_ba"));
+                }
                 Some(GpuDelta {
-                    proj: upload_parts(g, &[p("attn_qkv"), p("attn_gate"), p("ssm_ba")], up)?,
+                    proj: upload_parts(g, &parts, up)?,
                     conv: upload_vec(g, &v("ssm_conv1d.weight"), up)?,
                     dt_bias: upload_vec(g, &v("ssm_dt.bias"), up)?,
                     a: upload_vec(g, &v("ssm_a"), up)?,
@@ -6054,9 +6063,9 @@ impl GpuModel {
             (n as u32, (2 * dc.k_heads + 1) as u32),
             dc.head as u32,
             0,
-            &[Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::I((cd + vd) as i32), Arg::P(d.dt_bias.ptr), Arg::P(d.a.ptr), Arg::P(s.h.ptr), Arg::I(dc.k_heads as i32), Arg::I(dc.v_heads as i32), Arg::I(dc.head as i32), Arg::F(qscale), Arg::F(c.norm_eps)],
+            &[Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::I((cd + vd) as i32), Arg::P(d.dt_bias.ptr), Arg::P(d.a.ptr), Arg::P(s.h.ptr), Arg::I(dc.k_heads as i32), Arg::I(dc.v_heads as i32), Arg::I(dc.head as i32), Arg::F(qscale), Arg::F(c.norm_eps), Arg::I(dc.tiled as i32)],
         )?;
-        k.launch(k.delta_scan, (dc.v_heads as u32, (dc.head / 32) as u32), 32, 0, &[Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::P(s.h.ptr), Arg::P(state), Arg::P(s.att.ptr), Arg::I(n as i32), Arg::I(dc.k_heads as i32), Arg::I(dc.v_heads as i32)])?;
+        k.launch(k.delta_scan, (dc.v_heads as u32, (dc.head / 32) as u32), 32, 0, &[Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::P(s.h.ptr), Arg::P(state), Arg::P(s.att.ptr), Arg::I(n as i32), Arg::I(dc.k_heads as i32), Arg::I(dc.v_heads as i32), Arg::I(dc.tiled as i32)])?;
         k.launch(k.delta_norm, (n as u32, dc.v_heads as u32), dc.head as u32, 0, &[Arg::P(s.att.ptr), Arg::P(s.gu.ptr), Arg::I(stride as i32), Arg::I(cd as i32), Arg::P(d.norm.ptr), Arg::I(dc.v_heads as i32), Arg::I(dc.head as i32), Arg::F(c.norm_eps)])
     }
 
@@ -6601,7 +6610,7 @@ impl GpuSession {
         let (q_dim, kv_dim) = (cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
         // qwen3next: DeltaNet's [q k v | z | ba] rows and gated attention's [q | gate] ones go through s.gu, its
         // outputs (value heads) through s.att, its gates and the attention gates through s.h
-        let d = cfg.delta.unwrap_or(crate::model::Delta { k_heads: 0, v_heads: 0, head: 0, conv: 0, every: 1 });
+        let d = cfg.delta.unwrap_or(crate::model::Delta { k_heads: 0, v_heads: 0, head: 0, conv: 0, every: 1, tiled: false });
         let gu = (2 * cfg.ffn_dim).max(d.conv_dim() + d.value_dim() + 2 * d.v_heads).max(if cfg.attn_gated { 2 * q_dim + 2 * kv_dim } else { 0 });
         let att = q_dim.max(d.value_dim());
         let widest = cfg.dim.max(att).max(cfg.ffn_dim);

@@ -22,7 +22,7 @@
 
 <p align="center">
   <img src="docs/demo.gif" width="860" alt="The ghost-infer desktop app finding and fixing a bug, then running the tests">
-  <br><sub>Real time, not sped up: the desktop app fixing a failing test, Qwen3-30B-A3B-Instruct-2507 Q3_K_M on an RTX 2060 SUPER (8 GB) with 16 GB of RAM.</sub>
+  <br><sub>Real time, not sped up: the desktop app fixing a failing test, Qwen3.6-35B-A3B (Huihui abliterated, i1-Q3_K_M) on an RTX 2060 SUPER (8 GB) with 16 GB of RAM.</sub>
 </p>
 
 ## Why ghost-infer
@@ -44,7 +44,7 @@ mixture-of-experts model bigger than the GPU, ghost-infer generates 60% faster t
 setting, though it takes longer to the first token of a short prompt. Details and method in
 [Benchmarks](#benchmarks).
 
-- **One file, nothing to install.** A ~2 MB executable with two Rust dependencies (`memmap2`, `rayon`).
+- **One file, nothing to install.** A ~3 MB executable with two Rust dependencies (`memmap2`, `rayon`).
   No CUDA SDK, no Python, no Docker: it loads the NVIDIA driver at runtime and compiles its kernels for
   your GPU on first start.
 - **Bigger models than your GPU.** Mixture-of-experts models keep their experts in RAM and the ones a
@@ -259,6 +259,13 @@ round, asks before anything that changes something, and keeps every chat in `%LO
   <img src="docs/screenshot-app.png" width="860" alt="The desktop app: a bug found and fixed, its plan done, and the rail with the model, the context, the tasks, the changed file and the scheduled tasks">
 </p>
 
+The same task with Qwen3-Coder, which answers without thinking first:
+
+<p align="center">
+  <img src="docs/demo-coder.gif" width="860" alt="The desktop app with Qwen3-Coder-30B-A3B finding and fixing the same bug, then running the tests">
+  <br><sub>Real time, not sped up: the desktop app fixing a failing test, Qwen3-Coder-30B-A3B (Huihui abliterated, i1-Q3_K_M) on an RTX 2060 SUPER (8 GB) with 16 GB of RAM.</sub>
+</p>
+
 ```bash
 cargo build --release -p ghost-app
 target\release\ghost-infer serve models\Qwen3-8B-Q4_K_M.gguf --gpu
@@ -393,11 +400,11 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 | | |
 |---|---|
-| Architectures | Llama, Qwen3, Qwen3-MoE, DeepSeek-style models such as GLM-4.7-Flash, and Qwen3-Next such as Qwen3-Coder-Next (`general.architecture` `llama`, `qwen3`, `qwen3moe`, `deepseek2`, `qwen3next`; on the GPU, `deepseek2` with a 512-wide latent and up to 32 heads, `qwen3next` with 128-wide DeltaNet heads) |
+| Architectures | Llama, Qwen3, Qwen3-MoE, DeepSeek-style models such as GLM-4.7-Flash, Qwen3-Next such as Qwen3-Coder-Next, and Qwen3.5 / Qwen3.6 mixtures of experts such as Qwen3.6-35B-A3B (`general.architecture` `llama`, `qwen3`, `qwen3moe`, `deepseek2`, `qwen3next`, `qwen35moe`; on the GPU, `deepseek2` with a 512-wide latent and up to 32 heads, `qwen3next` and `qwen35moe` with 128-wide DeltaNet heads; text only) |
 | Weight formats | Q8_0, Q3_K, Q4_K, Q5_K, Q6_K (so Q3_K_M, Q4_K_M, Q5_K_M, Q6_K and Q8_0 files), IQ2_XXS, IQ2_XS and IQ2_S (the 2-bit IQ2 files), F16/F32 on the CPU; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ3_S and BF16 by dequantising, for the few tensors llama.cpp stores that way |
-| Tokenizer | byte-level BPE (`gpt2`): GPT-2 / Qwen2 / GLM-4 splitting, SmolLM-style digits |
-| Chat template | ChatML (SmolLM2, Qwen) with Qwen3's thinking and tool-call format, and Qwen3-Coder's XML tool format; GLM-4's format with its XML tool calls |
-| Tested with | [SmolLM2-135M-Instruct](https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF), Qwen3 0.6B and 8B fine-tunes, [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF), [GLM-4.7-Flash (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-GLM-4.7-Flash-abliterated-i1-GGUF), [Qwen3-Coder-30B-A3B (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated-i1-GGUF), [Qwen3-Coder-Next (Huihui abliterated, IQ2_S)](https://huggingface.co/bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF) |
+| Tokenizer | byte-level BPE (`gpt2`): GPT-2 / Qwen2 / Qwen3.5 / GLM-4 splitting, SmolLM-style digits |
+| Chat template | ChatML (SmolLM2, Qwen) with Qwen3's thinking and tool-call format, Qwen3-Coder's XML tool format, and Qwen3.5 / 3.6's (Qwen3-Coder's calls with thinking); GLM-4's format with its XML tool calls |
+| Tested with | [SmolLM2-135M-Instruct](https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF), Qwen3 0.6B and 8B fine-tunes, [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF), [GLM-4.7-Flash (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-GLM-4.7-Flash-abliterated-i1-GGUF), [Qwen3-Coder-30B-A3B (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated-i1-GGUF), [Qwen3-Coder-Next (Huihui abliterated, IQ2_S)](https://huggingface.co/bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF), [Qwen3.6-35B-A3B (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-Qwen3.6-35B-A3B-abliterated-i1-GGUF) |
 
 Not yet: other IQ formats (IQ1, IQ3_XXS, IQ4_XS), Gemma, Llama 3's tokenizer split, images.
 
@@ -453,6 +460,11 @@ it. Remove that file to build a portable binary.
   4,096 tokens, so a long prompt streams the experts that do not fit in VRAM or RAM once. On an RTX 2060
   Super with 16 GB of RAM (IQ2_S, 22 GB), against llama.cpp b11747 on the same prompts: code at 11.8
   tokens/s (9.3), a long answer at 14.5 (12.4), and a 2,867-token prompt in about 77 s (167 s).
+- **Qwen3.5 / Qwen3.6** (35B with 3B active): the same design at 40 layers, its value heads taking the key
+  heads in turn (the order llama.cpp's converter writes) and its multi-section RoPE, for text, Qwen3-Next's
+  partial RoPE. Small enough to stay in RAM: Qwen3.6-35B-A3B (i1-Q3_K_M, 16.8 GB) on the same machine, against
+  llama.cpp b11747: code at 31.9 tokens/s (26.0), a long answer at 31.9 (24.9), a 4,027-token prompt in about
+  6 s (22 s), and the desktop app's fix-a-failing-test task in 46 s, where Qwen3-Coder-Next took 10 minutes.
 - **Multi-head latent attention** (GLM-4.7-Flash, DeepSeek-style): each token caches one compressed
   key-value vector and a shared RoPE key, 54 KB per token where Qwen3-30B-A3B needs 96 KB. Each head's
   query moves into that compressed space and attention runs over the cache as it is, every head scored
@@ -482,6 +494,11 @@ exact maths is measured by [`scripts/kld.py`](scripts/kld.py).
 Qwen3-Coder-Next (IQ2_S) was checked against llama.cpp b11747: the same prompt token ids, and the same top 10
 next tokens in the same order on the CPU and the GPU (on a prompt with two likely answers, 0.410 / 0.366 on the
 CPU and 0.396 / 0.362 on the GPU with an f16 cache, against llama.cpp's 0.408 / 0.367).
+
+Qwen3.6-35B-A3B (i1-Q3_K_M) was checked the same way, on code, English and Malay: the same prompt token ids and
+the same five most likely next tokens, their probabilities no further from llama.cpp's than llama.cpp's own
+backends are from each other (" George": 0.489 on the CPU, 0.458 on the GPU and 0.481 with exact maths, against
+llama.cpp's 0.483 with the experts on the CPU and 0.427 on the CPU alone).
 
 GLM-4.7-Flash (i1-Q3_K_M) was checked against llama.cpp b9106 instead: identical token ids on 12 texts
 (code, Chinese, Malay, emoji), the chat template identical to llama.cpp's rendering of the model's own

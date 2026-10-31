@@ -51,9 +51,9 @@ pub struct Config {
     pub attn_gated: bool,
 }
 
-/// Gated DeltaNet sizes (qwen3next). Each layer keeps a `head` x `head` state per value head instead of a
-/// growing cache: every token decays it, corrects what it recalls for the token's key towards the token's
-/// value, and reads it with the token's query. Value heads share key heads, `v_heads / k_heads` each.
+/// Gated DeltaNet sizes (qwen3next, qwen35moe). Each layer keeps a `head` x `head` state per value head
+/// instead of a growing cache: every token decays it, corrects what it recalls for the token's key towards the
+/// token's value, and reads it with the token's query. Value heads share key heads, `v_heads / k_heads` each.
 #[derive(Debug, Clone, Copy)]
 pub struct Delta {
     pub k_heads: usize,
@@ -64,9 +64,35 @@ pub struct Delta {
     pub conv: usize,
     /// full attention every this many layers
     pub every: usize,
+    /// qwen35moe: the value heads take the key heads in turn (llama.cpp's converter reorders them so), and
+    /// beta and alpha come from two tensors in value head order; qwen3next: value heads grouped by key head,
+    /// and one ssm_ba grouped the same way
+    pub tiled: bool,
 }
 
 impl Delta {
+    /// The key (and query) head value head `h` reads.
+    pub fn key_head(&self, h: usize) -> usize {
+        if self.tiled {
+            h % self.k_heads
+        } else {
+            h / (self.v_heads / self.k_heads)
+        }
+    }
+
+    /// Where value head `h`'s beta and alpha are among a batch's projected values (`n` tokens, token `b`):
+    /// from two tensors, all the batch's betas and then all its alphas; from ssm_ba, per token and key head,
+    /// its value heads' betas and then their alphas.
+    pub fn ba_at(&self, n: usize, b: usize, h: usize) -> (usize, usize) {
+        let v = self.v_heads;
+        if self.tiled {
+            return (b * v + h, (n + b) * v + h);
+        }
+        let per = v / self.k_heads;
+        let beta = b * 2 * v + h / per * 2 * per + h % per;
+        (beta, beta + per)
+    }
+
     pub fn key_dim(&self) -> usize {
         self.k_heads * self.head
     }
@@ -104,7 +130,7 @@ pub struct Mla {
     pub v_head: usize,
 }
 
-pub const SUPPORTED_ARCHS: [&str; 5] = ["llama", "qwen3", "qwen3moe", "deepseek2", "qwen3next"];
+pub const SUPPORTED_ARCHS: [&str; 6] = ["llama", "qwen3", "qwen3moe", "deepseek2", "qwen3next", "qwen35moe"];
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Config, String> {
@@ -140,11 +166,20 @@ impl Config {
         };
         let vocab = u("vocab_size").or_else(|| g.tensor("token_embd.weight").and_then(|t| t.dims.get(1)).map(|&v| v as usize)).ok_or("cannot tell the vocabulary size")?;
         let blocks = need("block_count")?;
-        let next = arch == "qwen3next";
+        // Qwen3.5 / 3.6 are Qwen3-Next's design with the value heads reordered (see Delta::tiled); for text,
+        // their multi-section RoPE is Qwen3-Next's partial RoPE (every section reads the same position)
+        let next = arch == "qwen3next" || arch == "qwen35moe";
         let delta = if next {
-            let d = Delta { k_heads: need("ssm.group_count")?, v_heads: need("ssm.time_step_rank")?, head: need("ssm.state_size")?, conv: need("ssm.conv_kernel")?, every: u("full_attention_interval").unwrap_or(4) };
+            let d = Delta {
+                k_heads: need("ssm.group_count")?,
+                v_heads: need("ssm.time_step_rank")?,
+                head: need("ssm.state_size")?,
+                conv: need("ssm.conv_kernel")?,
+                every: u("full_attention_interval").unwrap_or(4),
+                tiled: arch == "qwen35moe",
+            };
             if need("ssm.inner_size")? != d.value_dim() || d.v_heads % d.k_heads != 0 || d.conv < 2 {
-                return Err("this qwen3next file's DeltaNet sizes do not fit together".into());
+                return Err(format!("this {arch} file's DeltaNet sizes do not fit together"));
             }
             Some(d)
         } else {
@@ -158,7 +193,8 @@ impl Config {
             // latent attention: one shared key-value "head" for all query heads
             n_kv_heads: if mla.is_some() { 1 } else { u("attention.head_count_kv").unwrap_or(n_heads) },
             head_dim,
-            ffn_dim: need("feed_forward_length")?,
+            // Qwen3.5's files have no dense feed-forward size; its shared expert's is the widest there is
+            ffn_dim: u("feed_forward_length").or_else(|| u("expert_shared_feed_forward_length")).ok_or(format!("missing {arch}.feed_forward_length"))?,
             // not every GGUF has <arch>.vocab_size; the embedding table always says
             vocab,
             max_ctx: need("context_length")?,
@@ -246,9 +282,9 @@ pub struct DeltaLayer<'a> {
     pub wqkv: Matrix<'a>,
     /// input to z, the gate of the output norm
     pub wz: Matrix<'a>,
-    /// input to beta (how far a token corrects the state) and alpha (how fast the state decays), grouped by
-    /// key head: its value heads' betas, then their alphas
-    pub wba: Matrix<'a>,
+    /// input to beta (how far a token corrects the state) and alpha (how fast the state decays): ssm_ba
+    /// grouped by key head (its value heads' betas, then their alphas), or ssm_beta and ssm_alpha (tiled)
+    pub wba: Vec<Matrix<'a>>,
     /// per channel of q, k, v: the convolution taps, oldest input first
     pub conv: Vec<f32>,
     /// per value head: added to alpha before softplus
@@ -265,13 +301,18 @@ impl<'a> DeltaLayer<'a> {
         let layer = DeltaLayer {
             wqkv: matrix(g, &p("attn_qkv.weight"))?,
             wz: matrix(g, &p("attn_gate.weight"))?,
-            wba: matrix(g, &p("ssm_ba.weight"))?,
+            wba: if d.tiled {
+                vec![matrix(g, &p("ssm_beta.weight"))?, matrix(g, &p("ssm_alpha.weight"))?]
+            } else {
+                vec![matrix(g, &p("ssm_ba.weight"))?]
+            },
             conv: vector(g, &p("ssm_conv1d.weight"))?,
             dt_bias: vector(g, &p("ssm_dt.bias"))?,
             a: vector(g, &p("ssm_a"))?,
             norm: vector(g, &p("ssm_norm.weight"))?,
         };
-        if layer.wqkv.rows != d.conv_dim() || layer.wz.rows != d.value_dim() || layer.wba.rows != 2 * d.v_heads || layer.conv.len() != d.conv_dim() * d.conv || layer.a.len() != d.v_heads || layer.norm.len() != d.head {
+        let ba_rows: usize = layer.wba.iter().map(|m| m.rows).sum();
+        if layer.wqkv.rows != d.conv_dim() || layer.wz.rows != d.value_dim() || ba_rows != 2 * d.v_heads || layer.conv.len() != d.conv_dim() * d.conv || layer.a.len() != d.v_heads || layer.norm.len() != d.head {
             return Err(format!("layer {l}: DeltaNet tensor shapes do not match the model's sizes (a file with ssm_in instead of attn_qkv needs a newer conversion)"));
         }
         Ok(layer)
@@ -628,7 +669,7 @@ impl Session {
     fn size_for(&mut self, cfg: &Config, n: usize) {
         let (kd, vd, _) = cfg.att_dims();
         let m = cfg.mla.unwrap_or(Mla { q_lora: 0, kv_lora: 0, nope: 0, v_head: 0 });
-        let d = cfg.delta.unwrap_or(Delta { k_heads: 0, v_heads: 0, head: 0, conv: 0, every: 1 });
+        let d = cfg.delta.unwrap_or(Delta { k_heads: 0, v_heads: 0, head: 0, conv: 0, every: 1, tiled: false });
         for (buf, width) in [
             (&mut self.x, cfg.dim),
             (&mut self.xb, cfg.dim),
@@ -978,8 +1019,13 @@ impl Model<'_> {
         let c = &self.cfg;
         let dc = c.delta.unwrap();
         let (kd, vd, cd, hk) = (dc.key_dim(), dc.value_dim(), dc.conv_dim(), dc.head);
-        let per = dc.v_heads / dc.k_heads; // value heads per key head
-        matmul_many(&mut [(&d.wqkv, &mut s.dqkv), (&d.wz, &mut s.dz), (&d.wba, &mut s.dba)], &s.xb, &s.xq);
+        match &d.wba[..] {
+            [wb, wa] => {
+                let (bb, aa) = s.dba[..2 * n * dc.v_heads].split_at_mut(n * dc.v_heads);
+                matmul_many(&mut [(&d.wqkv, &mut s.dqkv[..]), (&d.wz, &mut s.dz[..]), (wb, bb), (wa, aa)], &s.xb, &s.xq);
+            }
+            _ => matmul_many(&mut [(&d.wqkv, &mut s.dqkv[..]), (&d.wz, &mut s.dz[..]), (&d.wba[0], &mut s.dba[..])], &s.xb, &s.xq),
+        }
         let slot = c.slot(l);
         let taps = dc.conv - 1;
         let conv_state = &mut s.conv_state[slot * dc.conv_len()..(slot + 1) * dc.conv_len()];
@@ -1005,13 +1051,13 @@ impl Model<'_> {
                 h.iter_mut().for_each(|e| *e *= inv);
             }
             let (q, k, v) = (&*q, &*k, &*v);
-            let ba = &s.dba[b * 2 * dc.v_heads..(b + 1) * 2 * dc.v_heads];
+            let ba = &s.dba;
             let z = &s.dz[b * vd..(b + 1) * vd];
             let out = &mut s.att_out[b * vd..(b + 1) * vd];
             state.par_chunks_mut(hk * hk).zip(out.par_chunks_mut(hk)).enumerate().for_each(|(h, (st, o))| {
-                let (g, j) = (h / per, h % per);
-                let beta = 1.0 / (1.0 + (-ba[g * 2 * per + j]).exp());
-                let a = ba[g * 2 * per + per + j] + d.dt_bias[h];
+                let (g, (bi, ai)) = (dc.key_head(h), dc.ba_at(n, b, h));
+                let beta = 1.0 / (1.0 + (-ba[bi]).exp());
+                let a = ba[ai] + d.dt_bias[h];
                 let softplus = if a > 20.0 { a } else { a.exp().ln_1p() };
                 let decay = (softplus * d.a[h]).exp();
                 let (qh, kh, vh) = (&q[g * hk..(g + 1) * hk], &k[g * hk..(g + 1) * hk], &v[h * hk..(h + 1) * hk]);

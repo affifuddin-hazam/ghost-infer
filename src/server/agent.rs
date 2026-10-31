@@ -1450,7 +1450,7 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
     let (mut goal_nudges, mut done_then) = (0, 0); // goal nudges in a row, and the steps done at the last one
     for round in 0..MAX_ROUNDS {
         let prompt = fitted_prompt(req, chat, &tools, shared, loaded)?;
-        let lead = if loaded.glm && prompt.ends_with("<think>") { "<think>" } else { "" };
+        let lead = super::reply_lead(&prompt);
 
         let (tx, events) = mpsc::channel();
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);

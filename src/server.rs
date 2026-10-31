@@ -812,7 +812,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         Ok(p) => p,
         Err(e) => return respond(&mut conn, 400, &error_body(&e)),
     };
-    let lead = if chat && glm && prompt.ends_with("<think>") { "<think>" } else { "" };
+    let lead = if chat { reply_lead(&prompt) } else { "" };
     let f = |k: &str| body.get(k).and_then(Json::as_f64);
     let stop = match body.get("stop") {
         Some(Json::Str(s)) => vec![s.clone()],
@@ -1026,10 +1026,25 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
         contents.push(content_text(m.get("content"))?);
     }
     let tools = request_tools(body);
+    // Qwen3.5 / 3.6: Qwen3-Coder's calls in a thinking model's template, the tools listed as JSON under
+    // Qwen3-Coder's instructions, earlier replies of this turn with their reasoning, the reply's opened
+    let qwen35 = coder && switch;
 
     let mut s = String::new();
     let system = if roles[0] == "system" { Some(contents[0].as_str()) } else if roles.contains(&"system") { None } else { default_system };
-    if !tools.is_empty() && coder {
+    if !tools.is_empty() && qwen35 {
+        s.push_str("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for t in tools {
+            s.push('\n');
+            s.push_str(&t.to_python_string());
+        }
+        s.push_str(CODER_CALLS);
+        if let Some(sys) = system.map(str::trim).filter(|t| !t.is_empty()) {
+            s.push_str("\n\n");
+            s.push_str(sys);
+        }
+        s.push_str("<|im_end|>\n");
+    } else if !tools.is_empty() && coder {
         s.push_str("<|im_start|>system\n");
         s.push_str(system.unwrap_or("You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks."));
         s.push_str("\n\nYou have access to the following functions:\n\n<tools>");
@@ -1062,7 +1077,7 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
         match roles[i] {
             "system" if i == 0 => {}
             r @ ("system" | "user") => s.push_str(&format!("<|im_start|>{r}\n{content}<|im_end|>\n")),
-            "assistant" if coder => {
+            "assistant" if coder && !qwen35 => {
                 // Qwen3-Coder does not think; a call's arguments go one <parameter=...> each, values that are
                 // not text as JSON (the template writes Python's form; JSON is what coder_call reads back)
                 let content = content.rsplit("</think>").next().unwrap_or(content).trim_start_matches('\n');
@@ -1097,6 +1112,7 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
                 }
             }
             "assistant" => {
+                let content = if qwen35 { content.trim() } else { content };
                 let (mut reasoning, mut content) = (String::new(), content.to_string());
                 if let Some(r) = m.get("reasoning_content").and_then(Json::as_str) {
                     reasoning = r.to_string();
@@ -1105,10 +1121,37 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
                     content = after.trim_start_matches('\n').to_string();
                 }
                 s.push_str("<|im_start|>assistant\n");
-                if i > last_query && (i == messages.len() - 1 || !reasoning.is_empty()) {
+                if qwen35 && i > last_query {
+                    s.push_str(&format!("<think>\n{}\n</think>\n\n{content}", reasoning.trim()));
+                } else if i > last_query && (i == messages.len() - 1 || !reasoning.is_empty()) {
                     s.push_str(&format!("<think>\n{}\n</think>\n\n{}", reasoning.trim_matches('\n'), content.trim_start_matches('\n')));
                 } else {
                     s.push_str(&content);
+                }
+                if qwen35 {
+                    // each call as Qwen3-Coder writes it, values that are not text as JSON
+                    for (k, call) in m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]).iter().enumerate() {
+                        let f = call.get("function").unwrap_or(call);
+                        let lead = if k > 0 { "\n" } else if content.trim().is_empty() { "" } else { "\n\n" };
+                        s.push_str(&format!("{lead}<tool_call>\n<function={}>\n", f.get("name").and_then(Json::as_str).unwrap_or("")));
+                        let args = match f.get("arguments") {
+                            Some(Json::Str(a)) => Json::parse(a).unwrap_or(Json::Null),
+                            Some(a) => a.clone(),
+                            None => Json::Null,
+                        };
+                        if let Json::Obj(fields) = args {
+                            for (k, v) in fields {
+                                let v = match v {
+                                    Json::Str(t) => t,
+                                    other => other.to_python_string(),
+                                };
+                                s.push_str(&format!("<parameter={k}>\n{v}\n</parameter>\n"));
+                            }
+                        }
+                        s.push_str("</function>\n</tool_call>");
+                    }
+                    s.push_str("<|im_end|>\n");
+                    continue;
                 }
                 for (k, call) in m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]).iter().enumerate() {
                     if k > 0 || !content.is_empty() {
@@ -1125,7 +1168,7 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
                 }
                 s.push_str("<|im_end|>\n");
             }
-            "tool" if coder => {
+            "tool" if coder && !qwen35 => {
                 if i == 0 || roles[i - 1] != "tool" {
                     s.push_str("<|im_start|>user\n");
                 }
@@ -1154,8 +1197,22 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
     });
     if switch && !thinking.unwrap_or(think_default) {
         s.push_str("<think>\n\n</think>\n\n");
+    } else if qwen35 {
+        s.push_str("<think>\n");
     }
     Ok(s)
+}
+
+/// Text a chat prompt already holds that the reply is read with: a prompt that opens the reply's reasoning
+/// (GLM's `<think>`, Qwen3.5's `<think>\n`) gets a reply that starts with it too.
+pub(crate) fn reply_lead(prompt: &str) -> &'static str {
+    if prompt.ends_with("<|assistant|><think>") {
+        "<think>"
+    } else if prompt.ends_with("<|im_start|>assistant\n<think>\n") {
+        "<think>\n"
+    } else {
+        ""
+    }
 }
 
 /// The end of Qwen3-Coder's tool list and its instructions for calls, as its template writes them.
@@ -1591,6 +1648,51 @@ mod tests {
             "<|im_start|>assistant\n",
         );
         assert_eq!(chat_prompt(&body, None, true, false, true).unwrap(), want);
+    }
+
+    #[test]
+    fn qwen35_tool_template() {
+        // what Qwen3.6's chat template gives for these conversations, rendered as transformers does
+        const CALLS: &str = "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+        let first = Json::parse(
+            r#"{"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Time in Tokyo?"}],
+            "tools":[{"type":"function","function":{"name":"get_time","description":"Current time","parameters":{"type":"object","properties":{"tz":{"type":"string","description":"IANA zone"}},"required":["tz"]}}}]}"#,
+        )
+        .unwrap();
+        let want = format!(
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{}{CALLS}\n\nBe brief.<|im_end|>\n<|im_start|>user\nTime in Tokyo?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            r#"{"type": "function", "function": {"name": "get_time", "description": "Current time", "parameters": {"type": "object", "properties": {"tz": {"type": "string", "description": "IANA zone"}}, "required": ["tz"]}}}"#
+        );
+        let prompt = chat_prompt(&first, None, true, true, true).unwrap();
+        assert_eq!(prompt, want);
+        assert_eq!(reply_lead(&prompt), "<think>\n");
+
+        // calls after reasoning and after none, tool results, thinking off
+        let later = Json::parse(
+            r#"{"messages":[{"role":"user","content":"Time?"},
+            {"role":"assistant","content":"<think>\nneed tool\n</think>\n\nLet me check.","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"UTC\", \"n\": 2}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"12:00"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"c2","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"Asia/Tokyo\"}"}}]},
+            {"role":"tool","tool_call_id":"c2","content":"21:00"}],
+            "tools":[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string"},"n":{"type":"integer"}}}}}],
+            "chat_template_kwargs":{"enable_thinking":false}}"#,
+        )
+        .unwrap();
+        let want = format!(
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{}{CALLS}<|im_end|>\n{}",
+            r#"{"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {"tz": {"type": "string"}, "n": {"type": "integer"}}}}}"#,
+            concat!(
+                "<|im_start|>user\nTime?<|im_end|>\n",
+                "<|im_start|>assistant\n<think>\nneed tool\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_time>\n<parameter=tz>\nUTC\n</parameter>\n<parameter=n>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n",
+                "<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n",
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n<parameter=tz>\nAsia/Tokyo\n</parameter>\n</function>\n</tool_call><|im_end|>\n",
+                "<|im_start|>user\n<tool_response>\n21:00\n</tool_response><|im_end|>\n",
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            )
+        );
+        let prompt = chat_prompt(&later, None, true, true, true).unwrap();
+        assert_eq!(prompt, want);
+        assert_eq!(reply_lead(&prompt), "");
     }
 
     #[test]

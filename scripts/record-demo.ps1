@@ -7,11 +7,14 @@
 # Close what you can first (the model's experts need the RAM), then:
 #   powershell -ExecutionPolicy Bypass -File scripts\record-demo.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\record-demo.ps1 -NoDocs   (only into demo-out\)
+# The README's two demos, the main one and Qwen3-Coder's further down:
+#   powershell -ExecutionPolicy Bypass -File scripts\record-demo.ps1 -Model C:\models\Huihui-Qwen3.6-35B-A3B-abliterated.i1-Q3_K_M.gguf -Label "Qwen3.6-35B-A3B (Huihui abliterated, i1-Q3_K_M)"
+#   powershell -ExecutionPolicy Bypass -File scripts\record-demo.ps1 -Model C:\models\Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated.i1-Q3_K_M.gguf -Name demo-coder -Label "Qwen3-Coder-30B-A3B (Huihui abliterated, i1-Q3_K_M)"
 #
 # Results go to demo-out\<time>\ (the raw recording, demo.gif, demo.mp4, screenshot-app.png, the server's
-# log), and into docs\ with the README's caption, unless -NoDocs. Build both programs first if the code
-# changed (cargo build --release -p ghost-infer --target-dir target\glm, and -p ghost-app --target-dir
-# target\app).
+# log), and into docs\ as <Name>.gif and <Name>.mp4 (the main demo's screenshot too) with the caption under
+# docs/<Name>.gif in the README, unless -NoDocs. Build both programs first if the code changed (cargo build
+# --release -p ghost-infer --target-dir target\glm, and -p ghost-app --target-dir target\app).
 param(
     [string]$Model = '',    # default: models\Qwen3-30B-A3B-Instruct-2507-Q3_K_M.gguf
     [string]$Server = '',   # default: target\glm\release\ghost-infer.exe
@@ -21,6 +24,9 @@ param(
     [int]$Port = 8097,
     [string]$Message = 'total() in cart.py gets the discount wrong. Fix it and run the tests.',
     [int]$GifWidth = 960,
+    [string]$Name = 'demo', # docs\<Name>.gif and .mp4; only the main demo ("demo") replaces docs\screenshot-app.png
+    [string]$Label = '',    # the model as the caption names it; default: from the file name
+    [int]$Minutes = 8,      # how long a reply may take before the take is given up
     [switch]$NoDryRun,
     [switch]$NoDocs
 )
@@ -151,7 +157,7 @@ function Clear-Chats {
 }
 # Waits until the reply is done: the model has named the chat, or (if naming fails) the last message has
 # been a finished answer for a few seconds. `$tick` runs on every look (it keeps the app in place).
-function Wait-Reply([int]$minutes = 8, [scriptblock]$tick = {}) {
+function Wait-Reply([int]$minutes = $script:Minutes, [scriptblock]$tick = {}) {
     $deadline = (Get-Date).AddMinutes($minutes); $count = -1; $since = Get-Date
     while ((Get-Date) -lt $deadline) {
         & $tick
@@ -259,18 +265,25 @@ Get-Content (Join-Path $out 'server.log') | Select-String 'generated' | Select-O
 
 if (-not $NoDocs) {
     $docs = Join-Path $root 'docs'
-    Copy-Item $gif, $mp4, (Join-Path $out 'screenshot-app.png') $docs -Force
-    # the README's caption under the demo: real time now, with this model and GPU
-    $label = [IO.Path]::GetFileNameWithoutExtension($Model) -replace '-(Q\d\w*)$', ' $1'
+    # the README's caption under this demo first (a README without one stops here, before docs\ changes)
+    $readme = Join-Path $root 'README.md'
+    $text = [IO.File]::ReadAllText($readme)
+    $line = [regex]('(<img src="docs/' + [regex]::Escape($Name) + '\.gif"[^\n]*\n)  <br><sub>[^\n]*</sub>') # the line under the demo
+    if (-not $line.IsMatch($text)) { throw "the README has no caption under docs/$Name.gif to replace" }
+    Copy-Item $gif (Join-Path $docs "$Name.gif") -Force
+    Copy-Item $mp4 (Join-Path $docs "$Name.mp4") -Force
+    $files = "docs\$Name.gif, docs\$Name.mp4"
+    if ($Name -eq 'demo') {
+        Copy-Item (Join-Path $out 'screenshot-app.png') $docs -Force
+        $files += ', docs\screenshot-app.png'
+    }
+    # real time now, with this model and GPU
+    $label = if ($Label) { $Label } else { [IO.Path]::GetFileNameWithoutExtension($Model) -replace '-(Q\d\w*)$', ' $1' }
     $gpu = @($sys.gpus)[0]
     $card = if ($gpu) { "$(($gpu.name -replace '^NVIDIA ', '' -replace '^GeForce ', '')) ($([math]::Round($gpu.vram_total_gb)) GB)" } else { 'the CPU' }
     $an = if ($card -match '^[AEFHILMNORSX8]') { 'an' } else { 'a' }
     $caption = "  <br><sub>Real time, not sped up: the desktop app fixing a failing test, $label on $an $card with $([math]::Round($sys.ram_total_gb)) GB of RAM.</sub>"
-    $readme = Join-Path $root 'README.md'
-    $text = [IO.File]::ReadAllText($readme)
-    $line = [regex]'(<img src="docs/demo\.gif"[^\n]*\n)  <br><sub>[^\n]*</sub>' # the line under the demo
-    if (-not $line.IsMatch($text)) { throw 'the README has no caption under docs/demo.gif to replace' }
     $text = $line.Replace($text, { param($m) $m.Groups[1].Value + $caption }, 1)
     [IO.File]::WriteAllText($readme, $text, $utf8)
-    Say 'docs\demo.gif, docs\demo.mp4, docs\screenshot-app.png and the README caption updated (git diff shows them)'
+    Say "$files and the README caption updated (git diff shows them)"
 }
