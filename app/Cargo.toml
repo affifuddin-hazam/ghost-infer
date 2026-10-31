@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # drawn on the CPU (tiny-skia): no GPU memory taken from the model, about 16 MB idle
-iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "thread-pool", "markdown", "highlighter", "canvas", "selector"] }
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "thread-pool", "markdown", "highlighter", "canvas", "selector", "advanced"] }
 # Windows' own folder dialog, for the folders the model may use
 rfd = "0.17"
 

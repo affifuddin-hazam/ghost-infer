@@ -54,8 +54,10 @@ computer. With models but none running, sending opens the model menu instead.
   from a folder, a .zip or a GitHub link; a repository with several skills lets you pick. MCP servers go in
   `mcp.json` in Claude Desktop's format, and **From Claude** copies the ones Claude Desktop has.
 - **Slash commands.** Type `/` in the message box for the commands and installed skills: the arrows move,
-  Tab or Enter picks, Esc closes. A pick (or a whole name and a space) becomes a chip before your text, a
-  wand for a skill, and Backspace takes it away. A skill picked this way is loaded before the model starts.
+  Tab or Enter picks, Esc closes. At the start of the box a pick (or a whole name and a space) becomes a
+  chip before your text, a wand for a skill, and Backspace takes it away; further on, a skill's /name is
+  styled in the text ("make a page with /design-taste-frontend"). Every skill named this way is loaded
+  before the model starts.
 - **Scheduled tasks.** Ask in a chat ("remind me in 20 minutes to…", "every weekday at 9:00, check the
   build"): the model schedules it once, every N minutes or daily at a time, and it runs in that chat even
   while you are away. Its reply waits there, marked unread.

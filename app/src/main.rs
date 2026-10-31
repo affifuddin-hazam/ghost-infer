@@ -687,6 +687,23 @@ const COMMANDS: [(&str, &str); 2] = [
     ("loop", "Repeat a prompt in this chat every few minutes: /loop 10m check the build"),
 ];
 
+/// Where the text names one of `names` with a slash (/design-taste-frontend), as byte ranges: a / at the start
+/// or after a space, then the name, ending at a space, a line's end or a mark such as a comma.
+pub fn slash_spans(text: &str, names: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices('/') {
+        if at > 0 && !text[..at].ends_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).unwrap_or(rest.len());
+        if end > 0 && names.iter().any(|n| n.eq_ignore_ascii_case(&rest[..end])) {
+            out.push(at..at + 1 + end);
+        }
+    }
+    out
+}
+
 /// A command's or skill's name as the chip shows it: design-taste-frontend is Design Taste Frontend.
 pub fn slash_label(name: &str) -> String {
     let word = |w: &str| {
@@ -1076,12 +1093,22 @@ impl App {
                 let n = self.slash_list().len().max(1) as i32;
                 self.slash_pick = (self.slash_pick as i32 + d).rem_euclid(n) as usize;
             }
+            // at the start of the box the pick becomes the chip; further on, its name goes in the text in place
+            // of what was typed, styled there
             Message::SlashPick(name) => {
                 let list = self.slash_list();
                 let name = name.or_else(|| list.get(self.slash_pick.min(list.len().saturating_sub(1))).map(|e| e.name.clone()));
-                if let Some(name) = name {
-                    self.chip = Some(name);
-                    self.composer = text_editor::Content::new();
+                if let (Some(name), Some((q, at, first))) = (name, self.slash_typed()) {
+                    if first {
+                        let text = self.composer.text();
+                        self.chip = Some(name);
+                        self.composer = text_editor::Content::with_text(text[at + 1 + q.len()..].trim());
+                    } else {
+                        for _ in 0..=q.chars().count() {
+                            self.composer.perform(text_editor::Action::Select(text_editor::Motion::Left));
+                        }
+                        self.composer.perform(text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(format!("/{name} ")))));
+                    }
                     self.slash_pick = 0;
                 }
                 return iced::widget::operation::focus("editor");
@@ -2024,19 +2051,48 @@ impl App {
         commands.chain(skills).collect()
     }
 
-    /// The / list for what is in the box: "/" and part of a name, nothing after it yet. Names that start
-    /// with what is typed come first, then those that have it elsewhere.
+    /// The installed skills' names: a /name in the text that is one of them is styled, and loaded with it.
+    pub fn skill_names(&self) -> Vec<String> {
+        self.skills.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The / being typed: the part of a name between a / and the cursor, where the / starts the box or follows
+    /// a space and the cursor ends the word. With where it starts in its line (bytes), and whether that is the
+    /// start of the box, where the commands are offered too and a pick becomes the chip.
+    fn slash_typed(&self) -> Option<(String, usize, bool)> {
+        let c = self.composer.cursor();
+        if c.selection.is_some() {
+            return None;
+        }
+        let line = self.composer.line(c.position.line)?.text.to_string();
+        let col = c.position.column.min(line.len());
+        if !line.is_char_boundary(col) || line[col..].starts_with(|ch: char| !ch.is_whitespace()) {
+            return None;
+        }
+        let before = &line[..col];
+        let at = before.rfind(char::is_whitespace).map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
+        let q = before[at..].strip_prefix('/').filter(|q| !q.contains('/'))?;
+        Some((q.to_string(), at, c.position.line == 0 && at == 0 && self.chip.is_none()))
+    }
+
+    /// The / list for the / being typed, wherever it is in the text: the skills, and at the start of the box
+    /// the commands too. Names that start with what is typed come first, then those that have it elsewhere.
     pub fn slash_list(&self) -> Vec<Slash> {
-        let text = self.composer.text();
-        if self.chip.is_some() || self.slash_shut.as_ref() == Some(&text) {
+        if self.slash_shut.as_ref() == Some(&self.composer.text()) {
             return Vec::new();
         }
-        let typed = text.strip_suffix('\n').unwrap_or(&text);
-        let Some(q) = typed.strip_prefix('/').filter(|q| !q.contains(char::is_whitespace)) else { return Vec::new() };
+        let Some((q, _, first)) = self.slash_typed() else { return Vec::new() };
         let q = q.to_lowercase();
-        let (mut first, then): (Vec<Slash>, Vec<Slash>) = self.slash_all().into_iter().filter(|e| e.name.to_lowercase().contains(&q)).partition(|e| e.name.to_lowercase().starts_with(&q));
-        first.extend(then);
-        first
+        let offered = self.slash_all().into_iter().filter(|e| first || !COMMANDS.iter().any(|(n, _)| *n == e.name));
+        let (mut list, then): (Vec<Slash>, Vec<Slash>) = offered.filter(|e| e.name.to_lowercase().contains(&q)).partition(|e| e.name.to_lowercase().starts_with(&q));
+        list.extend(then);
+        // a whole name typed, and nothing longer to offer: nothing to pick, so Enter sends
+        if let [only] = list.as_slice() {
+            if only.name.to_lowercase() == q {
+                return Vec::new();
+            }
+        }
+        list
     }
 
     /// After typing: "/name " with a name / knows becomes its chip; while the / list is open, the box is

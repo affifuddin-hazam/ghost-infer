@@ -1119,6 +1119,7 @@ impl App {
         let chip_back = self.chip.is_some() && cursor.position.line == 0 && cursor.position.column == 0 && cursor.selection.is_none();
         let editor = text_editor(&self.composer)
             .id("editor")
+            .highlight_with::<SlashNames>((self.skill_names(), s.accent), |c, _| iced::advanced::text::highlighter::Format { color: Some(*c), font: Some(MEDIUM) })
             .placeholder(match (&self.chip, self.messages.is_empty()) {
                 (Some(_), _) => "Say what to do with it",
                 (None, true) => "How can I help you today?",
@@ -1341,8 +1342,27 @@ impl App {
             return row![Space::new().width(Fill), container(line).padding([6, 12]).style(move |_| container::Style { border: Border { width: 1.0, color: s.hover, radius: 16.0.into() }, ..Default::default() })].into();
         }
         if m.role == Role::User {
-            // sent with a chip (/design-taste-frontend make a page): the chip again, then the words
-            let said = |t: &'a str| text(t).size(15).line_height(1.5).color(s.text);
+            // sent with a chip (/design-taste-frontend make a page): the chip again, then the words, with any
+            // skill named further on styled as the message box showed it
+            let names = self.skill_names();
+            let said = move |t: &'a str| -> Element<'a, Message> {
+                let spans = crate::slash_spans(t, &names);
+                if spans.is_empty() {
+                    return text(t).size(15).line_height(1.5).color(s.text).into();
+                }
+                let mut words: Vec<text::Span<'a, (), Font>> = Vec::new();
+                let mut at = 0;
+                for r in spans {
+                    words.push(iced::widget::span(&t[at..r.start]).color(s.text));
+                    // one piece when the line wraps: a word joiner (invisible) after the / and each hyphen,
+                    // where a line could otherwise break
+                    let name = t[r.clone()].replace('/', "/\u{2060}").replace('-', "-\u{2060}");
+                    words.push(iced::widget::span(name).color(s.accent).font(MEDIUM));
+                    at = r.end;
+                }
+                words.push(iced::widget::span(&t[at..]).color(s.text));
+                rich_text(words).size(15).line_height(1.5).into()
+            };
             let picked = m.raw.strip_prefix('/').map(|t| t.split_once(char::is_whitespace).unwrap_or((t, ""))).filter(|(name, _)| self.slash_all().iter().any(|e| e.name == *name));
             let content: Element<'a, Message> = match picked {
                 Some((name, rest)) if rest.trim().is_empty() => self.chip(name),
@@ -1683,6 +1703,42 @@ impl<M> canvas::Program<M> for PageArea {
     fn draw(&self, _: &(), _: &iced::Renderer, _: &Theme, bounds: iced::Rectangle, _: iced::mouse::Cursor) -> Vec<canvas::Geometry> {
         crate::preview::place(bounds);
         Vec::new()
+    }
+}
+
+/// The message box's highlighter: a /name of an installed skill, anywhere in the text, in the accent colour
+/// (a chip cannot sit inside the text, so a name past the start is styled where it is).
+struct SlashNames {
+    names: Vec<String>,
+    color: Color,
+    line: usize,
+}
+
+impl text::Highlighter for SlashNames {
+    type Settings = (Vec<String>, Color);
+    type Highlight = Color;
+    type Iterator<'a> = std::vec::IntoIter<(std::ops::Range<usize>, Color)>;
+
+    fn new(settings: &Self::Settings) -> Self {
+        SlashNames { names: settings.0.clone(), color: settings.1, line: 0 }
+    }
+
+    fn update(&mut self, settings: &Self::Settings) {
+        (self.names, self.color, self.line) = (settings.0.clone(), settings.1, 0);
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.line = line;
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        self.line += 1;
+        let color = self.color;
+        crate::slash_spans(line, &self.names).into_iter().map(|r| (r, color)).collect::<Vec<_>>().into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
     }
 }
 

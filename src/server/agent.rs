@@ -8,7 +8,7 @@
 //! a new chat's working directory (kept with the chat), "tools" the tool groups (default: all of them),
 //! "preview" true from a client that shows the web pages the model writes (the "preview" event). A message
 //! may be a command: /goal <what done looks like> (or /goal clear), /loop <interval> <prompt> (or /loop stop),
-//! or /<skill> <request>, which loads that installed skill before the model starts.
+//! and a /<skill> anywhere in it loads that installed skill before the model starts.
 //!
 //! Events, one JSON object per server-sent event:
 //!   {"type":"chat","id","title","checkpoint"}     the chat this run belongs to (new chats get an id here), and
@@ -401,11 +401,22 @@ fn command(m: &str) -> Option<Result<Command, String>> {
     }
 }
 
-/// A message that starts with an installed skill's name after a slash (/design-taste-frontend make a page):
-/// that skill's name.
-fn skill_command(m: &str) -> Option<String> {
-    let head = m.split_whitespace().next()?.strip_prefix('/')?;
-    super::skills::list().into_iter().find(|s| s.name.eq_ignore_ascii_case(head)).map(|s| s.name)
+/// The installed skills a message names after a slash, anywhere in it (/design-taste-frontend make a page,
+/// or make a page with /design-taste-frontend): a word that is a / and a skill's name, perhaps with a mark
+/// such as a comma after it. Each once, in the order named.
+fn skill_commands(m: &str) -> Vec<String> {
+    let skills = super::skills::list();
+    let mut named: Vec<String> = Vec::new();
+    for word in m.split_whitespace() {
+        let Some(name) = word.strip_prefix('/') else { continue };
+        let name = name.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'));
+        if let Some(s) = skills.iter().find(|s| s.name.eq_ignore_ascii_case(name)) {
+            if !named.contains(&s.name) {
+                named.push(s.name.clone());
+            }
+        }
+    }
+    named
 }
 
 /// "10m", "10min", "2h", "90" (minutes): minutes, at least the scheduler's 5.
@@ -1204,15 +1215,19 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
                     msg.push(("reminder", str(&notes.join("\n\n"))));
                 }
                 chat.messages.push(obj(msg));
-                // /<skill> first (the app's skill chip): its instructions loaded before the model starts, as
-                // a use_skill call of its own, so the model need not think to load it
-                if let Some(name) = skill_command(m) {
-                    let (id, args, result) = ("call_skill", obj(vec![("name", str(&name))]).to_string(), super::skills::use_skill(&name));
-                    let call = obj(vec![("id", str(id)), ("type", str("function")), ("function", obj(vec![("name", str("use_skill")), ("arguments", str(&args))]))]);
-                    chat.messages.push(obj(vec![("role", str("assistant")), ("content", str("")), ("tool_calls", Json::Arr(vec![call]))]));
-                    chat.messages.push(obj(vec![("role", str("tool")), ("tool_call_id", str(id)), ("name", str("use_skill")), ("content", str(&result))]));
-                    emit(&mut out, obj(vec![("type", str("tool_call")), ("id", str(id)), ("name", str("use_skill")), ("arguments", str(&args))]))?;
-                    emit(&mut out, obj(vec![("type", str("tool_result")), ("id", str(id)), ("name", str("use_skill")), ("result", str(&result)), ("denied", Json::Bool(false))]))?;
+                // /<skill> anywhere in it (the app's skill chip, or a name typed further on): each skill's
+                // instructions loaded before the model starts, as use_skill calls of their own, so the model
+                // need not think to load them
+                let skills = skill_commands(m);
+                if !skills.is_empty() {
+                    let loads: Vec<(String, String, String)> = skills.iter().enumerate().map(|(i, name)| (format!("call_skill_{i}"), obj(vec![("name", str(name))]).to_string(), super::skills::use_skill(name))).collect();
+                    let calls = loads.iter().map(|(id, args, _)| obj(vec![("id", str(id)), ("type", str("function")), ("function", obj(vec![("name", str("use_skill")), ("arguments", str(args))]))])).collect();
+                    chat.messages.push(obj(vec![("role", str("assistant")), ("content", str("")), ("tool_calls", Json::Arr(calls))]));
+                    for (id, args, result) in &loads {
+                        chat.messages.push(obj(vec![("role", str("tool")), ("tool_call_id", str(id)), ("name", str("use_skill")), ("content", str(result))]));
+                        emit(&mut out, obj(vec![("type", str("tool_call")), ("id", str(id)), ("name", str("use_skill")), ("arguments", str(args))]))?;
+                        emit(&mut out, obj(vec![("type", str("tool_result")), ("id", str(id)), ("name", str("use_skill")), ("result", str(result)), ("denied", Json::Bool(false))]))?;
+                    }
                 }
             }
             // answer again: drop the reply after the last user message
