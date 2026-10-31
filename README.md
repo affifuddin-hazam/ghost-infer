@@ -20,6 +20,10 @@
 </p>
 
 <p align="center">
+  <a href="https://www.paypal.com/ncp/payment/WPSFYDSR9HVSY"><img src="https://img.shields.io/badge/Support_ghost--infer-PayPal-00457C?logo=paypal&logoColor=white" alt="Support ghost-infer with PayPal"></a>
+</p>
+
+<p align="center">
   <img src="docs/demo.gif" width="860" alt="The ghost-infer desktop app finding and fixing a bug, then running the tests">
   <br><sub>Real time, not sped up: the desktop app fixing a failing test, Qwen3.6-35B-A3B (Huihui abliterated, i1-Q3_K_M) on an RTX 2060 SUPER (8 GB) with 16 GB of RAM.</sub>
 </p>
