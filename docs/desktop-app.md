@@ -56,6 +56,14 @@ computer. With models but none running, sending opens the model menu instead.
 - **Scheduled tasks.** Ask in a chat ("remind me in 20 minutes to…", "every weekday at 9:00, check the
   build"): the model schedules it once, every N minutes or daily at a time, and it runs in that chat even
   while you are away. Its reply waits there, marked unread.
+- **Web pages, shown as they are made.** A page the model writes opens in a pane beside the chat (Edge's
+  WebView2, built into Windows) and shows again after every change to it, its stylesheet or its script;
+  close it, reload it or open it in your browser from its bar. The server serves only that page's folder,
+  only to this computer. Another client gets the page in a browser MCP server's window instead (Playwright's,
+  if `mcp.json` has it).
+- **Warm-up.** After a model loads, the server runs a few short replies so its weights are in memory before
+  your first message, which then goes first if it comes sooner. **Warm up after loading** in the settings
+  menu turns it off.
 
 Scheduled tasks and loops wait until nothing else has used the model for 20 seconds, and use only what
 you set to always allowed, since nobody is there to ask.

@@ -15,3 +15,8 @@ path = "src/main.rs"
 iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "thread-pool", "markdown", "highlighter", "canvas", "selector"] }
 # Windows' own folder dialog, for the folders the model may use
 rfd = "0.17"
+
+# the preview pane: Edge's WebView2 (part of Windows 10 and 11) as a child of the app's window, made only
+# when a page is shown
+[target.'cfg(windows)'.dependencies]
+wry = "0.55"

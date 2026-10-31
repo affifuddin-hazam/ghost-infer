@@ -3,9 +3,10 @@
 //! back, round after round. Every step streams to the client as an event, and the chat is saved as it goes
 //! in %LOCALAPPDATA%\ghost-infer\chats, so every client sees the same chats.
 //!
-//! A request: {"chat"?, "message"?, "mode"?, "cwd"?, "thinking"?, "max_tokens"?, "tools"?, "keep_going"?}.
-//! "mode" is the permission mode (auto, manual, accept_edits, plan, bypass; default manual), "cwd" a new
-//! chat's working directory (kept with the chat), "tools" the tool groups (default: all of them). A message
+//! A request: {"chat"?, "message"?, "mode"?, "cwd"?, "thinking"?, "max_tokens"?, "tools"?, "keep_going"?,
+//! "preview"?}. "mode" is the permission mode (auto, manual, accept_edits, plan, bypass; default manual), "cwd"
+//! a new chat's working directory (kept with the chat), "tools" the tool groups (default: all of them),
+//! "preview" true from a client that shows the web pages the model writes (the "preview" event). A message
 //! may be a command: /goal <what done looks like> (or /goal clear), /loop <interval> <prompt> (or /loop stop).
 //!
 //! Events, one JSON object per server-sent event:
@@ -23,6 +24,8 @@
 //!                                                 going ("goal": a /goal not met, or a task list left open)
 //!   {"type":"goal","goal","checking"?}            the chat's /goal: {"text","limit","tries","state","reason"}
 //!                                                 (state active, met or stopped; null once cleared)
+//!   {"type":"preview","url"}                      a web page the model wrote or changed, to show (served
+//!                                                 at /preview/...); only to a client that sent "preview"
 //!
 //! Scheduled tasks (schedule.rs) run here too, with nobody watching: their events go
 //! nowhere, the chat file keeps it all, and the chat is marked unread for the clients.
@@ -1039,6 +1042,7 @@ struct Request {
     instructions: String, // the GHOST.md files as the reply started
     memory: String, // the remembered facts, likewise
     skills: String, // the installed skills, likewise
+    preview: bool,  // the client shows web pages the model writes itself (the app's preview pane)
 }
 
 impl Request {
@@ -1063,6 +1067,7 @@ impl Request {
             folders,
             memory: memory_prompt(),
             skills: super::skills::prompt(),
+            preview: b.get("preview").and_then(Json::as_bool).unwrap_or(false),
         }
     }
 
@@ -1317,6 +1322,7 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         folders,
         memory: memory_prompt(),
         skills: super::skills::prompt(),
+        preview: false,
     };
     let before = chat.messages.len();
     chat.messages.push(obj(vec![("role", str("user")), ("content", str(w.text)), ("shown", str(w.shown))]));
@@ -1762,7 +1768,40 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
     let t = std::time::Instant::now();
     let result = crate::tools::run(name, &args, &settings, checkpoint).unwrap_or_else(|e| format!("Error: {e}"));
     RUN_SECS.with(|c| c.set(t.elapsed().as_secs_f64()));
+    let result = match show_page(out, req.preview, name, &args, &settings, &result) {
+        Some(note) => format!("{result}\n{note}"),
+        None => result,
+    };
     Ok((result, false))
+}
+
+/// A web page the model just wrote, shown to the user as it is made, without asking for it: an .html file
+/// itself (served by this server, see preview_url), and for a .css or .js file the page last shown, again. The
+/// app shows it in its preview pane (a "preview" event); another client gets it in a browser MCP server's
+/// window, if one has a browser_navigate tool (as Playwright's has). A note for the model if it was shown.
+fn show_page(out: &mut Out, client_shows: bool, name: &str, args: &Json, settings: &crate::tools::Settings, result: &str) -> Option<String> {
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    if !matches!(name, "write_file" | "edit_file") || result.starts_with("Error") {
+        return None;
+    }
+    let path = settings.resolve(args.get("path")?.as_str()?).ok()?;
+    let url = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "html" | "htm" => super::preview_url(&path)?,
+        "css" | "js" => LAST.lock().unwrap().clone()?,
+        _ => return None,
+    };
+    let note = if client_shows {
+        emit(out, obj(vec![("type", str("preview")), ("url", str(&url))])).ok()?;
+        format!("(ghost is showing {url} to the user in the app's preview pane, and shows it again after each change: there is no need to open it.)")
+    } else {
+        let tool = super::mcp::find_tool("browser_navigate")?;
+        if super::mcp::call(&tool, &obj(vec![("url", str(&url))])).starts_with("Error") {
+            return None;
+        }
+        format!("(ghost opened {url} in the browser for the user to see; the browser tools can look at it.)")
+    };
+    *LAST.lock().unwrap() = Some(url);
+    Some(note)
 }
 
 #[cfg(test)]

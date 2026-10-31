@@ -8,6 +8,7 @@ mod ghost;
 #[path = "../../src/json.rs"]
 #[allow(dead_code)]
 mod json;
+mod preview;
 mod setup;
 mod view;
 
@@ -653,6 +654,9 @@ struct App {
     download_polling: bool,
     download_rate: (f64, Option<Instant>, f64), // bytes at the last look, when, and bytes a second
     pick_model: bool,        // a folder of models was just added: the model menu opens once connected
+    warm_up: bool,           // the server runs a few short replies after a model loads (its harness setting)
+    preview_url: Option<String>, // the web page the agent last wrote, for the preview pane
+    preview_open: bool,      // the pane is shown
 }
 
 #[derive(Debug, Clone)]
@@ -721,6 +725,7 @@ enum Message {
     ToggleRail,
     TogglePlan,
     ToggleLoadLast,
+    ToggleWarmUp,
     Quit,
     System(Result<Json, String>),
     UndoAll,
@@ -757,6 +762,13 @@ enum Message {
     CancelDownload,
     UseModelFolder,
     ModelFolder(Option<String>),
+    // the preview pane: the page's view made, and the pane's buttons
+    PreviewMade(Result<(), String>),
+    PreviewOpen,
+    PreviewClose,
+    PreviewReload,
+    PreviewExternal,
+    FocusApp, // a click in the app: the keyboard comes back from the page
 }
 
 impl App {
@@ -848,6 +860,9 @@ impl App {
             download_polling: false,
             download_rate: (0.0, None, 0.0),
             pick_model: false,
+            warm_up: true,
+            preview_url: None,
+            preview_open: false,
         };
         let connecting = blocking(move || {
             setup::start_server(&addr, &launch.0, launch.1.as_deref());
@@ -1235,6 +1250,12 @@ impl App {
                 self.menu = Some(menu);
             }
             Message::Maximized(m) => self.maximized = m,
+            Message::ToggleWarmUp => {
+                self.menu = None;
+                self.warm_up = !self.warm_up;
+                let body = obj(vec![("folders", Json::Arr(self.folders.iter().map(|f| str(f)).collect())), ("warm_up", Json::Bool(self.warm_up))]);
+                return self.call(move |api| api.post("/api/harness", &body), Message::Harness);
+            }
             Message::ToggleLoadLast => {
                 self.load_last = !self.load_last;
                 // on with nothing picked yet: the model running now is the one to start with
@@ -1308,6 +1329,31 @@ impl App {
                     );
                 }
             }
+            Message::PreviewMade(Ok(())) => {}
+            Message::PreviewMade(Err(e)) => {
+                self.preview_open = false;
+                self.status = format!("Couldn't show the page here: {e}");
+            }
+            Message::PreviewOpen => {
+                if let Some(url) = self.preview_url.clone() {
+                    return self.show_preview(url);
+                }
+            }
+            Message::PreviewClose => {
+                self.preview_open = false;
+                preview::set_visible(false);
+            }
+            Message::PreviewReload => {
+                if let Some(url) = &self.preview_url {
+                    preview::navigate(url);
+                }
+            }
+            Message::PreviewExternal => {
+                if let Some(url) = &self.preview_url {
+                    open_link(url);
+                }
+            }
+            Message::FocusApp => preview::focus_app(),
             Message::UseModelFolder => {
                 return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose a folder with GGUF models").pick_folder().map(|p| p.display().to_string())), Message::ModelFolder);
             }
@@ -1360,7 +1406,7 @@ impl App {
                 self.set_harness(&j);
                 return self.refresh_instructions(); // a new folder may bring its own
             }
-            Message::Harness(Err(e)) => self.status = format!("Couldn't save the folders: {e}"),
+            Message::Harness(Err(e)) => self.status = format!("Couldn't save the settings: {e}"),
             Message::Memory(Ok(j)) => self.memory = j.get("facts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
             Message::Memory(Err(e)) => self.status = format!("Couldn't read the memory: {e}"),
             Message::MemoryDraft(d) => self.memory_draft = d,
@@ -1543,6 +1589,7 @@ impl App {
     /// The server's harness settings: the folders file tools may use.
     fn set_harness(&mut self, j: &Json) {
         self.folders = j.get("folders").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
+        self.warm_up = j.get("warm_up").and_then(Json::as_bool).unwrap_or(true);
     }
 
     /// Sends the new folder list to the server (it checks each one is a folder).
@@ -1749,7 +1796,34 @@ impl App {
         } else {
             iced::Subscription::none()
         };
-        iced::Subscription::batch([tick, resized, keys])
+        // a click in the app's own area takes the keyboard back from the preview page (a click in the page goes
+        // to the page, not here)
+        let clicks = if preview::exists() {
+            iced::event::listen_with(|e, _, _| matches!(e, iced::Event::Mouse(iced::mouse::Event::ButtonPressed(_))).then_some(Message::FocusApp))
+        } else {
+            iced::Subscription::none()
+        };
+        iced::Subscription::batch([tick, resized, keys, clicks])
+    }
+
+    /// Shows a web page in the preview pane, making the pane's view the first time (on the window's thread).
+    fn show_preview(&mut self, url: String) -> Task<Message> {
+        if url.is_empty() {
+            return Task::none();
+        }
+        self.preview_url = Some(url.clone());
+        self.preview_open = true;
+        if preview::exists() {
+            preview::set_visible(true);
+            preview::navigate(&url);
+            return Task::none();
+        }
+        iced::window::latest()
+            .and_then(move |id| {
+                let url = url.clone();
+                iced::window::run(id, move |w| preview::create(w, &url))
+            })
+            .map(Message::PreviewMade)
     }
 
     /// A task list with every step done leaves the pin above the message box: it goes into the latest reply,
@@ -1843,7 +1917,7 @@ impl App {
             self.status = self.no_model_status();
             return Task::none();
         }
-        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("mode", str(MODES[self.perm].0)), ("max_tokens", num(4096.0))];
+        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("mode", str(MODES[self.perm].0)), ("max_tokens", num(4096.0)), ("preview", Json::Bool(true))];
         match &self.chat {
             Some(id) => body.push(("chat", str(id))),
             // a new chat: the folder it works in from now on
@@ -1895,6 +1969,7 @@ impl App {
         let kind = ev.get("type").and_then(Json::as_str).unwrap_or("");
         let s = |k: &str| ev.get(k).and_then(Json::as_str).unwrap_or("").to_string();
         match kind {
+            "preview" => return self.show_preview(s("url")),
             "chat" => {
                 let new = self.chat.is_none();
                 self.chat = Some(s("id"));

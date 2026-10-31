@@ -8,7 +8,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::json::{Json, num, obj, str};
@@ -116,6 +116,7 @@ fn list_models(dirs: &[PathBuf]) -> Vec<(String, PathBuf, u64)> {
 
 pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
+    let _ = PORT.set(port);
     // without a model the server starts with none loaded and waits for one to be picked (chat page, app,
     // or POST /api/models/load) from the --models folders
     let start_idle = o.model.as_os_str().is_empty();
@@ -251,10 +252,20 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
             let _ = w.send(err.map_or(Ok(()), Err));
         }
         last_good = Some(path.clone());
-        warm_agent(&mut engine, &shared);
+        // a few short replies first (the weights into memory), then the agent's opening read in, unless a
+        // request comes in meanwhile: it goes first
+        let warm = shared.harness.lock().unwrap().warm_up;
+        let mut early = if warm { warm_up(&mut engine, &id, &rx) } else { None };
+        if early.is_none() {
+            warm_agent(&mut engine, &shared);
+        }
 
         let (next, reply) = loop {
-            match rx.recv() {
+            let work = match early.take() {
+                Some(w) => Ok(w),
+                None => rx.recv(),
+            };
+            match work {
                 Err(_) => return Ok(()),
                 Ok(Work::Job(job)) => run(&mut engine, &id, job),
                 Ok(Work::Load(p, reply)) if p == path => {
@@ -267,6 +278,32 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         path = next;
         waiting = Some((reply, None));
     }
+}
+
+/// A few short replies right after a model loads (the harness's warm_up setting): a mixture of experts then
+/// has the experts they used in RAM and in the GPU's cache before the first chat, which otherwise runs slower
+/// while it brings them in. Stops as soon as a request comes in, and hands it back to be served first.
+fn warm_up(engine: &mut Engine, id: &str, rx: &mpsc::Receiver<Work>) -> Option<Work> {
+    const PROMPTS: [&str; 3] = [
+        "def parse_iso_date(text):\n    \"\"\"Parse an ISO 8601 date string into (year, month, day).\"\"\"\n",
+        "The three habits that make technical documentation easy to read are",
+        "Q: How does a hash map deal with two keys that land in the same bucket?\nA:",
+    ];
+    let t = Instant::now();
+    let mut tokens = 0;
+    for prompt in PROMPTS {
+        match rx.try_recv() {
+            Ok(w) => return Some(w),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let (tx, events) = mpsc::channel();
+        let job = Job { model: id.to_string(), kind: Kind::Completion, prompt: prompt.into(), max_tokens: Some(48), temperature: 0.0, top_k: 1, top_p: 1.0, seed: 1, stop: Vec::new(), lead: "", events: tx };
+        run(engine, id, job);
+        tokens += events.try_iter().map(|e| if let Event::Done { completion_tokens, .. } = e { completion_tokens } else { 0 }).sum::<usize>();
+    }
+    eprintln!("[warmed up: {tokens} tokens in {:.2}s]", t.elapsed().as_secs_f64());
+    None
 }
 
 /// Reads the agent prompt's opening (instructions, memory, tool descriptions: a few thousand tokens) into the
@@ -483,6 +520,81 @@ fn tools_allowed(req: &Request, conn: &TcpStream, token: &str) -> Result<(), &'s
     Ok(())
 }
 
+/// The folders of web pages the agent wrote (agent::show_page), served at /preview/<n>/... so a browser tool,
+/// which keeps file:// shut, can open them over http. Nothing else on disk is served.
+static PREVIEWS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static PORT: OnceLock<u16> = OnceLock::new();
+
+/// http://127.0.0.1:<port>/preview/<n>/<name> for a page the agent wrote; its folder becomes servable.
+pub(crate) fn preview_url(page: &Path) -> Option<String> {
+    let dir = page.parent()?.to_path_buf();
+    let name = page.file_name()?.to_str()?;
+    let mut list = PREVIEWS.lock().unwrap();
+    let n = list.iter().position(|d| *d == dir).unwrap_or_else(|| {
+        list.push(dir);
+        list.len() - 1
+    });
+    let name: String = name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+    Some(format!("http://127.0.0.1:{}/preview/{n}/{name}", PORT.get()?))
+}
+
+/// A file from a preview folder (see PREVIEWS): only to this computer, addressed to localhost (a website
+/// pointing its own name at 127.0.0.1 cannot read it), and only from inside that folder.
+fn respond_preview(conn: &mut TcpStream, req: &Request, rest: &str) -> Result<(), String> {
+    let host = req.host.rsplit_once(':').map_or(req.host.as_str(), |(h, _)| h);
+    if !conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) || !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return respond(conn, 403, &error_body("previews are for this computer only"));
+    }
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (n, file) = rest.split_once('/').unwrap_or((rest, ""));
+    let file = if file.is_empty() { "index.html".to_string() } else { percent_decode(file) };
+    let dir = n.parse::<usize>().ok().and_then(|n| PREVIEWS.lock().unwrap().get(n).cloned());
+    let found = dir.and_then(|d| {
+        let (d, f) = (std::fs::canonicalize(&d).ok()?, std::fs::canonicalize(d.join(&file)).ok()?);
+        f.starts_with(&d).then_some(f)
+    });
+    let Some(path) = found.filter(|p| p.is_file()) else { return respond(conn, 404, &error_body("not found")) };
+    let body = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let kind = match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    respond_file(conn, &body, kind, "no-store")
+}
+
+/// "a%20b" -> "a b" (a URL path's escapes).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `respond` without CORS headers: for the agent tools, which other websites must not reach.
 fn respond_private(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
     let text = body.to_string();
@@ -528,6 +640,9 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let (defaults, think_default) = (shared.defaults, shared.think_default);
     // the agent tools and their settings: private to the chat page on this computer
     let path = req.path.trim_end_matches('/');
+    if req.method == "GET" && req.path.starts_with("/preview/") {
+        return respond_preview(&mut conn, &req, &req.path["/preview/".len()..]);
+    }
     if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));

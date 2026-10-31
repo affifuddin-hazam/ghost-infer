@@ -138,6 +138,7 @@ mod ic {
     pub const CLOCK: char = '\u{E916}';
     pub const UNDO: char = '\u{E7A7}';
     pub const DOWNLOAD: char = '\u{E896}';
+    pub const OPEN_NEW: char = '\u{E8A7}';
 }
 
 fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
@@ -257,6 +258,9 @@ impl App {
             body = body.push(self.sidebar());
         }
         body = body.push(self.main());
+        if self.preview_shown() {
+            body = body.push(self.preview_pane());
+        }
         if self.tasks_panel {
             body = body.push(self.tasks_panel());
         }
@@ -288,6 +292,7 @@ impl App {
                     item(if s.dark { ic::SUN } else { ic::MOON }, if s.dark { "Light theme (Fog)" } else { "Dark theme (Graphite)" }, Message::ToggleTheme),
                     item(ic::SETTINGS, "Follow Windows' theme", Message::SystemTheme),
                     Item { check: Some(self.load_last), ..item(ic::BOLT, "Start with the last model", Message::ToggleLoadLast) },
+                    Item { check: Some(self.warm_up), ..item(ic::NOW, "Warm up after loading", Message::ToggleWarmUp) },
                     item(ic::POWER, "Quit and stop the model", Message::Quit),
                 ],
                 Padding { left: 12.0, bottom: 60.0, ..Padding::ZERO },
@@ -895,9 +900,14 @@ impl App {
         }
         // the title bar: drag the window by its empty part, the window's buttons at its right
         // the rail's switch; with the rail open, the window's buttons move to its top
+        // a page the agent wrote, with its pane closed: the button that shows it again
+        if self.preview_url.is_some() && !self.preview_open {
+            top = top.push(button(icon(ic::GLOBE, 13).color(s.muted)).on_press(Message::PreviewOpen).padding(8).style(move |_, st| row_style(s, st, false)));
+        }
         let on = self.rail;
         top = top.push(button(icon(ic::DOCK_RIGHT, 13).color(if on { s.text } else { s.muted })).on_press(Message::ToggleRail).padding(8).style(move |_, st| row_style(s, st, on)));
-        let top: Element<'_, Message> = if self.rail { drag_area(top) } else { row![drag_area(top), self.window_controls()].into() };
+        // the window's buttons at the window's top right: here, unless the preview pane or the rail is to the right
+        let top: Element<'_, Message> = if self.rail || self.preview_shown() { drag_area(top) } else { row![drag_area(top), self.window_controls()].into() };
 
         if self.messages.is_empty() {
             // a new chat: the greeting, the ghost on the message box, recent chats; on the first run, with no
@@ -1000,6 +1010,36 @@ impl App {
             card = card.push(folder);
         }
         card.into()
+    }
+
+    fn preview_shown(&self) -> bool {
+        self.preview_open && self.preview_url.is_some()
+    }
+
+    /// The preview pane beside the chat: the page the agent last wrote, under a bar with its name, reload, open
+    /// in the browser and close. The page itself is a native view laid over the area below the bar (preview.rs).
+    fn preview_pane(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let url = self.preview_url.as_deref().unwrap_or("");
+        let name = url.rsplit('/').next().unwrap_or(url).replace("%20", " ");
+        let bar = row![
+            icon(ic::GLOBE, 13).color(s.muted),
+            container(text(name).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+            icon_button(s, ic::RETRY, Message::PreviewReload),
+            icon_button(s, ic::OPEN_NEW, Message::PreviewExternal),
+            icon_button(s, ic::CANCEL, Message::PreviewClose),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .padding(Padding { top: 6.0, right: 8.0, bottom: 6.0, left: 16.0 })
+        .height(44);
+        let bar: Element<'_, Message> = if self.rail { drag_area(bar) } else { row![drag_area(bar), self.window_controls()].into() };
+        let page = canvas(PageArea).width(Fill).height(Fill);
+        container(column![bar, page])
+            .width(Fill)
+            .height(Fill)
+            .style(move |_| container::Style { background: Some(Background::Color(s.bg)), border: Border { width: 1.0, color: s.line, ..Default::default() }, ..Default::default() })
+            .into()
     }
 
     /// The ghost perched on the message box, the box itself, and the pickers under it.
@@ -1531,6 +1571,19 @@ struct Ring {
     frac: f32,
     track: Color,
     fill: Color,
+}
+
+/// The preview page's area: nothing is drawn here (the page's own view covers it); drawing it moves the page
+/// to wherever the layout put it.
+struct PageArea;
+
+impl<M> canvas::Program<M> for PageArea {
+    type State = ();
+
+    fn draw(&self, _: &(), _: &iced::Renderer, _: &Theme, bounds: iced::Rectangle, _: iced::mouse::Cursor) -> Vec<canvas::Geometry> {
+        crate::preview::place(bounds);
+        Vec::new()
+    }
 }
 
 impl<M> canvas::Program<M> for Ring {

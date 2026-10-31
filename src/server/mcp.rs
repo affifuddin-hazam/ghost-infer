@@ -345,6 +345,16 @@ pub fn tools() -> Vec<Json> {
     out
 }
 
+/// The full name (mcp__<server>__<tool>) of a running server's tool called `tool`, if one has it.
+pub fn find_tool(tool: &str) -> Option<String> {
+    let list = servers().lock().unwrap().clone();
+    list.iter().find_map(|s| {
+        let s = s.try_lock().ok()?;
+        let has = s.conn.is_some() && s.tools.iter().any(|t| t.get("name").and_then(Json::as_str) == Some(tool));
+        has.then(|| format!("mcp__{}__{}", clean(&s.name), clean(tool)))
+    })
+}
+
 /// Runs an mcp__<server>__<tool> call; its result for the model.
 pub fn call(full: &str, args: &Json) -> String {
     let Some(rest) = full.strip_prefix("mcp__") else { return format!("Error: {full} is not an MCP tool") };

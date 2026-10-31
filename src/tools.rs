@@ -20,11 +20,19 @@ const SKIP_DIRS: [&str; 7] = [".git", "node_modules", "target", "__pycache__", "
 
 /// The harness settings, kept in %LOCALAPPDATA%\ghost-infer\harness.json: the folders tools may use (the
 /// first is where relative paths start).
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Settings {
     pub folders: Vec<PathBuf>,
     /// tool groups the user said to always allow (edit, cmd, web), for clients that run the agent here
     pub always: Vec<String>,
+    /// a few short replies right after a model loads, so its weights are in memory before the first chat
+    pub warm_up: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings { folders: Vec::new(), always: Vec::new(), warm_up: true }
+    }
 }
 
 /// Where installed skills live (%LOCALAPPDATA%\ghost-infer\skills): the file tools may read there, and
@@ -48,7 +56,8 @@ impl Settings {
             .ok()
             .and_then(|j| j.get("always").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect()))
             .unwrap_or_default();
-        Settings { folders, always }
+        let warm_up = Json::parse(&text).ok().and_then(|j| j.get("warm_up").and_then(Json::as_bool)).unwrap_or(true);
+        Settings { folders, always, warm_up }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -63,10 +72,12 @@ impl Settings {
         obj(vec![
             ("folders", Json::Arr(self.folders.iter().map(|f| str(&f.display().to_string())).collect())),
             ("always", Json::Arr(self.always.iter().map(|g| str(g)).collect())),
+            ("warm_up", Json::Bool(self.warm_up)),
         ])
     }
 
-    /// Settings from a client: folders that exist, as given (duplicates dropped); "always" if sent, else kept.
+    /// Settings from a client: folders that exist, as given (duplicates dropped); "always" and "warm_up" if
+    /// sent, else kept.
     pub fn from_json(j: &Json, old: &Settings) -> Result<Settings, String> {
         let mut folders: Vec<PathBuf> = Vec::new();
         for f in j.get("folders").and_then(Json::as_array).ok_or("send {\"folders\": [...]}")? {
@@ -86,7 +97,8 @@ impl Settings {
             Some(a) => a.iter().filter_map(Json::as_str).filter(|g| matches!(*g, "edit" | "cmd" | "web" | "mcp")).map(String::from).collect(),
             None => old.always.clone(),
         };
-        Ok(Settings { folders, always })
+        let warm_up = j.get("warm_up").and_then(Json::as_bool).unwrap_or(old.warm_up);
+        Ok(Settings { folders, always, warm_up })
     }
 
     /// `path` (absolute, or relative to the first allowed folder) if it lies inside an allowed folder. It is
@@ -904,7 +916,13 @@ fn html_to_text(html: &str, base: &str) -> String {
 /// What the chat page shows about the tools' state: the allowed folders.
 pub fn status(s: &Settings) -> Json {
     let j = s.to_json();
-    obj(vec![("folders", j.get("folders").cloned().unwrap_or(Json::Null)), ("always", j.get("always").cloned().unwrap_or(Json::Null)), ("max_result", num(MAX_RESULT as f64)), ("processes", processes())])
+    obj(vec![
+        ("folders", j.get("folders").cloned().unwrap_or(Json::Null)),
+        ("always", j.get("always").cloned().unwrap_or(Json::Null)),
+        ("warm_up", Json::Bool(s.warm_up)),
+        ("max_result", num(MAX_RESULT as f64)),
+        ("processes", processes()),
+    ])
 }
 
 #[cfg(test)]
@@ -935,7 +953,7 @@ mod tests {
     fn edit_and_undo() {
         let root = std::env::temp_dir().join("ghost_infer_edit_test");
         let _ = std::fs::create_dir_all(&root);
-        let s = Settings { folders: vec![root.clone()], always: Vec::new() };
+        let s = Settings { folders: vec![root.clone()], ..Settings::default() };
         let f = root.join("a.txt");
         let original = "one\r\ntwo  \r\nthree\r\ntwo  \r\n";
         std::fs::write(&f, original).unwrap();
@@ -960,7 +978,7 @@ mod tests {
     fn paths_stay_inside() {
         let root = std::env::temp_dir().join("ghost_infer_tools_test");
         let _ = std::fs::create_dir_all(root.join("sub"));
-        let s = Settings { folders: vec![root.clone()], always: Vec::new() };
+        let s = Settings { folders: vec![root.clone()], ..Settings::default() };
         assert!(s.resolve("sub").is_ok());
         assert!(s.resolve("sub/new.txt").is_ok());
         assert!(s.resolve("..").is_err());
