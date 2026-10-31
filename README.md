@@ -56,13 +56,13 @@ On an 8 GB RTX 2060 SUPER with 16 GB of RAM, on the same GGUF files:
 |---|---|---|---|
 | Qwen3 8B, 5 GB: fits in the GPU | **70.3 tokens/s** | 64.8 | 66.0 |
 | Qwen3-30B-A3B, 13.7 GB: bigger than the GPU | **38.0 tokens/s** | 23.7 | 21.7 |
-| Qwen3-Coder-30B-A3B, 14.7 GB \* | **30–47 tokens/s** | not measured | not measured |
-| Qwen3.6-35B-A3B, 16.8 GB \* | **31.9 tokens/s** | 24.9–26.0 | not measured |
-| Qwen3-Coder-Next 80B, 22 GB: bigger than the RAM \* | **11.8–14.5 tokens/s** | 9.3–12.4 | not measured |
+| Qwen3-Coder-30B-A3B, 14.7 GB \* | **32.7 / 47.3** | not measured | not measured |
+| Qwen3.6-35B-A3B, 16.8 GB \* | **31.9 / 31.9** | 26.0 / 24.9 | not measured |
+| Qwen3-Coder-Next 80B, 22 GB: bigger than the RAM \* | **11.8 / 14.5** | 9.3 / 12.4 | not measured |
 
 <sub>llama.cpp b11747 and Ollama 0.40.13. The first two rows: GuideLLM and seven varied prompts, llama.cpp at
-its best `--n-cpu-moe` setting. Rows marked \*: writing code and a long answer, llama.cpp with its automatic
-GPU split. Method and more results in [Benchmarks](docs/benchmarks.md).</sub>
+its best `--n-cpu-moe` setting. Rows marked \*: tokens/s writing code / writing a long answer, the second (warm)
+of two runs, llama.cpp with its automatic GPU split. Method and more results in [Benchmarks](docs/benchmarks.md).</sub>
 
 ## What you get
 
