@@ -56,6 +56,16 @@ setting, though it takes longer to the first token of a short prompt. Details an
 
 ## Quick start
 
+### Install
+
+Download `GhostSetup` from [Releases](https://github.com/affifuddin-hazam/ghost-infer/releases) and run it.
+It needs no administrator rights and nothing else installed (NVIDIA's runtime compiler comes with it), and
+opens the desktop app, which starts the server and, the first time, offers a model to download for your
+computer or reads the GGUF files you already have. Uninstall it from Windows' Apps settings; your chats and
+models stay unless you choose to remove them.
+
+### Build from source
+
 ```bash
 git clone https://github.com/affifuddin-hazam/ghost-infer
 cd ghost-infer
@@ -72,8 +82,8 @@ Open <http://127.0.0.1:8080> to chat, or point any OpenAI client at `http://127.
 other GGUF files in the same folder appear in the chat page's model picker.
 
 Requirements: Windows 10/11, an NVIDIA GPU with compute capability 6.1 or newer (GTX 10-series and
-later), a current driver, and the CUDA toolkit's NVRTC library (see [GPU requirements](#gpu-requirements)).
-Without `--gpu` it runs on the CPU (AVX2).
+later), a current driver, and, built from source, the CUDA toolkit's NVRTC library (see
+[GPU requirements](#gpu-requirements)). Without `--gpu` it runs on the CPU (AVX2).
 
 ## Benchmarks
 
@@ -273,6 +283,8 @@ target\release\ghost-app                # connects to 127.0.0.1:8080; give anoth
 ```
 
 The app runs on the same computer as the server: the agent only answers requests from this computer.
+Installed, the app starts its own server (`ghost-infer.exe` beside it) when none is running, and with no
+model yet it offers one to download from Hugging Face, the one that suits the computer marked.
 
 - **A folder per chat.** A new chat works in the folder shown under the message box (click it to pick
   another), and keeps it, as a Claude Code session does: relative paths and commands start there. Folders
@@ -413,14 +425,17 @@ Not yet: other IQ formats (IQ1, IQ3_XXS, IQ4_XS), Gemma, Llama 3's tokenizer spl
 - An NVIDIA GPU with compute capability 6.1 or newer (needs `dp4a`; 7.5+ also uses int8 tensor cores),
   and a current driver. Dense models must fit in VRAM (an 8B Q4_K_M needs about 5.5 GB); mixture-of-experts
   models only need their shared weights to fit.
-- NVRTC 11.1 or newer from a [CUDA toolkit](https://developer.nvidia.com/cuda-downloads). ghost-infer
-  picks the newest `nvrtc64_*.dll` under `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin`, or
-  the one named by `GHOST_INFER_NVRTC`. Compiled kernels are cached in `%LOCALAPPDATA%\ghost-infer\kernels`
-  (about 0.6 MB), so only the first start after an update or a GPU change compiles them.
+- NVRTC 11.1 or newer. The installer ships it; built from source, it comes from a
+  [CUDA toolkit](https://developer.nvidia.com/cuda-downloads). ghost-infer takes the one named by
+  `GHOST_INFER_NVRTC`, else an `nvrtc64_*.dll` beside the program, else the newest under
+  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin`. Compiled kernels are cached in
+  `%LOCALAPPDATA%\ghost-infer\kernels` (about 0.6 MB), so only the first start after an update or a GPU
+  change compiles them.
 - Windows only for now (Linux is on the roadmap).
 
 `.cargo/config.toml` builds with `target-cpu=native`, so the binary is tuned for the machine that built
-it. Remove that file to build a portable binary.
+it. [`scripts/build-installer.ps1`](scripts/build-installer.ps1) builds for any CPU with AVX2 and FMA
+(x86-64-v3, as fast here) and packs the installer with [Inno Setup](https://jrsoftware.org/isinfo.php) 6 or later.
 
 ## How it works
 

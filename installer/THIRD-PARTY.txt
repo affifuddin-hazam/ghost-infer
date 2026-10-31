@@ -1,0 +1,5 @@
+ghost-infer is MIT or Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).
+
+nvrtc64_*.dll and nvrtc-builtins64_*.dll are NVIDIA's CUDA Runtime Compilation library (NVRTC), copyright
+NVIDIA Corporation, redistributed with ghost-infer under the CUDA Toolkit End User License Agreement
+(https://docs.nvidia.com/cuda/eula/). ghost-infer uses them to compile its GPU kernels for your graphics card.

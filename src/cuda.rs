@@ -3705,10 +3705,19 @@ impl Api {
     }
 }
 
-/// Newest NVRTC under the CUDA toolkit folder, or GHOST_INFER_NVRTC.
+/// GHOST_INFER_NVRTC, else the NVRTC beside the program (the installer ships one), else the newest under the
+/// CUDA toolkit folder.
 fn find_nvrtc() -> Option<String> {
     if let Ok(p) = std::env::var("GHOST_INFER_NVRTC") {
         return Some(p);
+    }
+    let is_nvrtc = |p: &std::path::Path| {
+        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        n.starts_with("nvrtc64_") && n.ends_with(".dll") && !n.contains(".alt")
+    };
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
+    if let Some(p) = beside.and_then(|d| std::fs::read_dir(d).ok()).and_then(|d| d.flatten().map(|e| e.path()).filter(|p| is_nvrtc(p)).max()) {
+        return Some(p.to_string_lossy().into_owned());
     }
     let mut roots = Vec::new();
     if let Ok(p) = std::env::var("CUDA_PATH") {
@@ -3722,10 +3731,7 @@ fn find_nvrtc() -> Option<String> {
         .iter()
         .filter_map(|r| std::fs::read_dir(r).ok())
         .flat_map(|d| d.flatten().map(|e| e.path()))
-        .filter(|p| {
-            let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            n.starts_with("nvrtc64_") && n.ends_with(".dll") && !n.contains(".alt")
-        })
+        .filter(|p| is_nvrtc(p))
         .collect();
     found.sort();
     found.pop().map(|p| p.to_string_lossy().into_owned())

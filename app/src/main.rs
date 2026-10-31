@@ -8,6 +8,7 @@ mod ghost;
 #[path = "../../src/json.rs"]
 #[allow(dead_code)]
 mod json;
+mod setup;
 mod view;
 
 use std::time::Instant;
@@ -516,6 +517,7 @@ struct Saved {
     rail_open: Vec<String>,     // its cards (and their inner lists) that are open
     load_last: bool,            // the launcher starts the server with the last picked model
     last_model: Option<String>, // the model last picked in the app
+    model_dirs: Vec<String>,    // folders of models already on this computer (an installed app's server reads them)
 }
 
 fn load_settings() -> Saved {
@@ -537,6 +539,7 @@ fn load_settings() -> Saved {
         },
         load_last: j.get("load_last").and_then(Json::as_bool).unwrap_or(false),
         last_model: j.get("last_model").and_then(Json::as_str).map(String::from),
+        model_dirs: j.get("model_dirs").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
     }
 }
 
@@ -643,6 +646,12 @@ struct App {
     finished_open: bool,     // its finished group unfolded
     proc_output: std::collections::HashMap<usize, String>, // running processes' output, while the panel shows them
     polling: bool,
+    own_server: bool,        // installed with its server (ghost-infer.exe beside it), which it starts itself
+    model_dirs: Vec<String>, // folders of models already on this computer, for that server
+    download: Json,          // a model downloading for the first run (/api/downloads)
+    download_polled: u64,    // when it was last asked (the clock)
+    download_polling: bool,
+    download_rate: (f64, Option<Instant>, f64), // bytes at the last look, when, and bytes a second
 }
 
 #[derive(Debug, Clone)]
@@ -741,12 +750,20 @@ enum Message {
     RunScheduled(String), // a task's id: now
     CancelScheduled(String),
     Read(Result<Json, String>),
+    // the first run: a model to download (setup::OFFERS), or a folder of models already on this computer
+    GetModel(usize),
+    DownloadStatus(Result<Json, String>),
+    CancelDownload,
+    UseModelFolder,
+    ModelFolder(Option<String>),
 }
 
 impl App {
     fn new(args: Args) -> (App, Task<Message>) {
         let addr = args.addr.clone();
-        let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model } = load_settings();
+        let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model, model_dirs } = load_settings();
+        // an installed app starts its own server (with the last model if it is set to), as the launcher does
+        let launch = (model_dirs.clone(), if load_last { last_model.clone() } else { None });
         let dark = match mode {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
@@ -823,8 +840,18 @@ impl App {
             finished_open: true,
             proc_output: Default::default(),
             polling: false,
+            own_server: setup::own_server().is_some(),
+            model_dirs,
+            download: Json::Null,
+            download_polled: 0,
+            download_polling: false,
+            download_rate: (0.0, None, 0.0),
         };
-        (app, Task::perform(blocking(move || connect(&addr)), Message::Connected))
+        let connecting = blocking(move || {
+            setup::start_server(&addr, &launch.0, launch.1.as_deref());
+            connect(&addr)
+        });
+        (app, Task::perform(connecting, Message::Connected))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -860,7 +887,13 @@ impl App {
                     Some("skill-link") => Task::done(Message::OpenSkillLink),
                     _ => Task::none(),
                 };
-                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras(), self.wait_for_model(), plus]);
+                // no model at all yet: what this computer has (for the one to recommend), and a download under way
+                let first_run = if self.models.is_empty() {
+                    Task::batch([self.call(|api| api.get("/api/system"), Message::System), self.call(|api| api.get("/api/downloads"), Message::DownloadStatus)])
+                } else {
+                    Task::none()
+                };
+                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras(), self.wait_for_model(), plus, first_run]);
                 if let Some(id) = self.start.open.take() {
                     return Task::batch([system, self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded)]);
                 }
@@ -971,6 +1004,12 @@ impl App {
             Message::ToggleSidebar => self.sidebar = !self.sidebar,
             Message::Tick => {
                 self.clock = self.born.elapsed().as_millis() as u64;
+                // a model downloading: a look every second
+                let downloading = self.download.get("state").and_then(Json::as_str) == Some("downloading");
+                if downloading && !self.download_polling && self.clock.saturating_sub(self.download_polled) > 1000 {
+                    self.download_polling = true;
+                    return self.call(|api| api.get("/api/downloads"), Message::DownloadStatus);
+                }
                 // scheduled runs happen on the server on their own: a look every few seconds (the first at once)
                 let due = self.background == Json::Null || self.clock.saturating_sub(self.polled_at) > 4000;
                 if !self.polling && self.api.is_some() && due {
@@ -1214,6 +1253,83 @@ impl App {
             }
             Message::System(Ok(j)) => self.system = j,
             Message::System(Err(_)) => {}
+            Message::GetModel(i) => {
+                let Some(o) = setup::OFFERS.get(i) else { return Task::none() };
+                self.download_rate = (0.0, None, 0.0);
+                let body = obj(vec![("url", str(o.url)), ("file", str(o.file)), ("size", num(o.size as f64))]);
+                return self.call(move |api| api.post("/api/downloads", &body), Message::DownloadStatus);
+            }
+            Message::CancelDownload => return self.call(|api| api.post("/api/downloads/cancel", &Json::Null), Message::DownloadStatus),
+            Message::DownloadStatus(r) => {
+                self.download_polling = false;
+                self.download_polled = self.clock;
+                let j = match r {
+                    Ok(j) => j,
+                    Err(e) => {
+                        self.status = e;
+                        return Task::none();
+                    }
+                };
+                let state = |j: &Json| j.get("state").and_then(Json::as_str).unwrap_or("").to_string();
+                let was = state(&self.download);
+                // the speed, smoothed over the looks
+                let bytes = j.get("bytes").and_then(Json::as_f64).unwrap_or(0.0);
+                let now = Instant::now();
+                if let (Some(at), true) = (self.download_rate.1, bytes >= self.download_rate.0) {
+                    let secs = now.duration_since(at).as_secs_f64();
+                    if secs > 0.2 {
+                        let rate = (bytes - self.download_rate.0) / secs;
+                        self.download_rate.2 = if self.download_rate.2 == 0.0 { rate } else { 0.8 * self.download_rate.2 + 0.2 * rate };
+                    }
+                }
+                self.download_rate.0 = bytes;
+                self.download_rate.1 = Some(now);
+                self.download = j;
+                // done: the model loads, and the app starts with it from now on
+                if state(&self.download) == "done" && was == "downloading" {
+                    let file = self.download.get("file").and_then(Json::as_str).unwrap_or("").to_string();
+                    let id = file.trim_end_matches(".gguf").to_string();
+                    self.last_model = Some(id.clone());
+                    self.load_last = true;
+                    self.save_settings();
+                    self.status = format!("Loading {}…", short_model(&id));
+                    let body = obj(vec![("id", str(&id))]);
+                    return self.call(
+                        move |api| {
+                            api.post("/api/models/load", &body)?;
+                            api.get("/api/models")
+                        },
+                        Message::ModelLoaded,
+                    );
+                }
+            }
+            Message::UseModelFolder => {
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose a folder with GGUF models").pick_folder().map(|p| p.display().to_string())), Message::ModelFolder);
+            }
+            Message::ModelFolder(None) => {}
+            Message::ModelFolder(Some(f)) => {
+                if !self.model_dirs.contains(&f) {
+                    self.model_dirs.push(f);
+                }
+                self.save_settings();
+                // the server reads its folders when it starts: it starts again with this one
+                let (Some(api), addr, dirs) = (self.api.take(), self.start.addr.clone(), self.model_dirs.clone()) else { return Task::none() };
+                self.status = "Reading the folder…".into();
+                return Task::perform(
+                    blocking(move || {
+                        let _ = api.post("/api/quit", &Json::Null);
+                        for _ in 0..50 {
+                            if !setup::listening(&addr) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        setup::start_server(&addr, &dirs, None);
+                        connect(&addr)
+                    }),
+                    Message::Connected,
+                );
+            }
             Message::AddFolder => {
                 self.menu = None;
                 // the dialog blocks, so it opens on its own thread
@@ -1411,6 +1527,9 @@ impl App {
         }
         if let Some(w) = &self.workdir {
             fields.push(("workdir", str(w)));
+        }
+        if !self.model_dirs.is_empty() {
+            fields.push(("model_dirs", Json::Arr(self.model_dirs.iter().map(|d| str(d)).collect())));
         }
         let _ = std::fs::write(p, obj(fields).to_string());
     }

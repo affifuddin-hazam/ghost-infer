@@ -900,9 +900,12 @@ impl App {
         let top: Element<'_, Message> = if self.rail { drag_area(top) } else { row![drag_area(top), self.window_controls()].into() };
 
         if self.messages.is_empty() {
-            // a new chat: the greeting, the ghost on the message box, recent chats
+            // a new chat: the greeting, the ghost on the message box, recent chats; on the first run, with no
+            // model yet, the models to download instead of the message box
             let hello = text(if self.api.is_some() { greeting() } else { "Connecting…" }).size(38).font(SERIF).color(s.text);
-            let mut center = column![Space::new().height(Fill), hello, Space::new().height(26), self.dock_parts()].align_x(Alignment::Center).max_width(760).width(Fill);
+            let first_run = self.api.is_some() && self.models.is_empty() && self.model.is_none() && self.loading.is_none();
+            let below = if first_run { self.setup_card() } else { self.dock_parts() };
+            let mut center = column![Space::new().height(Fill), hello, Space::new().height(26), below].align_x(Alignment::Center).max_width(760).width(Fill);
             let recent: Vec<_> = self.chats.iter().take(3).collect();
             if !recent.is_empty() {
                 let cards = row(recent.into_iter().map(|c| {
@@ -935,6 +938,75 @@ impl App {
             .style(move |t, st| scroll_style(s, t, st));
         let dock = container(column![self.dock_parts()].max_width(740)).center_x(Fill).padding(Padding { top: 0.0, right: 24.0, bottom: 12.0, left: 24.0 });
         container(column![top, transcript, dock]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into()
+    }
+
+    /// The first run: the models to download (the one that suits this computer marked) with the download under
+    /// way, and, for an installed app, a folder of models already on this computer.
+    fn setup_card(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let state = self.download.get("state").and_then(Json::as_str).unwrap_or("");
+        let file = self.download.get("file").and_then(Json::as_str).unwrap_or("");
+        let busy = state == "downloading";
+        let pick = (self.system != Json::Null).then(|| crate::setup::recommended(&self.system));
+        let mut rows = column![].spacing(8);
+        for (i, o) in crate::setup::OFFERS.iter().enumerate() {
+            let this = file == o.file;
+            let mut name = row![text(o.name).size(15).font(MEDIUM).color(s.text)].spacing(8).align_y(Alignment::Center);
+            if pick == Some(i) {
+                let tag = container(text("Recommended").size(11).color(s.accent))
+                    .padding([1, 8])
+                    .style(move |_| container::Style { border: Border { radius: 999.0.into(), width: 1.0, color: Color { a: 0.45, ..s.accent } }, ..Default::default() });
+                name = name.push(tag);
+            }
+            let mut left = column![name, text(o.note).size(13).color(s.muted)].spacing(4).width(Fill);
+            let size = text(format!("{:.1} GB", o.size as f64 / 1e9)).size(13).color(s.faint);
+            let action: Element<'_, Message> = if this && busy {
+                button(text("Cancel").size(13).color(s.text)).on_press(Message::CancelDownload).padding([6, 14]).style(move |_, st| pill(s, st, false)).into()
+            } else if busy {
+                Space::new().into()
+            } else {
+                let label = if this && matches!(state, "failed" | "cancelled") { "Resume" } else { "Download" };
+                button(row![icon(ic::DOWNLOAD, 12).color(s.text), text(label).size(13).color(s.text)].spacing(8).align_y(Alignment::Center))
+                    .on_press(Message::GetModel(i))
+                    .padding([6, 14])
+                    .style(move |_, st| pill(s, st, pick == Some(i)))
+                    .into()
+            };
+            if this && busy {
+                let (bytes, total) = (self.download.get("bytes").and_then(Json::as_f64).unwrap_or(0.0), o.size as f64);
+                let done = ((bytes / total).clamp(0.0, 1.0) * 1000.0) as u16;
+                let bar = |c: Color| move |_: &Theme| container::Style { background: Some(Background::Color(c)), border: border::rounded(3), ..Default::default() };
+                let track = row![
+                    container(Space::new()).width(Length::FillPortion(done.max(1))).height(6).style(bar(s.accent)),
+                    container(Space::new()).width(Length::FillPortion((1000 - done).max(1))).height(6).style(bar(s.raise2)),
+                ];
+                let rate = self.download_rate.2;
+                let mut note = crate::setup::progress_text(bytes, total);
+                if rate > 1e5 {
+                    let mins = ((total - bytes) / rate / 60.0).ceil();
+                    note += &if mins <= 1.0 { " · about a minute left".to_string() } else { format!(" · {mins:.0} min left") };
+                }
+                left = left.push(Space::new().height(6)).push(track).push(text(note).size(12).color(s.muted));
+            } else if this && state == "failed" {
+                let why = self.download.get("error").and_then(Json::as_str).unwrap_or("The download stopped");
+                left = left.push(text(why).size(12).color(s.bad));
+            }
+            let line = row![left, size, action].spacing(16).align_y(Alignment::Center);
+            rows = rows.push(container(line).padding([14, 16]).width(Fill).style(move |_| container::Style {
+                background: Some(Background::Color(s.hover)),
+                border: Border { radius: 12.0.into(), width: if s.dark { 0.0 } else { 1.0 }, color: s.line },
+                ..Default::default()
+            }));
+        }
+        let mut card = column![row![text("Choose a model").size(13).color(s.muted)].padding([0, 2]), rows].spacing(10).max_width(640).width(Fill);
+        if self.own_server && !busy {
+            let folder = button(row![icon(ic::FOLDER, 13).color(s.muted), text("Use models already on this computer").size(13).color(s.muted)].spacing(8).align_y(Alignment::Center))
+                .on_press(Message::UseModelFolder)
+                .padding([6, 10])
+                .style(move |_, st| bare(s, st));
+            card = card.push(folder);
+        }
+        card.into()
     }
 
     /// The ghost perched on the message box, the box itself, and the pickers under it.

@@ -5,3 +5,4 @@
 /.playwright-mcp
 /log_*.txt
 /demo-out
+/dist

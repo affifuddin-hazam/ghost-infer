@@ -17,6 +17,7 @@ use crate::tokenizer::Utf8Stream;
 use crate::{ChatFormat, Engine, Opts};
 
 mod agent;
+mod download;
 mod mcp;
 mod schedule;
 mod skills;
@@ -82,6 +83,7 @@ struct Status {
 struct Shared {
     status: Mutex<Status>,
     dirs: Vec<PathBuf>, // the model's folder, then any --models folders
+    download_dir: Option<PathBuf>, // the first --models folder: where a downloaded model goes
     defaults: (f32, usize, f32, usize),
     think_default: bool,
     harness: Mutex<crate::tools::Settings>,
@@ -126,6 +128,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         // a model given at startup shows as loading from the first request on
         status: Mutex::new(Status { current: None, loading: (!start_idle).then(|| model_id(&o.model)) }),
         dirs,
+        download_dir: o.models.first().cloned(),
         defaults: (o.temp, o.top_k, o.top_p, o.max_new),
         think_default: !o.no_think,
         harness: Mutex::new(crate::tools::Settings::load()),
@@ -525,7 +528,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let (defaults, think_default) = (shared.defaults, shared.think_default);
     // the agent tools and their settings: private to the chat page on this computer
     let path = req.path.trim_end_matches('/');
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules"].iter().any(|p| path.starts_with(p)) {
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
@@ -635,6 +638,25 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 respond_private(&mut conn, 200, &obj(vec![("quitting", Json::Bool(true))]))?;
                 mcp::stop_all();
                 std::process::exit(0)
+            }
+            // a model for the models folder (the app's first run): {"url": a Hugging Face file, "file": its name
+            // here, "size": its bytes}; GET: how it is going; cancel: stop it (it resumes when started again)
+            ("GET", "/api/downloads") => respond_private(&mut conn, 200, &download::status()),
+            ("POST", "/api/downloads") => {
+                let b = body().unwrap_or(Json::Null);
+                let field = |k: &str| b.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+                let size = b.get("size").and_then(Json::as_f64).unwrap_or(0.0) as u64;
+                let Some(dir) = &shared.download_dir else {
+                    return respond_private(&mut conn, 400, &error_body("this server has no models folder to download into (start it with --models <folder>)"));
+                };
+                match download::start(&field("url"), &field("file"), size, dir) {
+                    Ok(()) => respond_private(&mut conn, 200, &download::status()),
+                    Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+                }
+            }
+            ("POST", "/api/downloads/cancel") => {
+                download::cancel();
+                respond_private(&mut conn, 200, &download::status())
             }
             // a fact the user adds: {"fact": "..."}
             ("POST", "/api/memory/add") => match agent::add_fact(body().ok().and_then(|b| b.get("fact").and_then(Json::as_str).map(String::from)).as_deref().unwrap_or("")) {
