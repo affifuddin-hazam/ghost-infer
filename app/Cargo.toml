@@ -20,3 +20,5 @@ rfd = "0.17"
 # when a page is shown
 [target.'cfg(windows)'.dependencies]
 wry = "0.55"
+# the ghost by the clock, where the window's X hides it
+tray-icon = "0.25"

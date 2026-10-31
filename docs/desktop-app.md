@@ -64,6 +64,10 @@ computer. With models but none running, sending opens the model menu instead.
   close it, reload it or open it in your browser from its bar. The server serves only that page's folder,
   only to this computer. Another client gets the page in a browser MCP server's window instead (Playwright's,
   if `mcp.json` has it).
+- **The tray.** The window's X (or Alt+F4) hides ghost to its icon by the clock, so the model and a reply
+  under way go on: click the icon, or start the app again, to bring it back. **Quit and stop the model**
+  (the icon's right-click menu, or the settings menu) ends both. Windows 10 may put a new icon behind the
+  ^ at first; drag it onto the taskbar to keep it in sight.
 - **Warm-up.** After a model loads, the server runs a few short replies so its weights are in memory before
   your first message, which then goes first if it comes sooner. The ghost says "Warming up…" (and the model
   name "warming up") until it is done, then "Warmed up and ready". **Warm up after loading** in the settings

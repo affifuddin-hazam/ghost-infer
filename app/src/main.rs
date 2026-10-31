@@ -10,6 +10,7 @@ mod ghost;
 mod json;
 mod preview;
 mod setup;
+mod tray;
 mod view;
 
 use std::time::Instant;
@@ -46,6 +47,10 @@ fn main() -> iced::Result {
             _ => args.addr = a,
         }
     }
+    // already running (perhaps hidden in the tray): that one comes to the front instead
+    if tray::already_running(&args.addr) {
+        return Ok(());
+    }
     iced::application(move || App::new(args.clone()), App::update, App::view)
         .subscription(App::subscription)
         .title(|app: &App| match &app.title {
@@ -70,6 +75,8 @@ fn main() -> iced::Result {
             decorations: false,
             icon: ghost::icon(view::GRAPHITE.accent),
             platform_specific: iced::window::settings::PlatformSpecific { undecorated_shadow: true, ..Default::default() },
+            // Alt+F4 hides it to the tray as the X does; the tray's menu quits
+            exit_on_close_request: false,
             ..Default::default()
         })
         .run()
@@ -700,6 +707,7 @@ enum Message {
     PickModel(ModelChoice),
     ModelLoaded(Result<Json, String>),
     Edit(text_editor::Action),
+    Tray(tray::Ask),           // the tray icon's click or menu, or a second start of the app
     SlashMove(i32),            // Up/Down in the / list
     SlashPick(Option<String>), // a line of the / list (None: the highlighted one)
     SlashClose,                // Esc: the / list shuts until the text changes
@@ -809,6 +817,9 @@ enum Message {
 impl App {
     fn new(args: Args) -> (App, Task<Message>) {
         let addr = args.addr.clone();
+        if let Some((rgba, side)) = ghost::icon_rgba(view::GRAPHITE.accent) {
+            tray::install(rgba, side);
+        }
         let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model, model_dirs } = load_settings();
         // an installed app starts its own server (with the last model if it is set to), as the launcher does
         let launch = (model_dirs.clone(), if load_last { last_model.clone() } else { None });
@@ -1313,7 +1324,13 @@ impl App {
             Message::DragWindow => return iced::window::latest().and_then(iced::window::drag),
             Message::ToggleMaximize => return iced::window::latest().and_then(iced::window::toggle_maximize),
             Message::Minimize => return iced::window::latest().and_then(|id| iced::window::minimize(id, true)),
-            Message::CloseWindow => return iced::exit(),
+            // the X (or Alt+F4) hides the window to the tray: the model and the chats go on, and the tray icon
+            // brings it back or quits
+            Message::CloseWindow => return iced::window::latest().and_then(|id| iced::window::set_mode(id, iced::window::Mode::Hidden)),
+            Message::Tray(tray::Ask::Show) => {
+                return iced::window::latest().and_then(|id| iced::window::set_mode::<Message>(id, iced::window::Mode::Windowed).chain(iced::window::gain_focus(id)));
+            }
+            Message::Tray(tray::Ask::Quit) => return Task::done(Message::Quit),
             Message::ResizeWindow(d) => return iced::window::latest().and_then(move |id| iced::window::drag_resize(id, d)),
             // maximized by the button, a double click, snapping or Win+Up: the size changes every time
             Message::WindowResized(size) => {
@@ -1886,7 +1903,13 @@ impl App {
         } else {
             iced::Subscription::none()
         };
-        iced::Subscription::batch([tick, resized, keys, clicks])
+        // the tray icon, a second start of the app, and Alt+F4 (which hides the window as the X does)
+        let tray = iced::Subscription::run(|| {
+            use iced::futures::StreamExt;
+            tray::events().map(Message::Tray)
+        });
+        let close = iced::window::close_requests().map(|_| Message::CloseWindow);
+        iced::Subscription::batch([tick, resized, keys, clicks, tray, close])
     }
 
     /// Shows a web page in the preview pane, making the pane's view the first time (on the window's thread).

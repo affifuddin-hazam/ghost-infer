@@ -188,6 +188,12 @@ impl Ghost {
 
 /// The window and taskbar icon: the idle ghost, two screen pixels per sprite pixel, centred in a square.
 pub fn icon(accent: Color) -> Option<iced::window::Icon> {
+    let (rgba, side) = icon_rgba(accent)?;
+    iced::window::icon::from_rgba(rgba, side, side).ok()
+}
+
+/// The icon's pixels, RGBA, and its side (it is square): for the window and the tray.
+pub fn icon_rgba(accent: Color) -> Option<(Vec<u8>, u32)> {
     let g = Ghost::still(1.0, accent).grid();
     let cells: Vec<(usize, usize)> = (0..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| g[y][x] != 0).collect();
     let (x0, x1) = (cells.iter().map(|c| c.0).min()?, cells.iter().map(|c| c.0).max()?);
@@ -206,7 +212,7 @@ pub fn icon(accent: Color) -> Option<iced::window::Icon> {
             }
         }
     }
-    iced::window::icon::from_rgba(rgba, side as u32, side as u32).ok()
+    Some((rgba, side as u32))
 }
 
 impl<Message> canvas::Program<Message> for Ghost {
