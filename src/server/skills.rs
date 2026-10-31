@@ -83,18 +83,46 @@ pub fn prompt() -> String {
     format!("Skills you can use. When a task matches one, call use_skill with its name before you start, then follow its instructions:\n{}", lines.join("\n"))
 }
 
+/// The most of a skill's instructions use_skill gives at once, in characters (about 6,000 tokens).
+const SKILL_CHARS: usize = 24000;
+
 /// The use_skill tool: a skill's instructions, and where its other files are.
 pub fn use_skill(name: &str) -> String {
     let skills = list();
     let Some(s) = skills.iter().find(|s| s.name.eq_ignore_ascii_case(name.trim())) else {
         return format!("Error: no skill named {name}. The skills are: {}", skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
     };
-    let text = std::fs::read_to_string(s.dir.join("SKILL.md")).unwrap_or_default();
+    let path = s.dir.join("SKILL.md");
+    let text = std::fs::read_to_string(&path).unwrap_or_default().replace("\r\n", "\n");
     let (_, body) = parse(&text);
     let dir = s.dir.display().to_string();
     format!(
         "{}\n\n(This skill's folder is {dir}. Read the files it mentions with read_file, using full paths in that folder; run its scripts with run_command and cwd set to that folder.)",
-        crate::tools::clip(body.trim(), 24000)
+        skill_text(body.trim(), &text, &path.display().to_string())
+    )
+}
+
+/// A skill's instructions as use_skill gives them: whole when they fit in SKILL_CHARS; else their start, to a
+/// line's end, then the headings of the rest with their lines in SKILL.md, so the model reads only the part a
+/// task needs (Taste's SKILL.md is 85 KB: read whole, it fills a 32K context on its own).
+fn skill_text(body: &str, file: &str, path: &str) -> String {
+    if body.len() <= SKILL_CHARS {
+        return body.to_string();
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let (mut kept, mut chars) = (0, 0);
+    while kept < lines.len() && chars + lines[kept].len() < SKILL_CHARS {
+        chars += lines[kept].len() + 1;
+        kept += 1;
+    }
+    // the body's first line in the file (after the front matter), so the numbers are read_file's
+    let first = file.lines().position(|l| l == lines[0]).unwrap_or(0) + 1;
+    let sections: Vec<String> = lines[kept..].iter().enumerate().filter(|(_, l)| l.starts_with('#')).take(60).map(|(i, l)| format!("line {}: {}", first + kept + i, l.trim())).collect();
+    format!(
+        "{}\n\n[{path} goes on for {} more lines, left out to save room in the context. Its sections from here: {}. Read one with read_file (offset and limit) only when the task needs it; do not read the whole file.]",
+        lines[..kept].join("\n"),
+        lines.len() - kept,
+        if sections.is_empty() { "(no headings)".to_string() } else { sections.join("; ") }
     )
 }
 
@@ -371,6 +399,22 @@ pub fn remove(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_skill_is_cut_with_its_sections_listed() {
+        // 3,000 lines of 20 characters, a heading every 500: the start whole, then where each later heading is
+        let body: String = (0..3000).map(|i| if i % 500 == 0 { format!("## Part {:<12}\n", i / 500) } else { format!("{:<19}\n", "text") }).collect();
+        let file = format!("---\nname: big\ndescription: d\n---\n{body}");
+        let (_, parsed) = parse(&file);
+        let out = skill_text(parsed.trim(), &file, "SKILL.md");
+        assert!(out.len() < SKILL_CHARS + 2000, "{}", out.len());
+        // about 1,200 lines fit; the body starts on the file's 5th line, so its line 1500 (Part 3) is the file's
+        // 1505th, and Part 2 (kept) is not listed
+        assert!(out.contains("line 1505: ## Part 3"), "{}", &out[out.len() - 400..]);
+        assert!(!out.contains("## Part 2;"));
+        assert!(out.contains("do not read the whole file"));
+        assert_eq!(skill_text("short", "short", "SKILL.md"), "short");
+    }
 
     #[test]
     fn front_matter() {

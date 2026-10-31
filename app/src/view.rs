@@ -163,6 +163,7 @@ fn tool_icon(name: &str) -> char {
         "read_chat" => ic::CHAT,
         "check_work" => ic::RETRY,
         "keep_going" => ic::TASKS,
+        "compacted" => ic::MEMORY,
         "schedule_task" | "list_schedules" | "cancel_schedule" => ic::CLOCK,
         n if n.starts_with("mcp__") => ic::PLUG,
         _ => ic::PC,
@@ -1326,12 +1327,26 @@ impl App {
         }
     }
 
+    /// The ghost's line. While a reply runs, after what it is doing: how long the reply has taken, the tokens it
+    /// has written (its rounds' counts and this round's pieces so far), and its speed (this round's while it
+    /// writes, else the reply's so far), as Claude Code shows them: Writing a file · 1m 23s · 2,345 tokens · 19 tok/s
     fn status_text(&self) -> String {
+        let (Some(started), true) = (self.started, self.busy.is_some()) else { return self.status.clone() };
+        let secs = started.elapsed().as_secs();
+        let mut line = format!("{} · {}", self.status, if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) });
+        let tokens = self.reply_tokens + self.chunks as f64;
+        if tokens > 0.0 {
+            line.push_str(&format!(" · {} tokens", thousands(tokens)));
+        }
         let rate = match self.writing_since {
-            Some(t) if self.chunks > 1 && self.status.starts_with("Writing") => format!(", {:.0} tok/s", (self.chunks - 1) as f64 / t.elapsed().as_secs_f64().max(0.001)),
-            _ => String::new(),
+            Some(t) if self.chunks > 1 => Some((self.chunks - 1) as f64 / t.elapsed().as_secs_f64().max(0.001)),
+            _ if self.reply_writing.1 > 0.0 => Some(self.reply_writing.0 / self.reply_writing.1),
+            _ => None,
         };
-        format!("{}{rate}", self.status)
+        if let Some(r) = rate {
+            line.push_str(&format!(" · {r:.0} tok/s"));
+        }
+        line
     }
 
     fn message<'a>(&'a self, i: usize, m: &'a Msg) -> Element<'a, Message> {

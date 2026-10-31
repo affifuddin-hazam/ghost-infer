@@ -634,8 +634,9 @@ impl Session {
         if !self.recurrent() || self.snaps.iter().any(|s| s.0 == self.pos) {
             return;
         }
-        if self.snaps.len() == 2 {
-            self.snaps.remove(1); // the earliest stays: a prompt's shared opening
+        // three: the earliest stays (a prompt's shared opening), with the latest prompt's header and end
+        if self.snaps.len() == 3 {
+            self.snaps.remove(1);
         }
         self.snaps.push((self.pos, self.conv_state.clone(), self.ssm_state.clone()));
     }

@@ -25,7 +25,9 @@
 //!   {"type":"tasks","tasks"}                      the model's task list changed: [{"text","status"}]
 //!   {"type":"title","id","title"}                 after a chat's first reply: the title the model gave it
 //!   {"type":"nudge","kind","text"}                the harness sent the model back: "check" its work, or keep
-//!                                                 going ("goal": a /goal not met, or a task list left open)
+//!                                                 going ("goal": a /goal not met, or a task list left open);
+//!                                                 or the chat outgrew the context: "compacting", then
+//!                                                 "compact" with the summary that now stands for it
 //!   {"type":"goal","goal","checking"?}            the chat's /goal: {"text","limit","tries","state","reason"}
 //!                                                 (state active, met or stopped; null once cleared)
 //!   {"type":"preview","url"}                      a web page the model wrote or changed, to show (served
@@ -499,6 +501,36 @@ fn flag(m: &Json, k: &str) -> bool {
     m.get(k).and_then(Json::as_bool).unwrap_or(false)
 }
 
+/// A call's arguments once taken out to make room ("args_trimmed" on its message): each long text in them (a
+/// file the model wrote, an edit's old and new text) is only how long it was.
+fn trimmed_args(name: &str, arguments: &str) -> String {
+    let Ok(Json::Obj(fields)) = Json::parse(arguments) else { return arguments.to_string() };
+    let where_ = if matches!(name, "write_file" | "edit_file") { ": the file has them, read it if needed" } else { "" };
+    let fields = fields
+        .into_iter()
+        .map(|(k, v)| match v {
+            Json::Str(s) if s.len() > 300 => (k, str(&format!("[{} lines, taken out to make room in the context{where_}]", s.lines().count()))),
+            v => (k, v),
+        })
+        .collect();
+    Json::Obj(fields).to_string()
+}
+
+/// The arguments of a message's calls as the model gets them, all together (empty when it made none).
+fn call_args(m: &Json) -> String {
+    let calls = m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]);
+    let cut = flag(m, "args_trimmed");
+    calls
+        .iter()
+        .filter_map(|c| {
+            let f = c.get("function")?;
+            let (name, args) = (f.get("name").and_then(Json::as_str).unwrap_or(""), f.get("arguments").and_then(Json::as_str)?);
+            Some(if cut { trimmed_args(name, args) } else { args.to_string() })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn role(m: &Json) -> &str {
     m.get("role").and_then(Json::as_str).unwrap_or("")
 }
@@ -512,7 +544,8 @@ fn mark(m: &mut Json, k: &str, v: Json) {
 }
 
 /// The chat as the model reads it: messages left out ("dropped") skipped, tool outputs taken out ("trimmed")
-/// replaced by a note, and messages cut down ("clip": the characters kept) cut in the middle.
+/// replaced by a note, messages cut down ("clip": the characters kept) cut in the middle, and the long texts in
+/// calls' arguments taken out ("args_trimmed") said in a line.
 fn for_model(messages: &[Json]) -> Vec<Json> {
     let mut out: Vec<Json> = Vec::with_capacity(messages.len());
     let mut left_out = false;
@@ -521,7 +554,8 @@ fn for_model(messages: &[Json]) -> Vec<Json> {
             left_out = true;
             continue;
         }
-        let (trimmed, clip, note) = (flag(m, "trimmed"), m.get("clip").and_then(Json::as_f64).map(|c| c as usize), left_out && out.is_empty());
+        // (a compaction's summary says itself what it stands for)
+        let (trimmed, clip, note) = (flag(m, "trimmed"), m.get("clip").and_then(Json::as_f64).map(|c| c as usize), left_out && out.is_empty() && !flag(m, "compact"));
         let mut m = m.clone();
         if let (Some(r), Json::Obj(fields)) = (m.get("reminder").and_then(Json::as_str).map(String::from), &mut m) {
             if let Some((_, Json::Str(t))) = fields.iter_mut().find(|(k, _)| k == "content") {
@@ -541,17 +575,35 @@ fn for_model(messages: &[Json]) -> Vec<Json> {
                 }
             }
         }
+        if let (true, Json::Obj(fields)) = (flag(&m, "args_trimmed"), &mut m) {
+            if let Some((_, Json::Arr(calls))) = fields.iter_mut().find(|(k, _)| k == "tool_calls") {
+                for call in calls {
+                    let Some(Json::Obj(f)) = (match call {
+                        Json::Obj(c) => c.iter_mut().find(|(k, _)| k == "function").map(|(_, f)| f),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    let name = f.iter().find(|(k, _)| k == "name").and_then(|(_, v)| v.as_str()).unwrap_or("").to_string();
+                    if let Some((_, Json::Str(a))) = f.iter_mut().find(|(k, _)| k == "arguments") {
+                        *a = trimmed_args(&name, a);
+                    }
+                }
+            }
+        }
         out.push(m);
     }
     out
 }
 
 /// Makes about `need` tokens of room, the least missed first: tool outputs taken out, oldest first, all but
-/// the last 3; then the oldest turns left out whole; then, when the turn being answered is too big on its
-/// own, its biggest messages cut in half. Whether it found anything to take out.
+/// the last 3; the long texts in the model's earlier calls (a file it wrote, an edit's texts: the file still
+/// has them), all but the latest; then the oldest turns left out whole; then, when the turn being answered is
+/// too big on its own, the latest call's texts, and its biggest messages cut in half. Whether it found
+/// anything to take out.
 fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) -> bool {
-    // a message's text as the model gets it now, in tokens
-    let cost = |m: &Json| -> usize {
+    // a message's text and its calls' arguments as the model gets them now, in tokens
+    let text_cost = |m: &Json| -> usize {
         if flag(m, "dropped") {
             return 0;
         }
@@ -562,6 +614,17 @@ fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) ->
         let shown = m.get("clip").and_then(Json::as_f64).map(|c| crate::tools::clip(t, c as usize));
         tok.encode(shown.as_deref().unwrap_or(t)).len()
     };
+    let args_cost = |m: &Json| -> usize {
+        let args = call_args(m);
+        if flag(m, "dropped") || args.is_empty() { 0 } else { tok.encode(&args).len() }
+    };
+    let cost = |m: &Json| text_cost(m) + args_cost(m);
+    // takes out a message's long call texts: the tokens that freed
+    let cut_args = |m: &mut Json| -> usize {
+        let before = args_cost(m);
+        mark(m, "args_trimmed", Json::Bool(true));
+        before.saturating_sub(args_cost(m))
+    };
     let msgs = &mut chat.messages;
     let current = msgs.iter().rposition(|m| role(m) == "user" && !is_auto(m)).unwrap_or(0);
     let mut freed = 0;
@@ -570,11 +633,18 @@ fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) ->
         if freed >= need {
             break;
         }
-        let c = cost(&msgs[i]);
+        let c = text_cost(&msgs[i]);
         if c > 100 {
             mark(&mut msgs[i], "trimmed", Json::Bool(true));
             freed += c - 25;
         }
+    }
+    let writes: Vec<usize> = (0..msgs.len()).filter(|&i| !flag(&msgs[i], "dropped") && !flag(&msgs[i], "args_trimmed") && call_args(&msgs[i]).len() > 1200).collect();
+    for &i in &writes[..writes.len().saturating_sub(1)] {
+        if freed >= need {
+            break;
+        }
+        freed += cut_args(&mut msgs[i]);
     }
     // a turn: a user's message and everything up to their next one
     let mut i = 0;
@@ -586,7 +656,12 @@ fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) ->
         }
         i = end;
     }
-    let mut big: Vec<(usize, usize)> = (current..msgs.len()).map(|j| (cost(&msgs[j]), j)).filter(|(c, _)| *c > 1000).collect();
+    if let Some(&last) = writes.last() {
+        if freed < need && !flag(&msgs[last], "dropped") {
+            freed += cut_args(&mut msgs[last]);
+        }
+    }
+    let mut big: Vec<(usize, usize)> = (current..msgs.len()).map(|j| (text_cost(&msgs[j]), j)).filter(|(c, _)| *c > 1000).collect();
     big.sort_by(|a, b| b.cmp(a));
     for (c, j) in big {
         if freed >= need {
@@ -600,11 +675,88 @@ fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) ->
     freed > 0
 }
 
+/// What the model is asked when a chat is compacted: Claude Code's summary (its nine sections made five, for
+/// a small model), after the chat itself so the server's cache still holds the prompt.
+const COMPACT_PROMPT: &str = "(From ghost, not from the user) This chat has grown too long for your context, so it is being compacted: everything above will be replaced by your summary of it. Do not call any tools; write only the summary, inside <summary></summary>, under these headings:
+1. The user's requests: every request and instruction the user gave, in their own words, the latest last.
+2. Done so far: the files created or changed (full paths) and what is in them now, the commands run and what they showed.
+3. What was learned: facts and decisions that matter for the rest of the work, errors and how they were fixed, anything the user said to do differently.
+4. Current work: exactly what you were doing right before this, and where it stopped.
+5. Next step: the next thing to do for the user's latest request, if anything is left.
+Be specific (names, paths, numbers) and leave out what no longer matters.";
+
+/// Put before the summary, in place of the chat it covers.
+const COMPACTED: &str = "(From ghost, not from the user) This chat was compacted to fit your context: the summary below takes the place of everything before it. Continue the work from where it stopped, without recapping it or asking anything; read again any file you need.";
+
+/// The summary's length at most: a twelfth of the context, from 1,024 to 4,096 tokens.
+fn summary_tokens(loaded: &Loaded) -> usize {
+    (loaded.ctx / 12).clamp(1024, 4096)
+}
+
+/// Compacts the chat as Claude Code does once its context is full: the model writes a summary of everything so
+/// far, and the summary takes the place of the messages it covers (left out of the model's prompt; the chat
+/// file keeps them). The prompt after it is short, so many rounds go by before the next one, each reading
+/// only what is new. Ok(false) when no usable summary came back.
+fn compact(out: &mut Out, req: &Request, chat: &mut Chat, tools: &[Json], work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<bool, String> {
+    emit(out, obj(vec![("type", str("nudge")), ("kind", str("compacting")), ("text", str("Compacting the chat to fit the context"))]))?;
+    // the summary begun for the model, so it writes one (asked, a small model may call a tool instead)
+    const START: &str = "<summary>\n1. The user's requests:";
+    let budget = summary_tokens(loaded);
+    let mut asked = None;
+    for _ in 0..4 {
+        let mut history = for_model(&chat.messages);
+        history.push(obj(vec![("role", str("user")), ("content", str(COMPACT_PROMPT))]));
+        let prompt = format!("{}{START}", prompt_for(req, &history, tools, false, shared, loaded)?);
+        // the question and the summary have to fit: old tool outputs out first if they do not
+        let n = loaded.tok.encode(&prompt).len();
+        if n + budget <= loaded.ctx {
+            asked = Some(prompt);
+            break;
+        }
+        if !make_room(chat, n + budget + 100 - loaded.ctx, &loaded.tok) {
+            break;
+        }
+    }
+    let Some(prompt) = asked else { return Ok(false) };
+    let (tx, events) = mpsc::channel();
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(budget), temperature: 0.3, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: vec!["</summary>".into()], lead: "", events: tx };
+    work.send(Work::Job(job)).map_err(|_| "the model thread stopped")?;
+    let mut text = String::new();
+    for ev in events {
+        match ev {
+            Event::Text(t) => text.push_str(&t),
+            Event::Done { .. } => break,
+            Event::Error(_, e) => return Err(e),
+        }
+    }
+    // the summary alone: not a tool call it went on to anyway
+    let written = text.split("<tool_call>").next().unwrap_or(&text);
+    let summary = format!("1. The user's requests:{}", written.split("</summary>").next().unwrap_or(written));
+    let summary = summary.trim();
+    if summary.len() < 200 {
+        return Ok(false);
+    }
+    for m in chat.messages.iter_mut() {
+        mark(m, "dropped", Json::Bool(true));
+    }
+    let mut msg = vec![("role", str("user")), ("content", str(&format!("{COMPACTED}\n\n{summary}"))), ("auto", Json::Bool(true)), ("compact", Json::Bool(true))];
+    if let Some(r) = task_reminder(chat) {
+        msg.push(("reminder", str(&r)));
+    }
+    chat.messages.push(obj(msg));
+    chat.save()?;
+    emit(out, obj(vec![("type", str("nudge")), ("kind", str("compact")), ("text", str(summary))]))?;
+    Ok(true)
+}
+
 /// This round's prompt, made to fit: when it would leave the reply less room than it asks for (up to a
-/// quarter of the context), make_room takes out enough that it fills at most 3/4 of the rest, so the next
-/// rounds fit too and start the same way (the server's cache still holds them).
-fn fitted_prompt(req: &Request, chat: &mut Chat, tools: &[Json], shared: &Shared, loaded: &Loaded) -> Result<String, String> {
+/// quarter of the context), the chat is compacted into a summary (compact); if no summary comes, make_room
+/// takes out enough that it fills at most half of the rest, so the next rounds fit too and start the same
+/// way (the server's cache still holds them: each taking out changes the prompt's start, and the whole of it
+/// is read again).
+fn fitted_prompt(out: &mut Out, req: &Request, chat: &mut Chat, tools: &[Json], work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
     let limit = loaded.ctx - req.max_tokens.min(loaded.ctx / 4);
+    let mut compacted = false;
     for _ in 0..8 {
         let prompt = prompt_for(req, &for_model(&chat.messages), tools, req.thinking, shared, loaded)?;
         // a token is at least one byte, so a prompt this short fits without counting
@@ -615,9 +767,16 @@ fn fitted_prompt(req: &Request, chat: &mut Chat, tools: &[Json], shared: &Shared
         if n <= limit {
             return Ok(prompt);
         }
-        if !make_room(chat, n - limit * 3 / 4, &loaded.tok) {
+        // once: a summary in place of the chat (more than the message being answered to summarize)
+        if !compacted && chat.messages.iter().filter(|m| !flag(m, "dropped")).count() > 2 {
+            compacted = true;
+            if compact(out, req, chat, tools, work, shared, loaded)? {
+                continue;
+            }
+        }
+        if !make_room(chat, n - limit / 2, &loaded.tok) {
             return Err(format!(
-                "this message is too long for the model: it needs {n} tokens, and the context holds {} with {} kept for the reply. Shorten it, or start a new chat",
+                "this chat no longer fits the model's context: it needs {n} tokens, and the context holds {} with {} kept for the reply. Start a new chat (or shorten the message, if it is the long part)",
                 loaded.ctx,
                 loaded.ctx - limit
             ));
@@ -1234,6 +1393,13 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
             None => {
                 let last_user = chat.messages.iter().rposition(|m| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m)).ok_or("this chat has no message to answer")?;
                 chat.messages.truncate(last_user + 1);
+                // a summary that came after it (compact) went with the reply: what it stood for is back in
+                // the prompt, and is made to fit again
+                for m in chat.messages.iter_mut() {
+                    if let Json::Obj(fields) = m {
+                        fields.retain(|(k, _)| k != "dropped");
+                    }
+                }
             }
         }
         chat.save()?;
@@ -1521,7 +1687,7 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
     let mut planned = false; // the task list was written in this reply (an old one is not this reply's goal)
     let (mut goal_nudges, mut done_then) = (0, 0); // goal nudges in a row, and the steps done at the last one
     for round in 0..MAX_ROUNDS {
-        let prompt = fitted_prompt(req, chat, &tools, shared, loaded)?;
+        let prompt = fitted_prompt(out, req, chat, &tools, work, shared, loaded)?;
         let lead = super::reply_lead(&prompt);
 
         let (tx, events) = mpsc::channel();

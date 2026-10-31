@@ -343,6 +343,19 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
     // which gives the logits for the first reply token)
     let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
     let keep = engine.truncate(keep);
+    let reused = keep;
+    // a recurrent (DeltaNet) model goes back only to a snapshot, and one is taken where a read ends: so the
+    // prompt is read in two, up to the reply's own header and then the header. The next prompt may write this
+    // turn's header differently (without its empty thinking once a message follows it, as the compaction's
+    // question or a nudge does): it then goes back to the header, not to the start.
+    let keep = match ["<|im_start|>assistant", "<|assistant|>"].iter().filter_map(|h| job.prompt.rfind(h)).max() {
+        Some(at) => {
+            let head = engine.tok.encode(&job.prompt[..at]);
+            let b = head.len();
+            if b > keep && b < ids.len() && ids[..b] == head[..] && engine.read_in(&ids[keep..b]).is_ok() { b } else { keep }
+        }
+        None => keep,
+    };
     let max_new = job.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len()).max(1);
     let mut sampler = Sampler::new(job.temperature, job.top_k, job.top_p, job.seed);
 
@@ -386,7 +399,7 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
                     Kind::Completion => "completion",
                 },
                 ids.len(),
-                ids.len() - keep,
+                ids.len() - reused,
                 st.gen_tokens,
                 t0.elapsed().as_secs_f64(),
                 st.gen_tokens as f64 / st.gen_secs.max(1e-9),

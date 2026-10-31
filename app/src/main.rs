@@ -127,6 +127,11 @@ impl ToolLine {
         ToolLine { result: Some(text.to_string()), ..ToolLine::new("nudge", if goal { "keep_going" } else { "check_work" }, "{}") }
     }
 
+    /// The chat compacted to fit the context: the summary that now stands for it, opened from the line.
+    fn compacted(summary: &str) -> ToolLine {
+        ToolLine { result: Some(summary.to_string()), ..ToolLine::new("nudge", "compacted", "{}") }
+    }
+
     /// Whether it changed a file (so the reply can be undone).
     fn changed_files(&self) -> bool {
         matches!(self.name.as_str(), "write_file" | "edit_file") && !self.denied && self.result.as_deref().is_some_and(|r| !r.starts_with("Error"))
@@ -352,6 +357,7 @@ fn tool_label(t: &ToolLine) -> String {
         "read_chat" => "Read an earlier chat".into(),
         "check_work" => "Asked to check its work".into(),
         "keep_going" => "Sent back to work".into(),
+        "compacted" => "Compacted the chat to fit the context".into(),
         "unreadable_tool_call" if t.result.as_deref().is_some_and(|r| r.contains("reached its limit")) => "Wrote a tool call the length limit cut off".into(),
         "unreadable_tool_call" => "Wrote a tool call that could not be read".into(),
         "schedule_task" => format!("Scheduled \"{}\"", if s("name").is_empty() { s("prompt") } else { s("name") }),
@@ -1990,7 +1996,8 @@ impl App {
                 // a message of the user
                 Some("user") if m.get("auto").and_then(Json::as_bool).unwrap_or(false) => {
                     if let Some(reply) = self.messages.last_mut().filter(|r| r.role == Role::Assistant) {
-                        reply.add_tool(ToolLine::nudge(content, m.get("goal").and_then(Json::as_bool).unwrap_or(false)));
+                        let compact = m.get("compact").and_then(Json::as_bool).unwrap_or(false);
+                        reply.add_tool(if compact { ToolLine::compacted(content) } else { ToolLine::nudge(content, m.get("goal").and_then(Json::as_bool).unwrap_or(false)) });
                     }
                 }
                 // sent by the scheduler: its short label, not the whole prompt the model got
@@ -2232,11 +2239,24 @@ impl App {
                 self.settle_plan();
             }
             "nudge" => {
-                let goal = s("kind") == "goal";
-                if let Some(m) = self.messages.last_mut() {
-                    m.add_tool(ToolLine::nudge(&s("text"), goal));
+                let kind = s("kind");
+                match kind.as_str() {
+                    // the chat outgrew the context: the model summarizes it (Claude Code's compaction)
+                    "compacting" => self.status = "Compacting the chat".into(),
+                    "compact" => {
+                        if let Some(m) = self.messages.last_mut() {
+                            m.add_tool(ToolLine::compacted(&s("text")));
+                        }
+                        self.status = "Compacted the chat".into();
+                    }
+                    _ => {
+                        let goal = kind == "goal";
+                        if let Some(m) = self.messages.last_mut() {
+                            m.add_tool(ToolLine::nudge(&s("text"), goal));
+                        }
+                        self.status = if goal { "Back to work on the goal".into() } else { "Checking its work".into() };
+                    }
                 }
-                self.status = if goal { "Back to work on the goal".into() } else { "Checking its work".into() };
             }
             // the chat's /goal: set, checked, met or given up on (null: cleared)
             "goal" => {

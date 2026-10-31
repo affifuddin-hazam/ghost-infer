@@ -6562,7 +6562,8 @@ impl GpuSession {
         if self.snaps.iter().any(|s| s.0 == self.pos) {
             return Ok(());
         }
-        let copy = if self.snaps.len() == MAX_SNAPS { self.snaps.remove(MAX_SNAPS - 1).1 } else { DeviceBuf::alloc(buf.bytes)? };
+        // full: the oldest after the earliest makes way
+        let copy = if self.snaps.len() == MAX_SNAPS { self.snaps.remove(1).1 } else { DeviceBuf::alloc(buf.bytes)? };
         let a = api()?;
         a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(copy.ptr, buf.ptr, buf.bytes) }, "DeltaNet snapshot")?;
         self.snaps.push((self.pos, copy));
@@ -6699,8 +6700,9 @@ fn free_memory() -> Result<usize, String> {
 /// Experts' slots per block of GPU memory (the expert cache grows and shrinks a block at a time).
 const SLOT_BLOCK: usize = 16;
 
-/// Copies of the DeltaNet states a session keeps (GpuSession::snapshot).
-const MAX_SNAPS: usize = 2;
+/// Copies of the DeltaNet states a session keeps (GpuSession::snapshot): the earliest (a prompt's shared
+/// opening), and the latest prompt's reply header and end.
+const MAX_SNAPS: usize = 3;
 
 /// A layer's experts in one 2-bit format (gate, up and down alike): its `fmt` for the IQ2 kernels.
 fn iq2_fmt(t: &[ExpertTensor; 3]) -> Option<i32> {

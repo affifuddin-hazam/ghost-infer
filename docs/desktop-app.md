@@ -45,8 +45,12 @@ computer. With models but none running, sending opens the model menu instead.
   check reads the work against the goal and sends it back with what is missing, until the goal is met or
   the tries run out (8 unless the goal says). `/loop 10m check the build and fix what fails` repeats a
   prompt in the chat; `/loop stop` ends it.
-- **Long chats fit.** Before each round, old tool outputs are taken out, then the oldest turns, so a chat
-  never outgrows the context; the chat file keeps everything, and the server's cache stays valid.
+- **Long chats fit, compacted as Claude Code does.** When a chat outgrows the model's context, the model
+  writes a summary of it (what you asked, what was done, where it stopped) and works on from that; the
+  chat file keeps everything, and the reply shows "Compacted the chat" with the summary. If no summary
+  comes, old tool outputs, old file writes and then the oldest turns are taken out instead.
+- **Progress as it works.** The ghost's line says what the model is doing, how long the reply has taken,
+  the tokens written and the speed: "Writing a file · 1m 23s · 2,345 tokens · 19 tok/s".
 - **Instructions and memory.** `GHOST.md` goes into every chat: the one in `%LOCALAPPDATA%\ghost-infer`,
   and one in each folder you add (a folder's `CLAUDE.md` or `AGENTS.md` works too). The model saves
   lasting facts with `remember` and can search earlier chats.
