@@ -1,10 +1,8 @@
 //! What an installed app does on its own: start its server (ghost-infer.exe beside it) when nothing answers
-//! yet, and offer a model to download when the models folder is empty.
+//! yet, and offer models to download when the models folder is empty (the user picks; none is pushed).
 
 use std::path::PathBuf;
 use std::time::Duration;
-
-use crate::json::Json;
 
 /// A model the first run offers, from Hugging Face.
 pub struct Offer {
@@ -38,13 +36,6 @@ pub const OFFERS: [Offer; 3] = [
         size: 2_497_281_120,
     },
 ];
-
-/// The offer that suits this computer (/api/system): the 35B with 16 GB of RAM or more (Windows reports a
-/// little under), else the 4B.
-pub fn recommended(system: &Json) -> usize {
-    let ram = system.get("ram_total_gb").and_then(Json::as_f64).unwrap_or(0.0);
-    if ram >= 15.0 { 0 } else { 2 }
-}
 
 /// %LOCALAPPDATA%\ghost-infer: the server's and the app's data.
 fn data_dir() -> Option<PathBuf> {

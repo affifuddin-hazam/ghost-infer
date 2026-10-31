@@ -940,24 +940,17 @@ impl App {
         container(column![top, transcript, dock]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into()
     }
 
-    /// The first run: the models to download (the one that suits this computer marked) with the download under
-    /// way, and, for an installed app, a folder of models already on this computer.
+    /// The first run: the models to download, the download under way, and, for an installed app, a folder of
+    /// models already on this computer. Which one is the user's choice: none is marked.
     fn setup_card(&self) -> Element<'_, Message> {
         let s = self.skin();
         let state = self.download.get("state").and_then(Json::as_str).unwrap_or("");
         let file = self.download.get("file").and_then(Json::as_str).unwrap_or("");
         let busy = state == "downloading";
-        let pick = (self.system != Json::Null).then(|| crate::setup::recommended(&self.system));
         let mut rows = column![].spacing(8);
         for (i, o) in crate::setup::OFFERS.iter().enumerate() {
             let this = file == o.file;
-            let mut name = row![text(o.name).size(15).font(MEDIUM).color(s.text)].spacing(8).align_y(Alignment::Center);
-            if pick == Some(i) {
-                let tag = container(text("Recommended").size(11).color(s.accent))
-                    .padding([1, 8])
-                    .style(move |_| container::Style { border: Border { radius: 999.0.into(), width: 1.0, color: Color { a: 0.45, ..s.accent } }, ..Default::default() });
-                name = name.push(tag);
-            }
+            let name = text(o.name).size(15).font(MEDIUM).color(s.text);
             let mut left = column![name, text(o.note).size(13).color(s.muted)].spacing(4).width(Fill);
             let size = text(format!("{:.1} GB", o.size as f64 / 1e9)).size(13).color(s.faint);
             let action: Element<'_, Message> = if this && busy {
@@ -969,7 +962,7 @@ impl App {
                 button(row![icon(ic::DOWNLOAD, 12).color(s.text), text(label).size(13).color(s.text)].spacing(8).align_y(Alignment::Center))
                     .on_press(Message::GetModel(i))
                     .padding([6, 14])
-                    .style(move |_, st| pill(s, st, pick == Some(i)))
+                    .style(move |_, st| pill(s, st, false))
                     .into()
             };
             if this && busy {

@@ -31,7 +31,7 @@ for the other case: **one person, one consumer GPU, one model at a time**, and i
 
 **[Download GhostSetup for Windows](https://github.com/affifuddin-hazam/ghost-infer/releases/latest)** and run
 it. It needs no administrator rights and nothing else installed. The app starts the server and, the first
-time, offers a model that suits your computer, or uses the GGUF files you already have.
+time, offers models to download, or uses the GGUF files you already have.
 
 <details>
 <summary>Build from source</summary>

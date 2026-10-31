@@ -652,6 +652,7 @@ struct App {
     download_polled: u64,    // when it was last asked (the clock)
     download_polling: bool,
     download_rate: (f64, Option<Instant>, f64), // bytes at the last look, when, and bytes a second
+    pick_model: bool,        // a folder of models was just added: the model menu opens once connected
 }
 
 #[derive(Debug, Clone)]
@@ -846,6 +847,7 @@ impl App {
             download_polled: 0,
             download_polling: false,
             download_rate: (0.0, None, 0.0),
+            pick_model: false,
         };
         let connecting = blocking(move || {
             setup::start_server(&addr, &launch.0, launch.1.as_deref());
@@ -887,9 +889,12 @@ impl App {
                     Some("skill-link") => Task::done(Message::OpenSkillLink),
                     _ => Task::none(),
                 };
-                // no model at all yet: what this computer has (for the one to recommend), and a download under way
+                // no model at all yet: a download that may be under way; models but none running after a folder of
+                // them was added: the model menu, to pick one
                 let first_run = if self.models.is_empty() {
-                    Task::batch([self.call(|api| api.get("/api/system"), Message::System), self.call(|api| api.get("/api/downloads"), Message::DownloadStatus)])
+                    self.call(|api| api.get("/api/downloads"), Message::DownloadStatus)
+                } else if std::mem::take(&mut self.pick_model) && self.model.is_none() && self.loading.is_none() {
+                    Task::done(Message::OpenMenu(Menu::Model))
                 } else {
                     Task::none()
                 };
@@ -1315,6 +1320,7 @@ impl App {
                 // the server reads its folders when it starts: it starts again with this one
                 let (Some(api), addr, dirs) = (self.api.take(), self.start.addr.clone(), self.model_dirs.clone()) else { return Task::none() };
                 self.status = "Reading the folder…".into();
+                self.pick_model = true;
                 return Task::perform(
                     blocking(move || {
                         let _ = api.post("/api/quit", &Json::Null);
@@ -1826,6 +1832,15 @@ impl App {
     fn send(&mut self, retry: Option<()>) -> Task<Message> {
         let Some(api) = self.api.clone() else { return Task::none() };
         if self.busy.is_some() {
+            return Task::none();
+        }
+        // no model running: nothing would answer, so the message waits in the box and the model menu opens (or,
+        // while one loads, the status says so)
+        if self.model.is_none() {
+            if self.loading.is_none() {
+                return Task::done(Message::OpenMenu(Menu::Model));
+            }
+            self.status = self.no_model_status();
             return Task::none();
         }
         let mut body = vec![("thinking", Json::Bool(self.thinking)), ("mode", str(MODES[self.perm].0)), ("max_tokens", num(4096.0))];

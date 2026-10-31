@@ -27,7 +27,8 @@ target\release\ghost-app                # connects to 127.0.0.1:8080; give anoth
 
 The app runs on the same computer as the server: the agent only answers requests from this computer.
 Installed, the app starts its own server (`ghost-infer.exe` beside it) when none is running, and with no
-model yet it offers one to download from Hugging Face, the one that suits the computer marked.
+model yet it offers models to download from Hugging Face, or reads a folder of GGUF files already on the
+computer. With models but none running, sending opens the model menu instead.
 
 - **A folder per chat.** A new chat works in the folder shown under the message box (click it to pick
   another), and keeps it, as a Claude Code session does: relative paths and commands start there. Folders
