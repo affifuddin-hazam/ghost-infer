@@ -53,6 +53,9 @@ computer. With models but none running, sending opens the model menu instead.
 - **Skills and MCP servers.** Install [Agent Skills](https://agentskills.io) (a folder with a `SKILL.md`)
   from a folder, a .zip or a GitHub link; a repository with several skills lets you pick. MCP servers go in
   `mcp.json` in Claude Desktop's format, and **From Claude** copies the ones Claude Desktop has.
+- **Slash commands.** Type `/` in the message box for the commands and installed skills: the arrows move,
+  Tab or Enter picks, Esc closes. A pick (or a whole name and a space) becomes a chip before your text, a
+  wand for a skill, and Backspace takes it away. A skill picked this way is loaded before the model starts.
 - **Scheduled tasks.** Ask in a chat ("remind me in 20 minutes to…", "every weekday at 9:00, check the
   build"): the model schedules it once, every N minutes or daily at a time, and it runs in that chat even
   while you are away. Its reply waits there, marked unread.
@@ -62,7 +65,8 @@ computer. With models but none running, sending opens the model menu instead.
   only to this computer. Another client gets the page in a browser MCP server's window instead (Playwright's,
   if `mcp.json` has it).
 - **Warm-up.** After a model loads, the server runs a few short replies so its weights are in memory before
-  your first message, which then goes first if it comes sooner. **Warm up after loading** in the settings
+  your first message, which then goes first if it comes sooner. The ghost says "Warming up…" (and the model
+  name "warming up") until it is done, then "Warmed up and ready". **Warm up after loading** in the settings
   menu turns it off.
 
 Scheduled tasks and loops wait until nothing else has used the model for 20 seconds, and use only what

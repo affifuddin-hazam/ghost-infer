@@ -255,10 +255,12 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         // a few short replies first (the weights into memory), then the agent's opening read in, unless a
         // request comes in meanwhile: it goes first
         let warm = shared.harness.lock().unwrap().warm_up;
+        WARMING.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut early = if warm { warm_up(&mut engine, &id, &rx) } else { None };
         if early.is_none() {
             warm_agent(&mut engine, &shared);
         }
+        WARMING.store(false, std::sync::atomic::Ordering::Relaxed);
 
         let (next, reply) = loop {
             let work = match early.take() {
@@ -279,6 +281,9 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         waiting = Some((reply, None));
     }
 }
+
+/// The model is warming up after it loaded (warm_up, then warm_agent): /api/models says so, for the app to show.
+static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A few short replies right after a model loads (the harness's warm_up setting): a mixture of experts then
 /// has the experts they used in RAM and in the GPU's cache before the first chat, which otherwise runs slower
@@ -850,6 +855,8 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             let body = obj(vec![
                 ("current", opt(current.as_ref().map(|c| c.id.as_str()))),
                 ("loading", opt(loading.as_deref())),
+                // loaded and warming up: a request now goes first, but runs slower than once it is done
+                ("warming", Json::Bool(current.is_some() && WARMING.load(std::sync::atomic::Ordering::Relaxed))),
                 ("context_length", current.as_ref().map(|c| num(c.ctx as f64)).unwrap_or(Json::Null)),
                 ("thinking", Json::Bool(current.as_ref().is_some_and(|c| c.thinking))),
                 // Qwen3 also reads "/no_think" in a message as switching thinking off; GLM does not
@@ -1554,6 +1561,24 @@ impl ToolCalls {
         out
     }
 
+    /// While a call is being written (nothing of it comes out until it is whole): its tool's name once
+    /// that can be read, "" before.
+    fn writing(&self) -> Option<&str> {
+        if !self.in_call {
+            return None;
+        }
+        let b = self.buf.trim_start();
+        let name = if let Some(rest) = b.strip_prefix("<function=") {
+            rest.split_once('>').map(|(n, _)| n)
+        } else if b.starts_with('{') {
+            let after = b.split_once("\"name\"").and_then(|(_, r)| r.trim_start().strip_prefix(':'));
+            after.and_then(|r| r.trim_start().strip_prefix('"')).and_then(|r| r.split_once('"')).map(|(n, _)| n)
+        } else {
+            b.split_once("<arg_key>").or_else(|| b.split_once('\n')).map(|(n, _)| n)
+        };
+        Some(name.map_or("", str::trim))
+    }
+
     /// What is left at the end of the reply.
     fn finish(&mut self) -> Vec<Part> {
         let rest = std::mem::take(&mut self.buf);
@@ -1869,6 +1894,26 @@ mod tests {
         parts.extend(tc.finish());
         assert_eq!(parts.iter().map(|p| match p { Part::Text(t) | Part::Bad(t) => t.as_str(), _ => "" }).collect::<String>(), "a <tool_call>not json</tool_call> b");
         assert!(parts.contains(&Part::Bad("<tool_call>not json</tool_call>".into())));
+    }
+
+    #[test]
+    fn a_call_being_written() {
+        // its tool's name as soon as it can be read, in each form; cut off by the length limit: Bad
+        let mut tc = ToolCalls::default();
+        tc.push("Writing it.\n<tool_call>\n<function=wri");
+        assert_eq!(tc.writing(), Some(""));
+        tc.push("te_file>\n<parameter=path>\nindex.html\n</parameter>\n<parameter=content>\n<!DOCTYPE html>\n<html>");
+        assert_eq!(tc.writing(), Some("write_file"));
+        assert!(matches!(tc.finish().as_slice(), [Part::Bad(_)]));
+        assert_eq!(tc.writing(), None);
+        let mut tc = ToolCalls::default();
+        tc.push("<tool_call>\n{\"name\": \"read_file\", \"argu");
+        assert_eq!(tc.writing(), Some("read_file"));
+        let mut tc = ToolCalls::default();
+        tc.push("<tool_call>write_file\n<arg_key>path</arg_key>");
+        assert_eq!(tc.writing(), Some("write_file"));
+        tc.push("<arg_value>a.txt</arg_value></tool_call>");
+        assert_eq!(tc.writing(), None);
     }
 
     #[test]

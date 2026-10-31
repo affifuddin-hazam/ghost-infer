@@ -139,6 +139,8 @@ mod ic {
     pub const UNDO: char = '\u{E7A7}';
     pub const DOWNLOAD: char = '\u{E896}';
     pub const OPEN_NEW: char = '\u{E8A7}';
+    pub const FLAG: char = '\u{E7C1}';
+    pub const REPEAT: char = '\u{E8EE}';
 }
 
 fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
@@ -268,7 +270,7 @@ impl App {
             body = body.push(self.rail());
         }
         let body: Element<'_, Message> = body.into();
-        let Some(menu) = self.menu else { return self.framed(body) };
+        let Some(menu) = self.menu else { return self.framed(self.with_slash(body)) };
         // an open menu: a click anywhere else closes it
         let shade = mouse_area(container(Space::new()).width(Fill).height(Fill)).on_press(Message::Menu(None));
         let item = |c: char, label: &str, msg: Message| Item { icon: Some(c), label: label.to_string(), detail: None, hint: None, msg, danger: false, check: None };
@@ -369,6 +371,53 @@ impl App {
             .align_x(if right { Alignment::End } else { Alignment::Start })
             .align_y(if matches!(menu, Menu::Chat) { Alignment::Start } else { Alignment::End });
         self.framed(stack![body, opaque(shade), placed].into())
+    }
+
+    /// The / list over the chat, just above the message box: the commands and skills whose names have what
+    /// is typed after the /. A click or Tab/Enter picks one, the arrows move, Esc closes it.
+    /// A stack either way: the body's place in the tree stays the same as the list opens and closes, so the
+    /// message box keeps its focus.
+    fn with_slash<'a>(&'a self, body: Element<'a, Message>) -> Element<'a, Message> {
+        let list = self.slash_list();
+        let Some(at) = self.composer_at.filter(|_| !list.is_empty()) else { return stack![body, Space::new()].into() };
+        let s = self.skin();
+        let pick = self.slash_pick.min(list.len() - 1);
+        // seven lines at most, the highlighted one among them
+        let mut lines = column![].spacing(1);
+        for (i, e) in list.iter().enumerate().skip(pick.saturating_sub(6)).take(7) {
+            let name = row![text(crate::slash_label(&e.name)).size(14).color(s.text), text(format!("/{}", e.name)).size(12).color(s.faint)].spacing(8).align_y(Alignment::Center);
+            let about = container(text(e.about.clone()).size(12).color(s.faint).wrapping(text::Wrapping::None)).width(Fill).clip(true);
+            let line = row![container(self.slash_icon(&e.name, 14.0, s.muted)).center_x(18), column![name, about].spacing(2).width(Fill)].spacing(10).align_y(Alignment::Center);
+            let on = i == pick;
+            let style = move |_: &Theme, st| button::Style { background: Some(Background::Color(if on || hovered(st) { s.hover } else { Color::TRANSPARENT })), text_color: s.text, border: border::rounded(8), ..Default::default() };
+            lines = lines.push(button(line).on_press(Message::SlashPick(Some(e.name.clone()))).width(Fill).padding([6, 10]).style(style));
+        }
+        let card = container(lines).padding(6).width(at.width).style(move |_| container::Style {
+            background: Some(Background::Color(s.menu)),
+            border: Border { radius: 12.0.into(), width: 1.0, color: s.line2 },
+            ..Default::default()
+        });
+        let placed = container(opaque(card)).padding(Padding { left: at.x, bottom: (self.window.height - at.y + 6.0).max(0.0), ..Padding::ZERO }).width(Fill).height(Fill).align_y(Alignment::End);
+        stack![body, placed].into()
+    }
+
+    /// A command's or skill's icon: a wand for a skill, a flag for /goal, the repeat arrows for /loop.
+    fn slash_icon(&self, name: &str, size: f32, color: Color) -> Element<'static, Message> {
+        match name {
+            "goal" => icon(ic::FLAG, size).color(color).into(),
+            "loop" => icon(ic::REPEAT, size).color(color).into(),
+            _ => canvas(Wand { color }).width(size).height(size).into(),
+        }
+    }
+
+    /// The command or skill picked with /, before the text: its icon and name, as Claude shows one.
+    fn chip(&self, name: &str) -> Element<'static, Message> {
+        let s = self.skin();
+        let label = row![self.slash_icon(name, 12.0, s.accent), text(crate::slash_label(name)).size(14).font(MEDIUM).color(s.accent)].spacing(6).align_y(Alignment::Center);
+        container(label)
+            .padding([3, 8])
+            .style(move |_| container::Style { background: Some(Background::Color(Color { a: 0.14, ..s.accent })), border: border::rounded(7), ..Default::default() })
+            .into()
     }
 
     /// The window's resize edges, invisible strips over everything (the window has no Windows frame to
@@ -1042,6 +1091,16 @@ impl App {
             .into()
     }
 
+    /// The message box's layout: whether it has grown past one line, and whether it holds a chip. One line,
+    /// as Claude's box, until the text needs more (a new line, or more than fits on one line at about 7.6 px
+    /// a character): then it grows, to about 10 lines, and scrolls beyond.
+    pub fn composer_shape(&self) -> (bool, bool) {
+        let main = self.window.width - if self.sidebar { 264.0 } else { 0.0 } - if self.rail { 300.0 } else { 0.0 } - if self.tasks_panel { if self.tasks_wide { 600.0 } else { 400.0 } } else { 0.0 };
+        let chip_chars = self.chip.as_deref().map_or(0, |c| crate::slash_label(c).len() + 5);
+        let fits = ((main.min(760.0) - 130.0) / 7.6).max(20.0) as usize - chip_chars.min(20);
+        (self.composer.line_count() > 1 || self.composer.text().chars().count() > fits, self.chip.is_some())
+    }
+
     /// The ghost perched on the message box, the box itself, and the pickers under it.
     fn dock_parts(&self) -> Element<'_, Message> {
         let s = self.skin();
@@ -1052,13 +1111,19 @@ impl App {
             .align_y(Alignment::End)
             .height(58);
         let mode_menu = self.menu == Some(Menu::Mode);
-        // one line, as Claude's box, until the text needs more (a new line, or more than fits on one line at
-        // about 7.6 px a character): then it grows, to about 10 lines, and scrolls beyond
-        let main = self.window.width - if self.sidebar { 264.0 } else { 0.0 } - if self.rail { 300.0 } else { 0.0 } - if self.tasks_panel { if self.tasks_wide { 600.0 } else { 400.0 } } else { 0.0 };
-        let fits = ((main.min(760.0) - 130.0) / 7.6).max(20.0) as usize;
-        let grown = self.composer.line_count() > 1 || self.composer.text().chars().count() > fits;
+        let grown = self.composer_shape().0;
+        // the / list open: the arrows move in it, Tab or Enter picks, Esc closes; Backspace before any text
+        // takes the chip away
+        let slash_open = !self.slash_list().is_empty();
+        let cursor = self.composer.cursor();
+        let chip_back = self.chip.is_some() && cursor.position.line == 0 && cursor.position.column == 0 && cursor.selection.is_none();
         let editor = text_editor(&self.composer)
-            .placeholder(if self.messages.is_empty() { "How can I help you today?" } else { "Reply to ghost-infer" })
+            .id("editor")
+            .placeholder(match (&self.chip, self.messages.is_empty()) {
+                (Some(_), _) => "Say what to do with it",
+                (None, true) => "How can I help you today?",
+                (None, false) => "Reply to ghost-infer",
+            })
             .on_action(Message::Edit)
             .padding(if grown { Padding { top: 4.0, right: 6.0, bottom: 10.0, left: 6.0 } } else { Padding::from([6, 6]) })
             .height(Length::Shrink)
@@ -1066,6 +1131,20 @@ impl App {
             .max_height(240)
             .size(15)
             .key_binding(move |kp| {
+                use keyboard::key::Named;
+                let custom = |m| Some(text_editor::Binding::Custom(m));
+                if slash_open {
+                    match kp.key {
+                        keyboard::Key::Named(Named::ArrowUp) => return custom(Message::SlashMove(-1)),
+                        keyboard::Key::Named(Named::ArrowDown) => return custom(Message::SlashMove(1)),
+                        keyboard::Key::Named(Named::Enter | Named::Tab) if !kp.modifiers.shift() => return custom(Message::SlashPick(None)),
+                        keyboard::Key::Named(Named::Escape) => return custom(Message::SlashClose),
+                        _ => {}
+                    }
+                }
+                if chip_back && matches!(kp.key, keyboard::Key::Named(Named::Backspace)) {
+                    return custom(Message::ChipRemove);
+                }
                 // Enter sends; Shift+Enter starts a new line
                 if matches!(kp.key, keyboard::Key::Named(keyboard::key::Named::Enter)) && !kp.modifiers.shift() {
                     return Some(text_editor::Binding::Custom(Message::Send));
@@ -1092,12 +1171,21 @@ impl App {
         } else {
             button(container(icon(ic::UP, 13).color(s.ink)).center(32)).on_press(Message::Send).padding(0).style(move |_, st| send_style(s, st))
         };
+        let chip = self.chip.as_deref().map(|c| self.chip(c));
         let (inside, pad, radius): (Element<'_, Message>, Padding, f32) = if grown {
-            (column![editor, row![plus, Space::new().width(Fill), send].align_y(Alignment::Center)].spacing(4).into(), Padding { top: 12.0, right: 12.0, bottom: 10.0, left: 14.0 }, 18.0)
+            let mut col = column![].spacing(4);
+            if let Some(chip) = chip {
+                col = col.push(row![chip]);
+            }
+            (col.push(editor).push(row![plus, Space::new().width(Fill), send].align_y(Alignment::Center)).into(), Padding { top: 12.0, right: 12.0, bottom: 10.0, left: 14.0 }, 18.0)
         } else {
-            (row![plus, editor, send].spacing(6).align_y(Alignment::Center).into(), Padding::from([6, 8]), 16.0)
+            let mut line = row![plus].spacing(6).align_y(Alignment::Center);
+            if let Some(chip) = chip {
+                line = line.push(chip);
+            }
+            (line.push(editor).push(send).into(), Padding::from([6, 8]), 16.0)
         };
-        let card = container(inside).padding(pad).style(move |_| container::Style {
+        let card = container(inside).id("composer").padding(pad).style(move |_| container::Style {
             background: Some(Background::Color(s.raise)),
             // no soft shadow: tiny-skia repaints only the ghost's patch each tick and leaves holes in it
             border: Border { radius: radius.into(), width: 1.0, color: s.line2 },
@@ -1108,7 +1196,11 @@ impl App {
             .padding([4, 8])
             .style(move |_, st| row_style(s, st, false));
         // the model by name, as Claude shows it: a label that opens the model menu
-        let name = self.model.as_ref().map_or("Model", |m| m.label.as_str());
+        let name = match &self.model {
+            Some(m) if self.warming => format!("{} · warming up", m.label),
+            Some(m) => m.label.clone(),
+            None => "Model".into(),
+        };
         let model = container(button(text(name).size(13).color(s.text)).on_press(Message::OpenMenu(Menu::Model)).padding([4, 8]).style(move |_, st| row_style(s, st, false))).id("model");
         let mode = crate::MODES[self.perm].1;
         let mode = container(button(text(mode).size(13).color(s.text)).on_press(Message::OpenMenu(Menu::Mode)).padding([4, 8]).style(move |_, st| row_style(s, st, true))).id("mode");
@@ -1235,7 +1327,7 @@ impl App {
 
     fn status_text(&self) -> String {
         let rate = match self.writing_since {
-            Some(t) if self.chunks > 1 && self.status == "Writing" => format!(", {:.0} tok/s", (self.chunks - 1) as f64 / t.elapsed().as_secs_f64().max(0.001)),
+            Some(t) if self.chunks > 1 && self.status.starts_with("Writing") => format!(", {:.0} tok/s", (self.chunks - 1) as f64 / t.elapsed().as_secs_f64().max(0.001)),
             _ => String::new(),
         };
         format!("{}{rate}", self.status)
@@ -1249,7 +1341,15 @@ impl App {
             return row![Space::new().width(Fill), container(line).padding([6, 12]).style(move |_| container::Style { border: Border { width: 1.0, color: s.hover, radius: 16.0.into() }, ..Default::default() })].into();
         }
         if m.role == Role::User {
-            let bubble = container(text(m.raw.as_str()).size(15).line_height(1.5).color(s.text)).padding([10, 16]).max_width(560).style(move |_| container::Style {
+            // sent with a chip (/design-taste-frontend make a page): the chip again, then the words
+            let said = |t: &'a str| text(t).size(15).line_height(1.5).color(s.text);
+            let picked = m.raw.strip_prefix('/').map(|t| t.split_once(char::is_whitespace).unwrap_or((t, ""))).filter(|(name, _)| self.slash_all().iter().any(|e| e.name == *name));
+            let content: Element<'a, Message> = match picked {
+                Some((name, rest)) if rest.trim().is_empty() => self.chip(name),
+                Some((name, rest)) => column![row![self.chip(name)], said(rest.trim_start())].spacing(6).into(),
+                None => said(m.raw.as_str()).into(),
+            };
+            let bubble = container(content).padding([10, 16]).max_width(560).style(move |_| container::Style {
                 background: Some(Background::Color(s.bubble)),
                 border: border::rounded(16),
                 ..Default::default()
@@ -1583,6 +1683,40 @@ impl<M> canvas::Program<M> for PageArea {
     fn draw(&self, _: &(), _: &iced::Renderer, _: &Theme, bounds: iced::Rectangle, _: iced::mouse::Cursor) -> Vec<canvas::Geometry> {
         crate::preview::place(bounds);
         Vec::new()
+    }
+}
+
+/// A magic wand, for skills (Segoe MDL2 has none): a stick up to the right, a four-point star at its tip
+/// and two small sparkles.
+struct Wand {
+    color: Color,
+}
+
+impl<M> canvas::Program<M> for Wand {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &iced::Renderer, _: &Theme, bounds: iced::Rectangle, _: iced::mouse::Cursor) -> Vec<canvas::Geometry> {
+        use canvas::{LineCap, Path, Stroke};
+        use iced::Point;
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let s = bounds.width.min(bounds.height);
+        let stick = Path::line(Point::new(0.14 * s, 0.86 * s), Point::new(0.56 * s, 0.44 * s));
+        frame.stroke(&stick, Stroke::default().with_width((0.13 * s).max(1.4)).with_color(self.color).with_line_cap(LineCap::Round));
+        let star = |cx: f32, cy: f32, r: f32| {
+            Path::new(|b| {
+                for i in 0..8 {
+                    let a = i as f32 * std::f32::consts::FRAC_PI_4 - std::f32::consts::FRAC_PI_2;
+                    let rr = if i % 2 == 0 { r } else { r * 0.32 };
+                    let p = Point::new(cx + rr * a.cos(), cy + rr * a.sin());
+                    if i == 0 { b.move_to(p) } else { b.line_to(p) }
+                }
+                b.close();
+            })
+        };
+        frame.fill(&star(0.7 * s, 0.3 * s, 0.28 * s), self.color);
+        frame.fill(&star(0.24 * s, 0.2 * s, 0.13 * s), self.color);
+        frame.fill(&star(0.86 * s, 0.7 * s, 0.11 * s), self.color);
+        vec![frame.into_geometry()]
     }
 }
 

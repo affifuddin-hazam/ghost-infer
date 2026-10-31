@@ -182,7 +182,7 @@ pub fn run(name: &str, args: &Json, s: &Settings, checkpoint: &str) -> Result<St
         "read_file" => read_file(&s.resolve_read(need("path")?)?, count("offset").unwrap_or(1), count("limit").unwrap_or(READ_LINES))?,
         "list_files" => list_files(s, &s.resolve_read(text("path").unwrap_or("."))?, text("pattern"))?,
         "search_files" => search_files(s, need("pattern")?, &s.resolve_read(text("path").unwrap_or("."))?, text("glob"), args.get("ignore_case").and_then(Json::as_bool).unwrap_or(false))?,
-        "write_file" => write_file(s, &writable(s.resolve(need("path")?)?)?, need("content")?, checkpoint)?,
+        "write_file" => write_file(s, &writable(s.resolve(need("path")?)?)?, need("content")?, args.get("append").and_then(Json::as_bool).unwrap_or(false), checkpoint)?,
         "edit_file" => edit_file(s, &writable(s.resolve(need("path")?)?)?, need("old_string")?, text("new_string").unwrap_or(""), args.get("replace_all").and_then(Json::as_bool).unwrap_or(false), checkpoint)?,
         "run_command" => {
             let secs = count("timeout").unwrap_or(COMMAND_SECS).min(MAX_COMMAND_SECS);
@@ -413,11 +413,14 @@ fn writable(path: PathBuf) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn write_file(s: &Settings, path: &Path, content: &str, checkpoint: &str) -> Result<String, String> {
+/// Writes `content` as the file's whole content, or with `append` adds it to the end (a file too long for
+/// one reply, written in parts).
+fn write_file(s: &Settings, path: &Path, content: &str, append: bool, checkpoint: &str) -> Result<String, String> {
     if path.is_dir() {
         return Err(format!("{} is a folder", path.display()));
     }
-    if std::fs::read(path).is_ok_and(|old| old == content.as_bytes()) {
+    let old = std::fs::read(path).ok();
+    if !append && old.as_deref() == Some(content.as_bytes()) {
         return Ok(format!("{} already has this content; nothing changed", s.show(path)));
     }
     if let Some(dir) = path.parent() {
@@ -425,8 +428,18 @@ fn write_file(s: &Settings, path: &Path, content: &str, checkpoint: &str) -> Res
     }
     let existed = path.exists();
     remember(path, checkpoint)?;
-    std::fs::write(path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    Ok(format!("{} {} ({} lines)", if existed { "overwrote" } else { "created" }, s.show(path), content.lines().count()))
+    let whole = match (append, old) {
+        (true, Some(old)) => [old.as_slice(), content.as_bytes()].concat(),
+        _ => content.as_bytes().to_vec(),
+    };
+    std::fs::write(path, &whole).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let lines = String::from_utf8_lossy(&whole).lines().count();
+    Ok(if append && existed {
+        let n = content.lines().count();
+        format!("added {n} line{} to {} ({lines} lines now)", if n == 1 { "" } else { "s" }, s.show(path))
+    } else {
+        format!("{} {} ({lines} lines)", if existed { "overwrote" } else { "created" }, s.show(path))
+    })
 }
 
 /// Replaces `old` with `new` in a text file: exactly once (or every time with `all`), else an error that
@@ -967,7 +980,11 @@ mod tests {
         edit_file(&s, &f, "two  ", "2", true, cp).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "ONE\r\nTHREE\r\n2\r\n");
         assert!(edit_file(&s, &f, "missing", "x", false, cp).is_err());
-        write_file(&s, &root.join("new.txt"), "hello", cp).unwrap();
+        // a file written in parts; undo takes back both
+        write_file(&s, &root.join("new.txt"), "hello\n", false, cp).unwrap();
+        let r = write_file(&s, &root.join("new.txt"), "world\n", true, cp).unwrap();
+        assert!(r.starts_with("added 1 line to") && r.contains("2 lines now"), "{r}");
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "hello\nworld\n");
         let done = undo(cp).unwrap();
         assert!(done.iter().any(|d| d.contains("new.txt")), "{done:?}");
         assert_eq!(std::fs::read_to_string(&f).unwrap(), original);

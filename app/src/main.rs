@@ -326,6 +326,7 @@ fn tool_label(t: &ToolLine) -> String {
         "read_file" => format!("Read {}", s("path")),
         "list_files" => format!("Listed {}", if s("path").is_empty() { "the folder".into() } else { s("path") }),
         "search_files" => format!("Searched for {}", s("pattern")),
+        "write_file" if a.get("append").and_then(Json::as_bool) == Some(true) => format!("Added to {}", s("path")),
         "write_file" => format!("Wrote {}", s("path")),
         "edit_file" => format!("Edited {}", s("path")),
         "run_command" => format!("Ran {}", s("command")),
@@ -344,6 +345,7 @@ fn tool_label(t: &ToolLine) -> String {
         "read_chat" => "Read an earlier chat".into(),
         "check_work" => "Asked to check its work".into(),
         "keep_going" => "Sent back to work".into(),
+        "unreadable_tool_call" if t.result.as_deref().is_some_and(|r| r.contains("reached its limit")) => "Wrote a tool call the length limit cut off".into(),
         "unreadable_tool_call" => "Wrote a tool call that could not be read".into(),
         "schedule_task" => format!("Scheduled \"{}\"", if s("name").is_empty() { s("prompt") } else { s("name") }),
         "list_schedules" => "Listed the scheduled tasks".into(),
@@ -361,6 +363,7 @@ fn tool_label(t: &ToolLine) -> String {
     let (verb, rest) = label.split_once(' ').unwrap_or((&label, ""));
     let verb = match verb {
         "Wrote" => "Write",
+        "Added" => "Add",
         "Edited" => "Edit",
         "Ran" => "Run",
         "Started" => "Start",
@@ -378,6 +381,7 @@ fn approval_text(t: &ToolLine) -> (String, String) {
     let s = |k: &str| a.get(k).and_then(Json::as_str).unwrap_or("").to_string();
     let cwd = if s("cwd").is_empty() { String::new() } else { format!(" in {}", s("cwd")) };
     match t.name.as_str() {
+        "write_file" if a.get("append").and_then(Json::as_bool) == Some(true) => (format!("Add {} lines to {}?", s("content").lines().count(), s("path")), s("content")),
         "write_file" => (format!("Write {} ({} lines)?", s("path"), s("content").lines().count()), s("content")),
         "edit_file" => {
             let lines = |k: &str, mark: &str| s(k).lines().map(|l| format!("{mark} {l}")).collect::<Vec<_>>().join("\n");
@@ -594,6 +598,7 @@ struct App {
     models: Vec<ModelChoice>,
     model: Option<ModelChoice>,
     loading: Option<String>, // the model the server is loading (none: idle, or started without one)
+    warming: bool,           // the model loaded and is warming up (a few short replies, the agent's opening read in)
     chats: Vec<ChatItem>,
     chat: Option<String>,
     title: Option<String>,
@@ -657,6 +662,31 @@ struct App {
     warm_up: bool,           // the server runs a few short replies after a model loads (its harness setting)
     preview_url: Option<String>, // the web page the agent last wrote, for the preview pane
     preview_open: bool,      // the pane is shown
+    chip: Option<String>,    // a command or skill picked with /: a chip before the text, sent as /name
+    slash_pick: usize,       // the / list's highlighted line
+    slash_shut: Option<String>, // the text the / list was closed at (Esc): shut until the text changes
+    composer_at: Option<iced::Rectangle>, // the message box on screen, for the / list above it
+}
+
+/// A line of the / list: a command of the server's, or an installed skill.
+pub struct Slash {
+    pub name: String,
+    pub about: String,
+}
+
+/// The commands / offers before the skills.
+const COMMANDS: [(&str, &str); 2] = [
+    ("goal", "Keep working until what you describe is done, checked after each try"),
+    ("loop", "Repeat a prompt in this chat every few minutes: /loop 10m check the build"),
+];
+
+/// A command's or skill's name as the chip shows it: design-taste-frontend is Design Taste Frontend.
+pub fn slash_label(name: &str) -> String {
+    let word = |w: &str| {
+        let mut c = w.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    };
+    name.split(['-', '_', ' ']).filter(|w| !w.is_empty()).map(word).collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Debug, Clone)]
@@ -670,6 +700,11 @@ enum Message {
     PickModel(ModelChoice),
     ModelLoaded(Result<Json, String>),
     Edit(text_editor::Action),
+    SlashMove(i32),            // Up/Down in the / list
+    SlashPick(Option<String>), // a line of the / list (None: the highlighted one)
+    SlashClose,                // Esc: the / list shuts until the text changes
+    ChipRemove,                // Backspace before any text
+    ComposerAt(Option<iced::Rectangle>),
     Send,
     Stop,
     Agent(Json),
@@ -800,6 +835,7 @@ impl App {
             models: Vec::new(),
             model: None,
             loading: None,
+            warming: false,
             chats: Vec::new(),
             chat: None,
             title: None,
@@ -838,6 +874,10 @@ impl App {
             memory_draft: String::new(),
             instructions: Vec::new(),
             skills: Vec::new(),
+            chip: None,
+            slash_pick: 0,
+            slash_shut: None,
+            composer_at: None,
             skill_link: String::new(),
             skill_choices: None,
             mcp: Vec::new(),
@@ -894,6 +934,8 @@ impl App {
                 };
                 if self.model.is_none() {
                     self.status = self.no_model_status();
+                } else if let Some(m) = self.model.as_ref().filter(|_| self.warming) {
+                    self.status = format!("Warming up {}…", m.label);
                 }
                 // the + menu opens as a click opens it: once the button is on screen
                 let plus = match menu.as_deref() {
@@ -1000,12 +1042,50 @@ impl App {
                 );
             }
             Message::ModelLoaded(Ok(models)) => {
+                let was_warming = self.warming;
                 self.set_models(&models);
-                self.status = if self.model.is_none() { self.no_model_status() } else { String::new() };
+                // loaded, warming up (asked again until it is done), then ready; a reply's own status stays
+                if self.busy.is_none() {
+                    self.status = match &self.model {
+                        None => self.no_model_status(),
+                        Some(m) if self.warming => format!("Warming up {}…", m.label),
+                        Some(_) if was_warming => "Warmed up and ready".into(),
+                        Some(_) => String::new(),
+                    };
+                }
                 return Task::batch([self.wait_for_model(), self.refresh_system()]);
             }
-            Message::Edit(action) => self.composer.perform(action),
-            Message::Send => return self.send(None),
+            Message::Edit(action) => {
+                let (edits, shape) = (action.is_edit(), self.composer_shape());
+                self.composer.perform(action);
+                let task = if edits { self.after_edit() } else { Task::none() };
+                return self.keep_focus(shape, task);
+            }
+            Message::SlashMove(d) => {
+                let n = self.slash_list().len().max(1) as i32;
+                self.slash_pick = (self.slash_pick as i32 + d).rem_euclid(n) as usize;
+            }
+            Message::SlashPick(name) => {
+                let list = self.slash_list();
+                let name = name.or_else(|| list.get(self.slash_pick.min(list.len().saturating_sub(1))).map(|e| e.name.clone()));
+                if let Some(name) = name {
+                    self.chip = Some(name);
+                    self.composer = text_editor::Content::new();
+                    self.slash_pick = 0;
+                }
+                return iced::widget::operation::focus("editor");
+            }
+            Message::SlashClose => self.slash_shut = Some(self.composer.text()),
+            Message::ChipRemove => {
+                self.chip = None;
+                return iced::widget::operation::focus("editor");
+            }
+            Message::ComposerAt(at) => self.composer_at = at,
+            Message::Send => {
+                let shape = self.composer_shape();
+                let task = self.send(None);
+                return self.keep_focus(shape, task);
+            }
             Message::Retry => return self.send(Some(())),
             Message::Stop => {
                 if let Some(h) = self.busy.take() {
@@ -1598,7 +1678,6 @@ impl App {
         self.call(move |api| api.post("/api/harness", &body), Message::Harness)
     }
 
-    /// While the server is still loading its model, asks again every two seconds until one is running.
     /// The status line while no model runs: the one loading, or a hint to pick one (the server may have
     /// started without a model).
     fn no_model_status(&self) -> String {
@@ -1608,8 +1687,11 @@ impl App {
         }
     }
 
+    /// While the server is still loading its model, or warming it up, asks again every two seconds until it
+    /// is done.
     fn wait_for_model(&self) -> Task<Message> {
-        if self.model.is_some() || self.loading.is_none() {
+        let loading = self.model.is_none() && self.loading.is_some();
+        if !loading && !self.warming {
             return Task::none();
         }
         self.call(
@@ -1671,6 +1753,7 @@ impl App {
         self.models = j.get("models").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|m| m.get("id").and_then(Json::as_str).map(choice)).collect();
         self.model = j.get("current").and_then(Json::as_str).map(choice);
         self.loading = j.get("loading").and_then(Json::as_str).map(String::from);
+        self.warming = j.get("warming").and_then(Json::as_bool).unwrap_or(false);
         self.context.1 = j.get("context_length").and_then(Json::as_f64).unwrap_or(0.0);
     }
 
@@ -1902,6 +1985,60 @@ impl App {
         self.settle_plan();
     }
 
+    /// `task`, and the focus back in the message box if its layout changed since `shape` (it grew or shrank,
+    /// or a chip came or went): the box's editor is then made anew, without the focus.
+    fn keep_focus(&self, shape: (bool, bool), task: Task<Message>) -> Task<Message> {
+        if self.composer_shape() == shape {
+            return task;
+        }
+        Task::batch([task, iced::widget::operation::focus("editor")])
+    }
+
+    /// What / offers: the server's commands, then the installed skills.
+    fn slash_all(&self) -> Vec<Slash> {
+        let commands = COMMANDS.iter().map(|(n, a)| Slash { name: n.to_string(), about: a.to_string() });
+        let skills = self.skills.iter().map(|(n, d)| Slash { name: n.clone(), about: d.lines().next().unwrap_or("").to_string() });
+        commands.chain(skills).collect()
+    }
+
+    /// The / list for what is in the box: "/" and part of a name, nothing after it yet. Names that start
+    /// with what is typed come first, then those that have it elsewhere.
+    pub fn slash_list(&self) -> Vec<Slash> {
+        let text = self.composer.text();
+        if self.chip.is_some() || self.slash_shut.as_ref() == Some(&text) {
+            return Vec::new();
+        }
+        let typed = text.strip_suffix('\n').unwrap_or(&text);
+        let Some(q) = typed.strip_prefix('/').filter(|q| !q.contains(char::is_whitespace)) else { return Vec::new() };
+        let q = q.to_lowercase();
+        let (mut first, then): (Vec<Slash>, Vec<Slash>) = self.slash_all().into_iter().filter(|e| e.name.to_lowercase().contains(&q)).partition(|e| e.name.to_lowercase().starts_with(&q));
+        first.extend(then);
+        first
+    }
+
+    /// After typing: "/name " with a name / knows becomes its chip; while the / list is open, the box is
+    /// found on screen, for the list to sit above it.
+    fn after_edit(&mut self) -> Task<Message> {
+        self.slash_pick = 0;
+        let text = self.composer.text();
+        if self.slash_shut.as_ref() != Some(&text) {
+            self.slash_shut = None;
+        }
+        if self.chip.is_none() {
+            let typed = text.strip_prefix('/').and_then(|t| t.split_once(char::is_whitespace));
+            if let Some((e, rest)) = typed.and_then(|(name, rest)| Some((self.slash_all().into_iter().find(|e| e.name.eq_ignore_ascii_case(name))?, rest))) {
+                self.chip = Some(e.name);
+                self.composer = text_editor::Content::with_text(rest);
+                self.composer.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+                return Task::none();
+            }
+        }
+        if self.slash_list().is_empty() {
+            return Task::none();
+        }
+        iced::widget::selector::find(iced::widget::selector::id("composer")).map(|t| Message::ComposerAt(t.map(|t| t.bounds())))
+    }
+
     /// Sends the composer's text (or, for a retry, answers the last message again) and streams the reply.
     fn send(&mut self, retry: Option<()>) -> Task<Message> {
         let Some(api) = self.api.clone() else { return Task::none() };
@@ -1917,7 +2054,7 @@ impl App {
             self.status = self.no_model_status();
             return Task::none();
         }
-        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("mode", str(MODES[self.perm].0)), ("max_tokens", num(4096.0)), ("preview", Json::Bool(true))];
+        let mut body = vec![("thinking", Json::Bool(self.thinking)), ("mode", str(MODES[self.perm].0)), ("max_tokens", num(16384.0)), ("preview", Json::Bool(true))];
         match &self.chat {
             Some(id) => body.push(("chat", str(id))),
             // a new chat: the folder it works in from now on
@@ -1931,6 +2068,11 @@ impl App {
         match retry {
             None => {
                 let text = self.composer.text().trim().to_string();
+                // a chip goes to the server as the command it stands for: /design-taste-frontend make a page
+                let text = match self.chip.take() {
+                    Some(c) => format!("/{c} {text}").trim_end().to_string(),
+                    None => text,
+                };
                 if text.is_empty() {
                     return Task::none();
                 }
@@ -1989,6 +2131,16 @@ impl App {
                     m.push(&s("text"));
                     self.status = if m.rounds.last().is_some_and(|r| r.answer.is_empty() && !r.think.is_empty()) { "Thinking".into() } else { "Writing".into() };
                 }
+            }
+            // a tool call being written, a piece at a time: counted in the speed as text is
+            "calling" => {
+                self.chunks += 1;
+                self.writing_since.get_or_insert_with(Instant::now);
+                self.last_chunk_at = Some(self.born.elapsed().as_millis() as u64);
+                self.status = match s("name").as_str() {
+                    "write_file" | "edit_file" => "Writing a file".into(),
+                    _ => "Writing a tool call".into(),
+                };
             }
             "tool_call" => {
                 if let Some(m) = self.messages.last_mut() {

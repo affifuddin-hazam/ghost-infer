@@ -7,12 +7,16 @@
 //! "preview"?}. "mode" is the permission mode (auto, manual, accept_edits, plan, bypass; default manual), "cwd"
 //! a new chat's working directory (kept with the chat), "tools" the tool groups (default: all of them),
 //! "preview" true from a client that shows the web pages the model writes (the "preview" event). A message
-//! may be a command: /goal <what done looks like> (or /goal clear), /loop <interval> <prompt> (or /loop stop).
+//! may be a command: /goal <what done looks like> (or /goal clear), /loop <interval> <prompt> (or /loop stop),
+//! or /<skill> <request>, which loads that installed skill before the model starts.
 //!
 //! Events, one JSON object per server-sent event:
 //!   {"type":"chat","id","title","checkpoint"}     the chat this run belongs to (new chats get an id here), and
 //!                                                 the checkpoint its file changes go under (POST /api/tools/undo)
 //!   {"type":"text","text"}                        reply text as it streams (a thinking reply starts with <think>)
+//!   {"type":"calling","name"}                     a piece of a tool call being written, one per piece as "text"
+//!                                                 is (the call itself comes whole, as "tool_call"); "name" its
+//!                                                 tool, "" until that can be read
 //!   {"type":"tool_call","id","name","arguments"}  the model called a tool
 //!   {"type":"approval","id","name","arguments","group"}  waiting for POST /api/agent/approve {"id","decision"}
 //!   {"type":"tool_result","id","name","result","denied","secs"?}  ("secs": how long it ran)
@@ -44,6 +48,10 @@ use crate::json::{num, obj, str, Json};
 /// Model turns one reply may take (each tool round is one).
 const MAX_ROUNDS: usize = 40;
 
+/// What one round may write for a scheduled run (the app asks for the same): room for a whole web page in
+/// one write_file call. The context's end stops it sooner when the chat is long.
+const ROUND_TOKENS: usize = 16384;
+
 // ---- tools
 
 /// The tools, by group: what the client turns on. The system group (this computer's specs, the task list
@@ -66,7 +74,7 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"search_files","description":"Search inside files for a regular expression. Returns path:line:text.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression"},"path":{"type":"string","description":"Folder or file to search"},"glob":{"type":"string","description":"Only files matching this, e.g. *.rs"},"ignore_case":{"type":"boolean","description":"Ignore upper/lower case"}},"required":["pattern"]}}}
  ],
  "edit": [
-  {"type":"function","function":{"name":"write_file","description":"Create a file, or replace a file's whole content.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"content":{"type":"string","description":"The complete content"}},"required":["path","content"]}}},
+  {"type":"function","function":{"name":"write_file","description":"Create a file, or replace a file's whole content. A file too long for one reply goes in parts: the first part, then each further part with append.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"content":{"type":"string","description":"The complete content, or with append the part to add"},"append":{"type":"boolean","description":"Add content to the end of the file instead of replacing it"}},"required":["path","content"]}}},
   {"type":"function","function":{"name":"edit_file","description":"Replace exact text in a file. Read the file first; old_string must match exactly once, so include enough surrounding lines.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"old_string":{"type":"string","description":"The exact text to replace"},"new_string":{"type":"string","description":"The text to put in its place"},"replace_all":{"type":"boolean","description":"Replace every match"}},"required":["path","old_string","new_string"]}}}
  ],
  "cmd": [
@@ -280,7 +288,31 @@ fn is_code(path: &str) -> bool {
 /// A `<tool_call>` block the model wrote that could not be read even mended: it stays in the chat as a call
 /// of this name (its arguments the block as written), and its result asks for the call again.
 const BAD_CALL: &str = "unreadable_tool_call";
-const BAD_CALL_RESULT: &str = "Error: this tool call could not be read, so nothing was run. Send it again inside <tool_call></tool_call> as valid JSON: {\"name\": \"<tool>\", \"arguments\": {...}}, with every brace and bracket closed.";
+
+/// The result of an unreadable call: send it again, in the form the model wrote it in (Qwen3-Coder's
+/// <function=...>, GLM's <arg_key>, or JSON).
+fn bad_call_result(arguments: &str) -> String {
+    let written = Json::parse(arguments).ok().and_then(|a| a.get("text").and_then(Json::as_str).map(String::from)).unwrap_or_default();
+    let form = if written.trim_start().starts_with("<function=") {
+        "<tool_call><function=TOOL><parameter=NAME>value</parameter></function></tool_call>, with every tag closed"
+    } else if written.contains("<arg_key>") {
+        "<tool_call>TOOL<arg_key>NAME</arg_key><arg_value>value</arg_value></tool_call>, with every tag closed"
+    } else {
+        "<tool_call>{\"name\": \"TOOL\", \"arguments\": {...}}</tool_call> as valid JSON, with every brace and bracket closed"
+    };
+    format!("Error: this tool call could not be read, so nothing was run. Send it again as {form}.")
+}
+
+/// The result of a call the reply's length limit cut off (`tokens` generated): sending it again whole would
+/// be cut off again, so a long file goes in parts.
+fn cut_call_result(tokens: usize) -> String {
+    format!(
+        "Error: your reply reached its limit ({tokens} tokens) in the middle of this tool call, so it was cut off and nothing was run. \
+Do not send it again whole: it would be cut off again. Write a long file in parts of at most about {} tokens: write_file with the first part, \
+then a write_file call with \"append\": true for each further part, one call per reply.",
+        (tokens / 2).max(500)
+    )
+}
 
 /// What the harness says when a reply would end with changed code that nothing has run since.
 const NUDGE: &str = "(Automatic check) You changed code in this reply and have not run anything since. Check your work now: run the code or its tests with run_command. If something fails, fix it and run it again. If it cannot be run here, or the user asked you not to run it, say so in one line.";
@@ -367,6 +399,13 @@ fn command(m: &str) -> Option<Result<Command, String>> {
         }
         _ => None,
     }
+}
+
+/// A message that starts with an installed skill's name after a slash (/design-taste-frontend make a page):
+/// that skill's name.
+fn skill_command(m: &str) -> Option<String> {
+    let head = m.split_whitespace().next()?.strip_prefix('/')?;
+    super::skills::list().into_iter().find(|s| s.name.eq_ignore_ascii_case(head)).map(|s| s.name)
 }
 
 /// "10m", "10min", "2h", "90" (minutes): minutes, at least the scheduler's 5.
@@ -1165,6 +1204,16 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
                     msg.push(("reminder", str(&notes.join("\n\n"))));
                 }
                 chat.messages.push(obj(msg));
+                // /<skill> first (the app's skill chip): its instructions loaded before the model starts, as
+                // a use_skill call of its own, so the model need not think to load it
+                if let Some(name) = skill_command(m) {
+                    let (id, args, result) = ("call_skill", obj(vec![("name", str(&name))]).to_string(), super::skills::use_skill(&name));
+                    let call = obj(vec![("id", str(id)), ("type", str("function")), ("function", obj(vec![("name", str("use_skill")), ("arguments", str(&args))]))]);
+                    chat.messages.push(obj(vec![("role", str("assistant")), ("content", str("")), ("tool_calls", Json::Arr(vec![call]))]));
+                    chat.messages.push(obj(vec![("role", str("tool")), ("tool_call_id", str(id)), ("name", str("use_skill")), ("content", str(&result))]));
+                    emit(&mut out, obj(vec![("type", str("tool_call")), ("id", str(id)), ("name", str("use_skill")), ("arguments", str(&args))]))?;
+                    emit(&mut out, obj(vec![("type", str("tool_result")), ("id", str(id)), ("name", str("use_skill")), ("result", str(&result)), ("denied", Json::Bool(false))]))?;
+                }
             }
             // answer again: drop the reply after the last user message
             None => {
@@ -1251,7 +1300,9 @@ fn reply(out: &mut Out, req: &Request, chat: &mut Chat, first: bool, work: &mpsc
     }
     let result = rounds(out, req, chat, &checkpoint, work, shared, loaded);
     chat.save()?;
-    let named = first && result.is_ok();
+    // named even when the reply was stopped or failed: the title is about the request, and a chat left
+    // unnamed would keep its first line as its title
+    let named = first;
     // the model answered with only its current step left open: that step is done
     if matches!(result, Ok("stop")) && close_last_task(chat) {
         chat.save()?;
@@ -1313,7 +1364,7 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         system: String::new(),
         thinking: w.thinking,
         temperature: shared.defaults.0,
-        max_tokens: shared.defaults.3.max(4096),
+        max_tokens: shared.defaults.3.max(ROUND_TOKENS),
         groups: w.groups.to_vec(),
         goal: true,                // nobody is there to say "go on"
         mode: "manual".to_string(), // nobody is there to ask either: only what the user always allows runs
@@ -1496,7 +1547,13 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
         for ev in events {
             match ev {
                 // the client going away drops `events`, which stops the generation
-                Event::Text(t) => take(if tools.is_empty() { vec![Part::Text(t)] } else { split.push(&t) }, out, &mut text, &mut calls)?,
+                Event::Text(t) => {
+                    take(if tools.is_empty() { vec![Part::Text(t)] } else { split.push(&t) }, out, &mut text, &mut calls)?;
+                    // a call shows nothing until it is whole (a file can take minutes): a sign of each piece
+                    if let Some(name) = split.writing() {
+                        emit(out, obj(vec![("type", str("calling")), ("name", str(name))]))?;
+                    }
+                }
                 Event::Done { finish: f, prompt_tokens, completion_tokens } => {
                     finish = f;
                     usage = (prompt_tokens, completion_tokens);
@@ -1505,7 +1562,10 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
                 Event::Error(_, e) => return Err(e),
             }
         }
+        let open_call = split.writing().is_some();
         take(split.finish(), out, &mut text, &mut calls)?;
+        // a call the length limit cut off: its result says so, not that it was written wrong
+        let cut = (finish == "length" && open_call).then(|| calls.last().map(|c| c.0.clone())).flatten();
         chat.tokens = (usage.0 + usage.1) as f64;
         chat.parts = parts.clone();
         emit(out, obj(vec![("type", str("context")), ("prompt_tokens", num(usage.0 as f64)), ("completion_tokens", num(usage.1 as f64)), ("context_length", num(loaded.ctx as f64)), ("parts", parts.clone())]))?;
@@ -1583,7 +1643,8 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
 Call it again with these parameters.", unloaded.unwrap().to_string()), false),
                 "tool_search" => (tool_search(&deferred, &arguments), false),
                 "update_tasks" => (update_tasks(out, chat, &arguments)?, false),
-                BAD_CALL => (BAD_CALL_RESULT.to_string(), false),
+                BAD_CALL if cut.as_ref() == Some(&id) => (cut_call_result(usage.1), false),
+                BAD_CALL => (bad_call_result(&arguments), false),
                 _ => {
                     RUN_SECS.with(|c| c.set(-1.0));
                     call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)?
