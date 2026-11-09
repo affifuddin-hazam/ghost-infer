@@ -663,9 +663,12 @@ impl Engine<'_> {
             self.hist.extend_from_slice(&ids);
             return Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on, ..Default::default() });
         }
-        // not for a mixture of experts (a batch runs even the GPU-held experts on the CPU: other arithmetic than
-        // a one-token step, and slower than it pays) or MLA attention (its split changes above 4 tokens)
-        if lookup::enabled() && matches!(&self.backend, Backend::Gpu(m, _) if !m.cfg.is_moe() && m.cfg.mla.is_none()) {
+        // not for MLA attention (its split changes above 4 tokens). A mixture of experts only with
+        // GHOST_INFER_MOE_LOOKUP=1: each checked token's experts run as a one-token step would (GpuModel::moe_ffn),
+        // exact, but the experts are most of an A3B model's work, so a check of k guesses costs about k steps and
+        // gains nothing (measured on Qwen3.6-35B-A3B: copy-heavy replies 31.1 tok/s with it, 32.4 without)
+        let moe_ok = |m: &cuda::GpuModel| !m.cfg.is_moe() || std::env::var_os("GHOST_INFER_MOE_LOOKUP").is_some();
+        if lookup::enabled() && matches!(&self.backend, Backend::Gpu(m, _) if moe_ok(m) && m.cfg.mla.is_none()) {
             self.lookup.sync(&self.hist);
             let pace = &mut self.pace[sampler.is_greedy() as usize];
             let before = (pace.rounds, pace.proposed, pace.accepted);
@@ -865,6 +868,11 @@ fn lookup_decode(backend: &mut Backend, lk: &mut lookup::Lookup, pace: &mut look
         let mut batch = vec![last];
         batch.extend_from_slice(&guesses);
         let k = guesses.len();
+        // a recurrent model (DeltaNet) cannot drop rejected guesses by moving back: its state took them in
+        let recurrent = ts.recurrent();
+        if recurrent {
+            ts.save_state()?;
+        }
         let (a, next) = if sampler.is_greedy() {
             let picks = tm.forward_argmax(&batch, ts)?;
             let a = guesses.iter().zip(&picks).take_while(|(g, p)| g == p).count();
@@ -887,6 +895,11 @@ fn lookup_decode(backend: &mut Backend, lk: &mut lookup::Lookup, pace: &mut look
         };
         // keep `last` and the accepted guesses; positions after them get overwritten later
         ts.pos = tpos0 + 1 + a;
+        if recurrent && a < k {
+            // back to before the batch, then `last` and the accepted guesses read again
+            ts.restore_state()?;
+            tm.forward_batch(&batch[..1 + a], ts, false)?;
+        }
         pace.round(t.elapsed().as_secs_f64(), matched, k, a);
         for (i, &g) in guesses[..a].iter().enumerate() {
             generated += 1;
@@ -1036,12 +1049,18 @@ fn bench(o: &Opts) -> Result<(), String> {
     // logits must match the step's bit for bit
     if let (Some(n), Backend::Gpu(m, s)) = (std::env::var("GHOST_INFER_VERIFY_CHECK").ok().and_then(|v| v.parse::<usize>().ok()), &mut engine.backend) {
         let batch: Vec<u32> = ids[..n].to_vec();
-        let pos = ids.len(); // right after the prompt, whose cache is still there
+        // right after the prompt, whose cache is still there; a recurrent model (DeltaNet) goes on from where
+        // it is, its state saved to start the batch from the same place
+        let pos = if s.recurrent() { s.pos } else { ids.len() };
         s.pos = pos;
+        s.save_state()?;
         let mut steps = Vec::new();
         for &t in &batch {
             m.forward_batch(&[t], s, true)?;
             steps.extend_from_slice(&s.logits);
+        }
+        if s.recurrent() {
+            s.restore_state()?;
         }
         s.pos = pos;
         m.forward_logits(&batch, s)?;

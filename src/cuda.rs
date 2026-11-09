@@ -5342,6 +5342,13 @@ pub fn ram_floor_mb() -> u64 {
     RAM_FLOOR_MB.load(Ordering::Relaxed)
 }
 
+/// Whether RAM is near the floor: within a GB of it. Until then a prompt's experts are mapped in as without a
+/// floor (so the reply that follows finds the CPU's in RAM); from then on they are read past the working set.
+fn ram_short() -> bool {
+    let floor = ram_floor_mb() << 20;
+    floor > 0 && os::available_ram() < floor + (1 << 30)
+}
+
 /// Whether the command line set the floor (the app shows that its setting does not apply then).
 pub fn ram_floor_fixed() -> bool {
     RAM_FLOOR_FIXED.load(Ordering::Relaxed)
@@ -5521,7 +5528,7 @@ impl CpuMoe {
                 ranges.push((base + t.offset + first * t.stride, (e - first) * t.stride));
             }
         }
-        if std::env::var_os("GHOST_INFER_NO_PREFETCH").is_none() && ram_floor_mb() == 0 {
+        if std::env::var_os("GHOST_INFER_NO_PREFETCH").is_none() && !ram_short() {
             self.prefetch.request(l, ranges);
         }
     }
@@ -5870,7 +5877,7 @@ impl ExpertCache {
         a.check(unsafe { (a.f.cuEventSynchronize)(self.events[i]) }, "staging wait")?;
         let buf = unsafe { std::slice::from_raw_parts_mut(self.pinned[i], self.scratch_bytes) };
         let t = std::time::Instant::now();
-        let bytes = if ram_floor_mb() > 0 {
+        let bytes = if ram_short() {
             // a prompt uses nearly every expert: mapped in, they would fill the RAM the floor keeps free (and
             // be released and read again, over and over); read from the file they only pass through
             let [g, u, d] = moe.tensors[l].map(|t| (t.offset + e * t.stride, t.stride));
@@ -7277,27 +7284,54 @@ impl GpuModel {
     /// routes them. For one token, the experts held in GPU memory run there (queued first) while the CPU
     /// computes the others; then both are added to s.x. Prompt batches run every expert on the CPU.
     fn moe_ffn(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession) -> Result<(), String> {
+        // a small batch (a lookup or draft check, a few tokens): each token as a one-token step would run it,
+        // its cached experts on the GPU and the others on the CPU, so each position gets the arithmetic of a
+        // one-token step (the rest of the layer still runs as one batch). Batched instead, every expert would
+        // run on the CPU, slower and with other arithmetic. GHOST_INFER_MOE_BATCH_CPU=1 keeps that old way.
+        if n > 1 && n < MOE_GPU_MIN_BATCH && std::env::var_os("GHOST_INFER_MOE_BATCH_CPU").is_none() {
+            // every row normed first, into s.xb, where each token's step reads its own and where the shared
+            // expert reads them all afterwards
+            let k = &self.k;
+            k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(self.cfg.dim as i32), Arg::F(self.cfg.norm_eps)])?;
+            for r in 0..n {
+                self.moe_ffn_rows(l, layer, 1, r, n, s)?;
+            }
+            return Ok(());
+        }
+        self.moe_ffn_rows(l, layer, n, 0, n, s)
+    }
+
+    /// moe_ffn on `n` rows of the session starting at row `row0`, of a batch of `rows`. One row of a larger
+    /// batch (n == 1 < rows) finds its normed row in s.xb already, and puts its router logits after the batch's.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_ffn_rows(&self, l: usize, layer: &GpuLayer, n: usize, row0: usize, rows: usize, s: &GpuSession) -> Result<(), String> {
         let (c, k, a) = (&self.cfg, &self.k, api()?);
         let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
         let dim = c.dim;
+        let x = s.x.ptr + (row0 * dim * 4) as u64;
+        let per_row = rows > n;
+        let xbr = s.xb.ptr + (row0 * dim * 4) as u64; // this row's normed input
+        let logits_at = s.xb.ptr + (rows * dim * 4) as u64; // the router logits, after every row
         let mut cache_ref = self.cache.borrow_mut();
         if cache_ref.is_none() {
             *cache_ref = Some(ExpertCache::new(moe, c, expert_cache_budget()?)?);
         }
         let cache = cache_ref.as_mut().unwrap();
-        if n >= MOE_GPU_MIN_BATCH && cache.batch_ok {
+        if n >= MOE_GPU_MIN_BATCH && cache.batch_ok && row0 == 0 {
             return self.moe_ffn_batch(l, layer, n, s, cache, moe);
         }
         let on_gpu = n == 1 && cache.cacheable[l] && cache.slots() > 0;
-        k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+        if !per_row {
+            k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(x), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+        }
         if on_gpu {
-            k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+            k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(x), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
         }
         // one token's router logits come from the GPU, right after the normalised row (s.xb holds a batch)
         let ne = c.n_experts;
         let gpu_route = n == 1 && dim % 4 == 0;
         if gpu_route {
-            k.launch(k.router_logits1, (ne.div_ceil(2) as u32, 1), 64, 0, &[Arg::P(s.xb.ptr), Arg::P(cache.routers[l].ptr), Arg::P(s.xb.ptr + (dim * 4) as u64), Arg::I(dim as i32), Arg::I(ne as i32)])?;
+            k.launch(k.router_logits1, (ne.div_ceil(2) as u32, 1), 64, 0, &[Arg::P(xbr), Arg::P(cache.routers[l].ptr), Arg::P(logits_at), Arg::I(dim as i32), Arg::I(ne as i32)])?;
         }
         let mut guard = s.moe.borrow_mut();
         let h = &mut *guard;
@@ -7307,7 +7341,14 @@ impl GpuModel {
         let stats = moe_stats_on() && on_gpu;
         let t0 = stats.then(Instant::now);
         // synchronous copy: waits for the norm (the launch stream is a blocking one)
-        a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.xb.ptr, got * 4) }, "copy to host")?;
+        if per_row {
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, xbr, len * 4) }, "copy to host")?;
+            if gpu_route {
+                a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb[len..].as_mut_ptr() as *mut c_void, logits_at, ne * 4) }, "copy to host")?;
+            }
+        } else {
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(h.xb.as_mut_ptr() as *mut c_void, s.xb.ptr, got * 4) }, "copy to host")?;
+        }
         let t1 = stats.then(Instant::now);
         if gpu_route {
             let logits = &h.xb[len..];
@@ -7396,9 +7437,9 @@ impl GpuModel {
         }
         if nk > 0 {
             let wts_ptr = s.moe_tab.ptr + (8 * 3 * nk) as u64;
-            k.launch(k.moe_combine, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(s.h.ptr), Arg::P(wts_ptr), Arg::I(nk as i32), Arg::P(cpu), Arg::I(dim as i32)])?;
+            k.launch(k.moe_combine, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.h.ptr), Arg::P(wts_ptr), Arg::I(nk as i32), Arg::P(cpu), Arg::I(dim as i32)])?;
         } else {
-            k.launch(k.add_rows, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(cpu), Arg::I(len as i32)])?;
+            k.launch(k.add_rows, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(cpu), Arg::I(len as i32)])?;
         }
         cache.note(moe, l, &h.picks, false);
         if let (Some(t0), Some(t1), Some(t2), Some(t4)) = (t0, t1, t2, t4) {
@@ -7877,6 +7918,7 @@ pub struct GpuSession {
     /// Gated DeltaNet layers: every layer's convolution state, then every layer's recurrent state (f32); and
     /// copies of it at earlier positions (see model::Session::snapshot)
     delta: Option<DeviceBuf>,
+    saved: Option<(usize, DeviceBuf)>, // save_state's copy of `delta`, and the position it was taken at
     snaps: Vec<(usize, DeviceBuf)>,
     pub logits: Vec<f32>,
     pub rows: Vec<f32>, // Out::All: a batch's logits, one vocab-long row per token
@@ -8024,6 +8066,7 @@ impl GpuSession {
                 }
             },
             snaps: Vec::new(),
+            saved: None,
             logits_dev: logits_dev?,
             picks: picks?,
             pos_dev: pos_dev?,
@@ -8088,6 +8131,29 @@ impl GpuSession {
         self.pos = 0;
         self.snaps.clear();
         self.delta.as_ref().map_or(Ok(()), zero)
+    }
+
+    /// Copies the DeltaNet states aside before a batch of guesses is checked (nothing for a model without
+    /// them): if some are rejected, restore_state goes back here and the accepted tokens are read again.
+    pub fn save_state(&mut self) -> Result<(), String> {
+        let Some(buf) = &self.delta else { return Ok(()) };
+        let copy = match self.saved.take() {
+            Some((_, b)) if b.bytes == buf.bytes => b,
+            _ => DeviceBuf::alloc(buf.bytes)?,
+        };
+        let a = api()?;
+        a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(copy.ptr, buf.ptr, buf.bytes) }, "DeltaNet save")?;
+        self.saved = Some((self.pos, copy));
+        Ok(())
+    }
+
+    /// Back to the state save_state copied (its position too).
+    pub fn restore_state(&mut self) -> Result<(), String> {
+        let (Some(buf), Some((pos, copy))) = (&self.delta, &self.saved) else { return Err("no saved DeltaNet state".into()) };
+        let a = api()?;
+        a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(buf.ptr, copy.ptr, buf.bytes) }, "DeltaNet restore")?;
+        self.pos = *pos;
+        Ok(())
     }
 
     /// Keeps a copy of the DeltaNet states at the current position (the earliest and the latest are kept).
