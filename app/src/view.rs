@@ -634,11 +634,38 @@ impl App {
                     })
                     .collect();
                 rows.push(row_of(tr("Add a folder"), tr("Its GGUF files show in the model menus at once, and from then on.").into(), action(tr("Add folder…"), Message::UseModelFolder, false)));
+                // RAM for a model bigger than the GPU: fill it with experts, or leave some for other programs
+                let floor_choice = |label: &'static str, gb: f64| -> Element<'static, Message> {
+                    let on = (self.ram_floor_gb - gb).abs() < 0.01;
+                    button(text(label).size(13).color(if on { s.text } else { s.muted }).font(if on { MEDIUM } else { BODY }))
+                        .on_press(Message::SetRamFloor(gb))
+                        .padding([5, 14])
+                        .style(move |_, st| button::Style {
+                            background: Some(Background::Color(if on { s.raise2 } else if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                            border: border::rounded(7),
+                            ..Default::default()
+                        })
+                        .into()
+                };
+                let floor_control: Element<'static, Message> = if self.ram_floor_fixed {
+                    value(tr("Set when ghost started (--ram-floor)").into())
+                } else {
+                    picker_box(row![floor_choice(tr("Use all"), 0.0), floor_choice(tr("Leave 2 GB"), 2.0), floor_choice(tr("Leave 4 GB"), 4.0)].spacing(2).into())
+                };
+                let memory = group(
+                    tr("RAM"),
+                    vec![row_of(
+                        tr("RAM for experts"),
+                        tr("For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it can be a little faster on long prompts.").into(),
+                        floor_control,
+                    )],
+                );
                 (
                     tr("Models"),
                     tr("Where ghost finds models."),
                     vec![
                         group(tr("Folders"), rows),
+                        memory,
                         text("Voice calls find their files in these folders too: a speech folder (a maya1 GGUF with snac.gguf) and a whisper folder with a whisper*.gguf, from huggingface.co/affifuddin-hazam/ghost-voice. They are read when ghost starts.").size(12.5).color(s.faint).into(),
                     ],
                 )

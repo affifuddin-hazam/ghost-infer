@@ -29,14 +29,30 @@ pub fn config_file() -> Result<PathBuf, String> {
     Ok(d.join("mcp.json"))
 }
 
-/// The configured servers: name and its settings, in the file's order.
-fn config() -> Vec<(String, Json)> {
+/// The servers in mcp.json: name and its settings, in the file's order.
+fn configured_servers() -> Vec<(String, Json)> {
     let text = config_file().ok().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     // a file saved by Notepad or PowerShell may start with a byte order mark
     match Json::parse(text.trim_start_matches('\u{feff}')).ok().and_then(|j| j.get("mcpServers").cloned()) {
         Some(Json::Obj(servers)) => servers,
         _ => Vec::new(),
     }
+}
+
+/// Every server to run: mcp.json's, then the enabled plugins (plugins.rs) that no server there is named as.
+fn config() -> Vec<(String, Json)> {
+    let mut list = configured_servers();
+    for (name, cfg) in super::plugins::servers() {
+        if !list.iter().any(|(n, _)| *n == name) {
+            list.push((name, cfg));
+        }
+    }
+    list
+}
+
+/// Whether mcp.json has a server of this name.
+pub fn configured(name: &str) -> bool {
+    configured_servers().iter().any(|(n, _)| n == name)
 }
 
 /// A JSON-RPC error from a server: its code and message (and data, which modern version errors use).
@@ -164,6 +180,9 @@ fn spawn(name: &str, cfg: &Json) -> Result<Conn, String> {
             c
         };
         c.envs(env.iter().cloned()).stdin(Stdio::piped()).stdout(Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
+        if let Some(d) = cfg.get("cwd").and_then(Json::as_str) {
+            c.current_dir(d);
+        }
         c.stderr(match log.as_ref().and_then(|f| f.try_clone().ok()) {
             Some(f) => Stdio::from(f),
             None => Stdio::null(),
@@ -299,6 +318,55 @@ pub fn stop_all() {
     }
 }
 
+/// Stops the server called `name` if it runs, and starts it again if it is still configured and enabled (a
+/// plugin saved, switched or removed), waiting for it. Its tools' names, or why it did not start.
+pub fn restart(name: &str) -> Result<Vec<String>, String> {
+    let old: Vec<Arc<Mutex<Server>>> = {
+        let mut list = servers().lock().unwrap();
+        let (gone, keep): (Vec<_>, Vec<_>) = list.drain(..).partition(|s| s.lock().is_ok_and(|s| s.name == name));
+        *list = keep;
+        gone
+    };
+    for s in old {
+        if let Ok(mut s) = s.lock() {
+            if let Some(mut c) = s.conn.take() {
+                c.stop();
+            }
+        }
+    }
+    let Some((_, cfg)) = config().into_iter().find(|(n, _)| n == name) else { return Ok(Vec::new()) };
+    if cfg.get("disabled").and_then(Json::as_bool) == Some(true) {
+        return Ok(Vec::new());
+    }
+    let s = Arc::new(Mutex::new(Server { name: name.to_string(), status: "starting".into(), tools: Vec::new(), conn: None }));
+    servers().lock().unwrap().push(s.clone());
+    let result = start(name, &cfg);
+    let mut s = s.lock().unwrap();
+    match result {
+        Ok((conn, tools)) => {
+            let names = tools.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).map(String::from).collect();
+            s.status = "ready".into();
+            s.tools = tools;
+            s.conn = Some(conn);
+            Ok(names)
+        }
+        Err(e) => {
+            s.status = e.clone();
+            Err(e)
+        }
+    }
+}
+
+/// The end of a server's log (what it wrote to stderr), at most `max` characters.
+pub fn log_tail(name: &str, max: usize) -> String {
+    let Some(p) = config_file().ok().and_then(|p| p.parent().map(|d| d.join(format!("mcp-{}.log", clean(name))))) else { return String::new() };
+    let text = String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).trim().to_string();
+    match text.char_indices().rev().nth(max) {
+        Some((i, _)) => format!("...{}", &text[i..]),
+        None => text,
+    }
+}
+
 /// The servers for the clients: name, state and tool names.
 pub fn status() -> Json {
     let list = servers().lock().unwrap().clone();
@@ -408,7 +476,7 @@ pub fn import_claude() -> Result<Vec<String>, String> {
         Some(Json::Obj(f)) => f,
         _ => Vec::new(),
     };
-    let mut ours = config();
+    let mut ours = configured_servers(); // not the plugins: they are not written into mcp.json
     let mut added = Vec::new();
     for (name, cfg) in theirs {
         if !ours.iter().any(|(n, _)| *n == name) {

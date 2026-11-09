@@ -4,6 +4,7 @@ mod gguf;
 mod iquant;
 mod json;
 mod lookup;
+mod lora;
 mod maya1;
 mod mimi;
 mod model;
@@ -63,7 +64,13 @@ OPTIONS:
         --draft-k <n>     tokens the draft proposes per step  [3]
         --no-lookup       GPU: one token per step, no guesses copied from the context to check in a batch
                           (also GHOST_INFER_NO_LOOKUP=1)
+        --lora <file>[:s] a LoRA adapter (llama.cpp's GGUF adapter format) on top of the model, at strength s [1];
+                          without it, %LOCALAPPDATA%\\ghost-infer\\lora\\<model name>.gguf is used when it exists
+                          (GHOST_INFER_NO_LORA=1 turns that off)
         --kv <f16|int8>   GPU KV cache: int8 holds about twice the context  [int8, or GHOST_INFER_KV]
+        --ram-floor <GB>  mixture of experts on the GPU: keep this much RAM free for other programs, releasing
+                          the experts used least recently (read again when needed); 0 fills RAM, the fastest
+                          [the server's saved setting, else 0; or GHOST_INFER_RAM_FLOOR]
         --threads <n>     CPU worker threads                 [physical cores]
         --special         print special tokens
         --host <addr>     serve: address to listen on        [127.0.0.1]
@@ -133,6 +140,10 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         tts: None,
         stt: None,
     };
+    // GHOST_INFER_RAM_FLOOR=<GB>, as --ram-floor (which, after it, wins)
+    if let Some(gb) = std::env::var("GHOST_INFER_RAM_FLOOR").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        cuda::set_ram_floor_mb((gb.max(0.0) * 1024.0) as u64, true);
+    }
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
         let num = |s: String, name: &str| s.parse::<f64>().map_err(|_| format!("{name}: \"{s}\" is not a number"));
@@ -162,6 +173,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--models" => o.models.push(PathBuf::from(val(a)?)),
             "--tts" => o.tts = Some(PathBuf::from(val(a)?)),
             "--stt" => o.stt = Some(PathBuf::from(val(a)?)),
+            "--lora" => lora::choose(&val(a)?)?,
+            "--ram-floor" => cuda::set_ram_floor_mb((num(val(a)?, a)?.max(0.0) * 1024.0) as u64, true),
             "--kv" => match val(a)?.as_str() {
                 "f16" => cuda::set_kv_int8(false),
                 "int8" => cuda::set_kv_int8(true),
@@ -385,7 +398,8 @@ impl<'a> Backend<'a> {
             let session = cuda::GpuSession::new(&model.cfg, ctx)?;
             Ok(Backend::Gpu(model, session))
         } else {
-            let model = Model::load(g)?;
+            let mut model = Model::load(g)?;
+            lora::attach_to(&g.path, |ad| model.attach_lora(ad))?;
             let session = Session::new(&model.cfg, ctx);
             Ok(Backend::Cpu(model, session))
         }
@@ -524,7 +538,10 @@ fn load<'a>(g: &'a Gguf, gpu: bool, ctx: usize) -> Result<Engine<'a>, String> {
 fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBuf>, draft_k: usize) -> Result<Engine<'a>, String> {
     let tok = Tokenizer::from_gguf(g)?;
     // the models first, then their sessions, so that an automatic context knows what is left
-    let main = if gpu { Some(cuda::GpuModel::load(g, Config::from_gguf(g)?)?) } else { None };
+    let mut main = if gpu { Some(cuda::GpuModel::load(g, Config::from_gguf(g)?)?) } else { None };
+    if let Some(m) = main.as_mut() {
+        lora::attach_to(&g.path, |ad| m.attach_lora(ad))?;
+    }
     let draft_model = match draft {
         None => None,
         Some(path) => {

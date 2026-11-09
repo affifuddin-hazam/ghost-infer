@@ -86,8 +86,11 @@ const TOOLS: &str = r#"{
  "cmd": [
   {"type":"function","function":{"name":"run_command","description":"Run programs, builds, tests and scripts: a Windows PowerShell command and its output. To find or read files use list_files, search_files and read_file instead (stops after 60 s unless timeout is set). Each call starts afresh in cwd: a cd does not carry over to the next call, so set cwd instead.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"timeout":{"type":"integer","description":"Seconds, up to 600"},"description":{"type":"string","description":"A few words saying what it does, for the user: Run the unit tests"}},"required":["command"]}}},
   {"type":"function","function":{"name":"start_process","description":"Start a long-running PowerShell command (a server, a build) in the background. Returns its id.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"description":{"type":"string","description":"A few words saying what it does, for the user: Run the unit tests"}},"required":["command"]}}},
-  {"type":"function","function":{"name":"check_process","description":"A background process's state and the output it printed since the last check.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}},
+  {"type":"function","function":{"name":"check_process","description":"A background process's state (running for how long, or how it ended) and the output it printed since the last check. While it runs with nothing new, this waits for it to print or end (30 s by default), so call it again to keep following a long build or render: each call brings news.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"},"wait":{"type":"integer","description":"Seconds to wait for new output or the end (default 30, up to 300; 0 answers at once)"}},"required":["id"]}}},
   {"type":"function","function":{"name":"stop_process","description":"Stop a background process.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}}
+ ],
+ "mcp": [
+  {"type":"function","function":{"name":"plugin_manager","description":"Make and manage plugins: small programs you write that give you new tools, kept for every later chat (they run as MCP servers, their tools named mcp__<plugin>__<tool>). Use it when the user asks for a plugin or for a tool you do not have that code could do. Before writing one, call it with action guide for the rules and a template. Actions: guide, list, show (name), save (name, description, files), install (source folder), enable (name), disable (name), remove (name).","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["guide","list","show","save","install","enable","disable","remove"],"description":"What to do"},"name":{"type":"string","description":"The plugin's name: short, lowercase, words joined by -"},"description":{"type":"string","description":"save: one line saying what the plugin is for"},"files":{"type":"object","description":"save: relative path -> the file's whole content, such as {\"server.py\": \"...\"}. For a change to an existing plugin, only the files that change","additionalProperties":{"type":"string"}},"source":{"type":"string","description":"install: a folder on this computer holding a plugin.json"}},"required":["action"]}}}
  ],
  "web": [
   {"type":"function","function":{"name":"web_search","description":"Search the web. Returns titles, addresses and snippets. When your reply uses these results, name the site each fact comes from and end it with a Sources list of the result links you used; a reply that uses no web results has no Sources list. To see what a site or page itself says, open it with fetch_url instead.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What to search for"}},"required":["query"]}}},
@@ -103,7 +106,7 @@ fn tool_groups() -> &'static Json {
 /// Loading and installing skills: always offered, so a skill installed during a reply can be used in it and
 /// the tool list (part of the cached prompt) does not change.
 const SKILL_TOOLS: [&str; 2] = [
-    r#"{"type":"function","function":{"name":"use_skill","description":"Load an installed skill's instructions (the installed skills are listed in the system prompt). Call it before a task one of them is for.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The skill's name"}},"required":["name"]}}}"#,
+    r#"{"type":"function","function":{"name":"use_skill","description":"Load an installed skill's instructions. Skills are not listed: find one with tool_search first (or the user names it). Call it before a task one of them is for.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"The skill's name"}},"required":["name"]}}}"#,
     r#"{"type":"function","function":{"name":"install_skill","description":"Install a skill (a folder with a SKILL.md and any files it uses) so it can be loaded with use_skill. The source can be a GitHub link (a repository, a folder in one, or a SKILL.md in one), a link to a .zip, or a folder or .zip on this computer. Use this, not git or a download, when the user asks to install or add a skill. When the source holds several skills, the result lists them; call again with skill set to the path of the one wanted, or all.","parameters":{"type":"object","properties":{"source":{"type":"string","description":"The link, folder or .zip"},"skill":{"type":"string","description":"Which skill, when the source holds several: its path from the list, or all"}},"required":["source"]}}}"#,
 ];
 
@@ -115,7 +118,7 @@ const SKILL_TOOLS: [&str; 2] = [
 /// reads faster and leaves a small model less to choose from.
 const CORE_TOOLS: [&str; 13] = ["read_file", "list_files", "search_files", "write_file", "edit_file", "run_command", "web_search", "fetch_url", "use_skill", "get_system_info", "update_tasks", "remember", "subagent"];
 
-const TOOL_SEARCH: &str = r#"{"type":"function","function":{"name":"tool_search","description":"Load the full description of tools that the system prompt lists by name only, so you can call them. Use \"select:<name>,<name>\" for tools you know by name, or a few words saying what you need to find tools by what they do. Call it before using such a tool for the first time in a chat. Not for telling the user what you can do: every tool is already named in the system prompt.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"select:<names>, or keywords"},"max_results":{"type":"integer","description":"Most tools to return for keywords (default 5)"}},"required":["query"]}}}"#;
+const TOOL_SEARCH: &str = r#"{"type":"function","function":{"name":"tool_search","description":"Load the full description of tools that the system prompt lists by name only, so you can call them, and find installed tools (MCP servers, plugins) and skills that are not listed. Use \"select:<name>,<name>\" for tools you know by name, or a few words saying what you need to find tools and skills by what they do. Call it before using such a tool for the first time in a chat. Not for telling the user what you can do: every tool is already named in the system prompt.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"select:<names>, or keywords"},"max_results":{"type":"integer","description":"Most tools to return for keywords (default 5)"}},"required":["query"]}}}"#;
 
 /// The tools the model gets described in the prompt: the core ones of these groups, and tool_search when
 /// others wait to be loaded.
@@ -176,11 +179,76 @@ fn tool_search(deferred: &[Json], arguments: &str) -> String {
             scored.into_iter().take(max).map(|(_, t)| t).collect()
         }
     };
+    // skills too, by the same words: they are not listed in the prompt either
+    let words: Vec<String> = query.trim_start_matches("select:").to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect();
+    let skills = super::skills::search(&words, 3);
+    let skill_text = if skills.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = skills.iter().map(|(n, d)| format!("- {n}: {}", crate::tools::clip(d, 400))).collect();
+        format!("Skills that may fit (load one with use_skill {{\"name\": \"<name>\"}} before starting the task):\n{}", lines.join("\n"))
+    };
     if found.is_empty() {
+        if !skill_text.is_empty() {
+            return format!("No tool matches \"{query}\".\n{skill_text}");
+        }
         let names: Vec<&str> = deferred.iter().map(tool_name).collect();
-        return format!("No tool matches \"{query}\". The tools you can load: {}.", names.join(", "));
+        return format!("No tool or skill matches \"{query}\". The tools you can load: {}.", names.join(", "));
     }
-    format!("Loaded; you can call these now:\n{}", found.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("\n"))
+    let loaded = format!("Loaded; you can call these now:\n{}", found.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("\n"));
+    if skill_text.is_empty() { loaded } else { format!("{loaded}\n\n{skill_text}") }
+}
+
+/// Words too common to say what a message is about (English and Malay).
+const HINT_STOP: [&str; 64] = [
+    "the", "and", "for", "with", "this", "that", "from", "into", "please", "can", "you", "your", "what", "how", "why", "when", "where", "who",
+    "want", "use", "using", "called", "some", "about", "have", "has", "give", "get", "set", "new", "all", "any", "make", "made", "file", "files",
+    "text", "create", "write", "read", "show", "tell", "help", "need", "like", "just", "now", "them", "they", "its", "are", "was", "will", "would",
+    "yang", "dan", "untuk", "ini", "itu", "saya", "boleh", "tolong", "dengan", "buat",
+];
+
+/// Whether a message word names a part of a name or description: the same word, or (4 letters or more) one
+/// beginning the other ("rolling" and "roll").
+fn word_fits(word: &str, part: &str) -> bool {
+    word == part || (word.len() >= 4 && part.len() >= 4 && (word.starts_with(part) || part.starts_with(word)))
+}
+
+/// A note for the model when an installed skill or MCP/plugin tool (none of which the prompt lists) clearly
+/// fits the message: one naming it in its name scores 3, a word of its description 1, and it counts at 3.
+/// The harness looks on the model's behalf, since a small model rarely searches for what it is not shown;
+/// a chat about something else carries nothing.
+fn extras_hint(message: &str, groups: &[String]) -> Option<String> {
+    let words: Vec<String> = message.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3 && !HINT_STOP.contains(w) && !w.chars().all(|c| c.is_ascii_digit())).map(String::from).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let score = |name: &str, desc: &str| -> usize {
+        let parts: Vec<&str> = name.split(|c: char| !c.is_alphanumeric()).filter(|p| p.len() >= 2).collect();
+        let desc_words: Vec<String> = desc.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3).map(String::from).collect();
+        words.iter().map(|w| if parts.iter().any(|p| word_fits(w, p)) { 3 } else if desc_words.iter().any(|d| word_fits(w, d)) { 1 } else { 0 }).sum()
+    };
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for s in super::skills::list() {
+        let n = score(&s.name.to_lowercase(), &s.description);
+        if n >= 3 {
+            found.push((n, format!("skill {} ({}): load it with use_skill", s.name, crate::tools::clip(&s.description, 160))));
+        }
+    }
+    for t in all_tools(groups).iter().filter(|t| tool_name(t).starts_with("mcp__")) {
+        let full = tool_name(t);
+        let short = full.rsplit("__").next().unwrap_or(full).to_lowercase();
+        let desc = t.get("function").and_then(|f| f.get("description")).and_then(Json::as_str).unwrap_or("");
+        let n = score(&short, desc);
+        if n >= 3 {
+            found.push((n, format!("tool {full} ({}): load it with tool_search (\"select:{full}\")", crate::tools::clip(desc, 160))));
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    let lines: Vec<String> = found.into_iter().take(3).map(|(_, l)| format!("- {l}")).collect();
+    Some(format!("(Note from ghost, not from the user: installed extras that may fit this request:\n{}\nUse one if it fits; otherwise ignore this note.)", lines.join("\n")))
 }
 
 /// Every tool of these groups (and the system one): with the skill tools, and the MCP servers' tools when the
@@ -221,7 +289,7 @@ const PLAN_NOTE: &str = "(Note from ghost, not from the user: plan mode is on. D
 fn gate(mode: &str, group: &str, args: &Json) -> Gate {
     match (mode, group) {
         ("bypass", _) => Gate::Run,
-        ("plan", "edit" | "cmd" | "skills") => Gate::Refuse(PLAN_REFUSAL),
+        ("plan", "edit" | "cmd" | "skills" | "plugins") => Gate::Refuse(PLAN_REFUSAL),
         ("accept_edits", "edit") | ("auto", "edit" | "web") => Gate::Run,
         ("auto", "cmd") if !risky_command(args.get("command").and_then(Json::as_str).unwrap_or("")) => Gate::Run,
         _ => Gate::Ask,
@@ -258,6 +326,7 @@ fn approval_group(name: &str) -> Option<&'static str> {
         "run_command" | "start_process" => Some("cmd"),
         "web_search" | "fetch_url" => Some("web"),
         "install_skill" => Some("skills"),
+        "plugin_manager" => Some("plugins"),
         n if n.starts_with("mcp__") => Some("mcp"),
         _ => None,
     }
@@ -273,12 +342,17 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String 
         Some((cwd, more)) => format!("Your working directory is {cwd}: relative paths and commands start there. You may also use files in {}.", more.join(", ")),
     };
     let check = if can_run { " After you change code, check it: run it or its tests with run_command. If something fails, fix it and run it again. Say it is done only once it works, and say how you checked." } else { "" };
-    let more = if deferred.is_empty() {
+    // ghost's own deferred tools are named; MCP servers' and plugins' are not (found with tool_search when a
+    // task needs them), so installing more of them costs a chat nothing
+    let names: Vec<&str> = deferred.iter().map(tool_name).filter(|n| !n.starts_with("mcp__")).collect();
+    let mut more = if names.is_empty() {
         String::new()
     } else {
-        let names: Vec<&str> = deferred.iter().map(tool_name).collect();
         format!(" These tools are named here without their descriptions: {}. Before calling one of them for the first time in a chat, load it with tool_search (\"select:<name>\").", names.join(", "))
     };
+    if deferred.iter().any(|t| tool_name(t).starts_with("mcp__")) {
+        more.push_str(" More tools are installed (from MCP servers and plugins) and not listed here: when a task needs something your tools above cannot do, search for one with tool_search, using a few words saying what it should do.");
+    }
     format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Answer greetings, chat and questions you can answer yourself directly, without tools; that includes questions about what you can do, which the tools below answer. Use tools when the request needs them; calls that do not depend on each other can go together in one turn. Before saying you cannot do something, check whether one of your tools can. Report what tools show faithfully: if a command failed or a search did not answer the question, say so, and never present a guess as a finding. To find and read files use list_files, search_files and read_file rather than commands, and read a file before you edit it. For a task of 3 or more steps, keep a task list with update_tasks. Save a fact with remember only when the user tells you something worth keeping for later chats. When the user refers to an earlier conversation, look it up with search_chats.{check}{more} Use tools until the task is done, then answer briefly.")
 }
 
@@ -1518,7 +1592,8 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
                     return answer_here(&mut out, &mut chat, m, &text);
                 }
                 let mut msg = vec![("role", str("user")), ("content", str(m))];
-                let notes: Vec<String> = (req.mode == "plan").then(|| PLAN_NOTE.to_string()).into_iter().chain((!req.groups.is_empty()).then(|| task_reminder(&chat)).flatten()).collect();
+                let extras = (!req.groups.is_empty() && skill_commands(m).is_empty()).then(|| extras_hint(m, &req.groups)).flatten();
+                let notes: Vec<String> = (req.mode == "plan").then(|| PLAN_NOTE.to_string()).into_iter().chain((!req.groups.is_empty()).then(|| task_reminder(&chat)).flatten()).chain(extras).collect();
                 if !notes.is_empty() {
                     msg.push(("reminder", str(&notes.join("\n\n"))));
                 }
@@ -1842,7 +1917,7 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
     // a subagent's tools: not those SUB_LEFT_OUT keeps from it
     let kept = |t: &Json| req.sub.is_empty() || !SUB_LEFT_OUT.contains(&tool_name(t));
     let tools: Vec<Json> = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) }.into_iter().filter(kept).collect();
-    let deferred: Vec<Json> = if req.groups.is_empty() { Vec::new() } else { deferred_tools(&req.groups) }.into_iter().filter(kept).collect();
+    let mut deferred: Vec<Json> = if req.groups.is_empty() { Vec::new() } else { deferred_tools(&req.groups) }.into_iter().filter(kept).collect();
     // a subagent's calls' ids begin with its own call's, so its approvals and results find their lines
     let prefix = if req.sub.is_empty() { String::new() } else { format!("{}.", req.sub) };
     let mut changed = false;
@@ -2024,6 +2099,10 @@ Call it again with these parameters.", unloaded.unwrap().to_string()), false),
                     call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)?
                 }
             };
+            if name == "plugin_manager" && !denied && !req.groups.is_empty() {
+                // a plugin saved, switched or removed: its tools can be loaded (or are gone) in this reply already
+                deferred = deferred_tools(&req.groups).into_iter().filter(kept).collect();
+            }
             let result = spill(result, &name, &chat.id, &id, loaded.ctx);
             let secs = RUN_SECS.with(|c| c.replace(-1.0));
             let secs = (secs >= 0.0).then(|| num((secs * 10.0).round() / 10.0));
@@ -2204,17 +2283,21 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
             return Ok((note, false));
         }
     }
-    // the same call a third time in one reply: a small model going round in circles
-    let same = chat.messages[reply_start..]
+    // the same call a third time in one reply: a small model going round in circles. Not check_process: asking
+    // again is how a long build is followed (each call waits for news), and blocking it hid a render that had
+    // died (the model was told "you already made this call" while the process had ended with an error)
+    let same = if name == "check_process" { 0 } else { chat.messages[reply_start..]
         .iter()
         .filter_map(|m| m.get("tool_calls").and_then(Json::as_array))
         .flatten()
         .filter(|c| c.get("function").is_some_and(|f| f.get("name").and_then(Json::as_str) == Some(name) && f.get("arguments").and_then(Json::as_str) == Some(arguments)))
-        .count();
+        .count() };
     if same > 2 {
         return Ok(("You already made this exact call twice; its result is above. Do something different, or answer with what you have.".into(), false));
     }
-    if let Some(group) = approval_group(name) {
+    // looking at plugins (their list, files, the guide) changes nothing
+    let group = if name == "plugin_manager" && super::plugins::read_only(arguments) { None } else { approval_group(name) };
+    if let Some(group) = group {
         let ask = match gate(&req.mode, group, &Json::parse(arguments).unwrap_or(Json::Null)) {
             Gate::Run => false,
             Gate::Refuse(why) => return Ok((why.to_string(), true)),
@@ -2265,6 +2348,9 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
         let args = Json::parse(arguments).unwrap_or(Json::Null);
         let always = shared.harness.lock().unwrap().always.clone();
         return Ok((super::schedule::tool(name, &args, &chat.id, &req.groups, req.thinking, &always), false));
+    }
+    if name == "plugin_manager" {
+        return Ok((super::plugins::tool(arguments), false));
     }
     if name.starts_with("mcp__") {
         let args = if arguments.trim().is_empty() { Json::Obj(Vec::new()) } else { Json::parse(arguments).unwrap_or(Json::Null) };

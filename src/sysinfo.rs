@@ -18,6 +18,14 @@ pub fn report(first: Vec<(&'static str, Json)>) -> Json {
     obj(fields)
 }
 
+/// Physical memory available to programs now, in bytes (free pages and reusable file cache), if known.
+pub fn available_ram() -> Option<u64> {
+    #[cfg(windows)]
+    return win::available_ram();
+    #[cfg(not(windows))]
+    None
+}
+
 #[cfg(windows)]
 mod win {
     use super::{Json, num, obj, str};
@@ -66,6 +74,12 @@ mod win {
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn RegGetValueW(key: isize, sub: *const u16, value: *const u16, flags: u32, ty: *mut u32, data: *mut c_void, len: *mut u32) -> i32;
+    }
+
+    pub fn available_ram() -> Option<u64> {
+        let mut m: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        m.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.avail_phys)
     }
 
     fn wide(s: &str) -> Vec<u16> {

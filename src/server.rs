@@ -20,6 +20,8 @@ mod agent;
 mod download;
 mod maya;
 mod mcp;
+mod nightly;
+mod plugins;
 mod schedule;
 mod skills;
 mod speech;
@@ -36,6 +38,9 @@ enum Work {
     Job(Job),
     /// switch to these models; the reply comes once a model is running again (Err: it stayed on the old one)
     Load(Plan, mpsc::Sender<Result<(), String>>),
+    /// drop every model, the voice's too, so the GPU is free (the nightly LoRA training); the reply says what
+    /// ran: the model's id and whether the voice was loaded
+    Unload(mpsc::Sender<(Option<String>, bool)>),
 }
 
 /// The models asked for: `model`, with the voice models beside it (Some(true)), unloaded (Some(false)) or as they
@@ -321,7 +326,11 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         download_dir: o.models.first().cloned(),
         defaults: (o.temp, o.top_k, o.top_p, o.max_new),
         think_default: !o.no_think,
-        harness: Mutex::new(crate::tools::Settings::load()),
+        harness: Mutex::new({
+            let s = crate::tools::Settings::load();
+            crate::cuda::apply_ram_floor_setting(s.ram_floor_gb);
+            s
+        }),
         agent_groups: Mutex::new(vec!["files".to_string()]),
         token: new_token(),
         voice: Mutex::new(speech::Voice { tts: o.tts.clone(), stt: o.stt.clone(), ..Default::default() }),
@@ -329,6 +338,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     std::thread::spawn(mcp::start_all); // the MCP servers in mcp.json, while the model loads
     let (work, rx) = mpsc::channel::<Work>();
     schedule::start(work.clone(), shared.clone()); // scheduled tasks, once a model runs
+    nightly::start(shared.clone()); // the nightly LoRA run, when nightly.json enables it
     let s = shared.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -364,6 +374,9 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
                         let _ = job.events.send(Event::Error(503, "no model is loaded; pick one first".into()));
                     }
                     Ok(Work::Load(p, reply)) => break (p, reply),
+                    Ok(Work::Unload(reply)) => {
+                        let _ = reply.send((None, false));
+                    }
                 }
             };
             plan = next;
@@ -523,10 +536,24 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
                     plan = p;
                     let _ = reply.send(Ok(()));
                 }
-                Ok(Work::Load(p, reply)) => break (p, reply),
+                Ok(Work::Load(p, reply)) => break Some((p, reply)),
+                Ok(Work::Unload(reply)) => {
+                    let voice = shared.voice.lock().unwrap().loaded();
+                    let _ = reply.send((Some(id.clone()), voice));
+                    break None;
+                }
             }
         };
-        let (next, reply) = next;
+        let Some((next, reply)) = next else {
+            // unloaded: the engines go with this turn of the loop; the voice is let go here
+            eprintln!("[unloaded {id}: the GPU is free]");
+            if shared.voice.lock().unwrap().loaded() {
+                speech::set_voice(&shared.voice, false);
+            }
+            *shared.status.lock().unwrap() = Status { current: None, call: None, together: false, loading: None };
+            idle = true;
+            continue;
+        };
         let also = match (&next.call, next.voice) {
             (Some(k), _) if *k != next.model => format!(", with {} for calls when they fit", model_id(k)),
             (Some(_), _) => ", with the voice when it fits".into(),
@@ -1259,19 +1286,26 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     if path == "/v1/audio/transcriptions" {
         return transcription_request(&mut conn, &req, shared);
     }
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/maya", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads", "/api/models/folders"].iter().any(|p| path.starts_with(p)) {
+    if ["/api/tools", "/api/harness", "/api/nightly", "/api/chats", "/api/agent", "/api/memory", "/api/maya", "/api/quit", "/api/skills", "/api/mcp", "/api/plugins", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads", "/api/models/folders"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
         let body = || std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse);
         return match (req.method.as_str(), path) {
             ("GET", "/api/harness") => respond_private(&mut conn, 200, &crate::tools::status(&shared.harness.lock().unwrap())),
+            // the nightly LoRA run: its settings and last result, or a run started now
+            ("GET", "/api/nightly") => respond_private(&mut conn, 200, &nightly::status()),
+            ("POST", "/api/nightly/run") => match nightly::launch(shared) {
+                Ok(()) => respond_private(&mut conn, 202, &nightly::status()),
+                Err(e) => respond_private(&mut conn, 409, &error_body(&e)),
+            },
             ("POST", "/api/harness") => match body().and_then(|b| {
                 let old = shared.harness.lock().unwrap().clone(); // released before the new settings go in
                 crate::tools::Settings::from_json(&b, &old)
             }) {
                 Ok(s) => {
                     s.save()?;
+                    crate::cuda::apply_ram_floor_setting(s.ram_floor_gb); // at once, even mid-reply
                     let reply = crate::tools::status(&s);
                     *shared.harness.lock().unwrap() = s;
                     respond_private(&mut conn, 200, &reply)
@@ -1460,6 +1494,8 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 Err(e) => respond_private(&mut conn, 404, &error_body(&e)),
             },
             // MCP servers: their state; reload after editing mcp.json; import Claude Desktop's
+            // plugins (the MCP servers ghost wrote for itself): their state and tools
+            ("GET", "/api/plugins") => respond_private(&mut conn, 200, &obj(vec![("plugins", plugins::status()), ("folder", str(&plugins::dir().map(|d| d.display().to_string()).unwrap_or_default()))])),
             ("GET", "/api/mcp") => {
                 let config = mcp::ensure_config().unwrap_or_default();
                 respond_private(&mut conn, 200, &obj(vec![("servers", mcp::status()), ("config", str(&config))]))
@@ -1558,6 +1594,21 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         // as they are without it)}; or {"id", "call": "<model for voice calls, may be the same>", "for_call": bool}:
         // both kept loaded with the voice when they all fit, else the call model with the voice (for_call) or the
         // model alone. Answers once the switch is done (it can take a minute)
+        // the nightly training's turn on the GPU: every model dropped; POST /api/models/load brings one back
+        ("POST", "/api/models/unload") => {
+            if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
+                return respond_private(&mut conn, 403, &error_body(e));
+            }
+            if let Some(l) = &loading {
+                return respond(&mut conn, 409, &error_body(&format!("{l} is loading; wait for it")));
+            }
+            let (tx, done) = mpsc::channel();
+            work.send(Work::Unload(tx)).map_err(|_| "the model thread stopped")?;
+            return match done.recv() {
+                Ok((model, voice)) => respond(&mut conn, 200, &obj(vec![("unloaded", model.as_deref().map(str).unwrap_or(Json::Null)), ("voice", Json::Bool(voice))])),
+                Err(_) => respond(&mut conn, 500, &error_body("the model thread stopped")),
+            };
+        }
         ("POST", "/api/models/load") => {
             let b = std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse).ok();
             let field = |k: &str| b.as_ref().and_then(|b| b.get(k)).cloned();

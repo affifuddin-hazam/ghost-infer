@@ -109,6 +109,13 @@ pub fn today() -> String {
     format!("{} {d} {} {y}", NAMES[at.weekday], MONTHS[(m as usize).clamp(1, 12) - 1])
 }
 
+/// Today's local date as YYYYMMDD and the local hour (the nightly run's clock).
+pub(super) fn local_day_hour() -> (String, u32) {
+    let at = local(agent::now_ms());
+    let (y, m, d) = civil_from_days(at.day);
+    (format!("{y:04}{m:02}{d:02}"), at.minute / 60)
+}
+
 /// The moment a local day and minute is, in milliseconds since 1970.
 fn moment(day: i64, minute: u32) -> f64 {
     (day * 86_400_000 + minute as i64 * 60_000 - offset_ms()) as f64

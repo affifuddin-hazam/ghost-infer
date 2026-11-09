@@ -3,7 +3,7 @@
 //! dependency: without a GPU the binary still works on the CPU.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -3077,6 +3077,31 @@ __global__ void silu_mul(const float* __restrict__ gu, float* __restrict__ h, in
     h[i] = g / (1.f + expf(-g)) * u;
 }
 
+// ---- LoRA adapters (see lora.rs): out += scale * B (A x), A and B in f32 ----
+
+// t[b * r + j] = dot(A[j], x[b]); one block per (j, b)
+__global__ void lora_a(const float* __restrict__ a, const float* __restrict__ x, float* __restrict__ t, int r, int cols) {
+    __shared__ float sh[32];
+    int j = blockIdx.x, b = blockIdx.y;
+    const float* row = a + (size_t)j * cols;
+    const float* xb = x + (size_t)b * cols;
+    float v = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) v += row[i] * xb[i];
+    v = block_sum(v, sh);
+    if (threadIdx.x == 0) t[(size_t)b * r + j] = v;
+}
+
+// out[b * stride + off + o] += scale * dot(B[o], t[b]); one thread per output row
+__global__ void lora_b(const float* __restrict__ bm, const float* __restrict__ t, float* __restrict__ out, int rows, int r, int stride, int off, float scale) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;
+    if (o >= rows) return;
+    const float* row = bm + (size_t)o * r;
+    const float* tb = t + (size_t)b * r;
+    float v = 0.f;
+    for (int j = 0; j < r; j++) v += row[j] * tb[j];
+    out[(size_t)b * stride + off + o] += scale * v;
+}
+
 // ---- mixture of experts, prompt batches ----
 
 // Router logits: out[t * ne + e] = dot(xb[t], R[e]), f32 throughout (the routing must not depend on
@@ -3988,6 +4013,12 @@ mod os {
         (c.faults as u64, c.ws as u64)
     }
 
+    /// Physical memory available to programs now, in bytes (free pages and the reusable file cache);
+    /// unknown: as much as could be wanted, so the RAM floor does nothing.
+    pub fn available_ram() -> u64 {
+        crate::sysinfo::available_ram().unwrap_or(u64::MAX)
+    }
+
     /// Takes these ranges of mapped memory out of the working set (VirtualUnlock on pages that are not
     /// locked does exactly that): they stay in the file cache, but are the first memory Windows reuses.
     pub fn release(ranges: &[(usize, usize)]) {
@@ -4025,6 +4056,9 @@ mod os {
     }
     pub fn prefetch(_: &[(usize, usize)]) {}
     pub fn release(_: &[(usize, usize)]) {}
+    pub fn available_ram() -> u64 {
+        u64::MAX // the RAM floor is Windows-only for now
+    }
     pub fn page_faults() -> (u64, u64) {
         (0, 0)
     }
@@ -4358,6 +4392,8 @@ struct Kernels {
     attention_decode_tc256: Option<Ptr>,    // one-token steps and verify batches of 256-wide grouped heads, int8 cache
     silu_mul: Ptr,
     silu_q8: Ptr,
+    lora_a: Ptr,
+    lora_b: Ptr,
     add_rows: Ptr,
     moe_gate_up_q3k: Ptr,
     moe_down_q4k: Ptr,
@@ -4565,6 +4601,8 @@ impl Kernels {
                 attention_decode_tc256: if a.compute >= (7, 5) && kv_int8() && std::env::var_os("GHOST_INFER_NO_TC_ATT").is_none() && std::env::var_os("GHOST_INFER_NO_TC_DECODE").is_none() { Some(get("attention_decode_tc256")?) } else { None },
                 silu_mul: get("silu_mul")?,
                 silu_q8: get("silu_q8")?,
+                lora_a: get("lora_a")?,
+                lora_b: get("lora_b")?,
                 add_rows: get("add_rows")?,
                 moe_gate_up_q3k: get("moe_gate_up_q3k")?,
                 moe_down_q4k: get("moe_down_q4k")?,
@@ -5094,6 +5132,28 @@ struct GpuLayer {
     wo: GpuMatrix, // a DeltaNet layer's ssm_out
     ffn_norm: DeviceBuf,
     ffn: GpuFfn,
+    lora: GpuLayerLora,
+}
+
+/// One LoRA pair on the GPU (see lora.rs): A (r x cols) and B (rows x r) in f32, added at row `off` of
+/// the packed output it belongs to ([q | k | v] or [gate | up]).
+struct GpuLora {
+    a: DeviceBuf,
+    b: DeviceBuf,
+    r: usize,
+    rows: usize,
+    cols: usize,
+    off: usize,
+    scale: f32,
+}
+
+/// A layer's LoRA pairs: those on the packed q/k/v and gate/up outputs, and on attn_output and ffn_down.
+#[derive(Default)]
+struct GpuLayerLora {
+    qkv: Vec<GpuLora>,
+    o: Option<GpuLora>,
+    gate_up: Vec<GpuLora>,
+    down: Option<GpuLora>,
 }
 
 /// A Gated DeltaNet layer (see model::Delta): one projection to [q k v | z | ba] rows, the convolution taps,
@@ -5259,8 +5319,119 @@ impl Drop for Prefetcher {
 
 /// The experts of a mixture-of-experts model, run on the CPU straight from the model file (its own
 /// mapping of it; the OS shares the pages with any other).
+/// The RAM floor: memory (MB) to leave available for other programs while a mixture of experts runs; 0: none
+/// (the CPU's experts fill whatever RAM there is, the fastest). Below it, the experts used least recently
+/// leave this process's working set and are read again from the file (cache or disk) when next used.
+static RAM_FLOOR_MB: AtomicU64 = AtomicU64::new(0);
+/// Whether --ram-floor (or GHOST_INFER_RAM_FLOOR) set it: a saved setting then does not change it.
+static RAM_FLOOR_FIXED: AtomicBool = AtomicBool::new(false);
+/// Bytes of experts released for the floor so far (the MoE statistics report it).
+static RAM_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the RAM floor in MB (0: off). `fixed`: from the command line, which a saved setting does not override.
+pub fn set_ram_floor_mb(mb: u64, fixed: bool) {
+    if fixed {
+        RAM_FLOOR_FIXED.store(true, Ordering::Relaxed);
+    } else if RAM_FLOOR_FIXED.load(Ordering::Relaxed) {
+        return;
+    }
+    RAM_FLOOR_MB.store(mb, Ordering::Relaxed);
+}
+
+pub fn ram_floor_mb() -> u64 {
+    RAM_FLOOR_MB.load(Ordering::Relaxed)
+}
+
+/// Whether the command line set the floor (the app shows that its setting does not apply then).
+pub fn ram_floor_fixed() -> bool {
+    RAM_FLOOR_FIXED.load(Ordering::Relaxed)
+}
+
+/// The floor from a saved setting in GB (the server's harness.json), unless the command line set one.
+pub fn apply_ram_floor_setting(gb: f64) {
+    set_ram_floor_mb((gb.max(0.0) * 1024.0) as u64, false);
+}
+
+/// Tenths of a second since the process started: when an expert was last used.
+fn now_tick() -> u32 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    (T0.get_or_init(std::time::Instant::now).elapsed().as_millis() / 100) as u32
+}
+
+/// Per expert (layer * n_experts + expert): when it was last used, and whether its pages may be in RAM.
+struct ExpertUse {
+    tick: Vec<AtomicU32>,
+    resident: Vec<AtomicBool>,
+}
+
+/// Keeps the RAM floor: a few times a second, while available memory is under it, releases the experts
+/// used least recently (none used in the last two seconds: those are this reply's) from the working set.
+struct Trimmer {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Trimmer {
+    /// `layout`: per layer, (address, bytes per expert) of the gate, up and down tensors in the mapping.
+    fn start(uses: Arc<ExpertUse>, layout: Vec<[(usize, usize); 3]>, n_experts: usize) -> Trimmer {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("ram floor".into())
+            .spawn(move || {
+                const MARGIN: u64 = 256 << 20; // released past the floor, so it is not crossed again at once
+                const HOT: u32 = 20; // used in the last 2 s: kept
+                while !s.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let floor = RAM_FLOOR_MB.load(Ordering::Relaxed) << 20;
+                    if floor == 0 {
+                        continue;
+                    }
+                    let avail = os::available_ram();
+                    if avail >= floor {
+                        continue;
+                    }
+                    let need = floor - avail + MARGIN;
+                    let now = now_tick();
+                    let mut cold: Vec<(u32, usize)> = (0..uses.tick.len())
+                        .filter(|&i| uses.resident[i].load(Ordering::Relaxed) && layout[i / n_experts][0].1 > 0)
+                        .map(|i| (uses.tick[i].load(Ordering::Relaxed), i))
+                        .filter(|&(t, _)| now.saturating_sub(t) > HOT)
+                        .collect();
+                    cold.sort_unstable();
+                    let mut freed = 0u64;
+                    for (_, i) in cold {
+                        let (l, e) = (i / n_experts, i % n_experts);
+                        let ranges = layout[l].map(|(a, stride)| (a + e * stride, stride));
+                        os::release(&ranges);
+                        uses.resident[i].store(false, Ordering::Relaxed);
+                        freed += ranges.iter().map(|r| r.1 as u64).sum::<u64>();
+                        if freed >= need {
+                            break;
+                        }
+                    }
+                    RAM_RELEASED.fetch_add(freed, Ordering::Relaxed);
+                }
+            })
+            .ok();
+        Trimmer { stop, thread }
+    }
+}
+
+impl Drop for Trimmer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 struct CpuMoe {
+    _trim: Trimmer,      // first, as the prefetcher: its thread stops before the mapping it releases goes
     prefetch: Prefetcher, // first, so its thread has stopped before the mapping it reads goes
+    uses: Arc<ExpertUse>,
+    file: std::fs::File, // for reading experts without mapping them in (prompts, under a RAM floor)
     mmap: memmap2::Mmap,
     n_experts: usize,
     routers: Vec<Vec<f32>>,          // per layer: n_experts rows of dim logit weights (empty: a dense layer)
@@ -5315,7 +5486,19 @@ impl CpuMoe {
             let (dim, ffn) = (cfg.dim, cfg.expert_ffn_dim);
             tensors.push([part("ffn_gate_exps", ffn, dim)?, part("ffn_up_exps", ffn, dim)?, part("ffn_down_exps", dim, ffn)?]);
         }
-        Ok(CpuMoe { prefetch: Prefetcher::new(), mmap, n_experts: cfg.n_experts, routers, biases, tensors })
+        let n = cfg.n_layers * cfg.n_experts;
+        let uses = Arc::new(ExpertUse { tick: (0..n).map(|_| AtomicU32::new(0)).collect(), resident: (0..n).map(|_| AtomicBool::new(false)).collect() });
+        let base = mmap.as_ptr() as usize;
+        let layout: Vec<[(usize, usize); 3]> = tensors.iter().map(|ts| ts.map(|t| (base + t.offset, t.stride))).collect();
+        let trim = Trimmer::start(uses.clone(), layout, cfg.n_experts);
+        Ok(CpuMoe { _trim: trim, prefetch: Prefetcher::new(), uses, file, mmap, n_experts: cfg.n_experts, routers, biases, tensors })
+    }
+
+    /// Notes that expert e of layer l is in use now (its pages are, or are about to be, in RAM).
+    fn touch(&self, l: usize, e: usize) {
+        let i = l * self.n_experts + e;
+        self.uses.tick[i].store(now_tick(), Ordering::Relaxed);
+        self.uses.resident[i].store(true, Ordering::Relaxed);
     }
 
     /// Starts reading layer l's experts (those `cached` does not hold in GPU memory) off the disk, as
@@ -5332,17 +5515,19 @@ impl CpuMoe {
                 }
                 let first = e;
                 while e < self.n_experts && cached[e] < 0 {
+                    self.touch(l, e); // read now for this batch: not the RAM floor's to release meanwhile
                     e += 1;
                 }
                 ranges.push((base + t.offset + first * t.stride, (e - first) * t.stride));
             }
         }
-        if std::env::var_os("GHOST_INFER_NO_PREFETCH").is_none() {
+        if std::env::var_os("GHOST_INFER_NO_PREFETCH").is_none() && ram_floor_mb() == 0 {
             self.prefetch.request(l, ranges);
         }
     }
 
     fn expert(&self, l: usize, e: usize) -> crate::model::Expert<'_> {
+        self.touch(l, e);
         let m = |t: &ExpertTensor| {
             let at = t.offset + e * t.stride;
             crate::quant::Matrix { data: &self.mmap[at..at + t.stride], ty: t.ty, rows: t.rows, cols: t.cols }
@@ -5531,6 +5716,7 @@ struct ExpertCache {
     conv_d: DeviceBuf,
     idx: DeviceBuf, // per layer: the tokens of each expert in turn, and their weights
     staged: usize,
+    read_buf: Vec<u8>, // with a RAM floor: an expert read from the file for staging (gate, up, down)
 }
 
 impl Drop for ExpertCache {
@@ -5598,6 +5784,7 @@ impl ExpertCache {
             conv_d: DeviceBuf::alloc(conv_elems / 32 * 4)?,
             idx: DeviceBuf::alloc(idx_bytes)?,
             staged: 0,
+            read_buf: Vec::new(),
         };
         cache.add_blocks(budget.saturating_sub(extras));
         Ok(cache)
@@ -5683,7 +5870,22 @@ impl ExpertCache {
         a.check(unsafe { (a.f.cuEventSynchronize)(self.events[i]) }, "staging wait")?;
         let buf = unsafe { std::slice::from_raw_parts_mut(self.pinned[i], self.scratch_bytes) };
         let t = std::time::Instant::now();
-        let bytes = self.pack(moe, l, e, buf);
+        let bytes = if ram_floor_mb() > 0 {
+            // a prompt uses nearly every expert: mapped in, they would fill the RAM the floor keeps free (and
+            // be released and read again, over and over); read from the file they only pass through
+            let [g, u, d] = moe.tensors[l].map(|t| (t.offset + e * t.stride, t.stride));
+            self.read_buf.resize(g.1 + u.1 + d.1, 0);
+            let (gb, rest) = self.read_buf.split_at_mut(g.1);
+            let (ub, db) = rest.split_at_mut(u.1);
+            for (dst, (at, _)) in [(gb, g), (ub, u), (db, d)] {
+                read_exact_at(&moe.file, dst, at as u64)?;
+            }
+            let (gate, rest) = self.read_buf.split_at(g.1);
+            let (up, down) = rest.split_at(u.1);
+            Self::pack_parts(gate, up, down, self.gate_bytes[l], iq2_fmt(&moe.tensors[l]).is_some(), buf)
+        } else {
+            self.pack(moe, l, e, buf)
+        };
         // a couple of MB from RAM take well under a millisecond; longer means the weights came off the disk
         let ms = t.elapsed().as_millis() as u64;
         if ms >= 3 {
@@ -5987,6 +6189,8 @@ impl GpuWhisper {
                 device: String::new(),
                 int8_q8: false,
                 iq_scratch: None,
+                lora_t: None,
+                lora: None,
                 _weights: None,
             },
             enc,
@@ -6261,6 +6465,10 @@ pub struct GpuModel {
     pub int8_q8: bool,
     /// 2-bit weights (Fmt::Iq2) as Q8 for prompt batches: int8 values, f32 scales
     iq_scratch: Option<(DeviceBuf, DeviceBuf)>,
+    /// a LoRA adapter's scratch (max_batch x its rank: each pair's A·x), when one is attached
+    lora_t: Option<DeviceBuf>,
+    /// the attached adapter's file, for the server's model description
+    pub lora: Option<std::path::PathBuf>,
     /// the weights' memory (dropped after the buffers pointing into it, which free nothing)
     _weights: Option<Arena>,
 }
@@ -6351,7 +6559,7 @@ impl GpuModel {
             } else {
                 GpuFfn::Dense { gate_up: upload_parts(g, &[p("ffn_gate"), p("ffn_up")], up)?, down: upload_one(g, &p("ffn_down"), up)? }
             };
-            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, mla, delta, wo, ffn_norm, ffn });
+            layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, mla, delta, wo, ffn_norm, ffn, lora: GpuLayerLora::default() });
         }
         let moe = if cfg.is_moe() { Some(CpuMoe::load(g, &cfg)?) } else { None };
         let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight", up)?) } else { None };
@@ -6425,14 +6633,22 @@ impl GpuModel {
         }
         let output_norm = upload_vec(g, "output_norm.weight", up)?;
         up.finish()?;
-        let model = GpuModel { output_norm, rope_freqs, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false, iq_scratch, _weights: up.arena.take() };
+        // Everything read through the model's map while loading is in GPU memory now; left alone, those pages
+        // stay in this process's working set (the whole trunk, and more), a second copy that RAM is too short
+        // for beside the CPU's experts and other programs. Out of the working set they become file cache:
+        // reused first when memory is short, read again from the file if anything touches them later.
+        let ws_loaded = os::page_faults().1;
+        os::release(&[(g.mmap.as_ptr() as usize, g.mmap.len())]);
+        let model = GpuModel { output_norm, rope_freqs, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false, iq_scratch, lora_t: None, lora: None, _weights: up.arena.take() };
         if std::env::var_os("GHOST_INFER_LOAD_TIMES").is_some() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "[GPU load: driver {:.0} ms, kernels {:.0} ms, weights {:.0} ms]",
+                "[GPU load: driver {:.0} ms, kernels {:.0} ms, weights {:.0} ms; RAM in use {} MB, {} MB once the uploaded weights left it]",
                 ms(t_api),
                 ms(t_kernels - t_api),
-                ms(t0.elapsed() - t_kernels)
+                ms(t0.elapsed() - t_kernels),
+                ws_loaded >> 20,
+                os::page_faults().1 >> 20
             );
         }
         Ok(model)
@@ -6628,6 +6844,100 @@ impl GpuModel {
         }
         k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xb.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
         self.matmul(parts, s.xb.ptr, out, out_stride, n, false, s)
+    }
+
+    /// `norm_matmul`, then each LoRA pair added to its rows of the packed output. With pairs the norm is
+    /// written out in f32 (s.xb) for them to read, instead of straight to int8.
+    #[allow(clippy::too_many_arguments)]
+    fn norm_matmul_lora(&self, norm: &DeviceBuf, parts: &[(&GpuMatrix, usize)], loras: &[GpuLora], out: u64, out_stride: usize, n: usize, s: &GpuSession) -> Result<(), String> {
+        if loras.is_empty() {
+            return self.norm_matmul(norm, parts, out, out_stride, n, s);
+        }
+        let (k, c) = (&self.k, &self.cfg);
+        k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xb.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
+        self.matmul(parts, s.xb.ptr, out, out_stride, n, false, s)?;
+        loras.iter().try_for_each(|p| self.lora_apply(p, s.xb.ptr, out, out_stride, n))
+    }
+
+    /// `out[b * stride + p.off ..] += p.scale · B·(A·x_b)` for the n rows of x (f32).
+    fn lora_apply(&self, p: &GpuLora, x: u64, out: u64, out_stride: usize, n: usize) -> Result<(), String> {
+        let k = &self.k;
+        let t = self.lora_t.as_ref().ok_or("a LoRA pair without its scratch")?.ptr;
+        k.launch(k.lora_a, (p.r as u32, n as u32), 256, 0, &[Arg::P(p.a.ptr), Arg::P(x), Arg::P(t), Arg::I(p.r as i32), Arg::I(p.cols as i32)])?;
+        k.launch(
+            k.lora_b,
+            (p.rows.div_ceil(256) as u32, n as u32),
+            256,
+            0,
+            &[Arg::P(p.b.ptr), Arg::P(t), Arg::P(out), Arg::I(p.rows as i32), Arg::I(p.r as i32), Arg::I(out_stride as i32), Arg::I(p.off as i32), Arg::F(p.scale)],
+        )
+    }
+
+    /// Adds a LoRA adapter on top of the weights (see crate::lora): grouped-query attention and dense
+    /// feed-forward layers. The pairs live in GPU memory as f32 (a rank-16 adapter on every projection of a
+    /// 4B model: about 130 MB).
+    pub fn attach_lora(&mut self, ad: &crate::lora::Adapter) -> Result<(), String> {
+        use crate::lora::{Adapter, Pair};
+        let c = &self.cfg;
+        if ad.layers.len() > self.layers.len() {
+            return Err(format!("the adapter has {} layers, the model {}", ad.layers.len(), self.layers.len()));
+        }
+        let k = self.k.clone();
+        let up = |p: &Pair, off: usize| -> Result<GpuLora, String> {
+            let (a, b) = (DeviceBuf::alloc(p.a.len() * 4)?, DeviceBuf::alloc(p.b.len() * 4)?);
+            k.h2d(a.ptr, &p.a)?;
+            k.h2d(b.ptr, &p.b)?;
+            Ok(GpuLora { a, b, r: p.r, rows: p.rows, cols: p.cols, off, scale: p.scale })
+        };
+        let q_dim = c.n_heads * c.head_dim;
+        let q_rows = if c.attn_gated { 2 * q_dim } else { q_dim };
+        let kv_rows = c.n_kv_heads * c.head_dim;
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let lo = ad.layer(l);
+            if lo.is_empty() {
+                continue;
+            }
+            let mut g = GpuLayerLora::default();
+            if lo.q.is_some() || lo.k.is_some() || lo.v.is_some() {
+                if layer.mla.is_some() || layer.delta.is_some() {
+                    return Err(format!("layer {l}: LoRA on this kind of attention is not supported"));
+                }
+                for (pair, rows, off, what) in [(&lo.q, q_rows, 0, "attn_q"), (&lo.k, kv_rows, q_rows, "attn_k"), (&lo.v, kv_rows, q_rows + kv_rows, "attn_v")] {
+                    Adapter::check(pair, rows, c.dim, &format!("layer {l} {what}"))?;
+                    if let Some(p) = pair {
+                        g.qkv.push(up(p, off)?);
+                    }
+                }
+            }
+            Adapter::check(&lo.o, layer.wo.rows, layer.wo.cols, &format!("layer {l} attn_output"))?;
+            if let Some(p) = &lo.o {
+                if layer.mla.is_some() || layer.delta.is_some() {
+                    return Err(format!("layer {l}: LoRA on this kind of attention is not supported"));
+                }
+                g.o = Some(up(p, 0)?);
+            }
+            if lo.gate.is_some() || lo.up.is_some() || lo.down.is_some() {
+                let GpuFfn::Dense { down, .. } = &layer.ffn else {
+                    return Err(format!("layer {l}: LoRA on a mixture of experts is not supported"));
+                };
+                let hidden = down.cols;
+                Adapter::check(&lo.gate, hidden, c.dim, &format!("layer {l} ffn_gate"))?;
+                Adapter::check(&lo.up, hidden, c.dim, &format!("layer {l} ffn_up"))?;
+                Adapter::check(&lo.down, down.rows, hidden, &format!("layer {l} ffn_down"))?;
+                for (pair, off) in [(&lo.gate, 0), (&lo.up, hidden)] {
+                    if let Some(p) = pair {
+                        g.gate_up.push(up(p, off)?);
+                    }
+                }
+                if let Some(p) = &lo.down {
+                    g.down = Some(up(p, 0)?);
+                }
+            }
+            layer.lora = g;
+        }
+        self.lora_t = Some(DeviceBuf::alloc(max_batch(c) * ad.rank * 4)?);
+        self.lora = Some(ad.path.clone());
+        Ok(())
     }
 
     fn matmul_one(&self, m: &GpuMatrix, x: u64, out: u64, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
@@ -7238,7 +7548,7 @@ impl GpuModel {
     /// Layer l's feed-forward, added to s.x.
     fn ffn(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession) -> Result<(), String> {
         match &layer.ffn {
-            GpuFfn::Dense { gate_up, down } => self.swiglu(gate_up, down, &layer.ffn_norm, None, n, s),
+            GpuFfn::Dense { gate_up, down } => self.swiglu_lora(gate_up, down, &layer.ffn_norm, &layer.lora, n, s),
             GpuFfn::Moe { shared, gate } => {
                 self.moe_ffn(l, layer, n, s)?;
                 match (shared, gate) {
@@ -7260,6 +7570,22 @@ impl GpuModel {
     /// normed input), then down.
     fn swiglu(&self, gate_up: &[(GpuMatrix, usize)], down: &GpuMatrix, norm: &DeviceBuf, normed: Option<u64>, n: usize, s: &GpuSession) -> Result<(), String> {
         self.swiglu_to(gate_up, down, norm, normed, n, s, s.x.ptr, true)
+    }
+
+    /// A dense layer's `swiglu` with its LoRA pairs: [gate | up] with theirs, silu(gate) * up in f32 (s.h) for
+    /// ffn_down's pair to read, ffn_down with its own. Without pairs, `swiglu` as it is.
+    fn swiglu_lora(&self, gate_up: &[(GpuMatrix, usize)], down: &GpuMatrix, norm: &DeviceBuf, lo: &GpuLayerLora, n: usize, s: &GpuSession) -> Result<(), String> {
+        if lo.gate_up.is_empty() && lo.down.is_none() {
+            return self.swiglu(gate_up, down, norm, None, n, s);
+        }
+        let k = &self.k;
+        let hidden = down.cols;
+        let parts: Vec<(&GpuMatrix, usize)> = gate_up.iter().map(|(m, off)| (m, *off)).collect();
+        self.norm_matmul_lora(norm, &parts, &lo.gate_up, s.gu.ptr, 2 * hidden, n, s)?;
+        let total = (n * hidden) as u32;
+        k.launch(k.silu_mul, (total.div_ceil(256), 1), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.h.ptr), Arg::I(hidden as i32), Arg::I(n as i32)])?;
+        self.matmul_one(down, s.h.ptr, s.x.ptr, n, true, s)?;
+        lo.down.as_ref().map_or(Ok(()), |p| self.lora_apply(p, s.h.ptr, s.x.ptr, self.cfg.dim, n))
     }
 
     /// `swiglu` into `out` (n rows of dim), added to it if `accumulate`.
@@ -7401,11 +7727,11 @@ impl GpuModel {
                 // [q | gate] per head, then k and v, into s.gu; split into the packed rows and the gates (s.h)
                 let rows = 2 * c.n_heads * hd + 2 * c.n_kv_heads * hd;
                 self.timed(2, || {
-                    self.norm_matmul(&layer.attn_norm, &qkv, s.gu.ptr, rows, n, s)?;
+                    self.norm_matmul_lora(&layer.attn_norm, &qkv, &layer.lora.qkv, s.gu.ptr, rows, n, s)?;
                     k.launch(k.next_split_qgate, (n as u32, (c.n_heads + 2 * c.n_kv_heads) as u32), 128, 0, &[Arg::P(s.gu.ptr), Arg::I(rows as i32), Arg::P(s.qkv.ptr), Arg::P(s.h.ptr), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32)])
                 })?;
             } else {
-                self.timed(2, || self.norm_matmul(&layer.attn_norm, &qkv, s.qkv.ptr, qkv_rows, n, s))?;
+                self.timed(2, || self.norm_matmul_lora(&layer.attn_norm, &qkv, &layer.lora.qkv, s.qkv.ptr, qkv_rows, n, s))?;
             }
             self.timed(3, || {
                 let (qn, kn) = match (&layer.q_norm, &layer.k_norm) {
@@ -7470,7 +7796,10 @@ impl GpuModel {
                 let len = n * c.n_heads * hd;
                 self.timed(4, || k.launch(k.sigmoid_mul, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.att.ptr), Arg::P(s.h.ptr), Arg::I(len as i32)]))?;
             }
-            self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
+            self.timed(5, || {
+                self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s)?;
+                layer.lora.o.as_ref().map_or(Ok(()), |p| self.lora_apply(p, s.att.ptr, s.x.ptr, c.dim, n))
+            })?;
 
             self.timed(6, || self.ffn(l, layer, n, s))?;
         }
@@ -8024,7 +8353,7 @@ pub fn moe_stats_take(tokens: usize) -> Option<String> {
     let (faults, working_set) = os::page_faults();
     let new_faults = faults.saturating_sub(FAULTS.swap(faults, Ordering::Relaxed));
     Some(format!(
-        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache, {:.1} uploads and {:.0} page faults per token (working set {} MB); per token: waiting for the GPU {:.2} ms, routing {:.2} ms, CPU experts {:.2} ms, copy back {:.2} ms, cache upkeep {:.2} ms]",
+        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache, {:.1} uploads and {:.0} page faults per token (working set {} MB); per token: waiting for the GPU {:.2} ms, routing {:.2} ms, CPU experts {:.2} ms, copy back {:.2} ms, cache upkeep {:.2} ms{}]",
         v[MS_STEPS],
         100.0 * hits,
         v[MS_UPLOADS] as f64 / tokens,
@@ -8034,7 +8363,11 @@ pub fn moe_stats_take(tokens: usize) -> Option<String> {
         ms(MS_ROUTE),
         ms(MS_CPU),
         ms(MS_BACK),
-        ms(MS_NOTE)
+        ms(MS_NOTE),
+        match ram_floor_mb() {
+            0 => String::new(),
+            mb => format!("; RAM floor {mb} MB, {} MB of experts released for it so far, {} MB available", RAM_RELEASED.load(Ordering::Relaxed) >> 20, os::available_ram() >> 20),
+        }
     ))
 }
 

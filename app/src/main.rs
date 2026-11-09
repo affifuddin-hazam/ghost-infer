@@ -328,6 +328,11 @@ fn split_think(raw: &str) -> (&str, &str) {
     }
 }
 
+/// The installed skills in an /api/skills answer: name and description.
+fn skills_of(j: &Json) -> Vec<(String, String)> {
+    j.get("skills").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("description").and_then(Json::as_str).unwrap_or("").to_string()))).collect()
+}
+
 /// A task list as the server keeps it: [{"text","status"}].
 fn tasks_of(j: Option<&Json>) -> Vec<(String, String)> {
     j.and_then(Json::as_array)
@@ -738,6 +743,8 @@ struct App {
     download_rate: (f64, Option<Instant>, f64), // bytes at the last look, when, and bytes a second
     pick_model: bool,        // a folder of models was just added: the model menu opens once connected
     warm_up: bool,           // the server runs a few short replies after a model loads (its harness setting)
+    ram_floor_gb: f64,       // RAM the server keeps free for other programs while a model bigger than the GPU runs (0: all)
+    ram_floor_fixed: bool,   // the server was started with --ram-floor: the setting does not apply
     preview_url: Option<String>, // the web page the agent last wrote, for the preview pane
     preview_open: bool,      // the pane is shown
     chip: Option<String>,    // a command or skill picked with /: a chip before the text, sent as /name
@@ -898,6 +905,7 @@ enum Message {
     TogglePlan,
     ToggleLoadLast,
     ToggleWarmUp,
+    SetRamFloor(f64),
     Quit,
     System(Result<Json, String>),
     UndoAll,
@@ -919,6 +927,7 @@ enum Message {
     InstallChoice(Option<String>), // one of a source's skills, by path (None: all of them)
     CancelChoice,
     Skills(Result<Json, String>),
+    SkillsRead(Result<Json, String>), // the list read again when a / is typed (a failure says nothing)
     RemoveSkill(String),
     Mcp(Result<Json, String>),
     McpReload,
@@ -1059,6 +1068,8 @@ impl App {
             pick_model: false,
             model_folders: Vec::new(),
             warm_up: true,
+            ram_floor_gb: 2.0,
+            ram_floor_fixed: false,
             preview_url: None,
             preview_open: false,
             voice: false,
@@ -1634,6 +1645,11 @@ impl App {
                 let body = obj(vec![("folders", Json::Arr(self.folders.iter().map(|f| str(f)).collect())), ("warm_up", Json::Bool(self.warm_up))]);
                 return self.call(move |api| api.post("/api/harness", &body), Message::Harness);
             }
+            Message::SetRamFloor(gb) => {
+                self.ram_floor_gb = gb;
+                let body = obj(vec![("folders", Json::Arr(self.folders.iter().map(|f| str(f)).collect())), ("ram_floor_gb", num(gb))]);
+                return self.call(move |api| api.post("/api/harness", &body), Message::Harness);
+            }
             Message::ToggleLoadLast => {
                 self.load_last = !self.load_last;
                 // on with nothing picked yet: the model running now is the one to start with
@@ -2009,7 +2025,7 @@ impl App {
             }
             Message::CancelChoice => self.skill_choices = None,
             Message::Skills(Ok(j)) => {
-                self.skills = j.get("skills").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("description").and_then(Json::as_str).unwrap_or("").to_string()))).collect();
+                self.skills = skills_of(&j);
                 if let Some(name) = j.get("installed").and_then(Json::as_str) {
                     self.skill_choices = None;
                     self.status = if name.contains(", ") { tf!("Installed the skills {name}", "已安装技能 {name}") } else { tf!("Installed the {name} skill", "已安装技能 {name}") };
@@ -2021,6 +2037,8 @@ impl App {
                     self.skill_choices = Some((s(&j, "source"), choices));
                 }
             }
+            Message::SkillsRead(Ok(j)) => self.skills = skills_of(&j),
+            Message::SkillsRead(Err(_)) => {}
             Message::Skills(Err(e)) => self.status = format!("Couldn't install the skill: {e}"),
             Message::RemoveSkill(name) => {
                 let body = obj(vec![("name", str(&name))]);
@@ -2142,6 +2160,8 @@ impl App {
     fn set_harness(&mut self, j: &Json) {
         self.folders = j.get("folders").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
         self.warm_up = j.get("warm_up").and_then(Json::as_bool).unwrap_or(true);
+        self.ram_floor_gb = j.get("ram_floor_gb").and_then(Json::as_f64).unwrap_or(2.0);
+        self.ram_floor_fixed = j.get("ram_floor_fixed").and_then(Json::as_bool).unwrap_or(false);
     }
 
     /// Sends the new folder list to the server (it checks each one is a folder).
@@ -2688,10 +2708,13 @@ impl App {
                 return Task::none();
             }
         }
+        // a / just typed: the installed skills read again, so one installed elsewhere (the model's install_skill,
+        // another client, a folder copied in) is in the list without restarting the app
+        let fresh = if matches!(self.slash_typed(), Some((q, _, _)) if q.is_empty()) { self.call(|api| api.get("/api/skills"), Message::SkillsRead) } else { Task::none() };
         if self.slash_list().is_empty() {
-            return Task::none();
+            return fresh;
         }
-        iced::widget::selector::find(iced::widget::selector::id("composer")).map(|t| Message::ComposerAt(t.map(|t| t.bounds())))
+        Task::batch([fresh, iced::widget::selector::find(iced::widget::selector::id("composer")).map(|t| Message::ComposerAt(t.map(|t| t.bounds())))])
     }
 
     /// Sends the composer's text (or, for a retry, answers the last message again) and streams the reply.

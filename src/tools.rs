@@ -27,11 +27,18 @@ pub struct Settings {
     pub always: Vec<String>,
     /// a few short replies right after a model loads, so its weights are in memory before the first chat
     pub warm_up: bool,
+    /// RAM (GB) to keep available for other programs while a mixture of experts runs; 0: fill RAM with
+    /// experts (cuda::set_ram_floor_mb; a --ram-floor given on the command line wins)
+    pub ram_floor_gb: f64,
 }
+
+/// The RAM floor a new installation starts with: on a 16 GB computer, measured as fast as filling RAM
+/// (prompts within a few percent, generation no slower) while the computer stays usable.
+pub const DEFAULT_RAM_FLOOR_GB: f64 = 2.0;
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { folders: Vec::new(), always: Vec::new(), warm_up: true }
+        Settings { folders: Vec::new(), always: Vec::new(), warm_up: true, ram_floor_gb: DEFAULT_RAM_FLOOR_GB }
     }
 }
 
@@ -39,6 +46,12 @@ impl Default for Settings {
 /// commands may run there (for a skill's scripts), but nothing is written there except by installing.
 pub fn skills_dir() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("skills"))
+}
+
+/// The plugins ghost wrote for itself (server/plugins.rs): readable by the file tools, so a broken one can be
+/// read and fixed, but written only through plugin_manager (whose saves the user approves).
+pub fn plugins_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("plugins"))
 }
 
 /// Where tool outputs too long for the model's context are saved, a folder per chat
@@ -63,7 +76,8 @@ impl Settings {
             .and_then(|j| j.get("always").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect()))
             .unwrap_or_default();
         let warm_up = Json::parse(&text).ok().and_then(|j| j.get("warm_up").and_then(Json::as_bool)).unwrap_or(true);
-        Settings { folders, always, warm_up }
+        let ram_floor_gb = Json::parse(&text).ok().and_then(|j| j.get("ram_floor_gb").and_then(Json::as_f64)).unwrap_or(DEFAULT_RAM_FLOOR_GB);
+        Settings { folders, always, warm_up, ram_floor_gb }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -79,11 +93,12 @@ impl Settings {
             ("folders", Json::Arr(self.folders.iter().map(|f| str(&f.display().to_string())).collect())),
             ("always", Json::Arr(self.always.iter().map(|g| str(g)).collect())),
             ("warm_up", Json::Bool(self.warm_up)),
+            ("ram_floor_gb", num(self.ram_floor_gb)),
         ])
     }
 
-    /// Settings from a client: folders that exist, as given (duplicates dropped); "always" and "warm_up" if
-    /// sent, else kept.
+    /// Settings from a client: folders that exist, as given (duplicates dropped); "always", "warm_up" and
+    /// "ram_floor_gb" if sent, else kept.
     pub fn from_json(j: &Json, old: &Settings) -> Result<Settings, String> {
         let mut folders: Vec<PathBuf> = Vec::new();
         for f in j.get("folders").and_then(Json::as_array).ok_or("send {\"folders\": [...]}")? {
@@ -104,7 +119,11 @@ impl Settings {
             None => old.always.clone(),
         };
         let warm_up = j.get("warm_up").and_then(Json::as_bool).unwrap_or(old.warm_up);
-        Ok(Settings { folders, always, warm_up })
+        let ram_floor_gb = match j.get("ram_floor_gb") {
+            Some(v) => v.as_f64().filter(|g| (0.0..=256.0).contains(g)).ok_or("ram_floor_gb is GB of RAM to keep free, 0 to 256")?,
+            None => old.ram_floor_gb,
+        };
+        Ok(Settings { folders, always, warm_up, ram_floor_gb })
     }
 
     /// `path` (absolute, or relative to the first allowed folder) if it lies inside an allowed folder. It is
@@ -138,7 +157,7 @@ impl Settings {
         Err(format!("{path} is outside the allowed folders ({})", self.folder_list()))
     }
 
-    /// `resolve`, or else an absolute path inside the skills folder or the saved outputs' folder: for reading
+    /// `resolve`, or else an absolute path inside the skills, plugins or saved outputs' folder: for reading
     /// and for a command's folder, never for writing (the write tools use `resolve`).
     pub fn resolve_read(&self, path: &str) -> Result<PathBuf, String> {
         let err = match self.resolve(path) {
@@ -147,7 +166,7 @@ impl Settings {
         };
         let p = Path::new(path.trim());
         if p.is_absolute() {
-            for root in [skills_dir(), outputs_dir()].into_iter().flatten() {
+            for root in [skills_dir(), outputs_dir(), plugins_dir()].into_iter().flatten() {
                 if let (Ok(real), Ok(r)) = (std::fs::canonicalize(p), std::fs::canonicalize(root)) {
                     if real.starts_with(&r) {
                         return Ok(real);
@@ -205,7 +224,7 @@ pub fn run_full(name: &str, args: &Json, s: &Settings, checkpoint: &str) -> Resu
         }
         // the chat that started it: a checkpoint is the chat's id and a time
         "start_process" => start_process(need("command")?, &s.resolve_read(text("cwd").unwrap_or("."))?, text("description").unwrap_or(""), checkpoint.rsplit_once('-').map_or("", |(c, _)| c))?,
-        "check_process" => check_process(count("id").ok_or("check_process needs \"id\"")?)?,
+        "check_process" => check_process(count("id").ok_or("check_process needs \"id\"")?, args.get("wait").and_then(Json::as_f64).map_or(CHECK_WAIT_SECS, |w| w.max(0.0) as usize).min(MAX_CHECK_WAIT_SECS))?,
         "stop_process" => stop_process(count("id").ok_or("stop_process needs \"id\"")?)?,
         "web_search" => web_search(need("query")?)?,
         // a site by its name alone (penipu.my) is its https address
@@ -587,11 +606,18 @@ fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
 
 /// Reads a child's stdout and stderr on two threads into one shared buffer, keeping its last `keep` bytes.
 fn collect(child: &mut std::process::Child, keep: usize) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    collect_counted(child, keep).0
+}
+
+/// `collect`, with a count of every byte the child has printed (the buffer keeps only the last `keep`), so a
+/// reader can tell what is new after old output was dropped. The count changes under the buffer's lock.
+fn collect_counted(child: &mut std::process::Child, keep: usize) -> (std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::io::Read;
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pipes: Vec<Box<dyn Read + Send>> = [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten().collect();
     for mut pipe in pipes {
-        let buf = buf.clone();
+        let (buf, total) = (buf.clone(), total.clone());
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             while let Ok(n) = pipe.read(&mut chunk) {
@@ -600,6 +626,7 @@ fn collect(child: &mut std::process::Child, keep: usize) -> std::sync::Arc<std::
                 }
                 let mut b = buf.lock().unwrap();
                 b.extend_from_slice(&chunk[..n]);
+                total.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 if b.len() > keep {
                     let cut = b.len() - keep;
                     b.drain(..cut);
@@ -607,7 +634,7 @@ fn collect(child: &mut std::process::Child, keep: usize) -> std::sync::Arc<std::
             }
         });
     }
-    buf
+    (buf, total)
 }
 
 /// Ends a process and everything it started (taskkill /T), by process id.
@@ -652,7 +679,8 @@ struct Background {
     command: String,
     child: std::process::Child,
     out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    seen: usize,
+    total: std::sync::Arc<std::sync::atomic::AtomicUsize>, // every byte it has printed (`out` keeps the last BG_KEEP)
+    seen: usize,                                           // how many of those the model has been shown
     started: std::time::Instant,
     ended: Option<(std::time::Duration, Option<i32>)>, // how long it ran, and its exit code, once seen to end
     stopped: bool,                                       // ended by stop_process
@@ -670,6 +698,40 @@ impl Background {
         }
         self.ended.is_none()
     }
+
+    /// Bytes printed that the model has not been shown yet.
+    fn unseen(&self) -> usize {
+        self.total.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(self.seen)
+    }
+
+    /// The output printed since the model last looked (the kept part of it), marked seen.
+    fn take_new(&mut self) -> String {
+        let buf = self.out.lock().unwrap();
+        let total = self.total.load(std::sync::atomic::Ordering::Relaxed);
+        let new = total.saturating_sub(self.seen);
+        let kept = new.min(buf.len());
+        let text = text_of(&buf[buf.len() - kept..]);
+        drop(buf);
+        self.seen = total;
+        if new > kept { format!("(earlier output dropped: only its last {} KB is kept)\n{text}", BG_KEEP >> 10) } else { text }
+    }
+
+    /// "still running for 3m 20s", "finished after 41 s with exit code 1", "stopped".
+    fn state(&mut self) -> String {
+        let ago = |d: std::time::Duration| match d.as_secs() {
+            s if s < 60 => format!("{s} s"),
+            s => format!("{}m {:02}s", s / 60, s % 60),
+        };
+        match (self.running(), self.ended) {
+            (true, _) => format!("still running ({} so far)", ago(self.started.elapsed())),
+            (false, _) if self.stopped => "stopped".to_string(),
+            (false, end) => format!(
+                "finished after {} with exit code {}",
+                end.map_or("?".into(), |e| ago(e.0)),
+                end.and_then(|e| e.1).map_or("?".into(), |c| c.to_string())
+            ),
+        }
+    }
 }
 
 fn background() -> &'static std::sync::Mutex<Vec<Option<Background>>> {
@@ -679,42 +741,55 @@ fn background() -> &'static std::sync::Mutex<Vec<Option<Background>>> {
 
 fn start_process(command: &str, cwd: &Path, title: &str, chat: &str) -> Result<String, String> {
     let mut child = shell(command, cwd)?;
-    let out = collect(&mut child, BG_KEEP);
+    let (out, total) = collect_counted(&mut child, BG_KEEP);
     let mut bg = background().lock().unwrap();
-    bg.push(Some(Background { command: command.to_string(), child, out, seen: 0, started: std::time::Instant::now(), ended: None, stopped: false, title: title.trim().to_string(), chat: chat.to_string() }));
+    bg.push(Some(Background { command: command.to_string(), child, out, total, seen: 0, started: std::time::Instant::now(), ended: None, stopped: false, title: title.trim().to_string(), chat: chat.to_string() }));
     Ok(format!("started as process {}; read its output with check_process, end it with stop_process", bg.len()))
 }
 
-/// A background process's state and the output it printed since the last check.
-fn check_process(id: usize) -> Result<String, String> {
-    let mut bg = background().lock().unwrap();
-    let p = bg.get_mut(id - 1).and_then(Option::as_mut).ok_or_else(|| format!("no process {id}"))?;
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let state = match (p.running(), p.ended) {
-        (true, _) => "still running".to_string(),
-        (false, _) if p.stopped => "stopped".to_string(),
-        (false, end) => format!("finished, exit code {}", end.and_then(|e| e.1).map_or("?".into(), |c| c.to_string())),
-    };
-    let out = p.out.lock().unwrap();
-    // `seen` counts bytes of the kept tail; if old output was dropped since, start from what is left
-    let from = p.seen.min(out.len());
-    let new = text_of(&out[from..]);
-    p.seen = out.len();
-    Ok(format!("process {id} ({}): {state}\n{}", p.command, if new.is_empty() { "(no new output)".into() } else { new }))
+/// How long check_process waits for news by default, and at most.
+const CHECK_WAIT_SECS: usize = 30;
+const MAX_CHECK_WAIT_SECS: usize = 300;
+
+/// A background process's state and the output it printed since the last check. While it runs and has printed
+/// nothing new, this waits up to `wait` seconds for it to print or end (a model checking on a long build gets
+/// news instead of the same empty answer many times over). The process list is not held while waiting.
+fn check_process(id: usize, wait: usize) -> Result<String, String> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(wait as u64);
+    loop {
+        {
+            let mut bg = background().lock().unwrap();
+            let p = bg.get_mut(id.wrapping_sub(1)).and_then(Option::as_mut).ok_or_else(|| format!("no process {id}"))?;
+            let running = p.running();
+            // a little more output may follow what is there: a short pause before taking it
+            if !running || p.unseen() > 0 || std::time::Instant::now() >= until {
+                drop(bg);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let mut bg = background().lock().unwrap();
+                let p = bg.get_mut(id - 1).and_then(Option::as_mut).ok_or_else(|| format!("no process {id}"))?;
+                let state = p.state();
+                let new = p.take_new();
+                let note = if new.is_empty() && running { format!("(no new output in the last {wait} s)") } else if new.is_empty() { "(no new output)".into() } else { new };
+                return Ok(format!("process {id} ({}): {state}\n{note}", p.command));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 /// Ends a background process (it stays listed, as stopped, for the clients).
 fn stop_process(id: usize) -> Result<String, String> {
     let mut bg = background().lock().unwrap();
     let p = bg.get_mut(id - 1).and_then(Option::as_mut).ok_or_else(|| format!("no process {id}"))?;
+    // already ended: how, and what it printed that the model has not seen (often the error that ended it)
     if !p.running() {
-        return Ok(format!("process {id} had already ended"));
+        let (state, out) = (p.state(), p.take_new());
+        return Ok(format!("process {id} had already ended: {state}{}", if out.is_empty() { String::new() } else { format!("; its output since the last check:\n{out}") }));
     }
     kill_tree(p.child.id());
     let _ = p.child.wait();
     (p.stopped, p.ended) = (true, Some((p.started.elapsed(), None)));
-    let buf = p.out.lock().unwrap();
-    let out = text_of(&buf[p.seen.min(buf.len())..]);
+    let out = p.take_new();
     Ok(format!("process {id} stopped{}", if out.is_empty() { String::new() } else { format!("; its last output:\n{out}") }))
 }
 
@@ -987,6 +1062,8 @@ pub fn status(s: &Settings) -> Json {
         ("folders", j.get("folders").cloned().unwrap_or(Json::Null)),
         ("always", j.get("always").cloned().unwrap_or(Json::Null)),
         ("warm_up", Json::Bool(s.warm_up)),
+        ("ram_floor_gb", num(s.ram_floor_gb)),
+        ("ram_floor_fixed", Json::Bool(crate::cuda::ram_floor_fixed())),
         ("max_result", num(MAX_RESULT as f64)),
         ("processes", processes()),
     ])
@@ -995,6 +1072,42 @@ pub fn status(s: &Settings) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The id start_process gave, from its answer.
+    fn started(answer: &str) -> usize {
+        answer.split_whitespace().nth(3).and_then(|n| n.trim_end_matches(';').parse().ok()).unwrap()
+    }
+
+    #[test]
+    fn check_process_waits_for_news_and_tells_how_it_ended() {
+        let dir = std::env::temp_dir();
+        let id = started(&start_process("Start-Sleep -Milliseconds 2500; 'all done'; exit 3", &dir, "test", "test").unwrap());
+        let now = check_process(id, 0).unwrap();
+        assert!(now.contains("still running") && now.contains("no new output"), "{now}");
+        let t = std::time::Instant::now();
+        let news = check_process(id, 20).unwrap();
+        assert!(news.contains("all done"), "{news}");
+        assert!(t.elapsed().as_secs() < 15, "it waited for the whole 20 s");
+        let end = check_process(id, 20).unwrap();
+        assert!(end.contains("finished after") && end.contains("exit code 3"), "{end}");
+    }
+
+    #[test]
+    fn new_output_shows_after_the_kept_tail_is_full() {
+        let dir = std::env::temp_dir();
+        // ~400 KB, more than the 256 KB kept, then a last line after a pause
+        let id = started(&start_process("1..20000 | ForEach-Object { \"line $_ padding padding\" }; Start-Sleep -Milliseconds 1500; 'the last line'", &dir, "test", "test").unwrap());
+        let first = check_process(id, 20).unwrap();
+        assert!(first.contains("line 1") || first.contains("earlier output dropped"), "{}", &first[..200.min(first.len())]);
+        let mut last = String::new();
+        for _ in 0..5 {
+            last = check_process(id, 20).unwrap();
+            if last.contains("the last line") {
+                break;
+            }
+        }
+        assert!(last.contains("the last line"), "{}", &last[last.len().saturating_sub(300)..]);
+    }
 
     #[test]
     fn globs() {

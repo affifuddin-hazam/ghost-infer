@@ -73,14 +73,29 @@ pub fn list_json() -> Json {
     Json::Arr(list().iter().map(|s| obj(vec![("name", str(&s.name)), ("description", str(&s.description))])).collect())
 }
 
-/// What the system prompt says about the skills, or nothing when none are installed.
+/// What the system prompt says about the skills, or nothing when none are installed. Not their list: a chat
+/// carries none of them until it needs one (tool_search finds them, or the user names one with /<skill>), so
+/// a growing collection costs no prompt and does not distract a small model from a plain answer.
 pub fn prompt() -> String {
-    let skills = list();
-    if skills.is_empty() {
+    if list().is_empty() {
         return String::new();
     }
-    let lines: Vec<String> = skills.iter().map(|s| format!("- {}: {}", s.name, crate::tools::clip(&s.description, 400))).collect();
-    format!("Skills you can use. When a task matches one, call use_skill with its name before you start, then follow its instructions:\n{}", lines.join("\n"))
+    "Skills are installed: step-by-step instructions for special kinds of task. They are not listed here. When a task may have one, find it with tool_search (a few words saying what the task is), then load it with use_skill before you start.".into()
+}
+
+/// The skills whose name and description hold the most of these words (the name counting double): name and
+/// description, for tool_search.
+pub fn search(words: &[String], max: usize) -> Vec<(String, String)> {
+    let mut scored: Vec<(usize, Skill)> = list()
+        .into_iter()
+        .map(|s| {
+            let (name, desc) = (s.name.to_lowercase(), s.description.to_lowercase());
+            (words.iter().map(|w| 2 * name.contains(w.as_str()) as usize + desc.contains(w.as_str()) as usize).sum(), s)
+        })
+        .filter(|(n, _)| *n > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().take(max).map(|(_, s)| (s.name, s.description)).collect()
 }
 
 /// The most of a skill's instructions use_skill gives at once, in characters (about 6,000 tokens), in a

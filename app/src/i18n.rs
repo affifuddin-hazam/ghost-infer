@@ -99,6 +99,13 @@ pub fn tr(en: &'static str) -> &'static str {
         "Open with the last model" => "启动时打开上次的模型",
         "Loads the model you used last when ghost starts." => "Ghost 启动时加载你上次使用的模型。",
         "Warm up after loading" => "加载后预热",
+        "RAM" => "运行内存",
+        "RAM for experts" => "专家权重的内存",
+        "Use all" => "全部使用",
+        "Leave 2 GB" => "保留 2 GB",
+        "Leave 4 GB" => "保留 4 GB",
+        "Set when ghost started (--ram-floor)" => "启动时已设置（--ram-floor）",
+        "For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it can be a little faster on long prompts." => "适用于比显卡更大的模型。保留内存可让其他程序保持流畅；全部使用在长提示时可能略快一些。",
         "Runs a few short replies after a model loads, so the first real answer comes quickly." => {
             "模型加载后先跑几段简短回复，好让第一个真正的回答来得更快。"
         }

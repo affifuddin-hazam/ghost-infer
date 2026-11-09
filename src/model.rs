@@ -284,6 +284,8 @@ struct Layer<'a> {
     wo: Matrix<'a>, // attn_output, or a DeltaNet layer's ssm_out
     ffn_norm: Vec<f32>,
     ffn: Ffn<'a>,
+    /// a LoRA adapter's pairs for this layer (Model::attach_lora); empty: the weights as they are
+    lora: crate::lora::LayerLora,
 }
 
 /// A Gated DeltaNet layer's weights (see `Delta`).
@@ -537,11 +539,47 @@ impl<'a> Model<'a> {
             let wo = matrix(g, &p(if cfg.recurrent(i) { "ssm_out" } else { "attn_output" }))?;
             // qwen3next names the norm before the feed-forward after the attention it follows
             let ffn_norm = if g.tensor(&p("ffn_norm")).is_some() { vector(g, &p("ffn_norm"))? } else { vector(g, &p("post_attention_norm"))? };
-            layers.push(Layer { attn_norm: vector(g, &p("attn_norm"))?, attn, wo, ffn_norm, ffn });
+            layers.push(Layer { attn_norm: vector(g, &p("attn_norm"))?, attn, wo, ffn_norm, ffn, lora: Default::default() });
         }
         // small models tie the output projection to the embedding table
         let output = if g.tensor("output.weight").is_some() { matrix(g, "output.weight")? } else { token_embd };
         Ok(Model { output_norm: vector(g, "output_norm.weight")?, cfg, token_embd, layers, output })
+    }
+
+    /// Adds a LoRA adapter on top of the weights (see crate::lora). Grouped-query attention and dense
+    /// feed-forward layers only; the adapter's shapes must be this model's.
+    pub fn attach_lora(&mut self, ad: &crate::lora::Adapter) -> Result<(), String> {
+        use crate::lora::Adapter;
+        if ad.layers.len() > self.layers.len() {
+            return Err(format!("the adapter has {} layers, the model {}", ad.layers.len(), self.layers.len()));
+        }
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let lo = ad.layer(l);
+            if lo.is_empty() {
+                continue;
+            }
+            match &layer.attn {
+                Attn::Gqa { wq, wk, wv, .. } => {
+                    Adapter::check(&lo.q, wq.rows, wq.cols, &format!("layer {l} attn_q"))?;
+                    Adapter::check(&lo.k, wk.rows, wk.cols, &format!("layer {l} attn_k"))?;
+                    Adapter::check(&lo.v, wv.rows, wv.cols, &format!("layer {l} attn_v"))?;
+                }
+                _ if lo.q.is_some() || lo.k.is_some() || lo.v.is_some() => return Err(format!("layer {l}: LoRA on this kind of attention is not supported")),
+                _ => {}
+            }
+            Adapter::check(&lo.o, layer.wo.rows, layer.wo.cols, &format!("layer {l} attn_output"))?;
+            match &layer.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    Adapter::check(&lo.gate, gate.rows, gate.cols, &format!("layer {l} ffn_gate"))?;
+                    Adapter::check(&lo.up, up.rows, up.cols, &format!("layer {l} ffn_up"))?;
+                    Adapter::check(&lo.down, down.rows, down.cols, &format!("layer {l} ffn_down"))?;
+                }
+                _ if lo.gate.is_some() || lo.up.is_some() || lo.down.is_some() => return Err(format!("layer {l}: LoRA on a mixture of experts is not supported")),
+                _ => {}
+            }
+            layer.lora = lo.clone();
+        }
+        Ok(())
     }
 }
 
@@ -867,6 +905,19 @@ impl Model<'_> {
                         } else {
                             matmul_many(&mut [(wq, &mut s.q), (wk, &mut s.k), (wv, &mut s.v)], &s.xb, &s.xq);
                         }
+                        let lo = &layer.lora;
+                        let q = if c.attn_gated { &mut s.qg } else { &mut s.q };
+                        for (pair, out) in [(&lo.q, q), (&lo.k, &mut s.k), (&lo.v, &mut s.v)] {
+                            if let Some(p) = pair {
+                                p.apply(&s.xb[..n * dim], out, p.rows, 0);
+                            }
+                        }
+                        if c.attn_gated && lo.q.is_some() {
+                            for (pair, (q, g)) in s.qg.chunks_exact(2 * hd).zip(s.q.chunks_exact_mut(hd).zip(s.att_gate.chunks_exact_mut(hd))) {
+                                q.copy_from_slice(&pair[..hd]);
+                                g.copy_from_slice(&pair[hd..]);
+                            }
+                        }
                     });
                     profile::time(3, || {
                         if let Some(w) = q_norm {
@@ -922,6 +973,9 @@ impl Model<'_> {
                 };
                 s.xq.quantize(heads, layer.wo.cols);
                 layer.wo.matmul(heads, &s.xq, &mut s.proj);
+                if let Some(p) = &layer.lora.o {
+                    p.apply(heads, &mut s.proj, p.rows, 0);
+                }
                 for (x, p) in s.x.iter_mut().zip(&s.proj) {
                     *x += p;
                 }
@@ -934,9 +988,29 @@ impl Model<'_> {
             });
             profile::time(6, || match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    gate_up_silu(gate, up, &s.xb, &s.xq, &mut s.gate);
+                    let lo = &layer.lora;
+                    if lo.gate.is_some() || lo.up.is_some() {
+                        // adapted: the two projections apart, each with its pair, then silu(gate) * up
+                        let len = s.gate.len();
+                        let (mut g, mut u) = (vec![0f32; len], vec![0f32; len]);
+                        gate.matmul(&s.xb, &s.xq, &mut g);
+                        up.matmul(&s.xb, &s.xq, &mut u);
+                        for (pair, out) in [(&lo.gate, &mut g), (&lo.up, &mut u)] {
+                            if let Some(p) = pair {
+                                p.apply(&s.xb[..n * dim], out, p.rows, 0);
+                            }
+                        }
+                        for ((h, g), u) in s.gate.iter_mut().zip(&g).zip(&u) {
+                            *h = g / (1.0 + (-g).exp()) * u;
+                        }
+                    } else {
+                        gate_up_silu(gate, up, &s.xb, &s.xq, &mut s.gate);
+                    }
                     s.xq.quantize(&s.gate, c.ffn_dim);
                     down.matmul(&s.gate, &s.xq, &mut s.proj);
+                    if let Some(p) = &lo.down {
+                        p.apply(&s.gate, &mut s.proj, p.rows, 0);
+                    }
                     for (x, f) in s.x.iter_mut().zip(&s.proj) {
                         *x += f;
                     }
