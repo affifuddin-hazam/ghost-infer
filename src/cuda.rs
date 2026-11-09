@@ -5559,6 +5559,17 @@ struct MoeHost {
 /// (Qwen3-30B-A3B, a third of its experts cached): 8 a token keep 72% of picks on the GPU, 16 80%, 24 84%,
 /// every miss 88%; the cache before this one, which kept the most picked experts, 64%. Through the server
 /// (scripts/bench-moe.py), median tokens/s: 8 30.5, 12 33.0, 16 32.8, 24 28.8.
+/// Layer steps between halvings of the experts' pick counts (ExpertCache::freq): about 128 tokens' worth of a
+/// 40-layer model, so the counts follow what replies use now.
+const FREQ_HALF: u64 = 5120;
+
+/// GHOST_INFER_CACHE_LRU=1: the expert cache takes every missed expert in, evicting the least recently used
+/// (the old way), instead of only those picked more often than the one they would evict.
+fn cache_lru() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_CACHE_LRU").is_some())
+}
+
 fn uploads_per_token() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| std::env::var("GHOST_INFER_UPLOADS_PER_TOKEN").ok().and_then(|v| v.parse().ok()).unwrap_or(12))
@@ -5706,6 +5717,7 @@ struct ExpertCache {
     free: Vec<usize>,
     used: Vec<u64>,          // per slot: the layer step that last picked its expert (u64::MAX: being copied)
     clock: u64,              // layer steps so far
+    freq: Vec<Vec<u16>>,     // [layer][expert]: how often it was picked lately (halved every FREQ_HALF layer steps)
     queued: Vec<Vec<bool>>,  // [layer][expert]: on its way into a slot
     sent: usize,             // uploads queued this token
     cacheable: Vec<bool>,
@@ -5724,6 +5736,11 @@ struct ExpertCache {
     idx: DeviceBuf, // per layer: the tokens of each expert in turn, and their weights
     staged: usize,
     read_buf: Vec<u8>, // with a RAM floor: an expert read from the file for staging (gate, up, down)
+    // GPU-only experts (moe_gpu_only): a pinned buffer and a device slot for each expert a token may miss in
+    // one layer (packed in parallel, copied, run as one group), and the event their last use recorded
+    miss_host: Vec<usize>,
+    miss_dev: Vec<DeviceBuf>,
+    miss_event: Ptr,
 }
 
 impl Drop for ExpertCache {
@@ -5731,6 +5748,12 @@ impl Drop for ExpertCache {
         if let Ok(a) = api() {
             for p in self.pinned.iter().filter(|p| !p.is_null()) {
                 unsafe { (a.f.cuMemFreeHost)(*p as *mut c_void) };
+            }
+            for &p in &self.miss_host {
+                unsafe { (a.f.cuMemFreeHost)(p as *mut c_void) };
+            }
+            if !self.miss_event.is_null() {
+                unsafe { (a.f.cuEventDestroy_v2)(self.miss_event) };
             }
         }
     }
@@ -5754,6 +5777,16 @@ impl ExpertCache {
         let conv_elems = (2 * g0.rows * g0.cols).max(g0.rows * g0.cols);
         // the prompt-batch table: per token and pick, its token index and weight
         let idx_bytes = 8 * max_batch(cfg) * cfg.n_experts_used.max(8);
+        let (mut miss_host, mut miss_dev, mut miss_event) = (Vec::new(), Vec::new(), std::ptr::null_mut());
+        if moe_gpu_only() {
+            for _ in 0..cfg.n_experts_used {
+                let mut p: *mut c_void = std::ptr::null_mut();
+                a.check(unsafe { (a.f.cuMemAllocHost_v2)(&mut p, scratch_bytes) }, "pinned expert staging")?;
+                miss_host.push(p as usize);
+                miss_dev.push(DeviceBuf::alloc(scratch_bytes)?);
+            }
+            a.check(unsafe { (a.f.cuEventCreate)(&mut miss_event, 2) }, "event")?;
+        }
         let extras = routers.iter().map(|b| b.bytes).sum::<usize>() + 2 * scratch_bytes + conv_elems * 9 / 8 + idx_bytes;
         let max_slots = if cacheable.iter().any(|&c| c) { cfg.n_layers * cfg.n_experts } else { 0 };
         let mut pinned = [std::ptr::null_mut(); 2];
@@ -5772,6 +5805,7 @@ impl ExpertCache {
             slot_bytes,
             gate_bytes,
             slot_of: vec![vec![-1; cfg.n_experts]; cfg.n_layers],
+            freq: vec![vec![0; cfg.n_experts]; cfg.n_layers],
             owner: Vec::new(),
             free: Vec::new(),
             used: Vec::new(),
@@ -5792,6 +5826,9 @@ impl ExpertCache {
             idx: DeviceBuf::alloc(idx_bytes)?,
             staged: 0,
             read_buf: Vec::new(),
+            miss_host,
+            miss_dev,
+            miss_event,
         };
         cache.add_blocks(budget.saturating_sub(extras));
         Ok(cache)
@@ -5939,6 +5976,12 @@ impl ExpertCache {
     fn note(&mut self, moe: &CpuMoe, l: usize, picks: &[(usize, f32)], prompt: bool) {
         self.collect();
         self.clock += 1;
+        if self.clock % FREQ_HALF == 0 {
+            self.freq.iter_mut().flatten().for_each(|f| *f /= 2);
+        }
+        for &(e, _) in picks {
+            self.freq[l][e] = self.freq[l][e].saturating_add(1);
+        }
         if !self.cacheable[l] || self.slots() == 0 {
             return;
         }
@@ -5965,6 +6008,12 @@ impl ExpertCache {
                         continue;
                     }
                     let (ol, oe) = self.owner[s].unwrap();
+                    // only for an expert picked more often lately than the one it would push out: a swap reads
+                    // the newcomer from RAM (or the disk, when RAM is short of the model) and gives up the other,
+                    // which comes back the same way if it is wanted again; one-off picks churn the cache for nothing
+                    if !cache_lru() && self.freq[l][e] <= self.freq[ol][oe] {
+                        continue;
+                    }
                     self.slot_of[ol][oe] = -1;
                     evicted = Some(ranges(ol, oe));
                     s
@@ -7382,24 +7431,92 @@ impl GpuModel {
             }
         }
         let nk = wts.len();
-        if nk > 0 {
+        // GPU-only experts: the token's experts that are not cached are copied into the two scratch slots in
+        // turn and run there with the same kernels, instead of on the CPU (which then only routes and copies)
+        let misses: Vec<(usize, f32)> = if on_gpu && moe_gpu_only() { std::mem::take(&mut h.cpu_picks) } else { Vec::new() };
+        let total = nk + misses.len();
+        // the table: the cached experts' [gate, up]* then downs; the misses' the same way at MISS_TAB (in their
+        // own device slots); every weight at WTS_TAB
+        const MISS_TAB: usize = 256;
+        const WTS_TAB: usize = 1024;
+        if total > 0 {
             ptrs.extend(&downs);
             let mut tab: Vec<u8> = ptrs.iter().flat_map(|p| p.to_le_bytes()).collect();
-            tab.extend(wts.iter().flat_map(|w| w.to_le_bytes()));
+            if !misses.is_empty() {
+                tab.resize(MISS_TAB, 0);
+                let gb = cache.gate_bytes[l] as u64;
+                let slots = &cache.miss_dev[..misses.len()];
+                tab.extend(slots.iter().flat_map(|d| [d.ptr, d.ptr + gb]).flat_map(|p| p.to_le_bytes()));
+                tab.extend(slots.iter().map(|d| d.ptr + 2 * gb).flat_map(|p| p.to_le_bytes()));
+            }
+            tab.resize(WTS_TAB, 0);
+            tab.extend(wts.iter().chain(misses.iter().map(|(_, w)| w)).flat_map(|w| w.to_le_bytes()));
             s.moe_tab.write(&tab)?;
             let (ex, ffn) = (moe.tensors[l][0], c.expert_ffn_dim);
             let silu = [Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(ffn as i32)];
-            match iq2_fmt(&moe.tensors[l]) {
-                Some(fmt) => {
-                    k.launch(k.moe_gate_up_iq2, (ex.rows.div_ceil(8) as u32, (2 * nk) as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32), Arg::I(fmt)])?;
-                    k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, nk as u32), 256, 0, &silu)?;
-                    k.launch(k.moe_down_iq2, (dim.div_ceil(8) as u32, nk as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::I(nk as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32), Arg::I(fmt)])?;
+            let fmt = iq2_fmt(&moe.tensors[l]);
+            // `count` experts from the table at `tab`, their outputs into s.h from row `row`
+            let group = |tab: u64, count: usize, row: usize| -> Result<(), String> {
+                let out = s.h.ptr + (row * dim * 4) as u64;
+                match fmt {
+                    Some(fmt) => {
+                        k.launch(k.moe_gate_up_iq2, (ex.rows.div_ceil(8) as u32, (2 * count) as u32), 256, 0, &[Arg::P(tab), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32), Arg::I(fmt)])?;
+                        k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, count as u32), 256, 0, &silu)?;
+                        k.launch(k.moe_down_iq2, (dim.div_ceil(8) as u32, count as u32), 256, 0, &[Arg::P(tab), Arg::I(count as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(out), Arg::I(dim as i32), Arg::I(ffn as i32), Arg::I(fmt)])
+                    }
+                    None => {
+                        k.launch(k.moe_gate_up_q3k, (ex.rows.div_ceil(8) as u32, (2 * count) as u32), 256, 0, &[Arg::P(tab), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
+                        k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, count as u32), 256, 0, &silu)?;
+                        k.launch(k.moe_down_q4k, (dim.div_ceil(8) as u32, count as u32), 256, 0, &[Arg::P(tab), Arg::I(count as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(dim as i32), Arg::I(ffn as i32)])
+                    }
                 }
-                None => {
-                    k.launch(k.moe_gate_up_q3k, (ex.rows.div_ceil(8) as u32, (2 * nk) as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
-                    k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, nk as u32), 256, 0, &silu)?;
-                    k.launch(k.moe_down_q4k, (dim.div_ceil(8) as u32, nk as u32), 256, 0, &[Arg::P(s.moe_tab.ptr), Arg::I(nk as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32)])?;
+            };
+            if nk > 0 {
+                group(s.moe_tab.ptr, nk, 0)?;
+            }
+            if !misses.is_empty() {
+                // the last layer's misses are done with these buffers; then this layer's are packed at once (a
+                // short burst on a few threads), copied, and run as one group
+                a.check(unsafe { (a.f.cuEventSynchronize)(cache.miss_event) }, "GPU-only experts wait")?;
+                let short = ram_short();
+                let bytes = cache.scratch_bytes;
+                let (gate_bytes, raw_fmt, hosts) = (cache.gate_bytes[l], iq2_fmt(&moe.tensors[l]).is_some(), cache.miss_host.clone());
+                let done: Vec<Result<usize, String>> = {
+                    use rayon::prelude::*;
+                    misses
+                        .par_iter()
+                        .zip(hosts.par_iter())
+                        .map(|(&(e, _), &host)| {
+                            let buf = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, bytes) };
+                            if !short {
+                                let ex = moe.expert(l, e);
+                                return Ok(ExpertCache::pack_parts(ex.gate.data, ex.up.data, ex.down.data, gate_bytes, raw_fmt, buf));
+                            }
+                            // RAM near the floor: read from the file, past the working set
+                            let [g, u, d] = moe.tensors[l].map(|t| (t.offset + e * t.stride, t.stride));
+                            let mut raw = vec![0u8; g.1 + u.1 + d.1];
+                            let (gb, rest) = raw.split_at_mut(g.1);
+                            let (ub, db) = rest.split_at_mut(u.1);
+                            for (dst, (at, _)) in [(gb, g), (ub, u), (db, d)] {
+                                read_exact_at(&moe.file, dst, at as u64)?;
+                            }
+                            let (gate, rest) = raw.split_at(g.1);
+                            let (up, down) = rest.split_at(u.1);
+                            Ok(ExpertCache::pack_parts(gate, up, down, gate_bytes, raw_fmt, buf))
+                        })
+                        .collect()
+                };
+                for ((n, &host), dev) in done.into_iter().zip(&cache.miss_host).zip(&cache.miss_dev) {
+                    let n = n?;
+                    a.check(unsafe { (a.f.cuMemcpyHtoDAsync_v2)(dev.ptr, host as *const c_void, n, k.stream) }, "GPU-only expert copy")?;
                 }
+                if nk > 0 {
+                    // the hidden state's Q8 took the input's place (silu_q8): the input again, from x (unchanged
+                    // until the experts' sums are added)
+                    k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(x), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+                }
+                group(s.moe_tab.ptr + MISS_TAB as u64, misses.len(), nk)?;
+                a.check(unsafe { (a.f.cuEventRecord)(cache.miss_event, k.stream) }, "event record")?;
             }
         }
         // the CPU's share, computed while the GPU works on its own
@@ -7435,9 +7552,9 @@ impl GpuModel {
                 i += 1;
             }
         }
-        if nk > 0 {
-            let wts_ptr = s.moe_tab.ptr + (8 * 3 * nk) as u64;
-            k.launch(k.moe_combine, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.h.ptr), Arg::P(wts_ptr), Arg::I(nk as i32), Arg::P(cpu), Arg::I(dim as i32)])?;
+        if total > 0 {
+            let wts_ptr = s.moe_tab.ptr + WTS_TAB as u64;
+            k.launch(k.moe_combine, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.h.ptr), Arg::P(wts_ptr), Arg::I(total as i32), Arg::P(cpu), Arg::I(dim as i32)])?;
         } else {
             k.launch(k.add_rows, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(cpu), Arg::I(len as i32)])?;
         }
@@ -8398,6 +8515,14 @@ const MS_ROUTE: usize = 4;
 const MS_CPU: usize = 5;
 const MS_BACK: usize = 6;
 const MS_NOTE: usize = 7;
+/// GPU-only experts (GHOST_INFER_MOE_GPU_ONLY=1): a one-token step's uncached experts are staged to the GPU
+/// and run there, so the CPU does no expert maths (the computer stays responsive) and every expert takes the
+/// same arithmetic.
+fn moe_gpu_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_MOE_GPU_ONLY").is_some())
+}
+
 fn moe_stats_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GHOST_INFER_MOE_STATS").is_some())

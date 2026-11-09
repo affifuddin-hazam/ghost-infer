@@ -79,7 +79,26 @@ impl Pool {
     }
 }
 
+/// The workers run below normal priority: they spin between a token's layers, and at normal priority that
+/// spinning would hold whole cores against the programs the user is working in (and against this
+/// process's own expert uploads). GHOST_INFER_POOL_PRIORITY=normal keeps them at normal priority.
+fn lower_priority() {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+        }
+        const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+        if std::env::var("GHOST_INFER_POOL_PRIORITY").map_or(true, |v| v != "normal") {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+        }
+    }
+}
+
 fn worker(s: &'static Shared, i: usize, n: usize) {
+    lower_priority();
     let mut seen = 0u64;
     loop {
         let mut since = Instant::now();
