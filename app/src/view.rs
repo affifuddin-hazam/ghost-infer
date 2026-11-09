@@ -656,7 +656,7 @@ impl App {
                     tr("RAM"),
                     vec![row_of(
                         tr("RAM for experts"),
-                        tr("For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it can be a little faster on long prompts.").into(),
+                        tr("For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it is faster when the model barely fits.").into(),
                         floor_control,
                     )],
                 );

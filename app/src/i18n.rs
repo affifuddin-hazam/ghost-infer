@@ -105,7 +105,7 @@ pub fn tr(en: &'static str) -> &'static str {
         "Leave 2 GB" => "保留 2 GB",
         "Leave 4 GB" => "保留 4 GB",
         "Set when ghost started (--ram-floor)" => "启动时已设置（--ram-floor）",
-        "For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it can be a little faster on long prompts." => "适用于比显卡更大的模型。保留内存可让其他程序保持流畅；全部使用在长提示时可能略快一些。",
+        "For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it is faster when the model barely fits." => "适用于比显卡更大的模型。保留内存可让其他程序保持流畅；模型勉强放得下时，全部使用会更快。",
         "Runs a few short replies after a model loads, so the first real answer comes quickly." => {
             "模型加载后先跑几段简短回复，好让第一个真正的回答来得更快。"
         }

@@ -32,8 +32,9 @@ pub struct Settings {
     pub ram_floor_gb: f64,
 }
 
-/// The RAM floor a new installation starts with: on a 16 GB computer, measured as fast as filling RAM
-/// (prompts within a few percent, generation no slower) while the computer stays usable.
+/// The RAM floor a new installation starts with: the computer stays usable while a model bigger than the GPU
+/// runs. When the CPU's experts do not fit beside it, it costs speed (Qwen3.6-35B-A3B on 16 GB: prompts about
+/// a third slower, the first reply after loading too); "use all" (0) is the faster choice then.
 pub const DEFAULT_RAM_FLOOR_GB: f64 = 2.0;
 
 impl Default for Settings {
