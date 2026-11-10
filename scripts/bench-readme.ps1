@@ -12,6 +12,9 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\bench-readme.ps1 -SkipDense  (only the MoE table)
 #   ... -Stage C:\ghost-bench-stage   (read the MoE model from a fast disk: it is copied there for the run, one
 #        engine's copy at a time since two may not fit, and the folder is deleted at the end)
+#   ... -Moe C:\models\big-moe.gguf -OllamaLinkStore C:\ghost-bench-ollama   (Ollama's store in that new folder on the
+#        model's disk, the model hard-linked in under the name Ollama gives it; the folder is deleted at the end. Ollama
+#        0.40 still writes a converted copy of a qwen35moe model beside it, so the disk needs room for one copy)
 #   powershell -ExecutionPolicy Bypass -File scripts\bench-readme.ps1 -Quick      (a smoke test: minutes, numbers mean nothing)
 #
 # Everything goes to bench-readme-<time>\ (gitignored): the raw results, and results.md with both tables.
@@ -27,6 +30,7 @@ param(
     [string[]]$Engines = @('ghost-infer', 'llama.cpp', 'ollama'),  # for the MoE table
     [int]$Port = 8090,
     [string]$Stage = '',      # a new folder on a fast disk for the MoE model (see above); deleted at the end
+    [string]$OllamaLinkStore = '',  # a new folder on the MoE model's disk for Ollama's store, the model hard-linked in
     [switch]$SkipDense,
     [switch]$Quick
 )
@@ -158,29 +162,48 @@ if ($Engines -contains 'llama.cpp') {
 }
 
 if ($Engines -contains 'ollama') {
-    if (Get-Process ollama*, 'ollama app' -ErrorAction SilentlyContinue) { throw 'Ollama is already running: quit it (its tray icon, Quit Ollama), then run this again.' }
-    if ($Stage) {
-        # its own copy goes on the stage instead: the other copy leaves first, since both may not fit
-        if ($moeRun -ne $Moe) { Remove-Item -LiteralPath $moeRun; $moeRun = $Moe }
-        $ollamaStore = Join-Path $Stage 'ollama'
-        New-Item -ItemType Directory -Force $ollamaStore | Out-Null
-    }
-    $env:OLLAMA_MODELS = $ollamaStore; $env:OLLAMA_HOST = "127.0.0.1:$Port"
-    # the model goes into Ollama's own store once (a copy of the file; quick when it is there already)
-    $c = Start-Process -FilePath $Ollama -ArgumentList 'serve' -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $moeOut 'ollama-create.server.log')
     try {
-        Wait-Up "http://127.0.0.1:$Port/api/tags" $c 'ollama'
-        $mf = Join-Path $moeOut 'moe.Modelfile'
-        Set-Content -Encoding ascii $mf "FROM $Moe"
-        $ErrorActionPreference = 'Continue'
-        & $Ollama create bench-moe -f $mf *> (Join-Path $moeOut 'ollama-create.log')
-        $ErrorActionPreference = 'Stop'
-        if ($LASTEXITCODE -ne 0) { throw "ollama create failed; see $moeOut\ollama-create.log" }
-    } finally { Stop-Tree $c; Wait-GpuFree }
-    Measure-Server 'ollama' $Ollama @('serve') "http://127.0.0.1:$Port/api/tags" 'bench-moe'
-    $labels += 'ollama=Ollama 0.40.13 (defaults)'
-    $split = Select-String -Path (Join-Path $moeOut 'ollama.server.err.log') -Pattern 'CUDA0 model buffer size|CUDA_Host model buffer size|layers \(\d+ overflowing\)' | ForEach-Object { $_.Line -replace '^.*?(CUDA|\d+ layers)', '$1' }
-    if ($split) { $notes += "Ollama placed the model: $(($split | Select-Object -Unique) -join '; ')." }
+        if ($OllamaLinkStore -and -not $Stage) {
+            # Ollama's store beside the model, the model hard-linked in as the blob `ollama create` would copy: it finds
+            # the blob there and copies nothing
+            if ((Split-Path $Moe -Qualifier) -ne (Split-Path $OllamaLinkStore -Qualifier)) { throw '-OllamaLinkStore must be on the same disk as the model' }
+            if ((Test-Path $OllamaLinkStore) -and (Get-ChildItem $OllamaLinkStore -Force | Select-Object -First 1)) { throw "$OllamaLinkStore exists and is not empty: give a new folder (this script deletes it at the end)" }
+            $ollamaStore = $OllamaLinkStore
+            New-Item -ItemType Directory -Force (Join-Path $ollamaStore 'blobs') | Out-Null
+            Say 'Ollama: hashing the model to link it into its store (about a minute)'
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $Moe).Hash.ToLower()
+            New-Item -ItemType HardLink -Path (Join-Path $ollamaStore "blobs\sha256-$sha") -Target $Moe | Out-Null
+        }
+        if (Get-Process ollama*, 'ollama app' -ErrorAction SilentlyContinue) { throw 'Ollama is already running: quit it (its tray icon, Quit Ollama), then run this again.' }
+        if ($Stage) {
+            # its own copy goes on the stage instead: the other copy leaves first, since both may not fit
+            if ($moeRun -ne $Moe) { Remove-Item -LiteralPath $moeRun; $moeRun = $Moe }
+            $ollamaStore = Join-Path $Stage 'ollama'
+            New-Item -ItemType Directory -Force $ollamaStore | Out-Null
+        }
+        $env:OLLAMA_MODELS = $ollamaStore; $env:OLLAMA_HOST = "127.0.0.1:$Port"
+        # the model goes into Ollama's own store once (a copy of the file; quick when it is there already)
+        $c = Start-Process -FilePath $Ollama -ArgumentList 'serve' -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $moeOut 'ollama-create.server.log')
+        try {
+            Wait-Up "http://127.0.0.1:$Port/api/tags" $c 'ollama'
+            $mf = Join-Path $moeOut 'moe.Modelfile'
+            Set-Content -Encoding ascii $mf "FROM $Moe"
+            $ErrorActionPreference = 'Continue'
+            & $Ollama create bench-moe -f $mf *> (Join-Path $moeOut 'ollama-create.log')
+            $ErrorActionPreference = 'Stop'
+            if ($LASTEXITCODE -ne 0) { throw "ollama create failed; see $moeOut\ollama-create.log" }
+        } finally { Stop-Tree $c; Wait-GpuFree }
+        Measure-Server 'ollama' $Ollama @('serve') "http://127.0.0.1:$Port/api/tags" 'bench-moe'
+        $labels += 'ollama=Ollama 0.40.13 (defaults)'
+        $split = Select-String -Path (Join-Path $moeOut 'ollama.server.err.log') -Pattern 'CUDA0 model buffer size|CUDA_Host model buffer size|layers \(\d+ overflowing\)' | ForEach-Object { $_.Line -replace '^.*?(CUDA|\d+ layers)', '$1' }
+        if ($split) { $notes += "Ollama placed the model: $(($split | Select-Object -Unique) -join '; ')." }
+    } catch {
+        # a model Ollama cannot run (an architecture it lacks): the other engines' results still count
+        Say "Ollama failed: $($_.Exception.Message)"
+        $notes += "Ollama could not be measured: $($_.Exception.Message)"
+    } finally {
+        if ($OllamaLinkStore -and -not $Stage -and (Test-Path $OllamaLinkStore)) { Remove-Item -LiteralPath $OllamaLinkStore -Recurse -Force }
+    }
 }
 
 } finally {

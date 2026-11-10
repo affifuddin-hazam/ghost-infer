@@ -10,6 +10,8 @@ to review, a document to summarise, an explanation, a chat, a word problem, SQL.
 
 Per request: generation = (completion tokens - 1) / (time from the first to the last streamed token); prompt
 reading = prompt tokens / time to the first token (so it includes the server's own overhead, as GuideLLM's does).
+Each request also keeps its streamed pieces and when each arrived ("pieces", "arrivals"): the README's race
+replays them.
 """
 
 import argparse
@@ -58,6 +60,7 @@ def one(url, model, text, max_tokens):
     t0 = time.perf_counter()
     first = last = None
     chunks, usage = 0, None
+    arrivals, parts = [], []  # each streamed piece: when (s after sending) and what, for replaying the race
     with urllib.request.urlopen(req, timeout=1800) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
@@ -70,6 +73,8 @@ def one(url, model, text, max_tokens):
                 # a reasoning model's thinking may stream as reasoning_content (llama.cpp's server does)
                 if delta.get("content") or delta.get("reasoning_content"):
                     now = time.perf_counter()
+                    arrivals.append(round(now - t0, 4))
+                    parts.append(delta.get("content") or delta.get("reasoning_content"))
                     chunks += 1
                     first = first or now
                     last = now
@@ -82,6 +87,8 @@ def one(url, model, text, max_tokens):
         "prompt_tokens": prompt,
         "gen_tps": (gen - 1) / (last - first) if first and last and last > first and gen > 1 else None,
         "prompt_tps": prompt / (first - t0) if prompt and first else None,
+        "arrivals": arrivals,
+        "pieces": parts,
     }
 
 
