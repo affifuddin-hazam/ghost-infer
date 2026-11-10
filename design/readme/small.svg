@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 400" width="860" height="400" role="img" aria-label="ghost-infer is one small program: instead of Python, pip packages, a CUDA toolkit and Docker, one 3.7 MB file with two dependencies that starts a server">
+  <style>
+    .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .m  { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+    .h  { font-size: 18px; font-weight: 700; fill: #e6edf3; }
+    .s  { font-size: 12px; fill: #8b949e; }
+    .k  { font-size: 11px; fill: #8b949e; }
+    .box { font-size: 13px; fill: #c9d1d9; }
+    .big { font-size: 44px; font-weight: 800; fill: #7ee2b8; letter-spacing: -1px; }
+    .term { font-size: 12.5px; fill: #c9d1d9; }
+    .dim { fill: #8b949e; }
+    .gr { fill: #7ee2b8; }
+  </style>
+  <defs>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"/></filter>
+  </defs>
+  <rect x="0.5" y="0.5" width="859" height="399" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text class="t h" x="24" y="40">One small program</text>
+  <text class="t s" x="24" y="62">No Python, no Docker, no CUDA toolkit to install: one file that compiles its GPU code for your card on first start.</text>
+  <text class="t k" x="24" y="98">what a local AI setup often asks for<animate attributeName="opacity" values="1;1;0;0;1" keyTimes="0.0000;0.2833;0.3333;0.9917;1.0000" dur="12.0s" repeatCount="indefinite"/></text>
+  <text class="t box" x="354" y="166" text-anchor="end" opacity="0" style="fill:#8b949e">all of that,<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3667;0.3767;0.9667;0.9917;1.0000" dur="12.0s" repeatCount="indefinite"/></text>
+  <text class="t box" x="354" y="186" text-anchor="end" opacity="0" style="fill:#8b949e">in one file<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3833;0.3933;0.9667;0.9917;1.0000" dur="12.0s" repeatCount="indefinite"/></text>
+  <g opacity="0">
+    <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0250;0.0458;0.3100;0.3683;1.0000" dur="12.0s" repeatCount="indefinite"/>
+    <animateTransform attributeName="transform" type="translate" values="0 -14;0 -14;0 0;0 0;330 0;330 0" keyTimes="0;0.0250;0.0500;0.3100;0.3683;1" dur="12.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.3 0 0.2 1;0 0 1 1;0.6 0 0.9 0.6;0 0 1 1"/>
+    <rect x="24" y="108" width="330" height="28" rx="6" fill="#161b22" stroke="#30363d"/>
+    <circle cx="40" cy="122" r="3.5" fill="#6e7681"/>
+    <text class="t box" x="52" y="127">Python and a virtual environment</text>
+  </g>
+  <g opacity="0">
+    <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0625;0.0833;0.3033;0.3617;1.0000" dur="12.0s" repeatCount="indefinite"/>
+    <animateTransform attributeName="transform" type="translate" values="0 -14;0 -14;0 0;0 0;330 0;330 0" keyTimes="0;0.0625;0.0875;0.3033;0.3617;1" dur="12.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.3 0 0.2 1;0 0 1 1;0.6 0 0.9 0.6;0 0 1 1"/>
+    <rect x="24" y="142" width="330" height="28" rx="6" fill="#161b22" stroke="#30363d"/>
+    <circle cx="40" cy="156" r="3.5" fill="#6e7681"/>
+    <text class="t box" x="52" y="161">pip install torch (the CUDA build)</text>
+  </g>
+  <g opacity="0">
+    <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1000;0.1208;0.2967;0.3550;1.0000" dur="12.0s" repeatCount="indefinite"/>
+    <animateTransform attributeName="transform" type="translate" values="0 -14;0 -14;0 0;0 0;330 0;330 0" keyTimes="0;0.1000;0.1250;0.2967;0.3550;1" dur="12.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.3 0 0.2 1;0 0 1 1;0.6 0 0.9 0.6;0 0 1 1"/>
+    <rect x="24" y="176" width="330" height="28" rx="6" fill="#161b22" stroke="#30363d"/>
+    <circle cx="40" cy="190" r="3.5" fill="#6e7681"/>
+    <text class="t box" x="52" y="195">the CUDA toolkit</text>
+  </g>
+  <g opacity="0">
+    <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1375;0.1583;0.2900;0.3483;1.0000" dur="12.0s" repeatCount="indefinite"/>
+    <animateTransform attributeName="transform" type="translate" values="0 -14;0 -14;0 0;0 0;330 0;330 0" keyTimes="0;0.1375;0.1625;0.2900;0.3483;1" dur="12.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.3 0 0.2 1;0 0 1 1;0.6 0 0.9 0.6;0 0 1 1"/>
+    <rect x="24" y="210" width="330" height="28" rx="6" fill="#161b22" stroke="#30363d"/>
+    <circle cx="40" cy="224" r="3.5" fill="#6e7681"/>
+    <text class="t box" x="52" y="229">Docker Desktop</text>
+  </g>
+  <g opacity="0">
+    <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1750;0.1958;0.2833;0.3417;1.0000" dur="12.0s" repeatCount="indefinite"/>
+    <animateTransform attributeName="transform" type="translate" values="0 -14;0 -14;0 0;0 0;330 0;330 0" keyTimes="0;0.1750;0.2000;0.2833;0.3417;1" dur="12.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.3 0 0.2 1;0 0 1 1;0.6 0 0.9 0.6;0 0 1 1"/>
+    <rect x="24" y="244" width="330" height="28" rx="6" fill="#161b22" stroke="#30363d"/>
+    <circle cx="40" cy="258" r="3.5" fill="#6e7681"/>
+    <text class="t box" x="52" y="263">a web UI, and its own server</text>
+  </g>
+  <path d="M374,190 H448 M440,183 L448,190 L440,197" fill="none" stroke="#6e7681" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2667;0.2767;0.9667;0.9917;1.0000" dur="12.0s" repeatCount="indefinite"/></path>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3250;0.3350;0.9667;0.9917;1.0000" dur="12.0s" repeatCount="indefinite"/>
+    <rect x="468" y="104" width="104" height="132" rx="10" fill="#7ee2b8" opacity="0" filter="url(#glow)"><animate attributeName="opacity" values="0;0;0.55;0.0;0" keyTimes="0.0000;0.3250;0.3417;0.4083;1.0000" dur="12.0s" repeatCount="indefinite"/></rect>
+    <path d="M478,104 H542 L572,134 V226 Q572,236 562,236 H478 Q468,236 468,226 V114 Q468,104 478,104 Z" fill="#161b22" stroke="#7ee2b8" stroke-width="1.8"/>
+    <path d="M542,104 V126 Q542,134 550,134 H572" fill="none" stroke="#7ee2b8" stroke-width="1.8"/>
+    <g transform="translate(520 186)">
+      <path d="M-22,10 V-12 A22,22 0 0 1 22,-12 V10 L15,4 L8,10 L0,4 L-8,10 L-15,4 Z" fill="none" stroke="#7ee2b8" stroke-width="1.8" stroke-linejoin="round"/>
+      <circle cx="-8" cy="-10" r="3" fill="#7ee2b8"/><circle cx="8" cy="-10" r="3" fill="#7ee2b8"/>
+    </g>
+    <text class="t k" x="520" y="256" text-anchor="middle" style="fill:#c9d1d9">ghost-infer.exe</text>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3583;0.3683;0.9667;0.9917;1.0000" dur="12.0s" repeatCount="indefinite"/>
+    <text class="t big" x="604" y="160">3.7 MB</text>
+    <text class="t box" x="606" y="188">one file, written in Rust</text>
+    <text class="t box" x="606" y="210">2 dependencies: <tspan class="gr">memmap2</tspan> and <tspan class="gr">rayon</tspan></text>
+    <text class="t box" x="606" y="232">nothing else to install</text>
+  </g>
+  <rect x="24" y="284" width="812" height="100" rx="8" fill="#010409" stroke="#30363d"/>
+  <circle cx="40" cy="298" r="4" fill="#30363d"/><circle cx="54" cy="298" r="4" fill="#30363d"/><circle cx="68" cy="298" r="4" fill="#30363d"/>
+  <clipPath id="tl0"><rect x="36" y="309" height="18" width="0"><animate attributeName="width" values="0;0;800;800;0;0" keyTimes="0.0000;0.4167;0.5333;0.9667;0.9675;1.0000" dur="12.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m term" x="38" y="322" clip-path="url(#tl0)"><tspan class="gr">&gt;</tspan> ghost-infer serve Qwen3-4B-Instruct-2507-Q4_K_M.gguf --gpu</text>
+  <clipPath id="tl1"><rect x="36" y="327" height="18" width="0"><animate attributeName="width" values="0;0;800;800;0;0" keyTimes="0.0000;0.5750;0.6167;0.9667;0.9675;1.0000" dur="12.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m term" x="38" y="340" clip-path="url(#tl1)"><tspan class="dim">[loaded Qwen3-4B-Instruct-2507 on GPU NVIDIA GeForce RTX 2060 SUPER in 1.1s]</tspan></text>
+  <clipPath id="tl2"><rect x="36" y="345" height="18" width="0"><animate attributeName="width" values="0;0;800;800;0;0" keyTimes="0.0000;0.6250;0.6583;0.9667;0.9675;1.0000" dur="12.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m term" x="38" y="358" clip-path="url(#tl2)">chat in your browser: <tspan class="gr">http://127.0.0.1:8080/</tspan></text>
+  <clipPath id="tl3"><rect x="36" y="363" height="18" width="0"><animate attributeName="width" values="0;0;800;800;0;0" keyTimes="0.0000;0.6667;0.7000;0.9667;0.9675;1.0000" dur="12.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m term" x="38" y="376" clip-path="url(#tl3)">OpenAI-compatible API: <tspan class="gr">http://127.0.0.1:8080/v1</tspan></text>
+  <rect x="38" y="382" width="8" height="3" fill="#7ee2b8" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0;1;1;0;0;1;1;0;0" keyTimes="0.0000;0.7000;0.7042;0.7417;0.7458;0.7833;0.7875;0.8250;0.8292;0.8667;0.8708;0.9083;0.9125;1.0000" dur="12.0s" repeatCount="indefinite"/></rect>
+</svg>

@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 196" width="860" height="196" role="img" aria-label="ghost-infer on an RTX 2060 SUPER: 1.8 times llama.cpp on a model bigger than the GPU; an 80B model on an 8 GB GPU; long prompts 7 times faster; 3.4 times faster at a 64K context">
+  <style>
+    .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .big { font-size: 38px; font-weight: 800; fill: #7ee2b8; letter-spacing: -1px; }
+    .l1 { font-size: 13px; font-weight: 600; fill: #e6edf3; }
+    .l2 { font-size: 11.5px; fill: #8b949e; }
+    .k  { font-size: 10px; fill: #8b949e; }
+    .kg { fill: #7ee2b8; font-weight: 700; }
+  </style>
+  <rect x="0.5" y="0.5" width="859" height="195" rx="12" fill="#0d1117" stroke="#30363d"/>
+
+  <!-- card 1: vs llama.cpp and Ollama -->
+  <g opacity="0" transform="translate(0 10)">
+    <animate attributeName="opacity" from="0" to="1" begin="0.1s" dur="0.5s" fill="freeze"/>
+    <animateTransform attributeName="transform" type="translate" from="0 10" to="0 0" begin="0.1s" dur="0.5s" fill="freeze"/>
+    <rect x="16" y="16" width="200" height="164" rx="10" fill="#161b22" stroke="#30363d"/>
+    <text class="t big" x="32" y="64">1.8×</text>
+    <text class="t l1" x="32" y="88">faster than llama.cpp</text>
+    <text class="t l2" x="32" y="105">MoE bigger than the GPU</text>
+    <rect x="32" y="124" width="0" height="7" rx="3.5" fill="#7ee2b8"><animate attributeName="width" from="0" to="100" begin="0.6s" dur="0.9s" fill="freeze"/></rect>
+    <rect x="32" y="139" width="0" height="7" rx="3.5" fill="#6e7681"><animate attributeName="width" from="0" to="55" begin="0.6s" dur="0.9s" fill="freeze"/></rect>
+    <rect x="32" y="154" width="0" height="7" rx="3.5" fill="#6e7681"><animate attributeName="width" from="0" to="58" begin="0.6s" dur="0.9s" fill="freeze"/></rect>
+    <text class="t k kg" x="140" y="131">45.3</text>
+    <text class="t k" x="140" y="146">25.1 llama.cpp</text>
+    <text class="t k" x="140" y="161">26.1 Ollama</text>
+  </g>
+
+  <!-- card 2: 80B on 8 GB -->
+  <g opacity="0" transform="translate(0 10)">
+    <animate attributeName="opacity" from="0" to="1" begin="0.3s" dur="0.5s" fill="freeze"/>
+    <animateTransform attributeName="transform" type="translate" from="0 10" to="0 0" begin="0.3s" dur="0.5s" fill="freeze"/>
+    <rect x="228" y="16" width="200" height="164" rx="10" fill="#161b22" stroke="#30363d"/>
+    <text class="t big" x="244" y="64">80B</text>
+    <text class="t l1" x="244" y="88">model on an 8 GB GPU</text>
+    <text class="t l2" x="244" y="105">Qwen3-Coder-Next · 11.8 tok/s</text>
+    <rect x="244" y="128" width="0" height="10" rx="5" fill="#7ee2b8"><animate attributeName="width" from="0" to="100" begin="0.8s" dur="0.9s" fill="freeze"/></rect>
+    <rect x="244" y="148" width="0" height="10" rx="5" fill="#6e7681"><animate attributeName="width" from="0" to="36" begin="0.8s" dur="0.9s" fill="freeze"/></rect>
+    <text class="t k kg" x="352" y="137">22 GB model</text>
+    <text class="t k" x="288" y="157">8 GB of VRAM</text>
+  </g>
+
+  <!-- card 3: long prompts -->
+  <g opacity="0" transform="translate(0 10)">
+    <animate attributeName="opacity" from="0" to="1" begin="0.5s" dur="0.5s" fill="freeze"/>
+    <animateTransform attributeName="transform" type="translate" from="0 10" to="0 0" begin="0.5s" dur="0.5s" fill="freeze"/>
+    <rect x="440" y="16" width="200" height="164" rx="10" fill="#161b22" stroke="#30363d"/>
+    <text class="t big" x="456" y="64">7×</text>
+    <text class="t l1" x="456" y="88">faster long prompts</text>
+    <text class="t l2" x="456" y="105">reading 128K tokens, 35B-A3B</text>
+    <rect x="456" y="128" width="0" height="10" rx="5" fill="#6e7681"><animate attributeName="width" from="0" to="120" begin="1.0s" dur="0.9s" fill="freeze"/></rect>
+    <rect x="456" y="148" width="0" height="10" rx="5" fill="#7ee2b8"><animate attributeName="width" from="0" to="18" begin="1.0s" dur="0.9s" fill="freeze"/></rect>
+    <text class="t k" x="582" y="137">27 min</text>
+    <text class="t k kg" x="482" y="157">4 min</text>
+  </g>
+
+  <!-- card 4: 64K context -->
+  <g opacity="0" transform="translate(0 10)">
+    <animate attributeName="opacity" from="0" to="1" begin="0.7s" dur="0.5s" fill="freeze"/>
+    <animateTransform attributeName="transform" type="translate" from="0 10" to="0 0" begin="0.7s" dur="0.5s" fill="freeze"/>
+    <rect x="652" y="16" width="192" height="164" rx="10" fill="#161b22" stroke="#30363d"/>
+    <text class="t big" x="668" y="64">3.4×</text>
+    <text class="t l1" x="668" y="88">faster at 64K context</text>
+    <text class="t l2" x="668" y="105">tensor-core attention, 35B-A3B</text>
+    <rect x="668" y="128" width="0" height="10" rx="5" fill="#6e7681"><animate attributeName="width" from="0" to="35" begin="1.2s" dur="0.9s" fill="freeze"/></rect>
+    <rect x="668" y="148" width="0" height="10" rx="5" fill="#7ee2b8"><animate attributeName="width" from="0" to="120" begin="1.2s" dur="0.9s" fill="freeze"/></rect>
+    <text class="t k" x="709" y="137">12.0 tok/s before</text>
+    <text class="t k kg" x="794" y="157">40.8</text>
+  </g>
+</svg>

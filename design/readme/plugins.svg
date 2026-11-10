@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" width="860" height="420" role="img" aria-label="ghost builds its own tools: asked to roll dice, it writes a small Python plugin, ghost starts it, and the new roll_dice tool is called in the same chat">
+  <style>
+    .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .m  { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+    .h  { font-size: 18px; font-weight: 700; fill: #e6edf3; }
+    .s  { font-size: 12px; fill: #8b949e; }
+    .k  { font-size: 11px; fill: #8b949e; }
+    .kw { fill: #c9d1d9; }
+    .code { font-size: 11px; fill: #c9d1d9; }
+    .kwd { fill: #ff7b72; }
+    .fn  { fill: #d2a8ff; }
+    .str { fill: #a5d6ff; }
+    .num { fill: #79c0ff; }
+    .chip { font-size: 11px; fill: #c9d1d9; }
+    .ask { font-size: 15px; fill: #e6edf3; font-style: italic; }
+  </style>
+  <defs><filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="4"/></filter></defs>
+  <rect x="0.5" y="0.5" width="859" height="419" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text class="t h" x="24" y="40">It builds its own tools</text>
+  <text class="t s" x="24" y="62">Ask for something it cannot do yet: it writes a small plugin, ghost starts it, and the new tool works in the same chat.</text>
+  <text class="t s" x="24" y="80">Each plugin runs as a program of its own, and every call to it asks you first.</text>
+  <text class="t ask" x="24" y="114" opacity="0">“Roll 3 dice with 20 sides for me.”<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0143;0.0250;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/></text>
+  <text class="t k" x="290" y="114" opacity="0">no tool for that yet…<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0643;0.0750;0.1464;0.1571;1.0000" dur="14.0s" repeatCount="indefinite"/></text>
+  <rect x="24" y="128" width="356" height="232" rx="8" fill="#010409" stroke="#30363d"/>
+  <path d="M24,150 H380" stroke="#30363d"/>
+  <text class="m k" x="38" y="144">tools.py</text>
+  <clipPath id="c0"><rect x="36" y="160" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.1286;0.1464;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="172" clip-path="url(#c0)" xml:space="preserve"><tspan class="kwd">import</tspan> random</text>
+  <clipPath id="c2"><rect x="36" y="192" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.1607;0.1786;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="204" clip-path="url(#c2)" xml:space="preserve"><tspan class="kwd">def</tspan> <tspan class="fn">roll_dice</tspan>(count: int = <tspan class="num">2</tspan>,</text>
+  <clipPath id="c3"><rect x="36" y="208" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.1821;0.2010;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="220" clip-path="url(#c3)" xml:space="preserve">              sides: int = <tspan class="num">6</tspan>) -&gt; str:</text>
+  <clipPath id="c4"><rect x="36" y="224" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.2046;0.2224;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="236" clip-path="url(#c4)" xml:space="preserve">    <tspan class="str">"""Roll dice and give each roll and the total.</tspan></text>
+  <clipPath id="c5"><rect x="36" y="240" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.2260;0.2439;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="252" clip-path="url(#c5)" xml:space="preserve"><tspan class="str">    count: how many dice</tspan></text>
+  <clipPath id="c6"><rect x="36" y="256" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.2474;0.2653;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="268" clip-path="url(#c6)" xml:space="preserve"><tspan class="str">    sides: how many sides each die has</tspan></text>
+  <clipPath id="c7"><rect x="36" y="272" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.2689;0.2867;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="284" clip-path="url(#c7)" xml:space="preserve"><tspan class="str">    """</tspan></text>
+  <clipPath id="c8"><rect x="36" y="288" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.2903;0.3081;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="300" clip-path="url(#c8)" xml:space="preserve">    rolls = [random.randint(<tspan class="num">1</tspan>, sides)</text>
+  <clipPath id="c9"><rect x="36" y="304" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.3117;0.3323;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="316" clip-path="url(#c9)" xml:space="preserve">             <tspan class="kwd">for</tspan> _ <tspan class="kwd">in</tspan> range(count)]</text>
+  <clipPath id="c10"><rect x="36" y="320" height="16" width="0"><animate attributeName="width" values="0;0;340;340;0;0" keyTimes="0.0000;0.3359;0.3537;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="38" y="332" clip-path="url(#c10)" xml:space="preserve">    <tspan class="kwd">return</tspan> <tspan class="str">f"rolls: {rolls}, total: {sum(rolls)}"</tspan></text>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3644;0.3751;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/>
+    <path d="M392,246 H468" fill="none" stroke="#6e7681" stroke-width="1.6" stroke-dasharray="5 4"><animate attributeName="stroke-dashoffset" values="0;-90" keyTimes="0.0000;1.0000" dur="14.0s" repeatCount="indefinite"/></path>
+    <path d="M462,240 L469,246 L462,252" fill="none" stroke="#6e7681" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <g opacity="0" transform="translate(430 212)"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3644;0.3751;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/>
+    <g><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(0)"/><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(45)"/><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(90)"/><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(135)"/><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(180)"/><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(225)"/><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(270)"/><rect x="-3" y="-15" width="6" height="7" rx="1.5" fill="#6e7681" transform="rotate(315)"/><circle r="10" fill="#161b22" stroke="#6e7681" stroke-width="2.5"/><circle r="3.5" fill="#6e7681"/><animateTransform attributeName="transform" type="rotate" values="0;0;360;360" keyTimes="0;0.3644;0.4573;1" dur="14.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.4 0 0.3 1;0 0 1 1"/></g>
+  </g>
+  <text class="t k" x="430" y="272" text-anchor="middle" opacity="0">ghost starts it<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3716;0.3823;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/></text>
+  <text class="t k" x="430" y="288" text-anchor="middle" opacity="0" style="fill:#7ee2b8">1 new tool<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4573;0.4680;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/></text>
+  <rect x="480" y="128" width="356" height="232" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text class="t k kw" x="496" y="148" style="font-weight:700">its tools</text>
+  <rect x="496" y="160" width="73" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="503" y="174">read_file</text>
+  <rect x="575.4" y="160" width="80" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="582.4" y="174">write_file</text>
+  <rect x="661.4" y="160" width="73" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="668.4" y="174">edit_file</text>
+  <rect x="740.8" y="160" width="80" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="747.8" y="174">list_files</text>
+  <rect x="496" y="188" width="93" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="503" y="202">search_files</text>
+  <rect x="595.2" y="188" width="87" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="602.2" y="202">run_command</text>
+  <rect x="687.8000000000001" y="188" width="80" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="694.8000000000001" y="202">web_search</text>
+  <rect x="496" y="216" width="73" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="503" y="230">fetch_url</text>
+  <rect x="575.4" y="216" width="67" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="582.4" y="230">remember</text>
+  <rect x="648.1999999999999" y="216" width="100" height="20" rx="10" fill="#0d1117" stroke="#30363d"/><text class="m chip" x="655.1999999999999" y="230">schedule_task</text>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4573;0.4680;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/>
+    <rect x="494" y="242" width="88" height="24" rx="12" fill="#7ee2b8" opacity="0" filter="url(#glow)"><animate attributeName="opacity" values="0;0;0.8;0;0" keyTimes="0.0000;0.4573;0.4680;0.5573;1.0000" dur="14.0s" repeatCount="indefinite"/></rect>
+    <rect x="496" y="244" width="84" height="20" rx="10" fill="#1f3b33" stroke="#3fb68b"/>
+    <text class="m chip" x="504" y="258" style="fill:#7ee2b8">roll_dice</text>
+    <text class="t k" x="586" y="258" style="fill:#7ee2b8">new</text>
+  </g>
+  <path d="M496,280 H822" stroke="#30363d" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.5287;0.5394;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/></path>
+  <clipPath id="call"><rect x="494" y="289" height="18" width="0"><animate attributeName="width" values="0;0;330;330;0;0" keyTimes="0.0000;0.5287;0.5787;0.9714;0.9721;1.0000" dur="14.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m code" x="496" y="302" clip-path="url(#call)"><tspan class="fn">roll_dice</tspan>(count=<tspan class="num">3</tspan>, sides=<tspan class="num">20</tspan>)</text>
+  <text class="m code" x="496" y="324" opacity="0">→ <tspan style="fill:#7ee2b8">rolls: [5, 12, 14], total: 31</tspan><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.6001;0.6109;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/></text>
+  <rect x="24" y="374" width="196" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+  <rect x="24" y="374" width="196" height="30" rx="15" fill="#1f3b33" stroke="#3fb68b" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0143;0.0250;0.1179;0.1286;1.0000" dur="14.0s" repeatCount="indefinite"/></rect>
+  <circle cx="40" cy="389" r="8" fill="#30363d"/><text class="t k kw" x="40" y="393" text-anchor="middle" style="font-weight:700">1</text>
+  <text class="t k kw" x="54" y="393">you ask for something new</text>
+  <rect x="230" y="374" width="196" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+  <rect x="230" y="374" width="196" height="30" rx="15" fill="#1f3b33" stroke="#3fb68b" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1286;0.1393;0.3537;0.3644;1.0000" dur="14.0s" repeatCount="indefinite"/></rect>
+  <circle cx="246" cy="389" r="8" fill="#30363d"/><text class="t k kw" x="246" y="393" text-anchor="middle" style="font-weight:700">2</text>
+  <text class="t k kw" x="260" y="393">it writes tools.py</text>
+  <rect x="436" y="374" width="196" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+  <rect x="436" y="374" width="196" height="30" rx="15" fill="#1f3b33" stroke="#3fb68b" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3644;0.3751;0.5180;0.5287;1.0000" dur="14.0s" repeatCount="indefinite"/></rect>
+  <circle cx="452" cy="389" r="8" fill="#30363d"/><text class="t k kw" x="452" y="393" text-anchor="middle" style="font-weight:700">3</text>
+  <text class="t k kw" x="466" y="393">ghost starts it as a plugin</text>
+  <rect x="642" y="374" width="196" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+  <rect x="642" y="374" width="196" height="30" rx="15" fill="#1f3b33" stroke="#3fb68b" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.5287;0.5394;0.9714;0.9929;1.0000" dur="14.0s" repeatCount="indefinite"/></rect>
+  <circle cx="658" cy="389" r="8" fill="#30363d"/><text class="t k kw" x="658" y="393" text-anchor="middle" style="font-weight:700">4</text>
+  <text class="t k kw" x="672" y="393">it calls its new tool</text>
+</svg>

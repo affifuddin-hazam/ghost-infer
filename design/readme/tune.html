@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tune the infer tag</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0d1117; color: #e6edf3; font: 14px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: #8b949e; }
+  .zoom { border: 1px solid #30363d; border-radius: 12px; overflow: hidden; }
+  .zoom svg { display: block; width: 100%; height: auto; }
+  .real { margin-top: 16px; overflow-x: auto; }
+  .real svg { display: block; width: 860px; max-width: none; height: auto; }
+  .label { margin: 20px 0 6px; font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; }
+  .controls { display: grid; grid-template-columns: 120px 1fr 56px; gap: 14px 12px; align-items: center; margin-top: 20px; }
+  input[type=range] { width: 100%; accent-color: #7ee2b8; }
+  output { font-variant-numeric: tabular-nums; text-align: right; color: #7ee2b8; font-weight: 600; }
+  .cmd { margin-top: 20px; display: flex; gap: 8px; align-items: stretch; }
+  code { flex: 1; padding: 10px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+         font: 12.5px ui-monospace, "Cascadia Code", Consolas, monospace; overflow-x: auto; white-space: nowrap; }
+  button { padding: 0 14px; border-radius: 8px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer; }
+  button:hover { border-color: #7ee2b8; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tune the infer tag</h1>
+  <p class="sub">Drag the sliders; both previews are the real race.svg. Then copy the command and run it (or tell Claude the numbers).</p>
+
+  <div class="label">Zoomed in</div>
+  <div class="zoom" id="zoom"></div>
+  <div class="label">Actual size, as on GitHub</div>
+  <div class="real" id="real"></div>
+
+  <div class="controls">
+    <label for="h">Tag height</label><input id="h" type="range" min="7" max="15" step="0.25"><output id="ho"></output>
+    <label for="l">Letter size</label><input id="l" type="range" min="0.6" max="1.3" step="0.02"><output id="lo"></output>
+    <label for="w">Letter weight</label><input id="w" type="range" min="2.5" max="6" step="0.1"><output id="wo"></output>
+  </div>
+  <div class="cmd"><code id="cmd"></code><button id="copy">Copy</button></div>
+</main>
+<script>
+  const CX = 32, CY = 18.5;  // make_race.py's LETTERS_AT
+  const $ = id => document.getElementById(id);
+
+  function read(svg) {
+    const tag = svg.querySelector('#infer-tag');
+    const m = tag.getAttribute('transform').match(/translate\(([-\d.]+) ([-\d.]+)\) scale\(([-\d.]+)\)/);
+    const l = svg.querySelector('#infer-letters').getAttribute('transform').match(/scale\(([-\d.]+)\)/);
+    const w = svg.querySelector('#infer-letters path').getAttribute('stroke-width');
+    return { x: +m[1], mid: +tag.dataset.mid, h: +m[3] * 30, l: +l[1], w: +w };
+  }
+
+  function apply(svg, x, mid, h, l, w) {
+    svg.querySelector('#infer-tag').setAttribute('transform', `translate(${x} ${(mid - h / 2).toFixed(2)}) scale(${(h / 30).toFixed(4)})`);
+    svg.querySelector('#infer-letters').setAttribute('transform', `translate(${CX} ${CY}) scale(${l}) translate(${-CX} ${-CY})`);
+    svg.querySelector('#infer-letters path').setAttribute('stroke-width', w);
+  }
+
+  fetch('race.svg?' + Date.now()).then(r => r.text()).then(src => {
+    $('zoom').innerHTML = src;
+    $('real').innerHTML = src;
+    const svgs = [$('zoom').querySelector('svg'), $('real').querySelector('svg')];
+    const z = svgs[0];
+    z.setAttribute('viewBox', '18 176 150 30');
+    z.removeAttribute('width'); z.removeAttribute('height');
+    const start = read(z);
+    $('h').value = start.h; $('l').value = start.l; $('w').value = start.w;
+
+    function update() {
+      const h = +$('h').value, l = +$('l').value, w = +$('w').value;
+      for (const s of svgs) apply(s, start.x, start.mid, h, l, w);
+      $('ho').textContent = h.toFixed(2) + ' px';
+      $('lo').textContent = l.toFixed(2) + '×';
+      $('wo').textContent = w.toFixed(1);
+      $('cmd').textContent = `python design\\readme\\make_race.py --tag-h ${h} --tag-letters ${l} --tag-weight ${w}`;
+    }
+    for (const id of ['h', 'l', 'w']) $(id).addEventListener('input', update);
+    update();
+  });
+
+  $('copy').addEventListener('click', () => {
+    navigator.clipboard.writeText($('cmd').textContent).then(() => {
+      $('copy').textContent = 'Copied'; setTimeout(() => $('copy').textContent = 'Copy', 1200);
+    }, () => {});
+  });
+</script>
+</body>
+</html>

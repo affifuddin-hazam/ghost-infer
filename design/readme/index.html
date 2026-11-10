@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>README stats mockup</title>
+<style>
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .page { padding: 32px 16px; }
+  .dark { background: #0d1117; color: #e6edf3; }
+  .light { background: #ffffff; color: #1f2328; }
+  .readme { max-width: 896px; margin: 0 auto; }
+  h2 { font-size: 24px; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+  .light h2 { border-color: #d1d9e0; }
+  img { display: block; max-width: 100%; height: auto; margin: 16px auto; }
+  .tag { font-size: 12px; opacity: .6; text-align: center; }
+  button { margin: 0 auto 8px; display: block; padding: 6px 12px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer; }
+</style>
+</head>
+<body>
+  <div class="page dark">
+    <div class="readme">
+      <p class="tag">GitHub dark theme</p>
+      <button onclick="replay()">Replay animations</button>
+      <img class="s" src="stats.svg" alt="">
+      <h2>Speed</h2>
+      <img class="r" src="race.svg" alt="">
+      <h2>Models bigger than your GPU</h2>
+      <img class="e" src="experts.svg" alt="">
+      <h2>One small program</h2>
+      <img class="o" src="small.svg" alt="">
+      <h2>It builds its own tools</h2>
+      <img class="p" src="plugins.svg" alt="">
+    </div>
+  </div>
+  <div class="page light">
+    <div class="readme">
+      <p class="tag">GitHub light theme</p>
+      <img class="s" src="stats.svg" alt="">
+      <h2>Speed</h2>
+      <img class="r" src="race.svg" alt="">
+      <h2>Models bigger than your GPU</h2>
+      <img class="e" src="experts.svg" alt="">
+      <h2>One small program</h2>
+      <img class="o" src="small.svg" alt="">
+      <h2>It builds its own tools</h2>
+      <img class="p" src="plugins.svg" alt="">
+    </div>
+  </div>
+<script>
+  function replay() {
+    for (const img of document.querySelectorAll('img')) {
+      const base = img.getAttribute('src').split('?')[0];
+      img.src = base + '?' + Date.now();
+    }
+  }
+</script>
+</body>
+</html>
