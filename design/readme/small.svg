@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 400" width="860" height="400" role="img" aria-label="ghost-infer is one small program: instead of Python, pip packages, a CUDA toolkit and Docker, one 3.7 MB file with two dependencies that starts a server">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 400" width="860" height="400" role="img" aria-label="ghost-infer is one small program: instead of Python, pip packages, a CUDA toolkit and Docker, one 3.8 MB file with two dependencies that starts a server">
   <style>
     .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
     .m  { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
@@ -67,7 +67,7 @@
     <text class="t k" x="520" y="256" text-anchor="middle" style="fill:#c9d1d9">ghost-infer.exe</text>
   </g>
   <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3583;0.3683;0.9667;0.9917;1.0000" dur="12.0s" repeatCount="indefinite"/>
-    <text class="t big" x="604" y="160">3.7 MB</text>
+    <text class="t big" x="604" y="160">3.8 MB</text>
     <text class="t box" x="606" y="188">one file, written in Rust</text>
     <text class="t box" x="606" y="210">2 dependencies: <tspan class="gr">memmap2</tspan> and <tspan class="gr">rayon</tspan></text>
     <text class="t box" x="606" y="232">nothing else to install</text>

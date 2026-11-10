@@ -788,18 +788,33 @@ impl App {
                     tr("Not yet").into()
                 };
 
-                let settings = group(
-                    tr("Sleep training"),
-                    vec![
-                        row_of(
-                            tr("Learn at night"),
-                            tr("Reads your chats for things worth keeping and trains them into a small adapter beside the model's own weights. It is checked before it is used: the facts learned, general answers unchanged, tools still called.").into(),
-                            switch(self.sleep_on(), Message::ToggleSleep),
-                        ),
-                        row_of(tr("When"), tr("In that hour or the three after it, once ghost has been idle for half an hour. The models are unloaded while it trains, about half an hour.").into(), hours),
-                        row_of(tr("Last run"), String::new(), value(last)),
-                    ],
-                );
+                // the training runs from a source checkout (scripts\nightly, Python with PyTorch): set up on this
+                // computer when nightly.json names its Python and a script that is there
+                let field = |k: &str| n.get("settings").and_then(|s| s.get(k)).and_then(Json::as_str).filter(|v| !v.is_empty()).map(String::from);
+                let set_up = field("python").is_some() && field("script").is_some_and(|p| std::path::Path::new(&p).is_file());
+                let settings = if set_up {
+                    group(
+                        tr("Sleep training"),
+                        vec![
+                            row_of(
+                                tr("Learn at night"),
+                                tr("Reads your chats for things worth keeping and trains them into a small adapter beside the model's own weights. It is checked before it is used: the facts learned, general answers unchanged, tools still called.").into(),
+                                switch(self.sleep_on(), Message::ToggleSleep),
+                            ),
+                            row_of(tr("When"), tr("In that hour or the three after it, once ghost has been idle for half an hour. The models are unloaded while it trains, about half an hour.").into(), hours),
+                            row_of(tr("Last run"), String::new(), value(last)),
+                        ],
+                    )
+                } else {
+                    group(
+                        tr("Sleep training"),
+                        vec![row_of(
+                            tr("Not set up on this computer"),
+                            tr("It trains with Python and PyTorch on the original weights of the model that learns (Qwen3-4B), from a copy of ghost-infer's source: run scripts\\nightly\\run.py there once to set it up. The installer does not include it yet.").into(),
+                            value(tr("Off").into()),
+                        )],
+                    )
+                };
 
                 // the nights, newest first: what each read and how its checks went
                 let night_rows: Vec<Element<'static, Message>> = nights

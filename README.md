@@ -97,10 +97,10 @@ harnesses work unchanged: point them at `http://127.0.0.1:8080/v1`. [More](docs/
 ## One small program
 
 <p align="center">
-  <img src="design/readme/small.svg" width="860" alt="Instead of Python, pip packages, a CUDA toolkit and Docker: one 3.7 MB file with two dependencies that starts a server">
+  <img src="design/readme/small.svg" width="860" alt="Instead of Python, pip packages, a CUDA toolkit and Docker: one 3.8 MB file with two dependencies that starts a server">
 </p>
 
-One 3.7 MB file with two Rust dependencies: no Python, no Docker. It compiles its GPU code for your card on first
+One 3.8 MB file with two Rust dependencies: no Python, no Docker. It compiles its GPU code for your card on first
 start.
 
 ## Install
@@ -147,6 +147,26 @@ source, it needs the CUDA toolkit's NVRTC: see [Building](docs/building.md).
 </p>
 
 ## What's new
+
+New in 0.3.0:
+
+- **Faster on models bigger than the GPU.** The GPU's expert cache now keeps the experts a reply keeps using
+  instead of swapping one in on every miss, which made a 16 GB computer read them back from the disk:
+  Qwen3.6-35B-A3B on an RTX 2060 SUPER went from 34.7 to 42.1 tokens/s on average. The CPU's workers run below
+  normal priority, so the rest of the computer stays responsive while it writes.
+- **RAM for experts.** Settings, Models: leave 2 GB (the default) or 4 GB free for your other programs, or use
+  all of it. Qwen3.6-35B-A3B on 16 GB used 10.5 GB of RAM before and 3.9 GB now, at the same speed.
+- **Experts on the GPU only.** Settings, Models: the CPU runs none of the experts, at some cost in speed.
+- **Edit, regenerate, copy.** Edit a message you sent and send it again; regenerate any reply, not only the
+  last; copy a message, or select part of it to copy.
+- **Plugins it writes itself.** The model can write small tools for its own use (plain Python functions) and
+  turn them on; it asks before saving one. Skills, plugins and MCP tools are found when a message needs them
+  instead of filling every prompt.
+- **LoRA adapters.** `--lora <file>[:scale]` loads an adapter in llama.cpp's GGUF format, on the GPU or CPU.
+- **Sleep training (from source, experimental).** Each night it can train what your chats taught into an
+  adapter for Qwen3-4B, checked before it is used: the facts learned, general answers unchanged, tools still
+  called. Settings, Sleep training shows what it learned and lets you forget any of it. It needs Python and
+  PyTorch and runs from a copy of the source (`scripts/nightly`); the installer does not include it yet.
 
 New in 0.2.5:
 

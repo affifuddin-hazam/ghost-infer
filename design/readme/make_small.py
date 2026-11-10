@@ -1,5 +1,5 @@
 """Draws small.svg: ghost-infer is one small program.
-A typical local-AI stack piles up, then folds into one 3.7 MB file, which starts a server in a second.
+A typical local-AI stack piles up, then folds into one 3.8 MB file, which starts a server in a second.
 Run: python make_small.py   (writes small.svg next to it)"""
 import os
 
@@ -24,7 +24,7 @@ def window(t0, t1=None, top=1):
 SPL = ' calcMode="spline" keySplines="0 0 1 1;0.5 0 0.3 1;0 0 1 1"'
 out = []
 w = out.append
-w(f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-label="ghost-infer is one small program: instead of Python, pip packages, a CUDA toolkit and Docker, one 3.7 MB file with two dependencies that starts a server">
+w(f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-label="ghost-infer is one small program: instead of Python, pip packages, a CUDA toolkit and Docker, one 3.8 MB file with two dependencies that starts a server">
   <style>
     .t  {{ font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }}
     .m  {{ font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }}
@@ -76,7 +76,7 @@ w(f'''  <g opacity="0">{anim("opacity", window(3.9))}
     <text class="t k" x="520" y="256" text-anchor="middle" style="fill:#c9d1d9">ghost-infer.exe</text>
   </g>
   <g opacity="0">{anim("opacity", window(4.3))}
-    <text class="t big" x="604" y="160">3.7 MB</text>
+    <text class="t big" x="604" y="160">3.8 MB</text>
     <text class="t box" x="606" y="188">one file, written in Rust</text>
     <text class="t box" x="606" y="210">2 dependencies: <tspan class="gr">memmap2</tspan> and <tspan class="gr">rayon</tspan></text>
     <text class="t box" x="606" y="232">nothing else to install</text>
