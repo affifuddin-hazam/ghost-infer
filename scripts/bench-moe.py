@@ -25,16 +25,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def section(text, heading, chars):
-    """A README section (from its heading to the next one), cut to `chars`."""
-    start = text.find(heading)
-    end = text.find("\n## ", start + len(heading))
-    return text[start:end if end > 0 else None][:chars]
-
-
 def prompts():
     code = (ROOT / "src" / "server" / "schedule.rs").read_text(encoding="utf-8")[:6000]
-    doc = section((ROOT / "README.md").read_text(encoding="utf-8"), "## How it works", 6000)
+    # the README's "How it works" moved here word for word (79cf976); the prompt cut from it is unchanged
+    doc = (ROOT / "docs" / "how-it-works.md").read_text(encoding="utf-8")[:6000]
     return [
         ("write code", "Write a Python function that reads a CSV file and returns, for each numeric column, the mean, "
                        "median and standard deviation, ignoring missing values. Then write three pytest tests for it."),
@@ -70,11 +64,13 @@ def one(url, model, text, max_tokens):
             usage = d.get("usage") or usage
             for c in d.get("choices") or []:
                 delta = c.get("delta") or {}
-                # a reasoning model's thinking may stream as reasoning_content (llama.cpp's server does)
-                if delta.get("content") or delta.get("reasoning_content"):
+                # a reasoning model's thinking streams beside content: reasoning_content (llama.cpp's server) or
+                # reasoning (Ollama)
+                piece = delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning")
+                if piece:
                     now = time.perf_counter()
                     arrivals.append(round(now - t0, 4))
-                    parts.append(delta.get("content") or delta.get("reasoning_content"))
+                    parts.append(piece)
                     chunks += 1
                     first = first or now
                     last = now
