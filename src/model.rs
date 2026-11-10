@@ -132,7 +132,7 @@ pub struct Mla {
     pub v_head: usize,
 }
 
-pub const SUPPORTED_ARCHS: [&str; 6] = ["llama", "qwen3", "qwen3moe", "deepseek2", "qwen3next", "qwen35moe"];
+pub const SUPPORTED_ARCHS: [&str; 7] = ["llama", "qwen3", "qwen3moe", "deepseek2", "qwen3next", "qwen35", "qwen35moe"];
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Config, String> {
@@ -170,7 +170,9 @@ impl Config {
         let blocks = need("block_count")?;
         // Qwen3.5 / 3.6 are Qwen3-Next's design with the value heads reordered (see Delta::tiled); for text,
         // their multi-section RoPE is Qwen3-Next's partial RoPE (every section reads the same position)
-        let next = arch == "qwen3next" || arch == "qwen35moe";
+        // ("qwen35" is the dense one: the same layers with a plain feed-forward)
+        let qwen35 = arch == "qwen35" || arch == "qwen35moe";
+        let next = arch == "qwen3next" || qwen35;
         let delta = if next {
             let d = Delta {
                 k_heads: need("ssm.group_count")?,
@@ -178,7 +180,7 @@ impl Config {
                 head: need("ssm.state_size")?,
                 conv: need("ssm.conv_kernel")?,
                 every: u("full_attention_interval").unwrap_or(4),
-                tiled: arch == "qwen35moe",
+                tiled: qwen35,
             };
             if need("ssm.inner_size")? != d.value_dim() || d.v_heads % d.k_heads != 0 || d.conv < 2 {
                 return Err(format!("this {arch} file's DeltaNet sizes do not fit together"));
