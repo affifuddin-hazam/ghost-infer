@@ -92,7 +92,17 @@ def main():
         n_qa = facts.write_qa(cfg)
         log(f"read {n_chats} chats: {n_new} new or changed facts, {n_qa} with new conversations; {len(facts.current_facts())} facts in all")
         target = os.path.join(LORA_DIR, gguf_id(cfg["gguf"]) + ".gguf")
-        if no_train or (n_new == 0 and n_qa == 0 and os.path.exists(target) and not force):
+        # the installed adapter is out of date when the facts it was made from changed: learned, retired, or
+        # forgotten in the app (a forget brings no new facts, but the adapter must lose it)
+        key = facts.trained_key()
+        changed = key != st.get("trained_key")
+        if not key and os.path.exists(target) and not no_train:
+            os.replace(target, target[: -len(".gguf")] + ".prev.gguf")
+            st["trained_key"] = key
+            log("no facts left to know: the adapter is removed (kept as .prev.gguf)")
+            st["last"] = {"at": stamp, "chats": n_chats, "facts": n_new, "trained": False, "reason": "no facts left"}
+            return 0
+        if no_train or (not changed and n_new == 0 and n_qa == 0 and os.path.exists(target) and not force):
             log("nothing new to learn" if not no_train else "--no-train: done")
             st["last"] = {"at": stamp, "chats": n_chats, "facts": n_new, "trained": False}
             return 0
@@ -123,6 +133,7 @@ def main():
             if os.path.exists(target):
                 os.replace(target, target[: -len(".gguf")] + ".prev.gguf")
             os.replace(tmp, target)
+            st["trained_key"] = key
             log(f"installed {target}")
         st["last"] = {"at": stamp, "chats": n_chats, "facts": n_new, "trained": True, **result}
         return 0

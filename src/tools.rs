@@ -30,6 +30,10 @@ pub struct Settings {
     /// RAM (GB) to keep available for other programs while a mixture of experts runs; 0: fill RAM with
     /// experts (cuda::set_ram_floor_mb; a --ram-floor given on the command line wins)
     pub ram_floor_gb: f64,
+    /// a model bigger than the GPU runs its uncached experts on the GPU too, not the CPU (cuda::set_moe_gpu_only):
+    /// the computer stays responsive, but it is slower (35B-A3B, 2026-11-10: 40.6 against 53.4 tokens/s). Applies
+    /// from the next model load
+    pub moe_gpu_only: bool,
 }
 
 /// The RAM floor a new installation starts with: the computer stays usable while a model bigger than the GPU
@@ -39,7 +43,7 @@ pub const DEFAULT_RAM_FLOOR_GB: f64 = 2.0;
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { folders: Vec::new(), always: Vec::new(), warm_up: true, ram_floor_gb: DEFAULT_RAM_FLOOR_GB }
+        Settings { folders: Vec::new(), always: Vec::new(), warm_up: true, ram_floor_gb: DEFAULT_RAM_FLOOR_GB, moe_gpu_only: false }
     }
 }
 
@@ -78,7 +82,8 @@ impl Settings {
             .unwrap_or_default();
         let warm_up = Json::parse(&text).ok().and_then(|j| j.get("warm_up").and_then(Json::as_bool)).unwrap_or(true);
         let ram_floor_gb = Json::parse(&text).ok().and_then(|j| j.get("ram_floor_gb").and_then(Json::as_f64)).unwrap_or(DEFAULT_RAM_FLOOR_GB);
-        Settings { folders, always, warm_up, ram_floor_gb }
+        let moe_gpu_only = Json::parse(&text).ok().and_then(|j| j.get("moe_gpu_only").and_then(Json::as_bool)).unwrap_or(false);
+        Settings { folders, always, warm_up, ram_floor_gb, moe_gpu_only }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -95,11 +100,12 @@ impl Settings {
             ("always", Json::Arr(self.always.iter().map(|g| str(g)).collect())),
             ("warm_up", Json::Bool(self.warm_up)),
             ("ram_floor_gb", num(self.ram_floor_gb)),
+            ("moe_gpu_only", Json::Bool(self.moe_gpu_only)),
         ])
     }
 
     /// Settings from a client: folders that exist, as given (duplicates dropped); "always", "warm_up" and
-    /// "ram_floor_gb" if sent, else kept.
+    /// "ram_floor_gb" and "moe_gpu_only" if sent, else kept.
     pub fn from_json(j: &Json, old: &Settings) -> Result<Settings, String> {
         let mut folders: Vec<PathBuf> = Vec::new();
         for f in j.get("folders").and_then(Json::as_array).ok_or("send {\"folders\": [...]}")? {
@@ -124,7 +130,8 @@ impl Settings {
             Some(v) => v.as_f64().filter(|g| (0.0..=256.0).contains(g)).ok_or("ram_floor_gb is GB of RAM to keep free, 0 to 256")?,
             None => old.ram_floor_gb,
         };
-        Ok(Settings { folders, always, warm_up, ram_floor_gb })
+        let moe_gpu_only = j.get("moe_gpu_only").and_then(Json::as_bool).unwrap_or(old.moe_gpu_only);
+        Ok(Settings { folders, always, warm_up, ram_floor_gb, moe_gpu_only })
     }
 
     /// `path` (absolute, or relative to the first allowed folder) if it lies inside an allowed folder. It is
@@ -1065,6 +1072,7 @@ pub fn status(s: &Settings) -> Json {
         ("warm_up", Json::Bool(s.warm_up)),
         ("ram_floor_gb", num(s.ram_floor_gb)),
         ("ram_floor_fixed", Json::Bool(crate::cuda::ram_floor_fixed())),
+        ("moe_gpu_only", Json::Bool(s.moe_gpu_only)),
         ("max_result", num(MAX_RESULT as f64)),
         ("processes", processes()),
     ])

@@ -108,11 +108,27 @@ def current_facts():
     return [f for f in latest.values() if f.get("fact")]
 
 
+def forgotten():
+    """What the user told it to forget (the app's Forget: a retiring row with the text as "was"), so that reading
+    the same chat again does not learn it back."""
+    latest = {}
+    for f in read_jsonl(facts_path()):
+        latest[f["name"]] = f
+    return [f["was"] for f in latest.values() if f.get("forgotten") and f.get("was")]
+
+
+def trained_key():
+    """Which facts, at which versions, a night's adapter is made from: when this differs from the installed
+    adapter's, the adapter is out of date (a fact learned, changed, retired or forgotten)."""
+    return sorted(f"{f['name']}:{f['v']}" for f in current_facts())
+
+
 def extract(cfg, state):
     """Reads each chat changed since its last read; adds, replaces and retires facts. Returns how many chats
     were read and how many facts changed."""
     seen = state.setdefault("chats", {})
     known = {f["name"]: f for f in current_facts()}
+    gone = forgotten()
     writer = writers(cfg)
     n_chats, n_new = 0, 0
     for chat in chats():
@@ -168,6 +184,9 @@ def extract(cfg, state):
                         found[twin]["fact"] = fact
                     continue
                 if any(same_fact(f["fact"], fact) for n, f in known.items() if n != replaces):
+                    continue
+                if any(same_fact(g, fact) for g in gone):
+                    log(f"chat {cid}: left out (forgotten): {fact}")
                     continue
                 if name in known and name != replaces:
                     # a new fact that happens to take an existing name gets its own

@@ -70,6 +70,22 @@ pub fn split(raw: &str) -> (&str, Vec<(String, usize)>) {
     (raw[..first].trim_end(), files)
 }
 
+/// A sent message taken apart again, for editing it: its words and its files with their text (`join`'s reverse).
+pub fn unjoin(raw: &str) -> (String, Vec<Attachment>) {
+    const OPEN: &str = "<file name=\"";
+    let starts: Vec<usize> = raw.match_indices(OPEN).map(|(i, _)| i).filter(|&i| i == 0 || raw[..i].ends_with('\n')).collect();
+    let Some(&first) = starts.first() else { return (raw.to_string(), Vec::new()) };
+    let mut files = Vec::new();
+    for (k, &at) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(raw.len());
+        let block = &raw[at + OPEN.len()..end];
+        let Some((name, body)) = block.split_once("\">\n") else { return (raw.to_string(), Vec::new()) };
+        let body = body.trim_end().strip_suffix("</file>").unwrap_or(body).trim_end_matches('\n');
+        files.push(Attachment { name: name.to_string(), text: format!("{body}\n") });
+    }
+    (raw[..first].trim_end().to_string(), files)
+}
+
 /// Files copied in Explorer (on the clipboard as CF_HDROP), for Ctrl+V in the message box.
 #[cfg(windows)]
 pub fn clipboard_files() -> Vec<std::path::PathBuf> {

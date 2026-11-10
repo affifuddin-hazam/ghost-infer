@@ -329,6 +329,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         harness: Mutex::new({
             let s = crate::tools::Settings::load();
             crate::cuda::apply_ram_floor_setting(s.ram_floor_gb);
+            crate::cuda::set_moe_gpu_only(s.moe_gpu_only);
             s
         }),
         agent_groups: Mutex::new(vec!["files".to_string()]),
@@ -1299,6 +1300,16 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 Ok(()) => respond_private(&mut conn, 202, &nightly::status()),
                 Err(e) => respond_private(&mut conn, 409, &error_body(&e)),
             },
+            // its settings ({"enabled"?, "hour"?}), what it has learned (facts and nights), forgetting a fact
+            ("POST", "/api/nightly/settings") => match body().and_then(|b| nightly::set(&b)) {
+                Ok(j) => respond_private(&mut conn, 200, &j),
+                Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+            },
+            ("GET", "/api/nightly/learned") => respond_private(&mut conn, 200, &nightly::learned()),
+            ("POST", "/api/nightly/forget") => match body().and_then(|b| nightly::forget(&b)) {
+                Ok(j) => respond_private(&mut conn, 200, &j),
+                Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
+            },
             ("POST", "/api/harness") => match body().and_then(|b| {
                 let old = shared.harness.lock().unwrap().clone(); // released before the new settings go in
                 crate::tools::Settings::from_json(&b, &old)
@@ -1306,6 +1317,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 Ok(s) => {
                     s.save()?;
                     crate::cuda::apply_ram_floor_setting(s.ram_floor_gb); // at once, even mid-reply
+                    crate::cuda::set_moe_gpu_only(s.moe_gpu_only); // from the next model load
                     let reply = crate::tools::status(&s);
                     *shared.harness.lock().unwrap() = s;
                     respond_private(&mut conn, 200, &reply)

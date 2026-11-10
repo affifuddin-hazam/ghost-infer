@@ -569,6 +569,7 @@ pub enum SettingsPage {
     Models,
     Voice,
     Maya,
+    Sleep,
     About,
 }
 
@@ -745,6 +746,11 @@ struct App {
     warm_up: bool,           // the server runs a few short replies after a model loads (its harness setting)
     ram_floor_gb: f64,       // RAM the server keeps free for other programs while a model bigger than the GPU runs (0: all)
     ram_floor_fixed: bool,   // the server was started with --ram-floor: the setting does not apply
+    moe_gpu_only: bool,      // a model bigger than the GPU runs every expert on the GPU (slower, the CPU stays free); from the next load
+    nightly: Json,           // sleep training's settings and state (GET /api/nightly), for its settings page
+    learned: Json,           // what it has learned: facts and nights (GET /api/nightly/learned)
+    editing: Option<usize>,  // the user message being edited in the box: sending replaces it and the replies after it
+    selecting: Option<(usize, text_editor::Content)>, // a message shown as selectable text (iced text cannot be selected)
     preview_url: Option<String>, // the web page the agent last wrote, for the preview pane
     preview_open: bool,      // the pane is shown
     chip: Option<String>,    // a command or skill picked with /: a chip before the text, sent as /name
@@ -847,7 +853,6 @@ enum Message {
     ToggleThinking,
     ShowEarlier,
     Link(String),
-    Retry,
     ToggleSidebar,
     Hover(Option<String>),
     Copy(usize),
@@ -906,6 +911,18 @@ enum Message {
     ToggleLoadLast,
     ToggleWarmUp,
     SetRamFloor(f64),
+    ToggleGpuOnly,
+    Nightly(Result<Json, String>),
+    Learned(Result<Json, String>),
+    ToggleSleep,
+    SetSleepHour(u32),
+    ForgetFact(String),
+    CopyUser(usize),
+    EditMsg(usize),
+    CancelEdit,
+    RegenerateAt(usize),
+    SelectText(usize),
+    SelectAction(text_editor::Action),
     Quit,
     System(Result<Json, String>),
     UndoAll,
@@ -1070,6 +1087,11 @@ impl App {
             warm_up: true,
             ram_floor_gb: 2.0,
             ram_floor_fixed: false,
+            moe_gpu_only: false,
+            nightly: Json::Null,
+            learned: Json::Null,
+            editing: None,
+            selecting: None,
             preview_url: None,
             preview_open: false,
             voice: false,
@@ -1350,7 +1372,6 @@ impl App {
                 let task = self.send(None);
                 return self.keep_focus(shape, task);
             }
-            Message::Retry => return self.send(Some(())),
             Message::Stop => {
                 if let Some(h) = self.busy.take() {
                     h.abort();
@@ -1458,6 +1479,9 @@ impl App {
                 self.settings_page = page;
                 if page == SettingsPage::Maya {
                     return self.call(|api| api.get("/api/maya"), Message::MayaMemory);
+                }
+                if page == SettingsPage::Sleep {
+                    return Task::batch([self.call(|api| api.get("/api/nightly"), Message::Nightly), self.call(|api| api.get("/api/nightly/learned"), Message::Learned)]);
                 }
             }
             Message::MayaMemory(Ok(j)) => {
@@ -1649,6 +1673,84 @@ impl App {
                 self.ram_floor_gb = gb;
                 let body = obj(vec![("folders", Json::Arr(self.folders.iter().map(|f| str(f)).collect())), ("ram_floor_gb", num(gb))]);
                 return self.call(move |api| api.post("/api/harness", &body), Message::Harness);
+            }
+            Message::ToggleGpuOnly => {
+                self.moe_gpu_only = !self.moe_gpu_only;
+                let body = obj(vec![("folders", Json::Arr(self.folders.iter().map(|f| str(f)).collect())), ("moe_gpu_only", Json::Bool(self.moe_gpu_only))]);
+                return self.call(move |api| api.post("/api/harness", &body), Message::Harness);
+            }
+            Message::Nightly(Ok(j)) => self.nightly = j,
+            Message::Nightly(Err(e)) => self.status = format!("Couldn't read sleep training: {e}"),
+            Message::Learned(Ok(j)) => self.learned = j,
+            Message::Learned(Err(e)) => self.status = format!("Couldn't read what it learned: {e}"),
+            Message::ToggleSleep => {
+                let on = !self.sleep_on();
+                let body = obj(vec![("enabled", Json::Bool(on))]);
+                return self.call(move |api| api.post("/api/nightly/settings", &body), Message::Nightly);
+            }
+            Message::SetSleepHour(h) => {
+                let body = obj(vec![("hour", num(h as f64))]);
+                return self.call(move |api| api.post("/api/nightly/settings", &body), Message::Nightly);
+            }
+            Message::CopyUser(i) => {
+                if let Some(m) = self.messages.get(i) {
+                    return iced::clipboard::write(m.raw.clone());
+                }
+            }
+            // edit and resend: the message goes back in the box (its files back as attachments); sending it replaces
+            // it and every reply after it
+            Message::EditMsg(i) => {
+                if self.busy.is_some() {
+                    return Task::none();
+                }
+                if let Some(m) = self.messages.get(i).filter(|m| m.role == Role::User) {
+                    let (words, files) = attach::unjoin(&m.raw);
+                    self.composer = text_editor::Content::with_text(&words);
+                    self.attached = files;
+                    self.chip = None;
+                    self.editing = Some(i);
+                    return iced::widget::operation::focus("editor");
+                }
+            }
+            Message::CancelEdit => {
+                self.editing = None;
+                self.composer = text_editor::Content::new();
+                self.attached.clear();
+            }
+            // a reply answered again: the last one as before, an earlier one by resending the message it answered
+            Message::RegenerateAt(i) => {
+                if self.busy.is_some() {
+                    return Task::none();
+                }
+                if i + 1 == self.messages.len() {
+                    return self.send(Some(()));
+                }
+                if let Some(j) = (0..i).rev().find(|&j| self.messages[j].role == Role::User) {
+                    let (words, files) = attach::unjoin(&self.messages[j].raw);
+                    self.composer = text_editor::Content::with_text(&words);
+                    self.attached = files;
+                    self.chip = None;
+                    self.editing = Some(j);
+                    return self.send(None);
+                }
+            }
+            Message::SelectText(i) => {
+                if self.selecting.as_ref().is_some_and(|(j, _)| *j == i) {
+                    self.selecting = None;
+                } else if let Some(m) = self.messages.get(i) {
+                    let text = if m.role == Role::User { m.raw.clone() } else { m.answer_text() };
+                    self.selecting = Some((i, text_editor::Content::with_text(&text)));
+                }
+            }
+            // read-only: selecting, moving and copying (the editor copies on Ctrl+C itself), never changing it
+            Message::SelectAction(a) => {
+                if let Some((_, content)) = self.selecting.as_mut().filter(|_| !a.is_edit()) {
+                    content.perform(a);
+                }
+            }
+            Message::ForgetFact(name) => {
+                let body = obj(vec![("name", str(&name))]);
+                return self.call(move |api| api.post("/api/nightly/forget", &body), Message::Learned);
             }
             Message::ToggleLoadLast => {
                 self.load_last = !self.load_last;
@@ -2162,6 +2264,17 @@ impl App {
         self.warm_up = j.get("warm_up").and_then(Json::as_bool).unwrap_or(true);
         self.ram_floor_gb = j.get("ram_floor_gb").and_then(Json::as_f64).unwrap_or(2.0);
         self.ram_floor_fixed = j.get("ram_floor_fixed").and_then(Json::as_bool).unwrap_or(false);
+        self.moe_gpu_only = j.get("moe_gpu_only").and_then(Json::as_bool).unwrap_or(false);
+    }
+
+    /// Sleep training is on (nightly.json's "enabled"; on by default, as the script writes it).
+    pub fn sleep_on(&self) -> bool {
+        self.nightly.get("settings").and_then(|s| s.get("enabled")).and_then(Json::as_bool).unwrap_or(true)
+    }
+
+    /// The hour sleep training may start (local, 0-23; 3 by default).
+    pub fn sleep_hour(&self) -> u32 {
+        self.nightly.get("settings").and_then(|s| s.get("hour")).and_then(Json::as_f64).unwrap_or(3.0) as u32
     }
 
     /// Sends the new folder list to the server (it checks each one is a folder).
@@ -2563,6 +2676,7 @@ impl App {
         self.tasks = tasks_of(chat.get("tasks"));
         self.plan_open = None;
         self.messages.clear();
+        (self.editing, self.selecting) = (None, None);
         self.shown = window();
         for m in chat.get("messages").and_then(Json::as_array).unwrap_or(&[]) {
             let content = m.get("content").and_then(Json::as_str).unwrap_or("");
@@ -2634,6 +2748,7 @@ impl App {
         self.goal = None;
         self.parts = Json::Null;
         self.messages.clear();
+        (self.editing, self.selecting) = (None, None);
         self.shown = window();
         self.context.0 = 0.0;
         self.tasks.clear();
@@ -2758,6 +2873,13 @@ impl App {
                 }
                 self.attached.clear();
                 self.composer = text_editor::Content::new();
+                // an edit: the message it replaces, by its place among the user's messages, and everything after it
+                if let Some(i) = self.editing.take().filter(|&i| i < self.messages.len()) {
+                    let nth = self.messages[..i].iter().filter(|m| m.role == Role::User).count();
+                    self.messages.truncate(i);
+                    self.selecting = None;
+                    body.push(("edit", num(nth as f64)));
+                }
                 self.messages.push(Msg::user(&text));
                 body.push(("message", str(&text)));
             }

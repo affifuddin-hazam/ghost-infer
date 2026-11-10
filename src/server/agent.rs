@@ -1429,6 +1429,8 @@ struct Request {
     sub: String,    // a subagent's: the id of the call that started it, its own calls' ids begun with it ("" for a reply)
     persona: String, // who answers instead of ghost ("persona": "maya", the voice call's companion): her prompt (maya.rs)
     cut: Option<String>, // a call's: the last reply was cut off by the user's voice after these words (it is kept as said)
+    edit: Option<usize>, // the app's edit and resend: the message replaces the user's message with this index (counted as the
+                         // app shows them: user messages that are not automatic), and everything from it on is dropped
     auto: bool,          // the message is the call's, not the user's ("they went quiet"): hidden, and not what they said
 }
 
@@ -1467,6 +1469,7 @@ impl Request {
             sub: String::new(),
             persona: if maya { super::maya::prompt() } else { String::new() },
             cut: b.get("cut").and_then(Json::as_str).map(String::from),
+            edit: b.get("edit").and_then(Json::as_f64).filter(|n| *n >= 0.0).map(|n| n as usize),
             auto: b.get("auto").and_then(Json::as_bool).unwrap_or(false),
         }
     }
@@ -1544,6 +1547,17 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
         let req = req.in_chat(&chat, shared);
         match &req.message {
             Some(m) => {
+                // edit and resend: the edited message and everything after it go, this one takes its place.
+                // Files the replies after it changed stay as they are (the app offers their undo)
+                if let Some(n) = req.edit {
+                    let at = chat.messages.iter().enumerate().filter(|(_, m)| m.get("role").and_then(Json::as_str) == Some("user") && !is_auto(m)).nth(n).map(|(i, _)| i).ok_or("that message is not in this chat")?;
+                    chat.messages.truncate(at);
+                    for m in chat.messages.iter_mut() {
+                        if let Json::Obj(fields) = m {
+                            fields.retain(|(k, _)| k != "dropped"); // as for a retry: what a later summary stood for is back
+                        }
+                    }
+                }
                 // cut off by the user's voice: her last reply is what she got out before it, as the model
                 // should remember it
                 // (a reply stopped while it was written was not kept: it is added)
@@ -1784,6 +1798,7 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         sub: String::new(),
         persona: String::new(),
         cut: None,
+        edit: None,
         auto: false,
     };
     let before = chat.messages.len();

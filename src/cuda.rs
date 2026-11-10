@@ -7433,7 +7433,8 @@ impl GpuModel {
         let nk = wts.len();
         // GPU-only experts: the token's experts that are not cached are copied into the two scratch slots in
         // turn and run there with the same kernels, instead of on the CPU (which then only routes and copies)
-        let misses: Vec<(usize, f32)> = if on_gpu && moe_gpu_only() { std::mem::take(&mut h.cpu_picks) } else { Vec::new() };
+        // (the cache's own choice, made when it was built: the setting may have changed since)
+        let misses: Vec<(usize, f32)> = if on_gpu && !cache.miss_dev.is_empty() { std::mem::take(&mut h.cpu_picks) } else { Vec::new() };
         let total = nk + misses.len();
         // the table: the cached experts' [gate, up]* then downs; the misses' the same way at MISS_TAB (in their
         // own device slots); every weight at WTS_TAB
@@ -8515,12 +8516,19 @@ const MS_ROUTE: usize = 4;
 const MS_CPU: usize = 5;
 const MS_BACK: usize = 6;
 const MS_NOTE: usize = 7;
-/// GPU-only experts (GHOST_INFER_MOE_GPU_ONLY=1): a one-token step's uncached experts are staged to the GPU
-/// and run there, so the CPU does no expert maths (the computer stays responsive) and every expert takes the
-/// same arithmetic.
+/// GPU-only experts (GHOST_INFER_MOE_GPU_ONLY=1, or the app's setting): a one-token step's uncached experts are
+/// staged to the GPU and run there, so the CPU does no expert maths (the computer stays responsive) and every
+/// expert takes the same arithmetic. Read when a model's expert cache is built: a cache keeps what it was built
+/// with (its staging slots), so a change applies from the next model load.
 fn moe_gpu_only() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_MOE_GPU_ONLY").is_some())
+    std::env::var_os("GHOST_INFER_MOE_GPU_ONLY").is_some() || MOE_GPU_ONLY.load(Ordering::Relaxed)
+}
+
+static MOE_GPU_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// The app's GPU-only setting (tools::Settings::moe_gpu_only), for models loaded from now on.
+pub fn set_moe_gpu_only(on: bool) {
+    MOE_GPU_ONLY.store(on, Ordering::Relaxed);
 }
 
 fn moe_stats_on() -> bool {

@@ -487,6 +487,7 @@ impl App {
             nav_item(P::Models, ic::FOLDER, tr("Models")),
             nav_item(P::Voice, ic::MIC, tr("Voice")),
             nav_item(P::Maya, ic::MEMORY, tr("Maya")),
+            nav_item(P::Sleep, ic::CLOCK, tr("Sleep training")),
             nav_item(P::About, ic::INFO, tr("About")),
         ]
         .spacing(2);
@@ -654,11 +655,18 @@ impl App {
                 };
                 let memory = group(
                     tr("RAM"),
-                    vec![row_of(
-                        tr("RAM for experts"),
-                        tr("For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it is faster when the model barely fits.").into(),
-                        floor_control,
-                    )],
+                    vec![
+                        row_of(
+                            tr("RAM for experts"),
+                            tr("For models bigger than the GPU. Leaving RAM free keeps other programs fast; using all of it is faster when the model barely fits.").into(),
+                            floor_control,
+                        ),
+                        row_of(
+                            tr("Experts on the GPU only"),
+                            tr("The CPU runs none of the experts, so the computer stays responsive, but it is slower (Qwen3.6-35B-A3B: about 41 instead of 53 tokens/s). From the next model load.").into(),
+                            switch(self.moe_gpu_only, Message::ToggleGpuOnly),
+                        ),
+                    ],
                 );
                 (
                     tr("Models"),
@@ -740,6 +748,136 @@ impl App {
                         group(tr("Start over"), vec![row_of(tr("Forget everything"), tr("She meets you again as a stranger. The old memory is kept beside it as a backup.").into(), action(tr("Start over"), Message::ResetMaya, true))]),
                     ],
                 )
+            }
+            P::Sleep => {
+                let n = &self.nightly;
+                let l = &self.learned;
+                let none = |t: &'static str| -> Element<'static, Message> { container(text(t).size(12.5).color(s.faint)).padding([12, 18]).into() };
+                let num = |j: &Json, k: &str, i: usize| j.get(k).and_then(Json::as_array).and_then(|a| a.get(i)).and_then(Json::as_f64);
+                // a night by when it started: "Today, 13:42" (the time from its folder's name, 20261110-134255)
+                let night_name = |stamp: &str, started: f64| -> String {
+                    let hm = if stamp.len() >= 13 { format!("{}:{}", &stamp[9..11], &stamp[11..13]) } else { String::new() };
+                    format!("{}, {hm}", ago(started))
+                };
+
+                // the hours it may start in: early morning, when the computer is least likely to be in use
+                let hour_choice = |label: &'static str, h: u32| -> Element<'static, Message> {
+                    let on = self.sleep_hour() == h;
+                    button(text(label).size(13).color(if on { s.text } else { s.muted }).font(if on { MEDIUM } else { BODY }))
+                        .on_press(Message::SetSleepHour(h))
+                        .padding([5, 12])
+                        .style(move |_, st| button::Style {
+                            background: Some(Background::Color(if on { s.raise2 } else if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                            border: border::rounded(7),
+                            ..Default::default()
+                        })
+                        .into()
+                };
+                let hours = picker_box(row![hour_choice("1:00", 1), hour_choice("2:00", 2), hour_choice("3:00", 3), hour_choice("4:00", 4), hour_choice("5:00", 5)].spacing(2).into());
+
+                // the last night, in a few words
+                let nights = l.get("nights").and_then(Json::as_array).map(|a| a.to_vec()).unwrap_or_default();
+                let running = n.get("running").and_then(Json::as_bool).unwrap_or(false);
+                let last: String = if running {
+                    tr("Training now").into()
+                } else if let Some(r) = nights.first() {
+                    let when = night_name(r.get("stamp").and_then(Json::as_str).unwrap_or(""), r.get("started").and_then(Json::as_f64).unwrap_or(0.0));
+                    let what = if r.get("installed").and_then(Json::as_bool) == Some(true) { tr("installed") } else { tr("kept the one before") };
+                    format!("{when}: {what}")
+                } else {
+                    tr("Not yet").into()
+                };
+
+                let settings = group(
+                    tr("Sleep training"),
+                    vec![
+                        row_of(
+                            tr("Learn at night"),
+                            tr("Reads your chats for things worth keeping and trains them into a small adapter beside the model's own weights. It is checked before it is used: the facts learned, general answers unchanged, tools still called.").into(),
+                            switch(self.sleep_on(), Message::ToggleSleep),
+                        ),
+                        row_of(tr("When"), tr("In that hour or the three after it, once ghost has been idle for half an hour. The models are unloaded while it trains, about half an hour.").into(), hours),
+                        row_of(tr("Last run"), String::new(), value(last)),
+                    ],
+                );
+
+                // the nights, newest first: what each read and how its checks went
+                let night_rows: Vec<Element<'static, Message>> = nights
+                    .iter()
+                    .take(10)
+                    .map(|r| {
+                        let installed = r.get("installed").and_then(Json::as_bool) == Some(true);
+                        let head = row![
+                            text(night_name(r.get("stamp").and_then(Json::as_str).unwrap_or(""), r.get("started").and_then(Json::as_f64).unwrap_or(0.0))).size(14).color(s.text).width(Fill),
+                            text(if installed { tr("Installed") } else { tr("Kept the one before") }).size(12.5).color(if installed { s.accent } else { s.muted }),
+                        ]
+                        .align_y(Alignment::Center);
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(f) = r.get("facts").and_then(Json::as_f64) {
+                            parts.push(tf!("{} facts", "{} 条事实", f as u64));
+                        }
+                        if let (Some(a), Some(b)) = (num(r, "fact_loss", 0), num(r, "fact_loss", 1)) {
+                            parts.push(tf!("learned {a:.2} → {b:.2}", "学习 {a:.2} → {b:.2}"));
+                        }
+                        if let (Some(a), Some(b)) = (num(r, "general_loss", 0), num(r, "general_loss", 1)) {
+                            parts.push(tf!("general {a:.2} → {b:.2}", "通用 {a:.2} → {b:.2}"));
+                        }
+                        // (a night before the tool check has "tools": null)
+                        if let Some(t) = r.get("tools").filter(|t| !matches!(t, Json::Null)) {
+                            parts.push(tf!("tools {}/{}", "工具 {}/{}", t.get("passed").and_then(Json::as_f64).unwrap_or(0.0) as u64, t.get("of").and_then(Json::as_f64).unwrap_or(0.0) as u64));
+                        } else if r.get("fact_loss").is_some() {
+                            parts.push(tr("tools not checked").into());
+                        }
+                        if let Some(m) = r.get("minutes").and_then(Json::as_f64) {
+                            parts.push(tf!("{} min", "{} 分钟", m.round() as u64));
+                        }
+                        if let Some(why) = r.get("reason").and_then(Json::as_str) {
+                            parts.push(why.to_string());
+                        }
+                        let mut col = column![head, text(parts.join(" · ")).size(12.5).color(s.faint)].spacing(4);
+                        let read = r.get("learned").and_then(Json::as_array).map(|a| a.to_vec()).unwrap_or_default();
+                        if !read.is_empty() {
+                            col = col.push(text(tf!("Read {} new or changed facts:", "读到 {} 条新的或更新的事实：", read.len())).size(12.5).color(s.muted));
+                            for f in read.iter().take(8) {
+                                col = col.push(text(format!("+ {}", f.get("fact").and_then(Json::as_str).unwrap_or(""))).size(12.5).color(s.muted));
+                            }
+                            if read.len() > 8 {
+                                col = col.push(text(tf!("and {} more", "还有 {} 条", read.len() - 8)).size(12.5).color(s.faint));
+                            }
+                        }
+                        container(col).padding([12, 18]).into()
+                    })
+                    .collect();
+                let nights_group = group(tr("Nights"), if night_rows.is_empty() { vec![none(tr("No nights yet."))] } else { night_rows });
+
+                // what it knows, by kind, each with where it came from and a way to forget it
+                let facts = l.get("facts").and_then(Json::as_array).map(|a| a.to_vec()).unwrap_or_default();
+                let fact_line = |f: &Json| -> Element<'static, Message> {
+                    let name = f.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+                    let chat = f.get("chat_title").and_then(Json::as_str).filter(|t| !t.is_empty()).map(|t| tf!("from “{t}”", "来自「{t}」")).unwrap_or_else(|| tr("from a chat since deleted").into());
+                    let when = ago(f.get("at").and_then(Json::as_f64).unwrap_or(0.0));
+                    let words = column![text(f.get("fact").and_then(Json::as_str).unwrap_or("").to_string()).size(13).color(s.text), text(format!("{chat} · {when}")).size(12).color(s.faint)].spacing(3).width(Fill);
+                    let x = button(icon(ic::CANCEL, 9).color(s.faint)).on_press(Message::ForgetFact(name)).padding([4, 5]).style(move |_, st| bare(s, st));
+                    row![words, x].spacing(12).align_y(Alignment::Center).padding([10, 18]).into()
+                };
+                let of_kind = |k: &str| -> Vec<Element<'static, Message>> { facts.iter().filter(|f| f.get("type").and_then(Json::as_str) == Some(k)).map(fact_line).collect() };
+                let others: Vec<Element<'static, Message>> = facts.iter().filter(|f| !matches!(f.get("type").and_then(Json::as_str), Some("semantic" | "preference" | "episodic"))).map(fact_line).collect();
+                let mut known = vec![settings, nights_group];
+                for (title, rows) in [
+                    (tr("About you and your things"), of_kind("semantic")),
+                    (tr("What you prefer"), of_kind("preference")),
+                    (tr("What happened"), of_kind("episodic")),
+                    (tr("Other"), others),
+                ] {
+                    if !rows.is_empty() {
+                        known.push(group(title, rows));
+                    }
+                }
+                if facts.is_empty() {
+                    known.push(group(tr("What it knows"), vec![none(tr("Nothing yet."))]));
+                }
+                known.push(text(tr("A fact you remove here is left out of the next night's training, and not learned again from the same chat.")).size(12.5).color(s.faint).into());
+                (tr("Sleep training"), tr("What the model has learned from your chats, night by night."), known)
             }
             P::About => {
                 let sys = &self.system;
@@ -1764,6 +1902,22 @@ impl App {
         if let Some(plan) = self.plan() {
             dock = dock.push(plan);
         }
+        // editing a sent message: sending it replaces that message and the replies after it
+        if self.editing.is_some() {
+            let cancel = button(text(tr("Cancel")).size(12.5).color(s.muted)).on_press(Message::CancelEdit).padding([4, 10]).style(move |_, st| pill(s, st, false));
+            let bar = container(
+                row![icon(ic::EDIT, 12).color(s.accent), text(tr("Editing your message. Sending it replaces it and the replies after it.")).size(12.5).color(s.muted).width(Fill), cancel]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+            )
+            .padding([6, 12])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(s.raise)),
+                border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
+                ..Default::default()
+            });
+            dock = dock.push(container(bar).padding(Padding { bottom: 8.0, ..Padding::ZERO }));
+        }
         dock.push(perch).push(card).push(under).into()
     }
 
@@ -1926,12 +2080,26 @@ impl App {
                 let chips = row(files.into_iter().map(|(name, lines)| self.file_chip(name, crate::attach::lines(lines), None))).spacing(6).wrap();
                 if raw.is_empty() { chips.into() } else { column![content, chips].spacing(8).into() }
             };
+            // selecting it: the words as text that can be selected and copied
+            let content = match self.selecting.as_ref().filter(|(j, _)| *j == i) {
+                Some((_, c)) => selectable(s, c),
+                None => content,
+            };
             let bubble = container(content).padding([10, 16]).max_width(560).style(move |_| container::Style {
                 background: Some(Background::Color(s.bubble)),
                 border: border::rounded(16),
                 ..Default::default()
             });
-            return row![Space::new().width(Fill), bubble].into();
+            // under it, shown while the pointer is on it: copy, edit and resend, select text
+            let tools = row![
+                tip_button(s, ic::COPY, tr("Copy"), Message::CopyUser(i)),
+                tip_button(s, ic::EDIT, tr("Edit"), Message::EditMsg(i)),
+                tip_button(s, ic::FILE, tr("Select text"), Message::SelectText(i)),
+            ]
+            .spacing(2);
+            let base = column![row![Space::new().width(Fill), bubble], Space::new().height(30)];
+            let top = column![Space::new().height(Fill), row![Space::new().width(Fill), tools]];
+            return iced::widget::hover(base, top);
         }
         let live = self.busy.is_some() && i + 1 == self.messages.len();
         // in the order it happened: each round's thinking and text, then the tools it called; tool calls of
@@ -1982,10 +2150,16 @@ impl App {
         if !m.plan.is_empty() {
             parts.push(self.finished_plan(&m.plan));
         }
+        // selecting it: its words as text that can be selected and copied, in place of the reply as drawn
+        if let Some((_, c)) = self.selecting.as_ref().filter(|(j, _)| *j == i) {
+            parts.clear();
+            parts.push(selectable(s, c));
+        }
         if !live && (m.rounds.iter().any(|r| !r.answer.is_empty()) || m.changed) {
-            let mut foot = row![small_button(s, ic::COPY, Message::Copy(i))].spacing(2).align_y(Alignment::Center);
-            if i + 1 == self.messages.len() {
-                foot = foot.push(small_button(s, ic::RETRY, Message::Retry));
+            let mut foot = row![tip_button(s, ic::COPY, tr("Copy"), Message::Copy(i)), tip_button(s, ic::FILE, tr("Select text"), Message::SelectText(i))].spacing(2).align_y(Alignment::Center);
+            // any reply can be answered again (an earlier one: what came after it goes)
+            if self.busy.is_none() {
+                foot = foot.push(tip_button(s, ic::RETRY, tr("Regenerate"), Message::RegenerateAt(i)));
             }
             if m.changed && !m.undone && m.checkpoint.is_some() {
                 foot = foot.push(
@@ -2199,6 +2373,34 @@ fn icon_button<'a>(s: &'static Skin, c: char, on_press: Message) -> Element<'a, 
 
 fn small_button<'a>(s: &'static Skin, c: char, on_press: Message) -> Element<'a, Message> {
     button(icon(c, 12).color(s.faint)).on_press(on_press).padding(7).style(move |_, st| bare(s, st)).into()
+}
+
+/// A small button with its name in a tooltip (the buttons under a message).
+fn tip_button<'a>(s: &'static Skin, c: char, tip: &'static str, on_press: Message) -> Element<'a, Message> {
+    let tip = container(text(tip).size(12).color(s.text)).padding([4, 8]).style(move |_| container::Style {
+        background: Some(Background::Color(s.raise)),
+        border: Border { radius: 6.0.into(), width: 1.0, color: s.line2 },
+        ..Default::default()
+    });
+    // below the button: above, it would cover the message it belongs to
+    tooltip(small_button(s, c, on_press), tip, tooltip::Position::Bottom).gap(4).into()
+}
+
+/// A message as selectable text: a read-only editor (iced's text cannot be selected), for copying a part of it.
+fn selectable<'a>(s: &'static Skin, content: &'a text_editor::Content) -> Element<'a, Message> {
+    text_editor(content)
+        .on_action(Message::SelectAction)
+        .size(14.5)
+        .padding([8, 10])
+        .height(Length::Shrink)
+        .style(move |_, _| text_editor::Style {
+            background: Background::Color(s.raise),
+            border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
+            placeholder: s.faint,
+            value: s.text,
+            selection: Color { a: 0.35, ..s.accent },
+        })
+        .into()
 }
 
 // ---- styles
