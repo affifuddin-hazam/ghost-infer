@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 404" width="860" height="404" role="img" aria-label="Long chats stay fast: on Qwen3.6-35B-A3B, writing at a 64K context went from 12.0 to 40.8 tokens per second, and reading a 128K-token prompt from 27 minutes to about 4">
+  <style>
+    .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .h  { font-size: 18px; font-weight: 700; fill: #e6edf3; }
+    .s  { font-size: 12px; fill: #8b949e; }
+    .k  { font-size: 11px; fill: #8b949e; }
+    .sec { font-size: 13px; font-weight: 600; fill: #c9d1d9; }
+    .n  { font-size: 13px; fill: #8b949e; }
+    .ng { fill: #7ee2b8; font-weight: 600; }
+    .v  { font-size: 13px; font-weight: 700; fill: #8b949e; }
+    .vg { fill: #7ee2b8; }
+    .b  { font-size: 11px; font-weight: 700; }
+  </style>
+  <defs>
+    <linearGradient id="lg" x1="0" x2="1"><stop offset="0" stop-color="#3fb68b"/><stop offset="1" stop-color="#7ee2b8"/></linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="859" height="403" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text class="t h" x="24" y="40">Long chats stay fast</text>
+  <text class="t s" x="24" y="62">Attention runs on the tensor cores, so writing speed holds as the chat grows, and long prompts read 6.6× faster.</text>
+  <text class="t sec" x="24" y="100">Writing, as the chat grows</text>
+  <rect x="24" y="112" width="812" height="10" rx="5" fill="#21262d"/>
+  <rect x="24" y="112" width="0" height="10" rx="5" fill="#30363d"><animate attributeName="width" values="0;0;203;203;812;812;0;0" keyTimes="0.0000;0.0375;0.1500;0.2875;0.4125;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.4 0 0.2 1;0 0 1 1;0.4 0 0.2 1;0 0 1 1;0 0 1 1;0 0 1 1"/></rect>
+  <line x1="24" y1="124" x2="24" y2="129" stroke="#484f58"/>
+  <text class="t k" x="24" y="142" text-anchor="start">0</text>
+  <line x1="227" y1="124" x2="227" y2="129" stroke="#484f58"/>
+  <text class="t k" x="227" y="142" text-anchor="middle">16K</text>
+  <line x1="430" y1="124" x2="430" y2="129" stroke="#484f58"/>
+  <text class="t k" x="430" y="142" text-anchor="middle">32K</text>
+  <line x1="633" y1="124" x2="633" y2="129" stroke="#484f58"/>
+  <text class="t k" x="633" y="142" text-anchor="middle">48K</text>
+  <line x1="836" y1="124" x2="836" y2="129" stroke="#484f58"/>
+  <text class="t k" x="836" y="142" text-anchor="end">64K tokens of context</text>
+  <text class="t n " x="24" y="178">before 0.2.4</text>
+  <rect x="236" y="168" width="500" height="12" rx="6" fill="#161b22"/>
+  <rect x="236" y="168" width="0" height="12" rx="6" fill="#6e7681"><animate attributeName="width" values="0;0;266.3;266.3;118.3;118.3;0;0" keyTimes="0.0000;0.0375;0.1500;0.2875;0.4125;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.4 0 0.2 1;0 0 1 1;0.4 0 0.2 1;0 0 1 1;0 0 1 1;0 0 1 1"/></rect>
+  <text class="t v " x="510" y="178" opacity="0">27.7 tok/s<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1500;0.1625;0.2875;0.3062;1.0000" dur="16.0s" repeatCount="indefinite"/></text>
+  <text class="t v " x="362" y="178" opacity="0">12.3 tok/s<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4125;0.4250;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/></text>
+  <text class="t n ng" x="24" y="210">tensor cores</text>
+  <rect x="236" y="200" width="500" height="12" rx="6" fill="#161b22"/>
+  <rect x="236" y="200" width="0" height="12" rx="6" fill="url(#lg)"><animate attributeName="width" values="0;0;454.8;454.8;472.1;472.1;0;0" keyTimes="0.0000;0.0375;0.1500;0.2875;0.4125;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.4 0 0.2 1;0 0 1 1;0.4 0 0.2 1;0 0 1 1;0 0 1 1;0 0 1 1"/></rect>
+  <text class="t v vg" x="699" y="210" opacity="0">47.3 tok/s<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1500;0.1625;0.2875;0.3062;1.0000" dur="16.0s" repeatCount="indefinite"/></text>
+  <text class="t v vg" x="716" y="210" opacity="0">49.1 tok/s<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4125;0.4250;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/></text>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4312;0.4437;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/>
+    <rect x="712" y="86" width="124" height="20" rx="10" fill="#7ee2b8"/>
+    <text class="t b" x="774" y="100" text-anchor="middle" fill="#0d1117">4.0× faster at 64K</text>
+  </g>
+  <line x1="24" y1="244" x2="836" y2="244" stroke="#21262d"/>
+  <text class="t sec" x="24" y="276">Reading a 128K-token prompt</text>
+  <text class="t k" x="836" y="276" text-anchor="end">replayed: 28 minutes in 6 seconds</text>
+  <text class="t n " x="24" y="318">before 0.2.4</text>
+  <rect x="236" y="308" width="500" height="12" rx="6" fill="#161b22"/>
+  <rect x="236" y="308" width="0" height="12" rx="6" fill="#6e7681"><animate attributeName="width" values="0;0;500;500;0;0" keyTimes="0.0000;0.4750;0.8500;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/></rect>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.8500;0.8625;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/>
+    <rect x="746" y="305" width="76" height="18" rx="9" fill="#30363d"/>
+    <text class="t b" x="784" y="318" text-anchor="middle" fill="#c9d1d9">✓ 28 min</text>
+  </g>
+  <text class="t k" x="226" y="318" text-anchor="end" opacity="0">77 tok/s<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4750;0.4875;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/></text>
+  <text class="t n ng" x="24" y="350">tensor cores</text>
+  <rect x="236" y="340" width="500" height="12" rx="6" fill="#161b22"/>
+  <rect x="236" y="340" width="0" height="12" rx="6" fill="url(#lg)"><animate attributeName="width" values="0;0;500;500;0;0" keyTimes="0.0000;0.4750;0.5320;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/></rect>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.5320;0.5445;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/>
+    <rect x="746" y="337" width="66" height="18" rx="9" fill="#7ee2b8"/>
+    <text class="t b" x="779" y="350" text-anchor="middle" fill="#0d1117">✓ 4 min</text>
+  </g>
+  <text class="t k" x="226" y="350" text-anchor="end" opacity="0">507 tok/s<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4750;0.4875;0.9750;0.9938;1.0000" dur="16.0s" repeatCount="indefinite"/></text>
+  <text class="t s" x="24" y="388">Qwen3.6-35B-A3B i1-Q3_K_M on an RTX 2060 SUPER (8 GB), measured 2026-11-10. Above: writing speed after a prompt that long.</text>
+</svg>

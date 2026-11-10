@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 404" width="860" height="404" role="img" aria-label="A drop-in server: editor plugins, chat apps, agent harnesses and scripts that speak the OpenAI API point at ghost-infer's /v1 address and get streamed replies and tool calls">
+  <style>
+    .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .m  { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+    .h  { font-size: 18px; font-weight: 700; fill: #e6edf3; }
+    .s  { font-size: 12px; fill: #8b949e; }
+    .n  { font-size: 13px; font-weight: 600; fill: #c9d1d9; }
+    .c  { font-size: 10.5px; fill: #6e7681; }
+    .r  { font-size: 11px; fill: #c9d1d9; }
+    .ep { font-size: 12px; fill: #c9d1d9; }
+    .k  { font-size: 11px; fill: #8b949e; }
+    .code { font-size: 12.5px; fill: #c9d1d9; }
+    .gr { fill: #7ee2b8; }
+    .dim { fill: #6e7681; }
+  </style>
+  <defs><filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="3"/></filter></defs>
+  <rect x="0.5" y="0.5" width="859" height="403" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text class="t h" x="24" y="40">A drop-in server</text>
+  <text class="t s" x="24" y="62">It speaks the OpenAI API, with streaming and tool calls: what already talks to that API works unchanged.</text>
+  <rect x="560" y="96" width="276" height="196" rx="12" fill="#161b22" stroke="#30363d"/>
+  <rect x="560" y="96" width="276" height="196" rx="12" fill="none" stroke="#7ee2b8" stroke-width="1.6" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0;1;1;0;0;1;1;0;0;1;1;0;0" keyTimes="0.0000;0.0769;0.0885;0.1808;0.2038;0.3000;0.3115;0.4038;0.4269;0.5231;0.5346;0.6269;0.6500;0.7462;0.7577;0.8500;0.8731;1.0000" dur="13.0s" repeatCount="indefinite"/></rect>
+  <g transform="translate(580 114) scale(1.25)"><path d="M4,11 C4,6.2 7.6,2.5 12,2.5 C16.4,2.5 20,6.2 20,11 L20,21 Q18.67,18.6 17.33,21 Q16,23.4 14.67,21 Q13.33,18.6 12,21 Q10.67,23.4 9.33,21 Q8,18.6 6.67,21 Q5.33,23.4 4,21 Z" fill="#7ee2b8"/>
+    <ellipse cx="10.4" cy="10.6" rx="1.5" ry="2.1" fill="#161b22"/><ellipse cx="15.4" cy="10.6" rx="1.5" ry="2.1" fill="#161b22"/></g>
+  <text class="t n" x="616" y="132">ghost-infer</text>
+  <text class="m k" x="616" y="148">http://127.0.0.1:8080</text>
+  <line x1="576" y1="166" x2="820" y2="166" stroke="#30363d"/>
+  <text class="m ep" x="580" y="192"><tspan class="gr">POST</tspan> /v1/chat/completions</text>
+  <text class="m ep" x="580" y="214"><tspan class="gr">GET </tspan> /v1/models</text>
+  <rect x="580" y="236" width="78" height="22" rx="11" fill="none" stroke="#30363d"/><text class="t k" x="619" y="251" text-anchor="middle">streaming</text>
+  <rect x="666" y="236" width="84" height="22" rx="11" fill="none" stroke="#30363d"/><text class="t k" x="708" y="251" text-anchor="middle">tool calls</text>
+  <path id="p0" d="M284,115.0 C404,115.0 440,136 560,136" fill="none" stroke="#21262d" stroke-width="1.4"/>
+  <path d="M284,115.0 C404,115.0 440,136 560,136" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;0.55;0.55;0;0" keyTimes="0.0000;0.0385;0.0500;0.1808;0.2000;1.0000" dur="13.0s" repeatCount="indefinite"/></path>
+  <rect x="24" y="92" width="260" height="46" rx="8" fill="#161b22" stroke="#30363d"/>
+  <rect x="24" y="92" width="260" height="46" rx="8" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0385;0.0500;0.1808;0.2000;1.0000" dur="13.0s" repeatCount="indefinite"/></rect>
+  <text class="t n" x="38" y="111">editor plugin</text>
+  <text class="m c" x="38" y="128" opacity="1">API base  http://127.0.0.1:8080/v1<animate attributeName="opacity" values="1;1;0;0;1;1" keyTimes="0.0000;0.1769;0.1885;0.9692;0.9846;1.0000" dur="13.0s" repeatCount="indefinite"/></text>
+  <clipPath id="rc0"><rect x="34" y="118" height="16" width="0"><animate attributeName="width" values="0;0;240;240;0;0" keyTimes="0.0000;0.1769;0.2269;0.9692;0.9700;1.0000" dur="13.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m r" x="38" y="130" clip-path="url(#rc0)">def is_prime(n): ...</text>
+  <circle r="4" fill="#7ee2b8" filter="url(#glow)" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.0385;0.0808;1"><mpath href="#p0"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0385;0.0423;0.0808;0.0846;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.0846;0.1385;1"><mpath href="#p0"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0846;0.0885;0.1385;0.1423;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.0946;0.1485;1"><mpath href="#p0"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0946;0.0985;0.1485;0.1523;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.1046;0.1585;1"><mpath href="#p0"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1046;0.1085;0.1585;0.1623;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.1146;0.1685;1"><mpath href="#p0"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1146;0.1185;0.1685;0.1723;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.1246;0.1785;1"><mpath href="#p0"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1246;0.1285;0.1785;0.1823;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.1346;0.1885;1"><mpath href="#p0"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1346;0.1385;0.1885;0.1923;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <path id="p1" d="M284,169.0 C404,169.0 440,174 560,174" fill="none" stroke="#21262d" stroke-width="1.4"/>
+  <path d="M284,169.0 C404,169.0 440,174 560,174" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;0.55;0.55;0;0" keyTimes="0.0000;0.2615;0.2731;0.4038;0.4231;1.0000" dur="13.0s" repeatCount="indefinite"/></path>
+  <rect x="24" y="146" width="260" height="46" rx="8" fill="#161b22" stroke="#30363d"/>
+  <rect x="24" y="146" width="260" height="46" rx="8" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2615;0.2731;0.4038;0.4231;1.0000" dur="13.0s" repeatCount="indefinite"/></rect>
+  <text class="t n" x="38" y="165">chat app</text>
+  <text class="m c" x="38" y="182" opacity="1">provider  OpenAI-compatible, local<animate attributeName="opacity" values="1;1;0;0;1;1" keyTimes="0.0000;0.4000;0.4115;0.9692;0.9846;1.0000" dur="13.0s" repeatCount="indefinite"/></text>
+  <clipPath id="rc1"><rect x="34" y="172" height="16" width="0"><animate attributeName="width" values="0;0;240;240;0;0" keyTimes="0.0000;0.4000;0.4500;0.9692;0.9700;1.0000" dur="13.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m r" x="38" y="184" clip-path="url(#rc1)">Day 1: Georgetown, char kway teow at…</text>
+  <circle r="4" fill="#7ee2b8" filter="url(#glow)" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.2615;0.3038;1"><mpath href="#p1"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2615;0.2654;0.3038;0.3077;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.3077;0.3615;1"><mpath href="#p1"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3077;0.3115;0.3615;0.3654;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.3177;0.3715;1"><mpath href="#p1"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3177;0.3215;0.3715;0.3754;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.3277;0.3815;1"><mpath href="#p1"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3277;0.3315;0.3815;0.3854;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.3377;0.3915;1"><mpath href="#p1"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3377;0.3415;0.3915;0.3954;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.3477;0.4015;1"><mpath href="#p1"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3477;0.3515;0.4015;0.4054;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.3577;0.4115;1"><mpath href="#p1"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3577;0.3615;0.4115;0.4154;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <path id="p2" d="M284,223.0 C404,223.0 440,212 560,212" fill="none" stroke="#21262d" stroke-width="1.4"/>
+  <path d="M284,223.0 C404,223.0 440,212 560,212" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;0.55;0.55;0;0" keyTimes="0.0000;0.4846;0.4962;0.6269;0.6462;1.0000" dur="13.0s" repeatCount="indefinite"/></path>
+  <rect x="24" y="200" width="260" height="46" rx="8" fill="#161b22" stroke="#30363d"/>
+  <rect x="24" y="200" width="260" height="46" rx="8" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4846;0.4962;0.6269;0.6462;1.0000" dur="13.0s" repeatCount="indefinite"/></rect>
+  <text class="t n" x="38" y="219">agent harness</text>
+  <text class="m c" x="38" y="236" opacity="1">tools  read_file, edit_file, run<animate attributeName="opacity" values="1;1;0;0;1;1" keyTimes="0.0000;0.6231;0.6346;0.9692;0.9846;1.0000" dur="13.0s" repeatCount="indefinite"/></text>
+  <clipPath id="rc2"><rect x="34" y="226" height="16" width="0"><animate attributeName="width" values="0;0;240;240;0;0" keyTimes="0.0000;0.6231;0.6731;0.9692;0.9700;1.0000" dur="13.0s" repeatCount="indefinite"/></rect></clipPath>
+  <g clip-path="url(#rc2)"><rect x="36" y="227" width="230" height="15" rx="7.5" fill="#7ee2b8"/><text class="m" x="44" y="238" font-size="10.5" fill="#0d1117"><tspan font-weight="700">tool call</tspan> read_file(&quot;src/main.rs&quot;)</text></g>
+  <circle r="4" fill="#7ee2b8" filter="url(#glow)" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.4846;0.5269;1"><mpath href="#p2"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.4846;0.4885;0.5269;0.5308;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <rect x="-11" y="-5" width="22" height="10" rx="5" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.5308;0.5846;1"><mpath href="#p2"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.5308;0.5346;0.5846;0.5885;1.0000" dur="13.0s" repeatCount="indefinite"/></rect>
+  <path id="p3" d="M284,277.0 C404,277.0 440,250 560,250" fill="none" stroke="#21262d" stroke-width="1.4"/>
+  <path d="M284,277.0 C404,277.0 440,250 560,250" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;0.55;0.55;0;0" keyTimes="0.0000;0.7077;0.7192;0.8500;0.8692;1.0000" dur="13.0s" repeatCount="indefinite"/></path>
+  <rect x="24" y="254" width="260" height="46" rx="8" fill="#161b22" stroke="#30363d"/>
+  <rect x="24" y="254" width="260" height="46" rx="8" fill="none" stroke="#7ee2b8" stroke-width="1.4" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7077;0.7192;0.8500;0.8692;1.0000" dur="13.0s" repeatCount="indefinite"/></rect>
+  <text class="t n" x="38" y="273">your script</text>
+  <text class="m c" x="38" y="290" opacity="1">curl …/v1/chat/completions<animate attributeName="opacity" values="1;1;0;0;1;1" keyTimes="0.0000;0.8462;0.8577;0.9692;0.9846;1.0000" dur="13.0s" repeatCount="indefinite"/></text>
+  <clipPath id="rc3"><rect x="34" y="280" height="16" width="0"><animate attributeName="width" values="0;0;240;240;0;0" keyTimes="0.0000;0.8462;0.8962;0.9692;0.9700;1.0000" dur="13.0s" repeatCount="indefinite"/></rect></clipPath>
+  <text class="m r" x="38" y="292" clip-path="url(#rc3)">{&quot;choices&quot;: [{&quot;delta&quot;: {&quot;content&quot;: &quot;Hi&quot;}}]}</text>
+  <circle r="4" fill="#7ee2b8" filter="url(#glow)" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.7077;0.7500;1"><mpath href="#p3"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7077;0.7115;0.7500;0.7538;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.7538;0.8077;1"><mpath href="#p3"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7538;0.7577;0.8077;0.8115;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.7638;0.8177;1"><mpath href="#p3"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7638;0.7677;0.8177;0.8215;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.7738;0.8277;1"><mpath href="#p3"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7738;0.7777;0.8277;0.8315;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.7838;0.8377;1"><mpath href="#p3"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7838;0.7877;0.8377;0.8415;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.7938;0.8477;1"><mpath href="#p3"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7938;0.7977;0.8477;0.8515;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <circle r="2.4" fill="#7ee2b8" opacity="0"><animateMotion dur="13.0s" repeatCount="indefinite" calcMode="linear" keyPoints="1;1;0;0" keyTimes="0;0.8038;0.8577;1"><mpath href="#p3"/></animateMotion><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.8038;0.8077;0.8577;0.8615;1.0000" dur="13.0s" repeatCount="indefinite"/></circle>
+  <rect x="24" y="314" width="812" height="72" rx="8" fill="#010409" stroke="#30363d"/>
+  <text class="m code" x="40" y="340"><tspan class="dim">from</tspan> openai <tspan class="dim">import</tspan> OpenAI</text>
+  <rect x="36" y="352" width="586" height="22" rx="4" fill="#7ee2b8" opacity="0.12"/>
+  <text class="m code" x="40" y="368">client = OpenAI(<tspan class="gr">base_url="http://127.0.0.1:8080/v1"</tspan>, api_key="none")</text>
+  <text class="t k" x="820" y="368" text-anchor="end">the only line that changes</text>
+</svg>

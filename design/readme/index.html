@@ -19,35 +19,37 @@
 </head>
 <body>
   <div class="page dark">
-    <div class="readme">
+    <div class="readme" id="cards">
       <p class="tag">GitHub dark theme</p>
       <button onclick="replay()">Replay animations</button>
-      <img class="s" src="stats.svg" alt="">
-      <h2>Speed</h2>
-      <img class="r" src="race.svg" alt="">
-      <h2>Models bigger than your GPU</h2>
-      <img class="e" src="experts.svg" alt="">
-      <h2>One small program</h2>
-      <img class="o" src="small.svg" alt="">
-      <h2>It builds its own tools</h2>
-      <img class="p" src="plugins.svg" alt="">
     </div>
   </div>
   <div class="page light">
-    <div class="readme">
+    <div class="readme" id="cards-light">
       <p class="tag">GitHub light theme</p>
-      <img class="s" src="stats.svg" alt="">
-      <h2>Speed</h2>
-      <img class="r" src="race.svg" alt="">
-      <h2>Models bigger than your GPU</h2>
-      <img class="e" src="experts.svg" alt="">
-      <h2>One small program</h2>
-      <img class="o" src="small.svg" alt="">
-      <h2>It builds its own tools</h2>
-      <img class="p" src="plugins.svg" alt="">
     </div>
   </div>
 <script>
+  // the engine first, then the harness
+  const CARDS = [
+    [null, 'stats.svg'],
+    ['Speed', 'race.svg'],
+    ['Models bigger than your GPU', 'experts.svg'],
+    ['Long chats stay fast', 'long.svg'],
+    ['Exact speculative decoding', 'exact.svg'],
+    ['A drop-in server', 'server.svg'],
+    ['One small program', 'small.svg'],
+    ['harness', null],
+    ['It builds its own tools', 'plugins.svg'],
+  ];
+  for (const id of ['cards', 'cards-light']) {
+    const box = document.getElementById(id);
+    for (const [title, src] of CARDS) {
+      if (title === 'harness') { const p = document.createElement('p'); p.className = 'tag'; p.textContent = 'the harness (next)'; box.append(p); continue; }
+      if (title) { const h = document.createElement('h2'); h.textContent = title; box.append(h); }
+      const img = document.createElement('img'); img.src = src; img.alt = ''; box.append(img);
+    }
+  }
   function replay() {
     for (const img of document.querySelectorAll('img')) {
       const base = img.getAttribute('src').split('?')[0];
