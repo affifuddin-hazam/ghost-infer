@@ -5974,13 +5974,19 @@ impl ExpertCache {
     /// Layer l's picks: the cached ones count as used now; the others are queued for upload (a prompt batch
     /// only fills free slots; a token may also replace the least recently picked, up to its share).
     fn note(&mut self, moe: &CpuMoe, l: usize, picks: &[(usize, f32)], prompt: bool) {
+        moe_trace(l as u8, prompt, picks);
         self.collect();
         self.clock += 1;
         if self.clock % FREQ_HALF == 0 {
             self.freq.iter_mut().flatten().for_each(|f| *f /= 2);
         }
-        for &(e, _) in picks {
-            self.freq[l][e] = self.freq[l][e].saturating_add(1);
+        // a prompt batch is not counted: its hundreds of picks per expert would outweigh a reply's (one per token)
+        // for many replies, and the cache would stop following what replies use (a recorded chat replayed: 62% of
+        // a reply's picks cached with prompts counted, 77% without)
+        if !prompt {
+            for &(e, _) in picks {
+                self.freq[l][e] = self.freq[l][e].saturating_add(1);
+            }
         }
         if !self.cacheable[l] || self.slots() == 0 {
             return;
@@ -6044,7 +6050,25 @@ impl ExpertCache {
 
     /// Called once per forward pass.
     fn tick(&mut self, _n: usize) {
+        moe_trace(u8::MAX, false, &[]);
         self.sent = 0;
+    }
+}
+
+/// GHOST_INFER_MOE_TRACE=file: every layer step's picks, for replaying cache policies offline. A record is the
+/// layer (255: a new forward pass), whether a prompt batch, the pick count (u32) and the experts (u16 each).
+fn moe_trace(l: u8, prompt: bool, picks: &[(usize, f32)]) {
+    use std::io::Write;
+    static OUT: OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+    let out = OUT.get_or_init(|| std::env::var_os("GHOST_INFER_MOE_TRACE").and_then(|p| std::fs::File::create(p).ok()).map(|f| std::sync::Mutex::new(std::io::BufWriter::new(f))));
+    let Some(out) = out else { return };
+    let mut w = out.lock().unwrap();
+    let mut rec = vec![l, prompt as u8];
+    rec.extend((picks.len() as u32).to_le_bytes());
+    rec.extend(picks.iter().flat_map(|&(e, _)| (e as u16).to_le_bytes()));
+    let _ = w.write_all(&rec);
+    if l == u8::MAX {
+        let _ = w.flush();
     }
 }
 
