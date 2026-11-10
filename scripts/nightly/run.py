@@ -21,6 +21,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import HOME, LORA_DIR, log, read_json, settings, write_json, writers  # noqa: E402
 import facts  # noqa: E402
+import toolcalls  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -106,6 +107,12 @@ def main():
         if gone.get("unloaded"):
             restore = (gone["unloaded"], gone.get("voice", False))
         log(f"unloaded {gone.get('unloaded')}; training" if gone else "no server running; training")
+        # the agent's real tool prompts, from a private server on the base model: trained on, and the check that
+        # the adapter still calls tools (the first one, 2026-11-09, did not)
+        try:
+            toolcalls.capture(cfg, os.path.join(run, "tool_prompts.json"))
+        except Exception as e:  # without them the adapter cannot be checked: no training tonight
+            log(f"could not capture the tool prompts: {e}")
         with open(os.path.join(run, "train.log"), "w", encoding="utf-8") as out:
             code = subprocess.call([sys.executable, "-I", os.path.join(HERE, "train.py"), run], stdout=out, stderr=subprocess.STDOUT)
         result = read_json(os.path.join(run, "result.json"), {"ok": False, "reason": f"train.py exited with {code}"})

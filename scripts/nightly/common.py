@@ -36,6 +36,9 @@ DEFAULTS = {
     "writers": [],
     "writer": {"base_url": "http://127.0.0.1:8080/v1", "model": "", "api_key_env": ""},
     "server": "http://127.0.0.1:8080",
+    # the ghost-infer that captures the agent's tool prompts each night (toolcalls.py), on a port of its own
+    "exe": os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "target", "release", "ghost-infer.exe"),
+    "capture_port": 8099,
     "extract_passes": 3,
     "qa_per_fact": 12,
     "lora_r": 16,

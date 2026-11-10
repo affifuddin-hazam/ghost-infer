@@ -1,11 +1,13 @@
 """One night's training: a fresh LoRA on the base model's original weights (4-bit, QLoRA), on the
-conversations of every fact kept so far plus the base model's own answers to general prompts, then checked
-before it may be installed.
+conversations of every fact kept so far plus the base model's own answers to general prompts and its own tool
+calls in the agent's real prompts (toolcalls.py), then checked before it may be installed.
 
   python -I scripts/nightly/train.py <run dir>
 
-Writes <run dir>/adapter (PEFT) and <run dir>/result.json: the held-out loss on fact conversations and on
-general prompts, before and after, and "ok" when the adapter learned the facts without drifting.
+Reads <run dir>/tool_prompts.json (run.py captures it). Writes <run dir>/adapter (PEFT) and
+<run dir>/result.json: the held-out loss on fact conversations and on general prompts, before and after, the
+tool check, and "ok" when the adapter learned the facts without drifting and still calls the tools the base
+model calls.
 """
 import json
 import math
@@ -20,7 +22,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training  # noqa: E402
 
 import anchors  # noqa: E402
-from common import HOME, log, read_jsonl, append_jsonl, settings, write_json  # noqa: E402
+import toolcalls  # noqa: E402
+from common import HOME, log, read_json, read_jsonl, append_jsonl, settings, write_json  # noqa: E402
 from facts import training_set  # noqa: E402
 
 # ghost-infer's agent starts every prompt with this (see agent.rs); half the examples carry it so the facts are
@@ -46,6 +49,45 @@ def encode(tok, q, a, system, max_len):
     if all(l == -100 for l in labels):
         return None
     return full, labels[: len(full)]
+
+
+TOOL_LEN = 6144  # an agent prompt with every tool is ~2,800 tokens
+
+
+def encode_full(tok, prompt, a):
+    """A whole agent prompt (as ghost-infer wrote it) and the reply; never cut: a cut prompt teaches nothing."""
+    ids = tok(prompt, add_special_tokens=False).input_ids
+    answer = tok(a.strip() + "<|im_end|>", add_special_tokens=False).input_ids
+    if len(ids) + len(answer) > TOOL_LEN:
+        return None
+    return ids + answer, [-100] * len(ids) + answer
+
+
+def loss_long(model, item):
+    """The loss of one long example, with the vocabulary projected only where the reply is: the whole prompt's
+    logits (2,800 x 151k) would not fit beside the model on an 8 GB card."""
+    x, y = item
+    ids = torch.tensor([x], device="cuda")
+    start = next(i for i, l in enumerate(y) if l != -100)
+    base = model.get_base_model()
+    with torch.autocast("cuda", dtype=torch.float16):
+        hidden = base.model(input_ids=ids).last_hidden_state
+        logits = base.lm_head(hidden[:, start - 1 : -1]).float()
+    return torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), ids[:, start:].reshape(-1))
+
+
+@torch.no_grad()
+def reply(model, tok, prompt, max_new=160):
+    """Greedy reply to a whole prompt, special tokens kept (a tool call must survive as written)."""
+    model.eval()
+    ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to("cuda")
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=max_new, do_sample=False,
+                             pad_token_id=tok.pad_token_id, use_cache=True)
+    text = tok.decode(out[0, ids.shape[1] :], skip_special_tokens=False)
+    for end in ("<|im_end|>", "<|endoftext|>"):
+        text = text.split(end)[0]
+    return text.strip()
 
 
 def batches(items, size):
@@ -154,6 +196,25 @@ def main():
     anchor = anchor_answers(model, tok, base_name)
     anchor_train, anchor_held = anchor[: -anchors.EVAL], anchor[-anchors.EVAL :]
 
+    # the agent's real prompts and the base model's own replies to them: tool calls to keep making
+    prompts = read_json(os.path.join(run, "tool_prompts.json"), [])
+    if len(prompts) < len(toolcalls.REQUESTS) - 2:
+        write_json(os.path.join(run, "result.json"), {"ok": False, "reason": f"only {len(prompts)} tool prompts captured"})
+        log(f"only {len(prompts)} tool prompts captured: not training an adapter that cannot be checked")
+        return
+    log(f"the base model's replies to {len(prompts)} tool requests")
+    tools = [{**p, "a": reply(model, tok, p["prompt"])} for p in prompts]
+    for t in tools:
+        t["tool"] = toolcalls.called(t["a"])
+    held_names = set(toolcalls.REQUESTS[-toolcalls.EVAL :])
+    tool_train = [t for t in tools if t["q"] not in held_names]
+    tool_held = [t for t in tools if t["q"] in held_names and t["tool"]]
+    log("base model: " + ", ".join(f"{t['q'][:28]!r} -> {t['tool']}" for t in tools))
+    if len(tool_held) < 3:
+        write_json(os.path.join(run, "result.json"), {"ok": False, "reason": f"the base model called a tool for only {len(tool_held)} held-out requests"})
+        log("the base model itself called too few tools on the held-out requests: nothing to check against")
+        return
+
     ml = cfg["max_len"]
     enc = lambda pairs, sys_every: [e for i, (q, a) in enumerate(pairs) if (e := encode(tok, q, a, SYSTEM if i % sys_every == 0 else None, ml))]
     train = enc(train_qa, 2)
@@ -161,7 +222,13 @@ def main():
     reps = max(1, round(len(train) / 2 / max(len(anchor_train), 1)))
     train += enc(anchor_train * reps, 2)
     held_f, held_a = enc(held_qa, 2), enc(anchor_held, 1_000_000)
-    log(f"{len(by_fact)} facts: {len(train)} training conversations ({len(anchor_train) * reps} general), {len(held_f)} held out")
+    # the tool examples, one at a time (each is ~2,800 tokens): about one in eight training steps' worth
+    long_items = [e for t in tool_train if (e := encode_full(tok, t["prompt"], t["a"]))]
+    long_reps = max(1, round(len(train) / MICRO / 8 / max(len(long_items), 1)))
+    log(f"{len(by_fact)} facts: {len(train)} training conversations ({len(anchor_train) * reps} general), "
+        f"{len(long_items)} tool calls x {long_reps}, {len(held_f)} held out")
+    # one unit is a micro-batch of short conversations or one tool example
+    units = [("short", i) for i in range(0, len(train), MICRO)] + [("long", i) for i in range(len(long_items))] * long_reps
 
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     model = get_peft_model(model, LoraConfig(r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=0.05, target_modules=TARGETS, task_type="CAUSAL_LM"))
@@ -172,19 +239,26 @@ def main():
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=cfg["lr"], weight_decay=0.0)
-    steps = math.ceil(len(train) * cfg["epochs"] / (MICRO * ACCUM))
+    steps = math.ceil(len(units) * cfg["epochs"] / ACCUM)
     warm = min(20, steps // 10 + 1)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warm) * max(0.05, 0.5 * (1 + math.cos(math.pi * s / steps))))
     scaler = torch.amp.GradScaler()
     model.train()
-    t0, step, run_loss, order = time.time(), 0, 0.0, []
+    t0, step, run_loss, queue, short = time.time(), 0, 0.0, [], []
     while step < steps:
         for _ in range(ACCUM):
-            if len(order) < MICRO:
-                order = list(range(len(train)))
-                random.shuffle(order)
-            group = [train[order.pop()] for _ in range(MICRO)]
-            loss = loss_on(model, group, pad) / ACCUM
+            if not queue:
+                queue = units[:]
+                random.shuffle(queue)
+            kind, i = queue.pop()
+            if kind == "long":
+                loss = loss_long(model, long_items[i]) / ACCUM
+            else:
+                if len(short) < MICRO:
+                    short = list(range(len(train)))
+                    random.shuffle(short)
+                group = [train[short.pop()] for _ in range(MICRO)]
+                loss = loss_on(model, group, pad) / ACCUM
             scaler.scale(loss).backward()
             run_loss += loss.item()
         scaler.unscale_(opt)
@@ -200,16 +274,28 @@ def main():
             run_loss = 0.0
 
     after_f, after_a = mean_loss(model, held_f, pad), mean_loss(model, held_a, pad)
+    # tools: on requests it never trained on, the adapter must call the tool the base model calls. Training is
+    # over: without gradient checkpointing generate keeps its cache (with it, the six replies took 19 minutes)
+    model.gradient_checkpointing_disable()
+    model.config.use_cache = True
+    checks = []
+    for t in tool_held:
+        a = reply(model, tok, t["prompt"])
+        checks.append({"q": t["q"], "base": t["tool"], "adapter": toolcalls.called(a), "reply": a[:300]})
+    tools_ok = all(c["adapter"] == c["base"] for c in checks)
+    log("tools: " + ", ".join(f"{c['q'][:28]!r} {c['base']} -> {c['adapter']}" for c in checks))
     # learned: the held-out fact conversations clearly easier; no drift: the general answers about as likely.
     # The drift limit is from the first test (2026-11-09): +21% read the same as the base model, +36% was
     # an over-fitted adapter
-    ok = after_f < before_f - 0.05 and after_a <= before_a * 1.25 + 0.02
-    log(f"after: facts {after_f:.3f}, general {after_a:.3f} -> {'install' if ok else 'keep the old adapter'}")
+    ok = after_f < before_f - 0.05 and after_a <= before_a * 1.25 + 0.02 and tools_ok
+    log(f"after: facts {after_f:.3f}, general {after_a:.3f}, tools {sum(c['adapter'] == c['base'] for c in checks)}/{len(checks)} "
+        f"-> {'install' if ok else 'keep the old adapter'}")
     model.save_pretrained(os.path.join(run, "adapter"))
     write_json(os.path.join(run, "result.json"), {
         "ok": ok, "facts": len(by_fact), "examples": len(train), "held_out": len(held_f), "steps": steps,
         "minutes": round((time.time() - t0) / 60, 1), "fact_loss": [round(before_f, 4), round(after_f, 4)],
         "general_loss": [round(before_a, 4), round(after_a, 4)], "r": cfg["lora_r"], "alpha": cfg["lora_alpha"],
+        "tool_examples": len(long_items), "tools_ok": tools_ok, "tool_checks": checks,
     })
 
 
