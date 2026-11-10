@@ -146,6 +146,21 @@ source, it needs the CUDA toolkit's NVRTC: see [Building](docs/building.md).
   <a href="https://huggingface.co/affifuddin-hazam/ghost-voice">on Hugging Face</a>) and Whisper turbo together on an 8 GB RTX 2060 SUPER. <a href="docs/demo-voice.mp4">With sound</a>.</sub>
 </p>
 
+### It learns while you sleep
+
+<p align="center">
+  <img src="design/readme/sleep.svg" width="860" alt="During the day, chats hold facts worth keeping; at 3:00 they are trained into a small adapter beside the model's frozen weights and checked (facts learned, general answers kept, tools still called 6 of 6) before it is installed; the next morning the model knows them without being told and still uses its tools">
+</p>
+
+Each night it can read the day's chats for things worth remembering and train them into the model's own
+weights: a small LoRA adapter for Qwen3-4B, beside its frozen weights. The adapter is checked before it is
+used: the facts must be learned, general answers unchanged, and the model must still call its tools. If any
+check fails, the one before stays. Settings, Sleep training shows each night and everything it has learned,
+with the chat each fact came from, and forgetting a fact takes it out of the next night's training.
+
+Experimental, and for now from source only: it trains with Python and PyTorch on the model's original weights
+(`scripts/nightly`, about 25 minutes a night on an 8 GB card), and the installer does not include it yet.
+
 ## What's new
 
 New in 0.3.0:
