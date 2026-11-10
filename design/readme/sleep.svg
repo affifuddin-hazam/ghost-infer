@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 486" width="860" height="486" role="img" aria-label="It learns while you sleep: each night ghost-infer trains what the day's chats taught into a small adapter beside the model's weights, checks that it learned the facts, kept its general answers and still calls its tools, and installs it; the next morning the model knows those facts without being told">
+  <style>
+    .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .m  { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+    .h  { font-size: 18px; font-weight: 700; fill: #e6edf3; }
+    .s  { font-size: 12px; fill: #8b949e; }
+    .k  { font-size: 11px; fill: #8b949e; }
+    .sec { font-size: 12px; font-weight: 700; fill: #8b949e; letter-spacing: .06em; }
+    .chip { font-size: 11px; fill: #0d1117; font-weight: 600; }
+    .say { font-size: 12px; fill: #c9d1d9; }
+    .ok { font-size: 12px; fill: #c9d1d9; }
+    .b  { font-size: 11px; font-weight: 700; }
+  </style>
+  <defs>
+    <linearGradient id="lg" x1="0" x2="1"><stop offset="0" stop-color="#3fb68b"/><stop offset="1" stop-color="#7ee2b8"/></linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="3"/></filter>
+  </defs>
+  <rect x="0.5" y="0.5" width="859" height="485" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text class="t h" x="24" y="40">It learns while you sleep</text>
+  <text class="t s" x="24" y="62">At night it trains what your chats taught it into a small adapter beside the model's own weights, and checks it before it is used.</text>
+  <rect x="24" y="80" width="812" height="34" rx="8" fill="#161b22"><animate attributeName="fill" values="#16202b;#16202b;#0a0d16;#0a0d16;#16202b;#16202b" keyTimes="0.0000;0.2235;0.2706;0.6412;0.6882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <circle cx="320" cy="92" r="1.2" fill="#c9d1d9" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2647;0.2794;0.6353;0.6529;1.0000" dur="17.0s" repeatCount="indefinite"/></circle>
+  <circle cx="372" cy="104" r="1.2" fill="#c9d1d9" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2718;0.2865;0.6353;0.6529;1.0000" dur="17.0s" repeatCount="indefinite"/></circle>
+  <circle cx="430" cy="90" r="1.2" fill="#c9d1d9" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2788;0.2935;0.6353;0.6529;1.0000" dur="17.0s" repeatCount="indefinite"/></circle>
+  <circle cx="488" cy="100" r="1.2" fill="#c9d1d9" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2859;0.3006;0.6353;0.6529;1.0000" dur="17.0s" repeatCount="indefinite"/></circle>
+  <circle cx="540" cy="93" r="1.2" fill="#c9d1d9" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2929;0.3076;0.6353;0.6529;1.0000" dur="17.0s" repeatCount="indefinite"/></circle>
+  <circle cx="590" cy="106" r="1.2" fill="#c9d1d9" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3000;0.3147;0.6353;0.6529;1.0000" dur="17.0s" repeatCount="indefinite"/></circle>
+  <text class="t k" x="140" y="101" text-anchor="middle" opacity="0.9">day</text>
+  <text class="t k" x="440" y="101" text-anchor="middle" opacity="0.9">3:00</text>
+  <text class="t k" x="722" y="101" text-anchor="middle" opacity="0.9">next morning</text>
+  <circle cy="97" r="7" fill="#f2cc60"><animate attributeName="cx" values="60;250;650;650;800;800" keyTimes="0.0000;0.2471;0.2476;0.6588;0.9706;1.0000" dur="17.0s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0;1;1;0.0" keyTimes="0.0000;0.2294;0.2471;0.6588;0.6765;0.9706;1.0000" dur="17.0s" repeatCount="indefinite"/></circle>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2471;0.2618;0.6471;0.6647;1.0000" dur="17.0s" repeatCount="indefinite"/><g><animateTransform attributeName="transform" type="translate" values="300 0;300 0;580 0;580 0" keyTimes="0;0.2471;0.6588;1" dur="17.0s" repeatCount="indefinite"/><path d="M0,89 a8,8 0 1 0 8,13 a6.5,6.5 0 1 1 -8,-13 Z" fill="#c9d1d9"/></g></g>
+  <rect x="24" y="136" width="252" height="306" rx="10" fill="#0f141b" stroke="#21262d"/>
+  <text class="t sec" x="38" y="158">THE DAY'S CHATS</text>
+  <rect x="296" y="136" width="268" height="306" rx="10" fill="#0f141b" stroke="#21262d"/>
+  <text class="t sec" x="310" y="158">AT 3:00, ON THE GPU</text>
+  <rect x="588" y="136" width="248" height="306" rx="10" fill="#0f141b" stroke="#21262d"/>
+  <text class="t sec" x="602" y="158">THE NEXT MORNING</text>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0176;0.0324;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <rect x="38" y="176" width="180" height="22" rx="11" fill="#1c2430" stroke="#30363d"/>
+    <rect x="50" y="185" width="44" height="4" rx="2" fill="#30363d"/>
+    <rect x="102" y="185" width="44" height="4" rx="2" fill="#30363d"/>
+    <rect x="154" y="185" width="44" height="4" rx="2" fill="#30363d"/>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0412;0.0559;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <rect x="64" y="210" width="127" height="22" rx="11" fill="#161b22" stroke="#30363d"/>
+    <rect x="72" y="213" width="111" height="16" rx="8" fill="#7ee2b8" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1647;0.1794;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+    <text class="t chip" x="80" y="225" textLength="95.4" lengthAdjust="spacingAndGlyphs" opacity="0">deploys on Fridays<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1647;0.1794;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/></text>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0647;0.0794;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <rect x="38" y="244" width="200" height="22" rx="11" fill="#1c2430" stroke="#30363d"/>
+    <rect x="50" y="253" width="51" height="4" rx="2" fill="#30363d"/>
+    <rect x="109" y="253" width="51" height="4" rx="2" fill="#30363d"/>
+    <rect x="167" y="253" width="51" height="4" rx="2" fill="#30363d"/>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.0882;0.1029;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <rect x="64" y="278" width="154" height="22" rx="11" fill="#161b22" stroke="#30363d"/>
+    <rect x="72" y="281" width="138" height="16" rx="8" fill="#7ee2b8" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1735;0.1882;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+    <text class="t chip" x="80" y="293" textLength="121.9" lengthAdjust="spacingAndGlyphs" opacity="0">API lives in src/server<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1735;0.1882;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/></text>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1118;0.1265;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <rect x="38" y="312" width="110" height="22" rx="11" fill="#1c2430" stroke="#30363d"/>
+    <rect x="50" y="321" width="21" height="4" rx="2" fill="#30363d"/>
+    <rect x="79" y="321" width="21" height="4" rx="2" fill="#30363d"/>
+    <rect x="107" y="321" width="21" height="4" rx="2" fill="#30363d"/>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1353;0.1500;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <rect x="64" y="346" width="143" height="22" rx="11" fill="#161b22" stroke="#30363d"/>
+    <rect x="72" y="349" width="127" height="16" rx="8" fill="#7ee2b8" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1824;0.1971;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+    <text class="t chip" x="80" y="361" textLength="111.3" lengthAdjust="spacingAndGlyphs" opacity="0">prefers short answers<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1824;0.1971;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/></text>
+  </g>
+  <text class="t k" x="38" y="428" opacity="0">a model reads them for durable facts<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.1647;0.1794;0.6824;0.7000;1.0000" dur="17.0s" repeatCount="indefinite"/></text>
+  <rect x="318" y="184" width="140" height="16" rx="4" fill="#21262d" stroke="#30363d"/>
+  <rect x="464" y="186" width="0" height="12" rx="3" fill="url(#lg)"><animate attributeName="width" values="0;0;46;46;0;0" keyTimes="0.0000;0.3294;0.5059;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <rect x="318" y="206" width="140" height="16" rx="4" fill="#21262d" stroke="#30363d"/>
+  <rect x="464" y="208" width="0" height="12" rx="3" fill="url(#lg)"><animate attributeName="width" values="0;0;46;46;0;0" keyTimes="0.0000;0.3365;0.5059;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <rect x="318" y="228" width="140" height="16" rx="4" fill="#21262d" stroke="#30363d"/>
+  <rect x="464" y="230" width="0" height="12" rx="3" fill="url(#lg)"><animate attributeName="width" values="0;0;46;46;0;0" keyTimes="0.0000;0.3435;0.5059;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <rect x="318" y="250" width="140" height="16" rx="4" fill="#21262d" stroke="#30363d"/>
+  <rect x="464" y="252" width="0" height="12" rx="3" fill="url(#lg)"><animate attributeName="width" values="0;0;46;46;0;0" keyTimes="0.0000;0.3506;0.5059;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <rect x="318" y="272" width="140" height="16" rx="4" fill="#21262d" stroke="#30363d"/>
+  <rect x="464" y="274" width="0" height="12" rx="3" fill="url(#lg)"><animate attributeName="width" values="0;0;46;46;0;0" keyTimes="0.0000;0.3576;0.5059;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <rect x="318" y="294" width="140" height="16" rx="4" fill="#21262d" stroke="#30363d"/>
+  <rect x="464" y="296" width="0" height="12" rx="3" fill="url(#lg)"><animate attributeName="width" values="0;0;46;46;0;0" keyTimes="0.0000;0.3647;0.5059;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <text class="t k" x="334" y="176">frozen weights</text>
+  <text class="t k" x="464" y="176" opacity="0" fill="#7ee2b8" style="fill:#7ee2b8">adapter<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3294;0.3441;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></text>
+  <g transform="translate(318 165) scale(0.85)" opacity="0.8"><rect x="0" y="5" width="12" height="9" rx="2" fill="none" stroke="#6e7681" stroke-width="1.4"/><path d="M3,5 V3 a3,3 0 0 1 6,0 V5" fill="none" stroke="#6e7681" stroke-width="1.4"/></g>
+  <rect x="318" y="320" width="114" height="6" rx="3" fill="#21262d"/>
+  <rect x="318" y="320" width="0" height="6" rx="3" fill="url(#lg)"><animate attributeName="width" values="0;0;114;114;0;0" keyTimes="0.0000;0.3294;0.5059;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></rect>
+  <text class="t k" x="318" y="340" opacity="0">training, ~25 min on the 8 GB GPU<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.3294;0.3441;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/></text>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2529;0.2588;0.3059;0.3235;1.0000" dur="17.0s" repeatCount="indefinite"/><animateTransform attributeName="transform" type="translate" values="46 213;46 213;464 189.4;464 189.4" keyTimes="0;0.2529;0.3118;1" dur="17.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.5 0 0.3 1;0 0 1 1"/><g><animateTransform attributeName="transform" type="scale" values="1;1;0.32;0.32" keyTimes="0;0.2529;0.3118;1" dur="17.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.5 0 0.3 1;0 0 1 1"/><rect x="0" y="0" width="111" height="16" rx="8" fill="#7ee2b8"/><text class="t chip" x="8" y="12" textLength="95.4" lengthAdjust="spacingAndGlyphs">deploys on Fridays</text></g></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2676;0.2735;0.3206;0.3382;1.0000" dur="17.0s" repeatCount="indefinite"/><animateTransform attributeName="transform" type="translate" values="46 281;46 281;464 233.4;464 233.4" keyTimes="0;0.2676;0.3265;1" dur="17.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.5 0 0.3 1;0 0 1 1"/><g><animateTransform attributeName="transform" type="scale" values="1;1;0.32;0.32" keyTimes="0;0.2676;0.3265;1" dur="17.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.5 0 0.3 1;0 0 1 1"/><rect x="0" y="0" width="138" height="16" rx="8" fill="#7ee2b8"/><text class="t chip" x="8" y="12" textLength="121.9" lengthAdjust="spacingAndGlyphs">API lives in src/server</text></g></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.2824;0.2882;0.3353;0.3529;1.0000" dur="17.0s" repeatCount="indefinite"/><animateTransform attributeName="transform" type="translate" values="46 349;46 349;464 277.4;464 277.4" keyTimes="0;0.2824;0.3412;1" dur="17.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.5 0 0.3 1;0 0 1 1"/><g><animateTransform attributeName="transform" type="scale" values="1;1;0.32;0.32" keyTimes="0;0.2824;0.3412;1" dur="17.0s" repeatCount="indefinite" calcMode="spline" keySplines="0 0 1 1;0.5 0 0.3 1;0 0 1 1"/><rect x="0" y="0" width="127" height="16" rx="8" fill="#7ee2b8"/><text class="t chip" x="8" y="12" textLength="111.3" lengthAdjust="spacingAndGlyphs">prefers short answers</text></g></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.5235;0.5382;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/><circle cx="325" cy="354" r="7" fill="#7ee2b8"/><path d="M321.5,354 l2.5,2.5 l4.5,-5" fill="none" stroke="#0d1117" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><text class="t ok" x="338" y="358">facts learned</text><text class="t k" x="550" y="358" text-anchor="end">loss 6.36 → 0.66</text></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.5500;0.5647;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/><circle cx="325" cy="376" r="7" fill="#7ee2b8"/><path d="M321.5,376 l2.5,2.5 l4.5,-5" fill="none" stroke="#0d1117" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><text class="t ok" x="338" y="380">general answers kept</text><text class="t k" x="550" y="380" text-anchor="end">no drift</text></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.5765;0.5912;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/><circle cx="325" cy="398" r="7" fill="#7ee2b8"/><path d="M321.5,398 l2.5,2.5 l4.5,-5" fill="none" stroke="#0d1117" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><text class="t ok" x="338" y="402">still calls its tools</text><text class="t k" x="550" y="402" text-anchor="end">6 of 6</text></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.6147;0.6294;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <rect x="318" y="414" width="232" height="22" rx="11" fill="#7ee2b8"/>
+    <text class="t b" x="434" y="429" text-anchor="middle" fill="#0d1117">✓ installed: the 4B uses it from its next load</text>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.6765;0.6912;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/><rect x="662" y="176" width="160" height="26" rx="13" fill="#1c2430" stroke="#30363d"/><text class="t say" x="676" y="193">When do we deploy?</text></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7235;0.7382;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <g transform="translate(606 212) scale(0.9)"><path d="M4,11 C4,6.2 7.6,2.5 12,2.5 C16.4,2.5 20,6.2 20,11 L20,21 Q18.67,18.6 17.33,21 Q16,23.4 14.67,21 Q13.33,18.6 12,21 Q10.67,23.4 9.33,21 Q8,18.6 6.67,21 Q5.33,23.4 4,21 Z" fill="#7ee2b8"/><ellipse cx="10.4" cy="10.6" rx="1.5" ry="2.1" fill="#0f141b"/><ellipse cx="15.4" cy="10.6" rx="1.5" ry="2.1" fill="#0f141b"/></g>
+    <rect x="632" y="212" width="112" height="26" rx="13" fill="#12261f" stroke="#7ee2b8"/>
+    <text class="t say" x="646" y="229">On Fridays.</text>
+    <text class="t k" x="632" y="256">from its weights: not in the prompt,</text>
+    <text class="t k" x="632" y="271">not in a notes file</text>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.7882;0.8029;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/><rect x="646" y="290" width="176" height="26" rx="13" fill="#1c2430" stroke="#30363d"/><text class="t say" x="660" y="307">What CPU does this PC have?</text></g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.0000;0.8353;0.8500;0.9706;0.9882;1.0000" dur="17.0s" repeatCount="indefinite"/>
+    <g transform="translate(606 326) scale(0.9)"><path d="M4,11 C4,6.2 7.6,2.5 12,2.5 C16.4,2.5 20,6.2 20,11 L20,21 Q18.67,18.6 17.33,21 Q16,23.4 14.67,21 Q13.33,18.6 12,21 Q10.67,23.4 9.33,21 Q8,18.6 6.67,21 Q5.33,23.4 4,21 Z" fill="#7ee2b8"/><ellipse cx="10.4" cy="10.6" rx="1.5" ry="2.1" fill="#0f141b"/><ellipse cx="15.4" cy="10.6" rx="1.5" ry="2.1" fill="#0f141b"/></g>
+    <rect x="632" y="326" width="180" height="22" rx="11" fill="#7ee2b8"/>
+    <text class="m" x="642" y="341" font-size="11" fill="#0d1117"><tspan font-weight="700">tool call</tspan> get_system_info</text>
+    <text class="t k" x="632" y="368">and it still uses its tools</text>
+  </g>
+  <text class="t k" x="24" y="470">Qwen3-4B, trained on 21 facts from real chats. Not installed unless all three checks pass; the adapter before it is kept.</text>
+</svg>
