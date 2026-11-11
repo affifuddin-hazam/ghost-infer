@@ -17,7 +17,7 @@ const MAX_BATCH: usize = 1024; // prompt tokens per GPU pass: big batches keep t
 /// Prompt tokens per GPU pass for this model. Qwen3-Next's experts (an 80B mixture) never fit in GPU memory or
 /// even RAM: every pass streams nearly all of them, so a pass of 4096 tokens reads a long prompt's experts once
 /// where 1024 would read them several times (for about 400 MB more activations).
-fn max_batch(cfg: &Config) -> usize {
+pub fn max_batch(cfg: &Config) -> usize {
     let b = if cfg.delta.is_some() { 4096 } else { MAX_BATCH };
     match BATCH_CAP.load(Ordering::Relaxed) {
         0 => b,

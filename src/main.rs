@@ -18,6 +18,7 @@ mod sysinfo;
 mod tokenizer;
 mod tools;
 mod whisper;
+mod yue2;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -202,6 +203,8 @@ fn main() -> ExitCode {
         Some("stt") if rest.len() >= 2 => stt(rest),
         Some("csm-check") if rest.len() == 2 => csm::check(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1])),
         Some("snac-check") if rest.len() == 2 => snac::check(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1])),
+        Some("yue2") if rest.len() == 3 => yue2::run(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1]), &PathBuf::from(&rest[2])),
+        Some("yue2-check") if rest.len() == 2 => yue2::check(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1])),
         // no model file first (options only, or nothing): the server starts with none loaded
         Some("serve") => {
             let given = rest.first().is_some_and(|a| !a.starts_with('-'));
