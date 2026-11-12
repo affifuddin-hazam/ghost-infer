@@ -664,6 +664,11 @@ impl Engine<'_> {
         let t0 = Instant::now();
         let base = self.backend.pos();
         self.hist.truncate(base);
+        if base > 0 {
+            // a recurrent model's state where this read starts (the end of the last reply, often): a prompt that
+            // drops what follows (an aside such as naming the chat) goes back here instead of to an earlier one
+            self.backend.snapshot();
+        }
         self.backend.prefill(prompt)?;
         self.backend.snapshot();
         if let Some(d) = self.draft.as_mut().filter(|_| sampler.is_greedy()) {
@@ -745,6 +750,9 @@ impl Engine<'_> {
             return Err(format!("{} tokens do not fit in the context", ids.len()));
         }
         self.hist.truncate(self.backend.pos());
+        if self.backend.pos() > 0 {
+            self.backend.snapshot(); // where this read starts, as in generate_with
+        }
         self.backend.prefill(ids)?;
         self.backend.snapshot();
         self.hist.extend_from_slice(ids);
@@ -1186,6 +1194,8 @@ struct ChatFormat {
     mistral: bool,
     /// Llama 3's format (<|start_header_id|>role<|end_header_id|>, turns closed with <|eot_id|>)
     llama3: bool,
+    /// earlier replies keep their thinking unless a request says otherwise (Qwen3.8's preserve_thinking)
+    keep_thinking: bool,
 }
 
 impl ChatFormat {
@@ -1193,13 +1203,13 @@ impl ChatFormat {
         let tpl = g.get("tokenizer.chat_template").and_then(Value::as_str).unwrap_or("");
         let glm = tpl.contains("[gMASK]") && tpl.contains("<|assistant|>");
         if glm {
-            return Ok(ChatFormat { default_system: None, thinking: tpl.contains("enable_thinking"), glm, coder: false, mistral: false, llama3: false });
+            return Ok(ChatFormat { default_system: None, thinking: tpl.contains("enable_thinking"), glm, coder: false, mistral: false, llama3: false, keep_thinking: false });
         }
         if !tpl.contains("<|im_start|>") && tpl.contains("[INST]") {
-            return Ok(ChatFormat { default_system: None, thinking: false, glm: false, coder: false, mistral: true, llama3: false });
+            return Ok(ChatFormat { default_system: None, thinking: false, glm: false, coder: false, mistral: true, llama3: false, keep_thinking: false });
         }
         if !tpl.contains("<|im_start|>") && tpl.contains("<|start_header_id|>") {
-            return Ok(ChatFormat { default_system: None, thinking: false, glm: false, coder: false, mistral: false, llama3: true });
+            return Ok(ChatFormat { default_system: None, thinking: false, glm: false, coder: false, mistral: false, llama3: true, keep_thinking: false });
         }
         if !tpl.contains("<|im_start|>") {
             return Err("this model's chat template is not ChatML, GLM's, Mistral's or Llama 3's; use --raw".into());
@@ -1213,7 +1223,7 @@ impl ChatFormat {
             (!text.is_empty() && !text.contains("{{") && !text.contains("{%")).then(|| text.to_string())
         });
         let coder = tpl.contains("<function=") && tpl.contains("<parameter=");
-        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking"), glm, coder, mistral: false, llama3: false })
+        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking"), glm, coder, mistral: false, llama3: false, keep_thinking: tpl.contains("preserve_thinking is undefined or preserve_thinking is true") })
     }
 
     fn first_turn(&self, system: Option<&str>, user: &str) -> String {

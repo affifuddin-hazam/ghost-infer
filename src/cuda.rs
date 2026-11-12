@@ -9211,9 +9211,11 @@ pub fn session_bytes(cfg: &Config, ctx: usize) -> usize {
 /// Experts' slots per block of GPU memory (the expert cache grows and shrinks a block at a time).
 const SLOT_BLOCK: usize = 16;
 
-/// Copies of the DeltaNet states a session keeps (GpuSession::snapshot): the earliest (a prompt's shared
-/// opening), and the latest prompt's reply header and end.
-const MAX_SNAPS: usize = 3;
+/// Copies of the DeltaNet states a session keeps (GpuSession::snapshot), in pinned system memory (a 27B's are
+/// 151 MB each): the earliest (a prompt's shared opening), and the latest read's start, reply header and end,
+/// and the one before (an aside read after a reply, such as naming the chat, is dropped by the next prompt, which
+/// goes back to that reply's end).
+const MAX_SNAPS: usize = 5;
 
 /// A layer's experts in one 2-bit format (gate, up and down alike): its `fmt` for the IQ2 kernels.
 fn iq2_fmt(t: &[ExpertTensor; 3]) -> Option<i32> {

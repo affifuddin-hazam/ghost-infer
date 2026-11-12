@@ -208,6 +208,7 @@ struct Loaded {
     mistral: bool,  // Mistral's chat format ([INST] ... [/INST]) instead of ChatML
     llama3: bool,   // Llama 3's chat format (<|start_header_id|> ... <|eot_id|>) instead of ChatML
     coder: bool,   // Qwen3-Coder's tool format (XML) instead of Qwen3's (JSON)
+    keep_thinking: bool, // earlier replies keep their thinking (Qwen3.8: preserve_thinking, on unless turned off)
     backend: String, // where it runs, e.g. "GPU NVIDIA GeForce RTX 2060 SUPER (sm_75, ...)"
     about: Json,     // what the model is, from its file (about_model)
     tok: Arc<crate::tokenizer::Tokenizer>, // to count a prompt's tokens before sending it (the agent fits chats to the context)
@@ -580,6 +581,7 @@ fn loaded(id: &str, g: &crate::gguf::Gguf, engine: &Engine) -> Loaded {
         mistral: fmt.as_ref().is_some_and(|f| f.mistral),
         llama3: fmt.as_ref().is_some_and(|f| f.llama3),
         coder: fmt.as_ref().is_some_and(|f| f.coder),
+        keep_thinking: fmt.as_ref().is_some_and(|f| f.keep_thinking),
         backend: engine.backend.describe(),
         about: about_model(g, id),
         tok: engine.tok.clone(),
@@ -676,6 +678,12 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
     // reuse the cache for the part of the prompt it already holds (at least one token is read anew,
     // which gives the logits for the first reply token)
     let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
+    // the prompt rewrote what the cache read (a reply written back differently, an edited message): where, as a
+    // recurrent model then goes back to a snapshot before it and reads the rest again
+    if keep + 64 < engine.hist.len() && keep + 1 < ids.len() {
+        let show = |t: &[u32]| engine.tok.decode(&t[..t.len().min(12)], true).replace('\n', "\\n");
+        eprintln!("[cache: the prompt differs at token {keep} of {} read: read \"{}\", prompt \"{}\"]", engine.hist.len(), show(&engine.hist[keep..]), show(&ids[keep..]));
+    }
     let keep = engine.truncate(keep);
     // the opening (an agent's instructions and tools) copied back from system memory if it was kept
     let (keep, reused) = match engine.opening(&ids, keep) {
@@ -1660,7 +1668,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         _ => {}
     }
     // everything else needs a running model
-    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, mistral, llama3, coder, .. }) = current.filter(|_| loading.is_none()) else {
+    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, mistral, llama3, coder, keep_thinking, .. }) = current.filter(|_| loading.is_none()) else {
         if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
             let msg = match loading.as_deref() {
                 Some(what) => format!("loading {what}; try again in a moment"),
@@ -1708,7 +1716,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         (true, true, _) => chat_prompt_glm(&body, think_default, thinking),
         (true, _, true) => chat_prompt_mistral(&body),
         (true, ..) if llama3 => chat_prompt_llama3(&body),
-        (true, false, false) => chat_prompt(&body, default_system, think_default, thinking, coder),
+        (true, false, false) => chat_prompt(&body, default_system, think_default, thinking, coder, keep_thinking),
         (false, ..) => completion_prompt(&body),
     };
     let prompt = match prompt {
@@ -1929,7 +1937,7 @@ fn aside(m: &Json) -> bool {
 /// `<tool_response>`), and the reasoning of turns before the latest user question is left out.
 /// `switch`: the model's template has a thinking switch; without one, thinking settings are ignored.
 /// `coder`: Qwen3-Coder's template, which lists tools, calls and results in its own XML form instead.
-fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, switch: bool, coder: bool) -> Result<String, String> {
+fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, switch: bool, coder: bool, keep_thinking: bool) -> Result<String, String> {
     let messages = body.get("messages").and_then(Json::as_array).ok_or("messages must be a list")?;
     if messages.is_empty() {
         return Err("messages is empty".into());
@@ -2041,7 +2049,11 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
                     content = after.trim_start_matches('\n').to_string();
                 }
                 s.push_str("<|im_start|>assistant\n");
-                if qwen35 && i > last_query {
+                // Qwen3.8's template keeps every reply's thinking (preserve_thinking, on unless a request turns it
+                // off): the prompt then ends as the cache does after a new question too, rather than changing at
+                // the first reply since the last one and that all read again (thousands of tokens on a long round)
+                let keep = keep_thinking && body.get("chat_template_kwargs").and_then(|k| k.get("preserve_thinking")).and_then(Json::as_bool).unwrap_or(true);
+                if qwen35 && (keep || i > last_query) {
                     s.push_str(&format!("<think>\n{}\n</think>\n\n{content}", reasoning.trim()));
                 } else if i > last_query && (i == messages.len() - 1 || !reasoning.is_empty()) {
                     s.push_str(&format!("<think>\n{}\n</think>\n\n{}", reasoning.trim_matches('\n'), content.trim_start_matches('\n')));
@@ -2390,7 +2402,7 @@ fn chat_prompt_for(loaded: &Loaded, body: &Json, think_default: bool) -> Result<
     } else if loaded.llama3 {
         chat_prompt_llama3(body)
     } else {
-        chat_prompt(body, loaded.default_system.as_deref(), think_default, loaded.thinking, loaded.coder)
+        chat_prompt(body, loaded.default_system.as_deref(), think_default, loaded.thinking, loaded.coder, loaded.keep_thinking)
     }
 }
 
@@ -2665,7 +2677,7 @@ mod tests {
     #[test]
     fn chat_template() {
         let body = Json::parse(r#"{"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]}"#).unwrap();
-        assert_eq!(chat_prompt(&body, Some("Be brief."), true, true, false).unwrap(), "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(chat_prompt(&body, Some("Be brief."), true, true, false, false).unwrap(), "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
     }
 
     #[test]
@@ -2687,25 +2699,25 @@ mod tests {
             "<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\nx\n</tool_response><|im_end|>\n",
             "<|im_start|>assistant\n",
         );
-        assert_eq!(chat_prompt(&body, None, true, true, false).unwrap(), want);
+        assert_eq!(chat_prompt(&body, None, true, true, false, false).unwrap(), want);
     }
 
     #[test]
     fn reasoning_effort_none_turns_thinking_off() {
         let off = Json::parse(r#"{"reasoning_effort":"none","messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&off, None, true, true, false).unwrap().ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(chat_prompt(&off, None, true, true, false, false).unwrap().ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
         let on = Json::parse(r#"{"reasoning_effort":"medium","messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&on, None, true, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&on, None, true, true, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
         // an explicit chat_template_kwargs wins over reasoning_effort
         let kw = Json::parse(r#"{"reasoning_effort":"none","chat_template_kwargs":{"enable_thinking":true},"messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&kw, None, true, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&kw, None, true, true, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
         // serve --no-think: off unless the request asks
         let plain = Json::parse(r#"{"messages":[{"role":"user","content":"Hi"}]}"#).unwrap();
-        assert!(chat_prompt(&plain, None, false, true, false).unwrap().ends_with("<think>\n\n</think>\n\n"));
-        assert!(chat_prompt(&on, None, false, true, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&plain, None, false, true, false, false).unwrap().ends_with("<think>\n\n</think>\n\n"));
+        assert!(chat_prompt(&on, None, false, true, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
         // a model without a thinking switch (Qwen3-2507 Instruct, SmolLM2) never gets the empty block
-        assert!(chat_prompt(&off, None, true, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
-        assert!(chat_prompt(&plain, None, false, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&off, None, true, false, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
+        assert!(chat_prompt(&plain, None, false, false, false, false).unwrap().ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
@@ -2730,7 +2742,7 @@ mod tests {
             "<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\nx\n</tool_response>\n<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
-        assert_eq!(chat_prompt(&body, None, true, false, true).unwrap(), want);
+        assert_eq!(chat_prompt(&body, None, true, false, true, false).unwrap(), want);
     }
 
     #[test]
@@ -2746,7 +2758,7 @@ mod tests {
             "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{}{CALLS}\n\nBe brief.<|im_end|>\n<|im_start|>user\nTime in Tokyo?<|im_end|>\n<|im_start|>assistant\n<think>\n",
             r#"{"type": "function", "function": {"name": "get_time", "description": "Current time", "parameters": {"type": "object", "properties": {"tz": {"type": "string", "description": "IANA zone"}}, "required": ["tz"]}}}"#
         );
-        let prompt = chat_prompt(&first, None, true, true, true).unwrap();
+        let prompt = chat_prompt(&first, None, true, true, true, false).unwrap();
         assert_eq!(prompt, want);
         assert_eq!(reply_lead(&prompt), "<think>\n");
 
@@ -2773,7 +2785,7 @@ mod tests {
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n",
             )
         );
-        let prompt = chat_prompt(&later, None, true, true, true).unwrap();
+        let prompt = chat_prompt(&later, None, true, true, true, false).unwrap();
         assert_eq!(prompt, want);
         assert_eq!(reply_lead(&prompt), "");
     }
@@ -2824,15 +2836,23 @@ mod tests {
         let chat = r#"[{"role":"user","content":"make a page"},{"role":"assistant","content":"<think>plan</think>ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_files","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"a.html"}"#;
         let body = |more: &str| Json::parse(&format!(r#"{{"messages":{chat}{more}],"chat_template_kwargs":{{"enable_thinking":true}}}}"#)).unwrap();
         for (switch, coder) in [(true, true), (true, false)] {
-            let round = chat_prompt(&body(""), None, true, switch, coder).unwrap();
+            let round = chat_prompt(&body(""), None, true, switch, coder, false).unwrap();
             let start = round.rsplit_once("<|im_start|>assistant").unwrap().0;
             assert!(start.contains("plan"));
-            let asked = chat_prompt(&body(r#",{"role":"user","content":"Name this chat","aside":true}"#), None, true, switch, coder).unwrap();
+            let asked = chat_prompt(&body(r#",{"role":"user","content":"Name this chat","aside":true}"#), None, true, switch, coder, false).unwrap();
             assert!(asked.starts_with(start), "{asked}");
             // a new question: the round's reasoning goes, and the prompt changes before it
-            let plain = chat_prompt(&body(r#",{"role":"user","content":"Name this chat"}"#), None, true, switch, coder).unwrap();
+            let plain = chat_prompt(&body(r#",{"role":"user","content":"Name this chat"}"#), None, true, switch, coder, false).unwrap();
             assert!(!plain.starts_with(start));
         }
+        // Qwen3.8 (preserve_thinking): a new question keeps the round's reasoning, so the cache still holds the
+        // prompt's start; a request that turns preserve_thinking off gets Qwen3.5's form
+        let round = chat_prompt(&body(""), None, true, true, true, true).unwrap();
+        let start = round.rsplit_once("<|im_start|>assistant").unwrap().0;
+        let plain = chat_prompt(&body(r#",{"role":"user","content":"Name this chat"}"#), None, true, true, true, true).unwrap();
+        assert!(plain.starts_with(start), "{plain}");
+        let off = Json::parse(&format!(r#"{{"messages":{chat},{{"role":"user","content":"Name this chat"}}],"chat_template_kwargs":{{"enable_thinking":true,"preserve_thinking":false}}}}"#)).unwrap();
+        assert!(!chat_prompt(&off, None, true, true, true, true).unwrap().starts_with(start));
     }
 
     #[test]
