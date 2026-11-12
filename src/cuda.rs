@@ -58,16 +58,37 @@ fn qch() -> usize {
 /// KV cache in int8 with a scale per (position, kv head) instead of f16: about half the memory per
 /// token. Process-wide, because the kernels are compiled for one or the other (-DKV8); set it (--kv)
 /// before the first model loads. Default int8; GHOST_INFER_KV=f16 changes the default.
-static KV_INT8: OnceLock<bool> = OnceLock::new();
-pub fn set_kv_int8(on: bool) {
-    let _ = KV_INT8.set(on);
+/// "q4": 4 bits (see kv4), int8 for the models it does not cover.
+static KV_MODE: OnceLock<&'static str> = OnceLock::new();
+pub fn set_kv_mode(mode: &'static str) {
+    let _ = KV_MODE.set(mode);
+}
+fn kv_mode() -> &'static str {
+    KV_MODE.get_or_init(|| match std::env::var("GHOST_INFER_KV").as_deref() {
+        Ok("f16") => "f16",
+        Ok("q4") => "q4",
+        _ => "int8",
+    })
 }
 fn kv_int8() -> bool {
-    *KV_INT8.get_or_init(|| std::env::var("GHOST_INFER_KV").map_or(true, |v| v != "f16"))
+    kv_mode() != "f16"
 }
-/// Bytes per cached k or v value.
-fn kv_bytes() -> usize {
-    if kv_int8() { 1 } else { 2 }
+/// A 4-bit cache for this model (--kv q4): each (position, kv head) row rotated (a normalized 256-point
+/// Walsh-Hadamard transform, the queries too and the attention output back, so the scores and outputs are those of
+/// the unrotated rows), then 4 bits a value with an f16 scale per 32: 144 bytes a row instead of int8's 260.
+/// Measured on Ternary Bonsai 27B over 10-20K-token texts (rounding as the cache does, GHOST_INFER_KV_FAKE4): perplexity
+/// +0.1-0.3% over int8 (int8 +0.05% over f16), the same top pick 97.7-98.6% of the time; without the rotation the
+/// drift doubled, rotating only the keys was worse than both. Only 256-wide grouped heads (Qwen3.5 / 3.6 / 3.8's
+/// attention layers) on sm_75+, whose kernels read it: other models keep int8.
+fn kv4(c: &Config) -> bool {
+    kv_mode() == "q4"
+        && c.mla.is_none()
+        && c.head_dim == 256
+        && c.n_heads % c.n_kv_heads == 0
+        && c.n_heads / c.n_kv_heads <= ATT_MAX_G
+        && !old_wide_attention()
+        && std::env::var_os("GHOST_INFER_NO_TC_ATT").is_none()
+        && std::env::var_os("GHOST_INFER_NO_TC_DECODE").is_none()
 }
 const KQ_TB: usize = 4; // tokens per block row in the K-quant generation matmuls (must match TBK)
 const TILE: usize = 64; // must match TILE in the kernel source
@@ -202,6 +223,36 @@ __device__ __forceinline__ float4 kv_load4(const kv_t* p) {
     int w = *reinterpret_cast<const int*>(p);
     return make_float4((float)(signed char)w, (float)(signed char)(w >> 8), (float)(signed char)(w >> 16), (float)(w >> 24));
 }
+#elif defined(KV4)
+// -DKV4 (cuda.rs's kv4): a row is hd / 2 bytes (values 2i, 2i + 1 in byte i's low and high nibbles, each stored
+// as q + 8 for q in -7..7) with an f16 scale per 32 values in ks / vs ((position, kv head) row of hd / 32).
+// Rows are rotated (kv4_fwht): the queries are too, and the attention output is rotated back. Only
+// qk_norm_rope, attn_prefill_tc and attention_decode_tc256 read or write it (the model refuses the other
+// kernels); the kv_load helpers below exist only so that the others compile.
+typedef unsigned char kv_t;
+#define KV_SCALE(sc, pos, n_kv, kvh) 1.f
+__device__ __forceinline__ float kv_load1(const kv_t* p) { return 0.f; }
+__device__ __forceinline__ float2 kv_load2(const kv_t* p) { return make_float2(0.f, 0.f); }
+__device__ __forceinline__ float4 kv_load4(const kv_t* p) { return make_float4(0.f, 0.f, 0.f, 0.f); }
+// byte b's two values (low nibble, high nibble) times scale s, as an f16x2 word
+__device__ __forceinline__ unsigned kv4_pair(unsigned b, float s) {
+    return (unsigned)f2h((float)((int)(b & 15) - 8) * s) | ((unsigned)f2h((float)((int)((b >> 4) & 15) - 8) * s) << 16);
+}
+// in-place normalized 256-point Walsh-Hadamard transform of b (shared memory), the whole block
+__device__ void kv4_fwht(float* b) {
+    for (int h = 1; h < 256; h <<= 1) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 128; i += blockDim.x) {
+            int j = (i / h) * 2 * h + (i % h);
+            float a = b[j], c = b[j + h];
+            b[j] = a + c;
+            b[j + h] = a - c;
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) b[i] *= 0.0625f;
+    __syncthreads();
+}
 #else
 typedef unsigned short kv_t;
 #define KV_SCALE(sc, pos, n_kv, kvh) 1.f
@@ -213,8 +264,72 @@ __device__ __forceinline__ float2 kv_load2(const kv_t* p) {
 __device__ __forceinline__ float4 kv_load4(const kv_t* p) { return h4f(p); }
 #endif
 
+#ifdef KV_FAKE4
+#ifndef KVF_G
+#define KVF_G 0
+#endif
+#ifndef KVF_CLIP
+#define KVF_CLIP 1.f
+#endif
+// in-place normalized Walsh-Hadamard transform of n (a power of two) floats in shared memory, the whole block
+__device__ void kvf_fwht(float* b, int n) {
+    for (int h = 1; h < n; h <<= 1) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < n / 2; i += blockDim.x) {
+            int j = (i / h) * 2 * h + (i % h);
+            float a = b[j], c = b[j + h];
+            b[j] = a + c;
+            b[j + h] = a - c;
+        }
+    }
+    __syncthreads();
+    float s = rsqrtf((float)n);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) b[i] *= s;
+    __syncthreads();
+}
+// the row as a 4-bit cache would give it back: rotated (rot), each group of KVF_G values (0: the row) to 15
+// levels of a scale (KVF_CLIP times its largest value / 7, the rest clipped), rotated back
+__device__ void kvf_round4(float* b, int hd, int rot, float* sh) {
+    if (rot) kvf_fwht(b, hd);
+    int g = KVF_G ? KVF_G : hd;
+    if (g == hd) {
+        float amax = 0.f;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) amax = fmaxf(amax, fabsf(b[d]));
+        amax = block_max(amax, sh);
+        float dd = KVF_CLIP * amax / 7.f, inv = dd != 0.f ? 1.f / dd : 0.f;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) b[d] = fminf(fmaxf(rintf(b[d] * inv), -7.f), 7.f) * dd;
+    } else {
+        for (int k = threadIdx.x; k < hd / g; k += blockDim.x) {
+            float amax = 0.f;
+            for (int d = 0; d < g; d++) amax = fmaxf(amax, fabsf(b[k * g + d]));
+            float dd = KVF_CLIP * amax / 7.f, inv = dd != 0.f ? 1.f / dd : 0.f;
+            for (int d = 0; d < g; d++) b[k * g + d] = fminf(fmaxf(rintf(b[k * g + d] * inv), -7.f), 7.f) * dd;
+        }
+    }
+    __syncthreads();
+    if (rot) kvf_fwht(b, hd);
+}
+#endif
 // One head's row of hd floats into the cache; the whole block calls it (int8 reduces the row's max).
-__device__ __forceinline__ void kv_store(kv_t* __restrict__ dst, float* __restrict__ scale, const float* __restrict__ src, int hd, float* sh) {
+__device__ __forceinline__ void kv_store(kv_t* __restrict__ dst, float* __restrict__ scale, const float* __restrict__ src, int hd, float* sh, int is_k) {
+#ifdef KV_FAKE4
+    __shared__ float kvf[512];
+    __syncthreads();
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) kvf[d] = src[d];
+    __syncthreads();
+#ifdef KVF_ROTK
+    int rk = 1;
+#else
+    int rk = 0;
+#endif
+#ifdef KVF_ROTV
+    int rv = 1;
+#else
+    int rv = 0;
+#endif
+    kvf_round4(kvf, hd, is_k ? rk : rv, sh);
+    src = kvf;
+#endif
 #ifdef KV8
     float amax = 0.f;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) amax = fmaxf(amax, fabsf(src[d]));
@@ -222,10 +337,37 @@ __device__ __forceinline__ void kv_store(kv_t* __restrict__ dst, float* __restri
     float dd = amax / 127.f, inv = dd != 0.f ? 1.f / dd : 0.f;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) dst[d] = (signed char)__float2int_rn(src[d] * inv);
     if (threadIdx.x == 0) *scale = dd;
+#elif defined(KV4)
+    // hd 256 and 64 threads (qk_norm_rope's block): thread t takes values 4t..4t+3, 8 threads a group of 32.
+    // A value row is rotated here; a key row comes rotated (qk_norm_rope rotates queries and keys alike).
+    __shared__ float kb[256];
+    __syncthreads();
+    for (int d = threadIdx.x; d < 256; d += blockDim.x) kb[d] = src[d];
+    if (!is_k) kv4_fwht(kb);
+    else __syncthreads();
+    int t = threadIdx.x;
+    float v0 = kb[4 * t], v1 = kb[4 * t + 1], v2 = kb[4 * t + 2], v3 = kb[4 * t + 3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+    for (int o = 1; o < 8; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    unsigned short dh = f2h(amax / 7.f);
+    float dd = h2f(dh), inv = dd != 0.f ? 1.f / dd : 0.f;
+    #define KV4_Q(v) ((unsigned)(fminf(fmaxf(rintf((v) * inv), -7.f), 7.f) + 8.f))
+    unsigned w = KV4_Q(v0) | (KV4_Q(v1) << 4) | (KV4_Q(v2) << 8) | (KV4_Q(v3) << 12);
+    #undef KV4_Q
+    *reinterpret_cast<unsigned short*>(dst + 2 * t) = (unsigned short)w;
+    if ((t & 7) == 0) reinterpret_cast<unsigned short*>(scale)[t >> 3] = dh;
 #else
     for (int d = threadIdx.x; d < hd; d += blockDim.x) dst[d] = f2h(src[d]);
 #endif
 }
+// a (position, kv head) row of the cache and of its scales (a 4-bit cache: half a byte a value, a scale per 32)
+#ifdef KV4
+#define KV_ROWP(c, pos, kv_dim, h, hd) ((c) + ((size_t)(pos) * (kv_dim) + (size_t)(h) * (hd)) / 2)
+#define KV_SROWP(s, pos, n_kv, h, hd) ((float*)((unsigned short*)(s) + ((size_t)(pos) * (n_kv) + (h)) * ((hd) / 32)))
+#else
+#define KV_ROWP(c, pos, kv_dim, h, hd) ((c) + (size_t)(pos) * (kv_dim) + (h) * (hd))
+#define KV_SROWP(s, pos, n_kv, h, hd) ((s) + (size_t)(pos) * (n_kv) + (h))
+#endif
 // d and dmin of a Q4_K block (one 32-bit load)
 __device__ __forceinline__ void q4k_dm(const unsigned char* b, float* d, float* dmin) {
     unsigned int w = *reinterpret_cast<const unsigned int*>(b);
@@ -303,7 +445,7 @@ __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ 
     float* row = qkv + (size_t)b * (q_dim + 2 * kv_dim);
     if (h >= n_heads + n_kv) { // a v head: straight into the cache (same for the whole block)
         int vh = h - n_heads - n_kv;
-        kv_store(vc + (size_t)pos * kv_dim + vh * hd, vs + (size_t)pos * n_kv + vh, row + q_dim + kv_dim + vh * hd, hd, sh);
+        kv_store(KV_ROWP(vc, pos, kv_dim, vh, hd), KV_SROWP(vs, pos, n_kv, vh, hd), row + q_dim + kv_dim + vh * hd, hd, sh, 0);
         return;
     }
     float* vec = row + h * hd; // k heads directly follow the q heads
@@ -327,10 +469,19 @@ __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ 
         vec[ia] = a * c - bb * s;
         vec[ib] = a * s + bb * c;
     }
+#ifdef KV4
+    { // queries and keys rotated alike (a 4-bit cache, see KV4): their dot products stay as they were
+        __shared__ float rb[256];
+        __syncthreads();
+        for (int d = threadIdx.x; d < 256; d += blockDim.x) rb[d] = vec[d];
+        kv4_fwht(rb);
+        for (int d = threadIdx.x; d < 256; d += blockDim.x) vec[d] = rb[d];
+    }
+#endif
     if (h >= n_heads) {
         __syncthreads();
         int kh = h - n_heads;
-        kv_store(kc + (size_t)pos * kv_dim + kh * hd, ks + (size_t)pos * n_kv + kh, vec, hd, sh);
+        kv_store(KV_ROWP(kc, pos, kv_dim, kh, hd), KV_SROWP(ks, pos, n_kv, kh, hd), vec, hd, sh, 1);
     }
 }
 
@@ -2070,6 +2221,26 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const kv_t* __res
         }
         if (tid < BK) kscale[tid] = sc_ld;
         else if (tid < 2 * BK) vscale[tid - BK] = sc_ld;
+#elif defined(KV4)
+        // 4-bit rows: 8 bytes (16 values, one scale) a load, staged as f16 values times their scale (so the rest
+        // is the f16 cache's path); past the end zeros
+        for (int idx = tid; idx < BK * HD / 16; idx += 128) {
+            int r = idx / (HD / 16), c16 = idx % (HD / 16), kp = t0 + r;
+            uint2 k8 = make_uint2(0u, 0u), v8 = k8;
+            float ksc = 0.f, vsc = 0.f;
+            if (kp < kv_len) {
+                k8 = *reinterpret_cast<const uint2*>(KV_ROWP(kc, kp, kv_dim, kvh, HD) + 8 * c16);
+                v8 = *reinterpret_cast<const uint2*>(KV_ROWP(vc, kp, kv_dim, kvh, HD) + 8 * c16);
+                ksc = h2f(reinterpret_cast<const unsigned short*>(KV_SROWP(ks, kp, n_kv, kvh, HD))[c16 >> 1]);
+                vsc = h2f(reinterpret_cast<const unsigned short*>(KV_SROWP(vs, kp, n_kv, kvh, HD))[c16 >> 1]);
+            }
+            unsigned* kd = Ks + r * LDW + 8 * c16;
+            unsigned* vd = Vs + r * LDW + 8 * c16;
+            *reinterpret_cast<uint4*>(kd) = make_uint4(kv4_pair(k8.x, ksc), kv4_pair(k8.x >> 8, ksc), kv4_pair(k8.x >> 16, ksc), kv4_pair(k8.x >> 24, ksc));
+            *reinterpret_cast<uint4*>(kd + 4) = make_uint4(kv4_pair(k8.y, ksc), kv4_pair(k8.y >> 8, ksc), kv4_pair(k8.y >> 16, ksc), kv4_pair(k8.y >> 24, ksc));
+            *reinterpret_cast<uint4*>(vd) = make_uint4(kv4_pair(v8.x, vsc), kv4_pair(v8.x >> 8, vsc), kv4_pair(v8.x >> 16, vsc), kv4_pair(v8.x >> 24, vsc));
+            *reinterpret_cast<uint4*>(vd + 4) = make_uint4(kv4_pair(v8.y, vsc), kv4_pair(v8.y >> 8, vsc), kv4_pair(v8.y >> 16, vsc), kv4_pair(v8.y >> 24, vsc));
+        }
 #else
         for (int idx = tid; idx < BK * HD / 4; idx += 128) {
             int r = idx / (HD / 4), c4 = idx % (HD / 4), kp = t0 + r;
@@ -2180,7 +2351,8 @@ __global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { at
 // head size 256: two blocks per head, each with half the output dimensions (all of Q, O for 256 do not fit in registers)
 __global__ void __launch_bounds__(128) attention_prefill_tc256(ATT_TC_ARGS) { attn_prefill_tc<256, 2>(qkv, kc, vc, ks, vs, out, pos0, n, n_heads, n_kv, scale); }
 
-#ifdef KV8
+#if defined(KV8) || defined(KV4)
+// (a 4-bit cache: its values times their scales as the f16 fragments, the scales applied that way instead)
 // Decode attention for 256-wide grouped heads on the tensor cores (int8 cache, sm_75+): attention_partial_gqa's
 // grid, slices and partial results (attention_combine merges them), so a token is attended the same way
 // alone or in a verify batch. The G <= 8 query heads of the kv head are the rows of the m16n8k8 tiles (rows
@@ -2235,12 +2407,29 @@ __global__ void __launch_bounds__(128) attention_decode_tc256(const float* __res
         // S: column g of the tile is position tt + g; this thread's 4 x 16 bytes of its key row
         float sc[2] = {0.f, 0.f};
         {
+#ifdef KV4
+            // values 64i + 16q.. (16 of them: 8 bytes, one scale) for i = 0..3
+            int kp = t0 + min(tt + g, len - 1);
+            const kv_t* krow = KV_ROWP(kc, kp, kv_dim, kvh, HD);
+            const unsigned short* ksr = reinterpret_cast<const unsigned short*>(KV_SROWP(ks, kp, n_kv, kvh, HD));
+            uint2 kw[4];
+            float kd[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) { kw[i] = *reinterpret_cast<const uint2*>(krow + 32 * i + 8 * q); kd[i] = h2f(ksr[2 * i + (q >> 1)]); }
+#else
             const uint4* krow = reinterpret_cast<const uint4*>(kbase + (size_t)(t0 + min(tt + g, len - 1)) * kv_dim + 16 * q);
             uint4 kw[4] = {krow[0], krow[4], krow[8], krow[12]}; // bytes 64i + 16q
+#endif
             #pragma unroll
             for (int j = 0; j < 16; j++) {
+#ifdef KV4
+                // values 4(j % 4).. of the 16: bytes 2(j % 4), +1
+                unsigned w = (j % 4 < 2 ? kw[j / 4].x : kw[j / 4].y) >> (16 * (j % 2));
+                uint2 e = make_uint2(kv4_pair(w, kd[j / 4]), kv4_pair(w >> 8, kd[j / 4]));
+#else
                 unsigned w = j % 4 == 0 ? kw[j / 4].x : j % 4 == 1 ? kw[j / 4].y : j % 4 == 2 ? kw[j / 4].z : kw[j / 4].w;
                 uint2 e = i8x4_to_h4(w); // k8 steps 2j, 2j + 1
+#endif
                 float c4[4] = {sc[0], sc[1], z[0], z[1]};
                 MMA_F16(c4, qf[2 * j], 0u, e.x);
                 MMA_F16(c4, qf[2 * j + 1], 0u, e.y);
@@ -2262,18 +2451,43 @@ __global__ void __launch_bounds__(128) attention_decode_tc256(const float* __res
         float v1 = pa + 1 < len ? KV_SCALE(vs, t0 + pa + 1, n_kv, kvh) * VSCALE_BIAS : 0.f;
         unsigned pf = pack_h2(p0 * v0, p1 * v1); // A fragment: row g, positions 2q, 2q + 1
         // V: B fragment of tile d = rows pa, pa + 1 at 128(d / 16) + 16g + d % 16: 2 x 16 bytes of each
+#ifdef KV4
+        // values 128i + 16g.. of rows pa, pa + 1 (8 bytes and one scale each) for i = 0, 1
+        int pa0 = t0 + min(pa, len - 1), pb0 = t0 + min(pa + 1, len - 1);
+        const kv_t* va = KV_ROWP(vc, pa0, kv_dim, kvh, HD);
+        const kv_t* vb = KV_ROWP(vc, pb0, kv_dim, kvh, HD);
+        const unsigned short* vsa = reinterpret_cast<const unsigned short*>(KV_SROWP(vs, pa0, n_kv, kvh, HD));
+        const unsigned short* vsb = reinterpret_cast<const unsigned short*>(KV_SROWP(vs, pb0, n_kv, kvh, HD));
+        uint2 a8[2] = {*reinterpret_cast<const uint2*>(va + 8 * g), *reinterpret_cast<const uint2*>(va + 64 + 8 * g)};
+        uint2 b8[2] = {*reinterpret_cast<const uint2*>(vb + 8 * g), *reinterpret_cast<const uint2*>(vb + 64 + 8 * g)};
+        float ad[2] = {h2f(vsa[g >> 1]), h2f(vsa[4 + (g >> 1)])}, bd[2] = {h2f(vsb[g >> 1]), h2f(vsb[4 + (g >> 1)])};
+#else
         const uint4* va = reinterpret_cast<const uint4*>(vbase + (size_t)(t0 + min(pa, len - 1)) * kv_dim + 16 * g);
         const uint4* vb = reinterpret_cast<const uint4*>(vbase + (size_t)(t0 + min(pa + 1, len - 1)) * kv_dim + 16 * g);
         uint4 a4[2] = {va[0], va[8]}, b4[2] = {vb[0], vb[8]}; // bytes 128i + 16g
+#endif
         #pragma unroll
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= alpha; o[d][1] *= alpha; }
         #pragma unroll
         for (int j = 0; j < 8; j++) {
+#ifdef KV4
+            // values 4(j % 4).. of the 16 (bytes 2(j % 4), +1) of each row, as (a, b) pairs: tiles 4j..4j + 3
+            unsigned wa = (j % 4 < 2 ? a8[j / 4].x : a8[j / 4].y) >> (16 * (j % 2));
+            unsigned wb = (j % 4 < 2 ? b8[j / 4].x : b8[j / 4].y) >> (16 * (j % 2));
+            float sa = ad[j / 4], sb = bd[j / 4];
+            unsigned bf[4];
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int na = (wa >> (4 * e)) & 15, nb = (wb >> (4 * e)) & 15;
+                bf[e] = (unsigned)f2h((float)(na - 8) * sa) | ((unsigned)f2h((float)(nb - 8) * sb) << 16);
+            }
+#else
             unsigned wa = j % 4 == 0 ? a4[j / 4].x : j % 4 == 1 ? a4[j / 4].y : j % 4 == 2 ? a4[j / 4].z : a4[j / 4].w;
             unsigned wb = j % 4 == 0 ? b4[j / 4].x : j % 4 == 1 ? b4[j / 4].y : j % 4 == 2 ? b4[j / 4].z : b4[j / 4].w;
             uint2 h01 = i8x4_to_h4(__byte_perm(wa, wb, 0x5140)); // (a0, b0), (a1, b1): tiles 4j, 4j + 1
             uint2 h23 = i8x4_to_h4(__byte_perm(wa, wb, 0x7362)); // (a2, b2), (a3, b3): tiles 4j + 2, 4j + 3
             unsigned bf[4] = {h01.x, h01.y, h23.x, h23.y};
+#endif
             #pragma unroll
             for (int e = 0; e < 4; e++) {
                 float c4[4] = {o[4 * j + e][0], o[4 * j + e][1], z[0], z[1]};
@@ -4901,7 +5115,7 @@ impl Kernels {
     /// The kernels as a GPU binary (cubin) for the installed GPU: from the on-disk cache when the source,
     /// options, NVRTC and GPU match a previous run, else compiled with NVRTC (seconds) and cached.
     /// GHOST_INFER_NO_KERNEL_CACHE=1 always compiles.
-    fn binary(a: &Api) -> Result<Vec<u8>, String> {
+    fn binary(a: &Api, kv4: bool) -> Result<Vec<u8>, String> {
         let mut opts = vec![
             format!("--gpu-architecture=sm_{}{}", a.compute.0, a.compute.1),
             "-std=c++14".into(),
@@ -4911,8 +5125,23 @@ impl Kernels {
             format!("-DDP4A_BATCH_MINB={}", std::env::var("GHOST_INFER_BATCH_MINB").unwrap_or("3".into())),
             format!("-DDP4A_BATCH_RPW={}", batch_rpw()),
         ];
-        if kv_int8() {
+        if kv4 {
+            opts.push("-DKV4".into());
+        } else if kv_int8() {
             opts.push("-DKV8".into());
+            // experiment: GHOST_INFER_KV_FAKE4=rotk,rotv,g32,clip90 rounds each cached row to 4 bits (as a 4-bit cache
+            // would) before the int8 store, to measure a format before writing its kernels
+            if let Ok(f) = std::env::var("GHOST_INFER_KV_FAKE4") {
+                opts.push("-DKV_FAKE4".into());
+                for (word, def) in [("rotk", "-DKVF_ROTK"), ("rotv", "-DKVF_ROTV"), ("g32", "-DKVF_G=32")] {
+                    if f.split(',').any(|w| w == word) {
+                        opts.push(def.into());
+                    }
+                }
+                if let Some(c) = f.split(',').find_map(|w| w.strip_prefix("clip")) {
+                    opts.push(format!("-DKVF_CLIP=0.{c}f"));
+                }
+            }
         }
         let key = {
             use std::hash::{Hash, Hasher};
@@ -4967,10 +5196,10 @@ impl Kernels {
     }
 
     /// The kernels, on a stream of their own (`private`: see Kernels::private).
-    fn compile_on(private: bool) -> Result<Kernels, String> {
+    fn compile_on(private: bool, kv4: bool) -> Result<Kernels, String> {
         let a = api()?;
         let f = &a.f;
-        let bin = Self::binary(a)?;
+        let bin = Self::binary(a, kv4)?;
         unsafe {
             let mut module: Ptr = std::ptr::null_mut();
             a.check((f.cuModuleLoadData)(&mut module, bin.as_ptr() as *const c_void), "load kernels")?;
@@ -5038,7 +5267,7 @@ impl Kernels {
                 attention_partial: get("attention_partial")?,
                 attention_partial_gqa: get("attention_partial_gqa")?,
                 // GHOST_INFER_NO_VFY_ATT=1: verify batches attend token by token (attention_partial_gqa)
-                attention_vfy: if kv_int8() && std::env::var_os("GHOST_INFER_NO_VFY_ATT").is_none() {
+                attention_vfy: if kv_int8() && !kv4 && std::env::var_os("GHOST_INFER_NO_VFY_ATT").is_none() {
                     Some([
                         [get("attention_vfy_s2")?, get("attention_vfy_o2")?],
                         [get("attention_vfy_s4")?, get("attention_vfy_o4")?],
@@ -6779,7 +7008,7 @@ impl GpuWhisper {
             attn_gated: false,
         };
         // its own non-blocking stream: it runs beside the language model, on a thread of its own
-        let k = Arc::new(Kernels::compile_on(true)?);
+        let k = Arc::new(Kernels::compile_on(true, false)?);
         let mut up = Uploader::new()?;
         let up = &mut up;
         let one = |name: &str, up: &mut Uploader| upload_one(g, name, up);
@@ -7162,7 +7391,10 @@ impl GpuModel {
             free >> 20
         };
         let free_before = free_mb();
-        let k = Arc::new(Kernels::compile_on(private)?);
+        let k = Arc::new(Kernels::compile_on(private, kv4(&cfg))?);
+        if kv4(&cfg) && (k.attention_decode_tc256.is_none() || k.attention_prefill_tc256.is_none()) {
+            return Err("--kv q4 needs the tensor-core attention kernels (an sm_75 or newer GPU)".into());
+        }
         let t_kernels = t0.elapsed();
         let free_kernels = free_mb();
         let mut up = Uploader::new()?;
@@ -8677,6 +8909,10 @@ impl GpuModel {
             } else {
                 self.timed(4, || self.attention(s, n, (kc, vc, ks, vs), posp, fixed_split))?;
             }
+            if kv4(c) {
+                // a 4-bit cache holds rotated rows (kv4): the output, a sum of rotated values, rotated back
+                self.timed(4, || k.launch(k.hadamard_rows, (c.n_heads as u32, n as u32), 128, 0, &[Arg::P(s.att.ptr), Arg::P(0), Arg::I((c.n_heads * hd) as i32), Arg::I(hd as i32)]))?;
+            }
             if c.attn_gated {
                 let len = n * c.n_heads * hd;
                 self.timed(4, || k.launch(k.sigmoid_mul, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(s.att.ptr), Arg::P(s.h.ptr), Arg::I(len as i32)]))?;
@@ -9086,7 +9322,13 @@ impl GpuSession {
         if cfg.mla.is_some() {
             return [2 * cfg.k_row(), 0, 0, 0];
         }
-        let kv = cfg.n_kv_heads * cfg.head_dim * kv_bytes();
+        if kv4(cfg) {
+            // two values a byte, an f16 scale per 32
+            let kv = cfg.n_kv_heads * cfg.head_dim / 2;
+            let scales = cfg.n_kv_heads * cfg.head_dim / 32 * 2;
+            return [kv, kv, scales, scales];
+        }
+        let kv = cfg.n_kv_heads * cfg.head_dim * if kv_int8() { 1 } else { 2 };
         let scales = if kv_int8() { 4 * cfg.n_kv_heads } else { 0 };
         [kv, kv, scales, scales]
     }

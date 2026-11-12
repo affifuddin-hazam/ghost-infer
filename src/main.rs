@@ -178,9 +178,10 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--lora" => lora::choose(&val(a)?)?,
             "--ram-floor" => cuda::set_ram_floor_mb((num(val(a)?, a)?.max(0.0) * 1024.0) as u64, true),
             "--kv" => match val(a)?.as_str() {
-                "f16" => cuda::set_kv_int8(false),
-                "int8" => cuda::set_kv_int8(true),
-                v => return Err(format!("--kv: \"{v}\" is not f16 or int8")),
+                "f16" => cuda::set_kv_mode("f16"),
+                "int8" => cuda::set_kv_mode("int8"),
+                "q4" => cuda::set_kv_mode("q4"),
+                v => return Err(format!("--kv: \"{v}\" is not f16, int8 or q4")),
             },
             other => return Err(format!("unknown option {other}")),
         }
@@ -198,6 +199,7 @@ fn main() -> ExitCode {
         Some("tokenize") if rest.len() == 2 => tokenize(&PathBuf::from(&rest[0]), &rest[1]),
         Some("top") if rest.len() == 2 || (rest.len() == 3 && rest[2] == "--gpu") => top(&PathBuf::from(&rest[0]), &rest[1], rest.len() == 3),
         Some("bench") if !rest.is_empty() => parse_opts(rest).and_then(|o| bench(&o)),
+        Some("kvcheck") if rest.len() == 4 => rest[3].parse().map_err(|e| format!("tail: {e}")).and_then(|t| kvcheck(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1]), &PathBuf::from(&rest[2]), t)),
         Some("run") if !rest.is_empty() => parse_opts(rest).and_then(|o| run(&o)),
         Some("chat") if !rest.is_empty() => parse_opts(rest).and_then(|o| chat(&o)),
         Some("tts") if rest.len() >= 2 => tts(rest),
@@ -1083,6 +1085,39 @@ fn top(path: &PathBuf, text: &str, gpu: bool) -> Result<(), String> {
 }
 
 /// Fixed workload: a `prompt_len`-token prompt, then `max_new` greedy tokens; best of 3 runs.
+/// kvcheck <model> <text file> <out file> <tail>: the text read on the GPU, all but its last `tail` tokens as a
+/// prompt, those one at a time (the decode path): for each, the model's pick and the log-probability it gave the
+/// text's token, a line each in the out file. Two runs (cache formats, builds) compared line by line show how far
+/// one drifts from the other over a long context.
+fn kvcheck(model: &PathBuf, text: &PathBuf, out: &PathBuf, tail: usize) -> Result<(), String> {
+    let g = Gguf::open(model)?;
+    let text = std::fs::read_to_string(text).map_err(|e| e.to_string())?;
+    let tok = Tokenizer::from_gguf(&g)?;
+    let ids = tok.encode(&text);
+    if ids.len() <= tail + 1 {
+        return Err(format!("the text has {} tokens, not more than {tail}", ids.len()));
+    }
+    let mut engine = load(&g, true, ids.len() + 8)?;
+    let split = ids.len() - tail;
+    let t0 = Instant::now();
+    engine.backend.prefill(&ids[..split])?;
+    eprintln!("[read {split} tokens in {:.1}s]", t0.elapsed().as_secs_f64());
+    let mut lines = String::new();
+    let mut nll = 0f64;
+    for &id in &ids[split..] {
+        let l = engine.backend.logits();
+        let max = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let total: f64 = l.iter().map(|&v| ((v - max) as f64).exp()).sum();
+        let lp = (l[id as usize] - max) as f64 - total.ln();
+        nll -= lp;
+        lines.push_str(&format!("{} {lp:.5}\n", argmax(l)));
+        engine.backend.step(id)?;
+    }
+    std::fs::write(out, lines).map_err(|e| e.to_string())?;
+    eprintln!("[{tail} tokens: mean NLL {:.4}, perplexity {:.3}]", nll / tail as f64, (nll / tail as f64).exp());
+    Ok(())
+}
+
 fn bench(o: &Opts) -> Result<(), String> {
     let g = Gguf::open(&o.model)?;
     let mut engine = load_with_draft(&g, o.gpu, o.prompt_len + o.max_new + 8, o.draft.as_ref(), o.draft_k)?;
