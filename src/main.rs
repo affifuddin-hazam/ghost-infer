@@ -1,6 +1,7 @@
 mod csm;
 mod cuda;
 mod gguf;
+mod hadamard;
 mod iquant;
 mod json;
 mod lookup;
@@ -193,7 +194,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("inspect") if rest.len() == 1 => inspect(&PathBuf::from(&rest[0])),
         Some("meta") if rest.len() == 2 => meta(&PathBuf::from(&rest[0]), &rest[1]),
-        Some("dequant") if rest.len() == 3 => dequant(&PathBuf::from(&rest[0]), &rest[1], &rest[2]),
+        Some("dequant") if rest.len() == 3 || (rest.len() == 4 && rest[3] == "--unfold") => dequant(&PathBuf::from(&rest[0]), &rest[1], &rest[2], rest.len() == 4),
         Some("tokenize") if rest.len() == 2 => tokenize(&PathBuf::from(&rest[0]), &rest[1]),
         Some("top") if rest.len() == 2 || (rest.len() == 3 && rest[2] == "--gpu") => top(&PathBuf::from(&rest[0]), &rest[1], rest.len() == 3),
         Some("bench") if !rest.is_empty() => parse_opts(rest).and_then(|o| bench(&o)),
@@ -354,7 +355,8 @@ fn meta(path: &PathBuf, key: &str) -> Result<(), String> {
 }
 
 /// Row `row` of tensor `name`, dequantised, one value per line (rows of every expert counted together).
-fn dequant(path: &PathBuf, name: &str, row: &str) -> Result<(), String> {
+/// `unfold`: a Hadamard-folded weight's row (see hadamard.rs) back to the original weight's.
+fn dequant(path: &PathBuf, name: &str, row: &str, unfold: bool) -> Result<(), String> {
     let g = Gguf::open(path)?;
     let t = g.tensor(name).ok_or_else(|| format!("no tensor {name}"))?;
     let cols = t.dims[0] as usize;
@@ -366,6 +368,20 @@ fn dequant(path: &PathBuf, name: &str, row: &str) -> Result<(), String> {
     let m = quant::Matrix { data: &g.mmap[t.offset..t.offset + t.n_bytes], ty: t.ty, rows, cols };
     let mut out = vec![0f32; cols];
     m.row_f32(r, &mut out);
+    if unfold {
+        let h = hadamard::Hadamard::from_gguf(&g)?.ok_or("this file has no prism.hadamard folding")?;
+        if !h.is_folded(name) && !(name == "token_embd.weight" && h.embd_inverse) {
+            return Err(format!("{name} is not folded"));
+        }
+        h.check_width(cols)?;
+        let arch = g.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("");
+        let u = |k: &str| g.get(&format!("{arch}.{k}")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let perm = (h.gdn_v_grouped && name.contains(".ssm_out.")).then(|| {
+            let (nv, nk) = (u("ssm.time_step_rank"), u("ssm.group_count"));
+            (cols / nv, nk, nv / nk)
+        });
+        h.unfold_row(&mut out, perm);
+    }
     let mut text = String::with_capacity(cols * 12);
     for v in out {
         text.push_str(&format!("{v:e}\n"));
@@ -514,7 +530,14 @@ struct Engine<'a> {
     /// and greedy requests (their rounds cost and keep differently)
     lookup: lookup::Lookup,
     pace: [lookup::Pace; 2],
+    /// GPU: prompts' openings (see Engine::opening) and the state after each, in system memory, latest used last
+    openings: Vec<(Vec<u32>, cuda::SavedState)>,
 }
+
+/// Openings shorter than this are read again rather than kept (copying back is not worth it).
+const OPENING_MIN: usize = 512;
+/// Openings kept at most: the main agent's and a subagent's (about 300 MB of system memory each on a 27B).
+const MAX_OPENINGS: usize = 2;
 
 #[derive(Default)]
 struct Stats {
@@ -607,7 +630,7 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
             }
         }
     }
-    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new(), lookup: Default::default(), pace: Default::default() })
+    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new(), lookup: Default::default(), pace: Default::default(), openings: Vec::new() })
 }
 
 impl Engine<'_> {
@@ -728,6 +751,54 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// The cache for a prompt `ids` of which it holds the first `keep` tokens: when it lacks the prompt's
+    /// opening (everything up to the first end of a turn: an agent's instructions and tool descriptions, a few
+    /// thousand tokens), that opening comes back from system memory if it was kept, else it is read and kept.
+    /// The main agent and its subagents have different tools, so different openings: switching between them
+    /// then copies one back (milliseconds) instead of reading it all again (half a minute on a 27B). Returns
+    /// how many tokens of `ids` the cache now holds, and whether the opening came back from system memory.
+    fn opening(&mut self, ids: &[u32], keep: usize) -> (usize, bool) {
+        let Backend::Gpu(_, sess) = &mut self.backend else { return (keep, false) };
+        let Some(n) = ids.iter().position(|id| self.stop.contains(id)).map(|i| i + 1) else { return (keep, false) };
+        if n < OPENING_MIN || n >= ids.len() || keep >= n {
+            return (keep, false);
+        }
+        if let Some(i) = self.openings.iter().position(|(o, _)| o[..] == ids[..n]) {
+            let (o, saved) = self.openings.remove(i);
+            let loaded = sess.load(&saved);
+            self.openings.push((o, saved));
+            match loaded {
+                Ok(()) => {
+                    self.hist.clear();
+                    self.hist.extend_from_slice(&ids[..n]);
+                    if let Some(d) = self.draft.as_mut() {
+                        d.sess.pos = d.sess.pos.min(keep);
+                    }
+                    self.backend.snapshot();
+                    return (n, true);
+                }
+                Err(e) => {
+                    eprintln!("[could not copy back a kept opening: {e}]");
+                    return (self.truncate(0), false);
+                }
+            }
+        }
+        if self.read_in(&ids[keep..n]).is_err() {
+            return (self.truncate(keep), false);
+        }
+        let Backend::Gpu(_, sess) = &self.backend else { return (n, false) };
+        match sess.keep() {
+            Ok(saved) => {
+                if self.openings.len() == MAX_OPENINGS {
+                    self.openings.remove(0);
+                }
+                self.openings.push((ids[..n].to_vec(), saved));
+            }
+            Err(e) => eprintln!("[could not keep the opening: {e}]"),
+        }
+        (n, false)
+    }
+
     /// Makes the cache hold at most its first `pos` tokens (in the draft model too); returns how many it
     /// holds, which is less than `pos` when a recurrent model could only go back to an earlier snapshot.
     fn truncate(&mut self, pos: usize) -> usize {
@@ -778,6 +849,11 @@ fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize,
         let dpos0 = d.sess.pos;
         let mut feed = std::mem::take(&mut pending);
         feed.push(last);
+        // a recurrent model (DeltaNet) cannot drop rejected tokens by moving back: its state took them in
+        let d_recurrent = d.sess.recurrent();
+        if d_recurrent {
+            d.sess.save_state()?;
+        }
         let mut guesses = vec![*d.model.forward_argmax(&feed, &mut d.sess)?.last().unwrap()];
         while guesses.len() < k {
             let g = d.model.forward_argmax(&[*guesses.last().unwrap()], &mut d.sess)?[0];
@@ -789,16 +865,32 @@ fn speculate(backend: &mut Backend, d: &mut Draft, stop: &[u32], max_new: usize,
         let tpos0 = ts.pos;
         let mut batch = vec![last];
         batch.extend_from_slice(&guesses);
+        let recurrent = ts.recurrent();
+        if recurrent {
+            ts.save_state()?;
+        }
         let picks = tm.forward_argmax(&batch, ts)?;
-        d.verify_secs += tv.elapsed().as_secs_f64();
-        d.rounds += 1;
         let a = guesses.iter().zip(&picks).take_while(|(g, p)| g == p).count();
         d.proposed += k;
         d.accepted += a;
         // keep `last` and the accepted guesses; positions after them get overwritten later
         ts.pos = tpos0 + 1 + a;
+        if recurrent && a < k {
+            // back to before the batch, then `last` and the accepted guesses read again
+            ts.restore_state()?;
+            tm.forward_batch(&batch[..1 + a], ts, false)?;
+        }
+        d.verify_secs += tv.elapsed().as_secs_f64();
+        d.rounds += 1;
         seq.push(last);
         d.sess.pos = dpos0 + feed.len() + a.min(k - 1);
+        if d_recurrent && a < k - 1 {
+            // the draft read guesses[..k - 1]; it keeps the feed and the accepted ones
+            d.sess.pos = dpos0;
+            d.sess.restore_state()?;
+            feed.extend_from_slice(&guesses[..a]);
+            d.model.forward_batch(&feed, &mut d.sess, false)?;
+        }
         if a == k {
             pending.push(guesses[k - 1]); // the draft never read its own last guess
         }

@@ -123,6 +123,11 @@ pub enum GgmlType {
     Iq2Xs,
     Iq2S,
     Iq3S,
+    /// 64-value blocks, f16 scale, 2-bit codes worth (code - 1) * d: -1, 0, +1 (and +2, unused by ternary files)
+    Q2_0,
+    /// PrismML's ternary at group 128 (their llama.cpp fork's PTQ1_0): 28-byte blocks of 120 values five base-3
+    /// digits per byte, 8 four per byte, then an f16 scale; a digit q is worth (q - 1) * d
+    Ptq1_0,
     Other(u32),
 }
 
@@ -146,6 +151,8 @@ impl GgmlType {
             17 => GgmlType::Iq2Xs,
             21 => GgmlType::Iq3S,
             22 => GgmlType::Iq2S,
+            42 => GgmlType::Q2_0,
+            143 => GgmlType::Ptq1_0,
             other => GgmlType::Other(other),
         }
     }
@@ -170,6 +177,8 @@ impl GgmlType {
             GgmlType::Iq2Xs => Some((256, crate::iquant::IQ2_XS_BYTES)),
             GgmlType::Iq2S => Some((256, crate::iquant::IQ2_S_BYTES)),
             GgmlType::Iq3S => Some((256, crate::iquant::IQ3_S_BYTES)),
+            GgmlType::Q2_0 => Some((64, 18)),
+            GgmlType::Ptq1_0 => Some((128, 28)),
             GgmlType::Other(_) => None,
         }
     }
@@ -193,6 +202,8 @@ impl GgmlType {
             GgmlType::Iq2Xs => "IQ2_XS".into(),
             GgmlType::Iq2S => "IQ2_S".into(),
             GgmlType::Iq3S => "IQ3_S".into(),
+            GgmlType::Q2_0 => "Q2_0".into(),
+            GgmlType::Ptq1_0 => "PTQ1_0".into(),
             GgmlType::Other(id) => format!("type#{id}"),
         }
     }
@@ -204,7 +215,7 @@ impl GgmlType {
 
     /// Formats with no fast dot product here: their rows are dequantised to f32 and dotted as floats.
     pub fn dequant_only(self) -> bool {
-        matches!(self, GgmlType::Bf16 | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Iq4Nl) || self.is_iquant()
+        matches!(self, GgmlType::Bf16 | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Iq4Nl | GgmlType::Q2_0 | GgmlType::Ptq1_0) || self.is_iquant()
     }
 
     /// The grid-based i-quants (iquant.rs).

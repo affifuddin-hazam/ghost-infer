@@ -375,6 +375,97 @@ pub struct Model<'a> {
     layers: Vec<Layer<'a>>,
     output_norm: Vec<f32>,
     output: Matrix<'a>,
+    /// Hadamard-folded weights (prism.hadamard, the Ternary Bonsai files): whose inputs get the transform
+    fold: Option<Folding>,
+}
+
+/// Which matmul inputs of a Hadamard-folded model get the transform (see hadamard.rs).
+pub(crate) struct Folding {
+    pub(crate) h: crate::hadamard::Hadamard,
+    pub(crate) layers: Vec<LayerFold>,
+    pub(crate) output: bool,
+    /// ssm_out's input from tiled to grouped value heads: (head size, key heads, value heads per key head)
+    pub(crate) ssm_perm: Option<(usize, usize, usize)>,
+}
+
+/// A layer's folded inputs: the attention's (q k v, or a DeltaNet's qkv and z), its output projection's,
+/// the feed-forward's (gate and up) and down's.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LayerFold {
+    pub(crate) attn_in: bool,
+    pub(crate) wo: bool,
+    pub(crate) ffn_in: bool,
+    pub(crate) down: bool,
+}
+
+impl Folding {
+    /// The folding of a dense model whose every folded weight is one this forward pass transforms the input
+    /// of; an error otherwise (a weight left out would quietly give wrong results).
+    pub(crate) fn new(g: &Gguf, cfg: &Config, h: crate::hadamard::Hadamard) -> Result<Folding, String> {
+        if cfg.is_moe() || cfg.mla.is_some() {
+            return Err("prism.hadamard: folded weights are supported in dense models only".into());
+        }
+        let mut handled = 0;
+        let mut group = |names: &[String], what: &str| -> Result<bool, String> {
+            let folded = names.iter().filter(|n| h.is_folded(n)).count();
+            if folded != 0 && folded != names.len() {
+                return Err(format!("prism.hadamard: {what} is folded in part ({folded} of {})", names.len()));
+            }
+            handled += folded;
+            Ok(folded != 0)
+        };
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            let p = |s: &str| format!("blk.{i}.{s}.weight");
+            let rec = cfg.recurrent(i);
+            let attn_in = if rec { [p("attn_qkv"), p("attn_gate")].to_vec() } else { [p("attn_q"), p("attn_k"), p("attn_v")].to_vec() };
+            for raw in [p("ssm_beta"), p("ssm_alpha"), p("ssm_ba")] {
+                if h.is_folded(&raw) {
+                    return Err(format!("prism.hadamard: {raw} is folded, which is not supported"));
+                }
+            }
+            layers.push(LayerFold {
+                attn_in: group(&attn_in, &format!("layer {i}'s attention input"))?,
+                wo: group(&[p(if rec { "ssm_out" } else { "attn_output" })], "")?,
+                ffn_in: group(&[p("ffn_gate"), p("ffn_up")], &format!("layer {i}'s feed-forward input"))?,
+                down: group(&[p("ffn_down")], "")?,
+            });
+        }
+        let output = group(&["output.weight".to_string()], "")?;
+        if handled != h.n_folded() {
+            return Err(format!("prism.hadamard: {} folded weights are listed, {handled} of them are ones this engine transforms", h.n_folded()));
+        }
+        let ssm_perm = match cfg.delta {
+            Some(d) if h.gdn_v_grouped => {
+                if !d.tiled {
+                    return Err("prism.hadamard: gdn_v_grouped needs tiled value heads".into());
+                }
+                Some((d.head, d.k_heads, d.v_heads / d.k_heads))
+            }
+            _ => None,
+        };
+        let mut widths = vec![cfg.dim];
+        if layers.iter().any(|l| l.down) {
+            widths.push(cfg.ffn_dim);
+        }
+        for (i, l) in layers.iter().enumerate() {
+            if l.wo {
+                widths.push(tensor(g, &format!("blk.{i}.{}.weight", if cfg.recurrent(i) { "ssm_out" } else { "attn_output" }))?.dims[0] as usize);
+            }
+        }
+        for w in widths {
+            h.check_width(w)?;
+        }
+        Ok(Folding { h, layers, output, ssm_perm })
+    }
+}
+
+/// `x` (rows of `width`) through a folded weight's input transform into `hx`, and quantised into `hxq`.
+fn fold_input(h: &crate::hadamard::Hadamard, x: &[f32], width: usize, perm: Option<(usize, usize, usize)>, hx: &mut Vec<f32>, hxq: &mut QuantizedBatch) {
+    hx.clear();
+    hx.extend_from_slice(x);
+    h.forward(hx, width, perm);
+    hxq.quantize(hx, width);
 }
 
 fn tensor<'g>(g: &'g Gguf, name: &str) -> Result<&'g TensorInfo, String> {
@@ -545,13 +636,20 @@ impl<'a> Model<'a> {
         }
         // small models tie the output projection to the embedding table
         let output = if g.tensor("output.weight").is_some() { matrix(g, "output.weight")? } else { token_embd };
-        Ok(Model { output_norm: vector(g, "output_norm.weight")?, cfg, token_embd, layers, output })
+        let fold = match crate::hadamard::Hadamard::from_gguf(g)? {
+            Some(h) => Some(Folding::new(g, &cfg, h)?),
+            None => None,
+        };
+        Ok(Model { output_norm: vector(g, "output_norm.weight")?, cfg, token_embd, layers, output, fold })
     }
 
     /// Adds a LoRA adapter on top of the weights (see crate::lora). Grouped-query attention and dense
     /// feed-forward layers only; the adapter's shapes must be this model's.
     pub fn attach_lora(&mut self, ad: &crate::lora::Adapter) -> Result<(), String> {
         use crate::lora::Adapter;
+        if self.fold.is_some() {
+            return Err("a LoRA adapter cannot go on Hadamard-folded weights (prism.hadamard)".into());
+        }
         if ad.layers.len() > self.layers.len() {
             return Err(format!("the adapter has {} layers, the model {}", ad.layers.len(), self.layers.len()));
         }
@@ -606,6 +704,9 @@ pub struct Session {
     x: Vec<f32>,
     xb: Vec<f32>,
     xq: QuantizedBatch,
+    // a Hadamard-folded weight's input, transformed, and quantised
+    hx: Vec<f32>,
+    hxq: QuantizedBatch,
     q: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
@@ -647,6 +748,8 @@ impl Session {
             x: Vec::new(),
             xb: Vec::new(),
             xq: QuantizedBatch::default(),
+            hx: Vec::new(),
+            hxq: QuantizedBatch::default(),
             q: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),
@@ -885,27 +988,35 @@ impl Model<'_> {
             for (b, &t) in tokens.iter().enumerate() {
                 self.token_embd.row_f32(t as usize, &mut s.x[b * dim..(b + 1) * dim]);
             }
+            if let Some(f) = self.fold.as_ref().filter(|f| f.h.embd_inverse) {
+                f.h.inverse(&mut s.x[..n * dim], dim);
+            }
         });
 
         for (l, layer) in self.layers.iter().enumerate() {
+            let lf = self.fold.as_ref().map_or(LayerFold::default(), |f| f.layers[l]);
             // --- attention ---
             profile::time(1, || {
                 rms_norm_rows(&mut s.xb, &s.x, &layer.attn_norm, c.norm_eps);
                 s.xq.quantize(&s.xb, dim);
+                if lf.attn_in {
+                    fold_input(&self.fold.as_ref().unwrap().h, &s.xb, dim, None, &mut s.hx, &mut s.hxq);
+                }
             });
             let (k_base, v_base) = (c.slot(l) * s.ctx * c.k_row(), c.slot(l) * s.ctx * c.v_row());
             match &layer.attn {
                 Attn::Gqa { wq, wk, wv, q_norm, k_norm } => {
                     profile::time(2, || {
+                        let (xin, xinq) = if lf.attn_in { (&s.hx, &s.hxq) } else { (&s.xb, &s.xq) };
                         if c.attn_gated {
                             // [q | gate] per head: the queries to s.q, the gates aside
-                            matmul_many(&mut [(wq, &mut s.qg), (wk, &mut s.k), (wv, &mut s.v)], &s.xb, &s.xq);
+                            matmul_many(&mut [(wq, &mut s.qg), (wk, &mut s.k), (wv, &mut s.v)], xin, xinq);
                             for (pair, (q, g)) in s.qg.chunks_exact(2 * hd).zip(s.q.chunks_exact_mut(hd).zip(s.att_gate.chunks_exact_mut(hd))) {
                                 q.copy_from_slice(&pair[..hd]);
                                 g.copy_from_slice(&pair[hd..]);
                             }
                         } else {
-                            matmul_many(&mut [(wq, &mut s.q), (wk, &mut s.k), (wv, &mut s.v)], &s.xb, &s.xq);
+                            matmul_many(&mut [(wq, &mut s.q), (wk, &mut s.k), (wv, &mut s.v)], xin, xinq);
                         }
                         let lo = &layer.lora;
                         let q = if c.attn_gated { &mut s.qg } else { &mut s.q };
@@ -938,7 +1049,7 @@ impl Model<'_> {
                     });
                 }
                 Attn::Mla { wq_a, wq, wkv_a, kv_a_norm, k_b, .. } => profile::time(2, || self.mla_in(s, n, k_base, v_base, wq_a.as_ref(), wq, wkv_a, kv_a_norm, k_b)),
-                Attn::Delta(d) => profile::time(2, || self.delta_net(d, s, l, n)),
+                Attn::Delta(d) => profile::time(2, || self.delta_net(d, s, l, n, lf.attn_in)),
             }
             if !matches!(layer.attn, Attn::Delta(_)) {
                 profile::time(4, || self.attention(s, k_base, v_base, n));
@@ -973,8 +1084,15 @@ impl Model<'_> {
                         &s.heads
                     }
                 };
-                s.xq.quantize(heads, layer.wo.cols);
-                layer.wo.matmul(heads, &s.xq, &mut s.proj);
+                if lf.wo {
+                    let f = self.fold.as_ref().unwrap();
+                    let perm = if matches!(layer.attn, Attn::Delta(_)) { f.ssm_perm } else { None };
+                    fold_input(&f.h, heads, layer.wo.cols, perm, &mut s.hx, &mut s.hxq);
+                    layer.wo.matmul(&s.hx, &s.hxq, &mut s.proj);
+                } else {
+                    s.xq.quantize(heads, layer.wo.cols);
+                    layer.wo.matmul(heads, &s.xq, &mut s.proj);
+                }
                 if let Some(p) = &layer.lora.o {
                     p.apply(heads, &mut s.proj, p.rows, 0);
                 }
@@ -986,7 +1104,11 @@ impl Model<'_> {
             // --- feed-forward (SwiGLU) ---
             profile::time(1, || {
                 rms_norm_rows(&mut s.xb, &s.x, &layer.ffn_norm, c.norm_eps);
-                s.xq.quantize(&s.xb, dim);
+                if lf.ffn_in {
+                    fold_input(&self.fold.as_ref().unwrap().h, &s.xb, dim, None, &mut s.hx, &mut s.hxq);
+                } else {
+                    s.xq.quantize(&s.xb, dim);
+                }
             });
             profile::time(6, || match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
@@ -1005,11 +1127,18 @@ impl Model<'_> {
                         for ((h, g), u) in s.gate.iter_mut().zip(&g).zip(&u) {
                             *h = g / (1.0 + (-g).exp()) * u;
                         }
+                    } else if lf.ffn_in {
+                        gate_up_silu(gate, up, &s.hx, &s.hxq, &mut s.gate);
                     } else {
                         gate_up_silu(gate, up, &s.xb, &s.xq, &mut s.gate);
                     }
-                    s.xq.quantize(&s.gate, c.ffn_dim);
-                    down.matmul(&s.gate, &s.xq, &mut s.proj);
+                    if lf.down {
+                        fold_input(&self.fold.as_ref().unwrap().h, &s.gate, c.ffn_dim, None, &mut s.hx, &mut s.hxq);
+                        down.matmul(&s.hx, &s.hxq, &mut s.proj);
+                    } else {
+                        s.xq.quantize(&s.gate, c.ffn_dim);
+                        down.matmul(&s.gate, &s.xq, &mut s.proj);
+                    }
                     if let Some(p) = &lo.down {
                         p.apply(&s.gate, &mut s.proj, p.rows, 0);
                     }
@@ -1046,8 +1175,16 @@ impl Model<'_> {
                 let last = &s.x[(n - 1) * dim..n * dim];
                 let mut normed = vec![0f32; dim];
                 rms_norm_rows(&mut normed, last, &self.output_norm, c.norm_eps);
-                s.xq.quantize(&normed, dim);
-                self.output.matmul(&normed, &s.xq, &mut s.logits);
+                match self.fold.as_ref().filter(|f| f.output) {
+                    Some(f) => {
+                        fold_input(&f.h, &normed, dim, None, &mut s.hx, &mut s.hxq);
+                        self.output.matmul(&s.hx, &s.hxq, &mut s.logits);
+                    }
+                    None => {
+                        s.xq.quantize(&normed, dim);
+                        self.output.matmul(&normed, &s.xq, &mut s.logits);
+                    }
+                }
             });
         }
         s.pos += n;
@@ -1102,16 +1239,28 @@ impl Model<'_> {
 
     /// A Gated DeltaNet layer over the batch, token by token through its state: the outputs (each value
     /// head's, after the gated norm) go to `s.att_out`, ready for ssm_out.
-    fn delta_net(&self, d: &DeltaLayer, s: &mut Session, l: usize, n: usize) {
+    /// `folded`: qkv and z read the Hadamard-transformed input (`s.hx`), beta and alpha the plain one.
+    fn delta_net(&self, d: &DeltaLayer, s: &mut Session, l: usize, n: usize, folded: bool) {
         let c = &self.cfg;
         let dc = c.delta.unwrap();
         let (kd, vd, cd, hk) = (dc.key_dim(), dc.value_dim(), dc.conv_dim(), dc.head);
-        match &d.wba[..] {
-            [wb, wa] => {
-                let (bb, aa) = s.dba[..2 * n * dc.v_heads].split_at_mut(n * dc.v_heads);
-                matmul_many(&mut [(&d.wqkv, &mut s.dqkv[..]), (&d.wz, &mut s.dz[..]), (wb, bb), (wa, aa)], &s.xb, &s.xq);
+        if folded {
+            matmul_many(&mut [(&d.wqkv, &mut s.dqkv[..]), (&d.wz, &mut s.dz[..])], &s.hx, &s.hxq);
+            match &d.wba[..] {
+                [wb, wa] => {
+                    let (bb, aa) = s.dba[..2 * n * dc.v_heads].split_at_mut(n * dc.v_heads);
+                    matmul_many(&mut [(wb, bb), (wa, aa)], &s.xb, &s.xq);
+                }
+                _ => matmul_many(&mut [(&d.wba[0], &mut s.dba[..])], &s.xb, &s.xq),
             }
-            _ => matmul_many(&mut [(&d.wqkv, &mut s.dqkv[..]), (&d.wz, &mut s.dz[..]), (&d.wba[0], &mut s.dba[..])], &s.xb, &s.xq),
+        } else {
+            match &d.wba[..] {
+                [wb, wa] => {
+                    let (bb, aa) = s.dba[..2 * n * dc.v_heads].split_at_mut(n * dc.v_heads);
+                    matmul_many(&mut [(&d.wqkv, &mut s.dqkv[..]), (&d.wz, &mut s.dz[..]), (wb, bb), (wa, aa)], &s.xb, &s.xq);
+                }
+                _ => matmul_many(&mut [(&d.wqkv, &mut s.dqkv[..]), (&d.wz, &mut s.dz[..]), (&d.wba[0], &mut s.dba[..])], &s.xb, &s.xq),
+            }
         }
         let slot = c.slot(l);
         let taps = dc.conv - 1;

@@ -217,6 +217,80 @@ mod kernels {
         out
     }
 
+    // ---- Q2_0: 64-value blocks of 2-bit codes worth (code - 1) * d ----
+
+    /// Each byte of Q2_0 codes as its four codes, one per byte (code j of the byte in byte j).
+    const Q2_0_SPREAD: [u32; 256] = {
+        let mut t = [0u32; 256];
+        let mut b = 0;
+        while b < 256 {
+            t[b] = (b as u32 & 3) | ((b as u32 >> 2 & 3) << 8) | ((b as u32 >> 4 & 3) << 16) | ((b as u32 >> 6 & 3) << 24);
+            b += 1;
+        }
+        t
+    };
+
+    /// 32 codes (half a block, from 8 bytes) as 32 bytes of 0..=3.
+    #[inline]
+    fn q2_0_codes(bytes: &[u8]) -> [u32; 8] {
+        std::array::from_fn(|i| Q2_0_SPREAD[bytes[i] as usize])
+    }
+
+    /// Dot products of one Q2_0 weight row with `N` quantised activation rows: per activation block of 32,
+    /// d_w * d_x * (sum(code * x) - sum(x)), the sum of x being the block's `s`.
+    pub fn q2_0_row_scalar<const N: usize>(w: &[u8], xs: [super::XRow; N]) -> [f32; N] {
+        let mut out = [0f32; N];
+        for (b, blk) in w.chunks_exact(18).enumerate() {
+            let d = read_f16(blk);
+            for h in 0..2 {
+                let codes = q2_0_codes(&blk[2 + 8 * h..10 + 8 * h]);
+                let codes: &[u8; 32] = unsafe { &*(codes.as_ptr() as *const [u8; 32]) };
+                let k = 2 * b + h;
+                for (o, x) in out.iter_mut().zip(xs.iter()) {
+                    let q = &x.q[k * 32..(k + 1) * 32];
+                    let isum: i32 = codes.iter().zip(q).map(|(&c, &v)| c as i32 * v as i32).sum();
+                    *o += d * x.d[k] * (isum - x.s[k]) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn q2_0_row_avx2<const N: usize>(w: &[u8], xs: [super::XRow; N]) -> [f32; N] {
+        use std::arch::x86_64::*;
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_ps(); N];
+        let mut corr = [0f32; N];
+        for (b, blk) in w.chunks_exact(18).enumerate() {
+            _mm_prefetch::<_MM_HINT_T0>(blk.as_ptr().wrapping_add(8 * 18) as *const i8);
+            let d = read_f16(blk);
+            for h in 0..2 {
+                let codes = q2_0_codes(&blk[2 + 8 * h..10 + 8 * h]);
+                let wv = unsafe { _mm256_loadu_si256(codes.as_ptr() as *const __m256i) };
+                let k = 2 * b + h;
+                for ((a, c), x) in acc.iter_mut().zip(corr.iter_mut()).zip(xs.iter()) {
+                    let xv = unsafe { _mm256_loadu_si256(x.q.as_ptr().add(k * 32) as *const __m256i) };
+                    // codes are 0..=3, unsigned: maddubs takes them as they are
+                    let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(wv, xv), ones);
+                    let s = d * x.d[k];
+                    *a = _mm256_fmadd_ps(_mm256_set1_ps(s), _mm256_cvtepi32_ps(p32), *a);
+                    *c += s * x.s[k] as f32;
+                }
+            }
+        }
+        let mut out = [0f32; N];
+        for ((o, a), c) in out.iter_mut().zip(acc).zip(corr) {
+            let hi = _mm256_extractf128_ps(a, 1);
+            let s = _mm_add_ps(_mm256_castps256_ps128(a), hi);
+            let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+            *o = _mm_cvtss_f32(s) - c;
+        }
+        out
+    }
+
     // ---- K-quants: 256-value super-blocks; activation blocks of 32 line up with their sub-blocks ----
 
     pub const Q3K_BYTES: usize = 110; // 32 bytes high bits, 64 bytes low 2-bit pairs, 12 bytes of 6-bit scales, f16 d
@@ -712,6 +786,43 @@ fn has_avx2() -> bool {
 /// IQ4_NL's 16 levels (ggml's kvalues_iq4nl).
 const IQ4NL_LEVELS: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 
+/// One row of Q2_0: 64-value blocks of an f16 scale and 16 bytes of 2-bit codes, value j in bits 2 * (j % 4)
+/// of byte j / 4, worth (code - 1) * d (ggml's dequantize_row_q2_0).
+fn dequant_q2_0(row: &[u8], out: &mut [f32]) {
+    for (blk, o) in row.chunks_exact(18).zip(out.chunks_exact_mut(64)) {
+        let d = read_f16(blk);
+        for (j, v) in o.iter_mut().enumerate() {
+            let q = (blk[2 + j / 4] >> (2 * (j % 4))) & 3;
+            *v = (q as f32 - 1.0) * d;
+        }
+    }
+}
+
+/// Base-3 digit `n` of a PTQ1_0 (and TQ1_0) byte: the byte holds the digits as a fixed-point fraction, so
+/// shifting it n places (times 3^n, mod 256) brings digit n to the top, read off as (b * 3) >> 8.
+#[inline]
+pub fn trit(byte: u8, n: u32) -> u8 {
+    let b = byte.wrapping_mul(3u8.pow(n));
+    ((b as u16 * 3) >> 8) as u8
+}
+
+/// One row of PTQ1_0 (PrismML's llama.cpp fork, dequantize_row_ptq1_0): per 128 values, 24 bytes of five
+/// digits (values 0..80: byte v % 16, digit v / 16; values 80..120: byte 16 + (v - 80) % 8, digit (v - 80) / 8),
+/// 2 bytes of four (values 120..128: byte (v - 120) % 2, digit (v - 120) / 2), then the f16 d.
+fn dequant_ptq1_0(row: &[u8], out: &mut [f32]) {
+    for (blk, o) in row.chunks_exact(28).zip(out.chunks_exact_mut(128)) {
+        let d = read_f16(&blk[26..]);
+        for (v, x) in o.iter_mut().enumerate() {
+            let (byte, n) = match v {
+                0..80 => (blk[v % 16], v / 16),
+                80..120 => (blk[16 + (v - 80) % 8], (v - 80) / 8),
+                _ => (blk[24 + (v - 120) % 2], (v - 120) / 2),
+            };
+            *x = (trit(byte, n as u32) as f32 - 1.0) * d;
+        }
+    }
+}
+
 /// One row of a 32-value-block format (or BF16) as f32. In each block, value j comes from the low nibble
 /// of byte j and value j + 16 from its high nibble; Q5 formats keep the fifth bits in a 32-bit mask.
 fn dequant_small(ty: GgmlType, row: &[u8], out: &mut [f32]) {
@@ -784,6 +895,8 @@ impl<'a> Matrix<'a> {
             GgmlType::Q4K => kernels::dequant_q4k(row, out),
             GgmlType::Q5K => kernels::dequant_q5k(row, out),
             GgmlType::Q6K => kernels::dequant_q6k(row, out),
+            GgmlType::Q2_0 => dequant_q2_0(row, out),
+            GgmlType::Ptq1_0 => dequant_ptq1_0(row, out),
             ty if ty.is_iquant() => crate::iquant::dequant(ty, row, out),
             ty if ty.dequant_only() => dequant_small(ty, row, out),
             _ => panic!("unsupported weight type {}", self.ty.name()),
@@ -849,6 +962,22 @@ impl<'a> Matrix<'a> {
                 }
                 while b < n {
                     let one = if avx2 { unsafe { crate::iquant::row_dot_avx2(ty, w, [xq.row(b)]) } } else { crate::iquant::row_dot_scalar(ty, w, [xq.row(b)]) };
+                    emit(b, one[0]);
+                    b += 1;
+                }
+            }
+            GgmlType::Q2_0 if !exact_mode() => {
+                debug_assert_eq!(xq.n, n);
+                let dot = |xs| if avx2 { unsafe { kernels::q2_0_row_avx2(w, xs) } } else { kernels::q2_0_row_scalar(w, xs) };
+                let mut b = 0;
+                while b + 4 <= n {
+                    for (i, v) in dot([xq.row3(b), xq.row3(b + 1), xq.row3(b + 2), xq.row3(b + 3)]).into_iter().enumerate() {
+                        emit(b + i, v);
+                    }
+                    b += 4;
+                }
+                while b < n {
+                    let one = if avx2 { unsafe { kernels::q2_0_row_avx2(w, [xq.row3(b)]) } } else { kernels::q2_0_row_scalar(w, [xq.row3(b)]) };
                     emit(b, one[0]);
                     b += 1;
                 }
@@ -1027,6 +1156,25 @@ mod tests {
         }
         assert_eq!(f16_to_f32(0x3c00), 1.0);
         assert_eq!(f16_to_f32(0xc000), -2.0);
+    }
+
+    /// Every five-digit (and four-digit) group packed as PrismML's quantize_row_ptq1_0_ref packs it reads back.
+    #[test]
+    fn ptq1_0_trits_round_trip() {
+        for code in 0..243u32 {
+            let digits: Vec<u8> = (0..5).map(|n| (code / 3u32.pow(4 - n) % 3) as u8).collect();
+            let byte = ((code * 256 + 242) / 243) as u8;
+            for (n, &dg) in digits.iter().enumerate() {
+                assert_eq!(trit(byte, n as u32), dg, "code {code} digit {n}");
+            }
+        }
+        for code in 0..81u32 {
+            let digits: Vec<u8> = (0..4).map(|n| (code / 3u32.pow(3 - n) % 3) as u8).collect();
+            let byte = ((code * 3 * 256 + 242) / 243) as u8;
+            for (n, &dg) in digits.iter().enumerate() {
+                assert_eq!(trit(byte, n as u32), dg, "code {code} digit {n}");
+            }
+        }
     }
 
     #[test]

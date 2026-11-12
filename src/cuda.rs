@@ -29,8 +29,13 @@ pub fn max_batch(cfg: &Config) -> usize {
 static BATCH_CAP: AtomicUsize = AtomicUsize::new(0);
 /// The smallest prompt batch fit_ctx goes down to for more context.
 const MIN_FIT_BATCH: usize = 256;
-/// fit_ctx makes prompt batches smaller (down to MIN_FIT_BATCH) while the context is shorter than this.
-const FIT_SHORT_CTX: usize = 8192;
+/// Q2_0 batches up to this many tokens go through its dp4a kernel (a weight read per 8 tokens); bigger ones convert
+/// the weights to Q8 for the tiled prompt kernels, which pays off only over many tokens.
+const Q2_0_KERNEL_MAX: usize = 64;
+/// fit_ctx makes prompt batches smaller (down to MIN_FIT_BATCH) while the context is shorter than this. 32K: a
+/// big model on a small card (a 27B in 2 bits on 8 GB) gets about 10K positions more for 256-token prompt batches
+/// instead of 2048-token ones (about 600 MB of activations), at a little prompt speed.
+const FIT_SHORT_CTX: usize = 32768;
 const MATMUL_TB: usize = 8; // tokens per matmul block row (must match TB in the kernel source)
 /// Rows per warp in the K-quant generation matmuls (passed to the kernels as -DRPW).
 /// GHOST_INFER_RPW overrides it for tuning.
@@ -3694,7 +3699,40 @@ __global__ void gated_add(float* __restrict__ x, const float* __restrict__ y, co
 // see iquant.rs). Blocks are only 2-byte aligned, so they are read a byte at a time. A lane takes one group of 8
 // values of a 256-value block: 4 groups per 32 (lanes 4*ib .. 4*ib+3 cover 32-value sub-block ib).
 
-__device__ __forceinline__ int iq2_bytes(int fmt) { return fmt == 0 ? 66 : fmt == 1 ? 82 : 74; }
+// Q2_0 (fmt 3) joins them as four of its 64-value blocks per 256 (72 bytes: f16 d and 16 bytes of 2-bit codes
+// each, worth (code - 1) * d), kept as in the file like the others.
+// PTQ1_0 (fmt 4, PrismML's ternary at group 128) likewise as two of its 128-value blocks per 256 (56 bytes: 24
+// bytes of five base-3 digits each, 2 of four, f16 d; a digit q is worth (q - 1) * d).
+__device__ __forceinline__ int iq2_bytes(int fmt) { return fmt == 0 ? 66 : fmt == 1 ? 82 : fmt == 3 ? 72 : fmt == 4 ? 56 : 74; }
+
+// Ternary formats (Q2_0, PTQ1_0) for the dp4a kernels: lane l's 8 values of a 256-value step as raw codes
+// 0..2 (one per byte, two words) and their scale; the -1 of (code - 1) comes off with the activations' sums.
+__device__ __forceinline__ int q2_0_spread(unsigned b) {
+    return (int)((b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303u);
+}
+// base-3 digit n (p = 3^n) of each of four PTQ1_0 bytes: the byte times 3^n mod 256 brings the digit to the top,
+// read off as (b * 3) >> 8; bytes 0, 2 and 1, 3 in 16-bit lanes so nothing carries between them
+__device__ __forceinline__ unsigned ptq1_digits(unsigned packed, unsigned p) {
+    unsigned lo = ((packed & 0x00FF00FFu) * p) & 0x00FF00FFu;
+    unsigned hi = (((packed >> 8) & 0x00FF00FFu) * p) & 0x00FF00FFu;
+    return (((lo * 3) >> 8) & 0x00FF00FFu) | ((((hi * 3) >> 8) & 0x00FF00FFu) << 8);
+}
+__device__ __forceinline__ void tern_lane(int fmt, const unsigned char* sb, int lane, float* d, int* w0, int* w1) {
+    if (fmt == 3) {
+        // Q2_0: block lane / 8, its 2-bit codes 8 (lane % 8) ..
+        const unsigned short* q = reinterpret_cast<const unsigned short*>(sb + 18 * (lane >> 3));
+        *d = h2f(q[0]);
+        unsigned c = q[1 + (lane & 7)];
+        *w0 = q2_0_spread(c & 0xFF);
+        *w1 = q2_0_spread(c >> 8);
+        return;
+    }
+    // PTQ1_0 (fmt 4) is repacked at upload (see matmul_ptq1_dp4a): its 256-value steps are not laid out on their
+    // own, so it never comes here (ptq1_to_q8 converts it for prompts); zero codes and scale if it ever did
+    *d = 0.f;
+    *w0 = 0;
+    *w1 = 0;
+}
 
 // byte masks: 0xff in byte i where bit i of the 4-bit argument is set
 __device__ __forceinline__ unsigned iq2_mask4(unsigned bits) {
@@ -3705,7 +3743,20 @@ __device__ __forceinline__ unsigned iq2_mask4(unsigned bits) {
 __device__ __forceinline__ void iq2_group(int fmt, const unsigned char* blk, int g, unsigned long long* grid, unsigned* signs, float* scale) {
     float d = h2f((unsigned)blk[0] | ((unsigned)blk[1] << 8));
     int ib = g >> 2, l = g & 3;
-    if (fmt == 0) {
+    if (fmt >= 3) {
+        // ternary (Q2_0, PTQ1_0): group g's codes as magnitudes |code - 1| and signs
+        int w[2];
+        tern_lane(fmt, blk, g, scale, &w[0], &w[1]);
+        unsigned long long gr = 0;
+        unsigned sg = 0;
+        for (int i = 0; i < 8; i++) {
+            int v = (int)((w[i >> 2] >> (8 * (i & 3))) & 0xFF) - 1;
+            gr |= (unsigned long long)(v < 0 ? -v : v) << (8 * i);
+            sg |= (v < 0 ? 1u : 0u) << i;
+        }
+        *grid = gr;
+        *signs = sg;
+    } else if (fmt == 0) {
         const unsigned char* q = blk + 2 + 8 * ib;
         unsigned aux = (unsigned)q[4] | ((unsigned)q[5] << 8) | ((unsigned)q[6] << 16) | ((unsigned)q[7] << 24);
         *grid = iq2xxs_grid_d[q[l]];
@@ -3796,6 +3847,364 @@ __global__ void iq2_to_q8(const unsigned char* __restrict__ w, signed char* __re
     float dd = amax / 127.f;
     q[(size_t)b * 32 + lane] = (signed char)__float2int_rn(dd != 0.f ? v / dd : 0.f);
     if (lane == 0) d[b] = dd;
+}
+
+// base-3 digit n of one PTQ1_0 byte (PrismML's decoding: times 3^n mod 256, the digit is the top of times 3)
+__device__ __forceinline__ int ptq1_trit(unsigned b, int n) {
+    unsigned p = n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u;
+    return (int)((((b * p) & 0xFFu) * 3u) >> 8);
+}
+// PTQ1_0 rows as repacked at upload (see matmul_ptq1_dp4a) to Q8 for the prompt-batch matmuls, as iq2_to_q8.
+__global__ void ptq1_to_q8(const unsigned char* __restrict__ w, signed char* __restrict__ q, float* __restrict__ d, int blocks32, int cols) {
+    int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b >= blocks32) return;
+    int per_row = cols >> 5, nblk = cols >> 7, nsb = nblk / 5;
+    int row = b / per_row, v = 32 * (b - row * per_row) + lane;
+    const unsigned char* wr = w + (size_t)row * nblk * 28;
+    int blk = v >> 7, o = v & 127, byte, n;
+    float scale;
+    if (blk < 5 * nsb) {
+        const unsigned char* sb = wr + (size_t)(blk / 5) * 140;
+        int g = blk % 5;
+        if (g < 4) {
+            byte = sb[4 * (8 * g + (o >> 4)) + (o & 3)];
+            n = (o >> 2) & 3;
+        } else {
+            byte = sb[o];
+            n = 4;
+        }
+        scale = h2f((unsigned)sb[128 + 2 * g] | ((unsigned)sb[129 + 2 * g] << 8));
+    } else {
+        const unsigned char* fb = wr + (size_t)nsb * 140 + (size_t)(blk - 5 * nsb) * 28;
+        if (o < 80) { byte = fb[o & 15]; n = o >> 4; }
+        else if (o < 120) { byte = fb[16 + ((o - 80) & 7)]; n = (o - 80) >> 3; }
+        else { byte = fb[24 + ((o - 120) & 1)]; n = (o - 120) >> 1; }
+        scale = h2f((unsigned)fb[26] | ((unsigned)fb[27] << 8));
+    }
+    float val = (float)(ptq1_trit((unsigned)byte, n) - 1) * scale;
+    float amax = fabsf(val);
+    for (int s = 16; s > 0; s >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, s));
+    float dd = amax / 127.f;
+    q[(size_t)b * 32 + lane] = (signed char)__float2int_rn(dd != 0.f ? val / dd : 0.f);
+    if (lane == 0) d[b] = dd;
+}
+
+// Ternary weights (decoding; fmt 3 Q2_0, 4 PTQ1_0): out[t * out_stride + out_off + row] (+)= W[row] · x[t] over n
+// tokens of int8 activations. A warp per row, 256 values per step: lane l takes values 8l .. 8l + 7 (tern_lane), so
+// the warp's activation reads are 256 contiguous bytes. The codes (0..2) take dp4a against the activations as they
+// are; the -1 of (code - 1) * d comes off with each 32-value activation block's sum (once, by the first of its four
+// lanes). matmul_q2_0_dp4a: one token (grid (rows / 8, 1)); matmul_q2_0_dp4a8: up to Q2_0_TB tokens share each
+// weight read (small batches: grid (rows / 8, n / Q2_0_TB)). A token's sums are the same in both, rounding
+// included (explicit __fmul_rn / __fmaf_rn), as a verify batch needs.
+#define Q2_0_TB 8
+__device__ __forceinline__ void tern_mv1(const int fmt, const unsigned char* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                                 const int* __restrict__ xsum, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    int nsb = cols >> 8, sbytes = iq2_bytes(fmt);
+    const unsigned char* wr = w + (size_t)row * nsb * sbytes;
+    const signed char* xt = xq + 8 * lane;
+    const float* d32 = xd + (lane >> 2);
+    const int* s32 = xsum + (lane >> 2);
+    bool first = (lane & 3) == 0;
+    float acc = 0.f;
+#pragma unroll 4
+    for (int sb = 0; sb < nsb; sb++) {
+        float d;
+        int w0, w1;
+        tern_lane(fmt, wr + (size_t)sb * sbytes, lane, &d, &w0, &w1);
+        int2 xv = *reinterpret_cast<const int2*>(xt + (size_t)sb * 256);
+        int dot = __dp4a(w1, xv.y, __dp4a(w0, xv.x, 0));
+        if (first) dot -= s32[sb * 8];
+        acc = __fmaf_rn(__fmul_rn(d, d32[sb * 8]), (float)dot, acc);
+    }
+    float v = warp_sum(acc);
+    if (lane == 0) {
+        size_t i = (size_t)out_off + row;
+        out[i] = accumulate ? out[i] + v : v;
+    }
+}
+__device__ __forceinline__ void tern_mv8(const int fmt, const unsigned char* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                                  const int* __restrict__ xsum, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31, t0 = blockIdx.y * Q2_0_TB;
+    if (row >= rows) return;
+    int nt = min(Q2_0_TB, n - t0), nsb = cols >> 8, nb = cols >> 5, sbytes = iq2_bytes(fmt);
+    const unsigned char* wr = w + (size_t)row * nsb * sbytes;
+    const signed char* xt = xq + (size_t)t0 * cols + 8 * lane;
+    const float* d32 = xd + (size_t)t0 * nb + (lane >> 2);
+    const int* s32 = xsum + (size_t)t0 * nb + (lane >> 2);
+    bool first = (lane & 3) == 0;
+    float acc[Q2_0_TB];
+#pragma unroll
+    for (int j = 0; j < Q2_0_TB; j++) acc[j] = 0.f;
+#pragma unroll 2
+    for (int sb = 0; sb < nsb; sb++) {
+        float d;
+        int w0, w1;
+        tern_lane(fmt, wr + (size_t)sb * sbytes, lane, &d, &w0, &w1);
+#pragma unroll
+        for (int j = 0; j < Q2_0_TB; j++) {
+            if (j < nt) {
+                int2 xv = *reinterpret_cast<const int2*>(xt + (size_t)j * cols + (size_t)sb * 256);
+                int dot = __dp4a(w1, xv.y, __dp4a(w0, xv.x, 0));
+                if (first) dot -= s32[(size_t)j * nb + sb * 8];
+                acc[j] = __fmaf_rn(__fmul_rn(d, d32[(size_t)j * nb + sb * 8]), (float)dot, acc[j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < Q2_0_TB; j++) {
+        if (j < nt) {
+            float v = warp_sum(acc[j]);
+            if (lane == 0) {
+                size_t i = (size_t)(t0 + j) * out_stride + out_off + row;
+                out[i] = accumulate ? out[i] + v : v;
+            }
+        }
+    }
+}
+
+// one kernel per format and batch kind, the format a constant: the inlined bodies keep only its path
+__global__ void matmul_q2_0_dp4a(const unsigned char* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xd, const int* __restrict__ xsum, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) { tern_mv1(3, w, xq, xd, xsum, out, rows, cols, n, accumulate, out_stride, out_off); }
+__global__ void matmul_q2_0_dp4a8(const unsigned char* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xd, const int* __restrict__ xsum, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) { tern_mv8(3, w, xq, xd, xsum, out, rows, cols, n, accumulate, out_stride, out_off); }
+// PTQ1_0 decoding. Rows are repacked at upload (ptq1_repack_row in cuda.rs's Rust): every five 128-value blocks
+// (640 values, 140 bytes as in the file) become a superblock of 32 digit words and the five f16 scales (bytes
+// 128..137, then 2 bytes of padding). Lane i (g = i / 8, j = i % 8) takes word i: byte k's digit n < 4 is value
+// 16j + 4n + k of block g, its digit 4 value 4i + k of block 4. So the lane's digits 0..3 are 16 contiguous
+// values in one 32-value activation block (one int4 load, one scale), digit 4 another 4 (one int), and each warp
+// load covers contiguous bytes (Nsight: the file's layout scattered them, stalling on the LG queue). The digits
+// come off as -1..1 (signed bytes), so dp4a gives the weights' dot directly, no activation sums. A row's last
+// nblk % 5 blocks stay as in the file (24 bytes of five digits, 2 of four, f16 d): six words each, lane after
+// lane (values off + n * stride: words 0-3 4w + 16n, words 4-5 64 + 4w + 8n), then block after block the 8 qh
+// values and the -1 of every value (each 32-value activation block's sum). Both kernels do the same arithmetic for
+// a token (explicit rounding), as a verify batch needs.
+__device__ __forceinline__ unsigned ptq1_step(unsigned& lo, unsigned& hi) {
+    unsigned wl = lo * 3, wh = hi * 3;
+    lo = wl & 0x00FF00FFu;
+    hi = wh & 0x00FF00FFu;
+    return __byte_perm(wl, wh, 0x7531);
+}
+struct Ptq1Word { unsigned q[5]; float d; int off, stride; };
+__device__ __forceinline__ Ptq1Word ptq1_word(const unsigned char* wr, int wi) {
+    Ptq1Word r;
+    int b = wi / 6, w = wi - 6 * b;
+    const unsigned char* blk = wr + (size_t)b * 28;
+    unsigned v = *reinterpret_cast<const unsigned*>(blk + 4 * w);
+    // bytes 0, 1 and 2, 3 in 16-bit lanes (ptq1_step's __byte_perm puts the digits back in byte order)
+    unsigned lo = __byte_perm(v, 0, 0x4140), hi = __byte_perm(v, 0, 0x4342);
+#pragma unroll
+    for (int n = 0; n < 5; n++) r.q[n] = ptq1_step(lo, hi);
+    r.d = h2f(*reinterpret_cast<const unsigned short*>(blk + 26));
+    r.off = b * 128 + (w < 4 ? 4 * w : 64 + 4 * w);
+    r.stride = w < 4 ? 16 : 8;
+    return r;
+}
+__device__ __forceinline__ float ptq1_word_dot(const Ptq1Word& r, const signed char* x, const float* xd) {
+    int e = r.off, st = r.stride;
+    const int* xi = reinterpret_cast<const int*>(x);
+    int s0 = __dp4a((int)r.q[1], xi[(e + st) >> 2], __dp4a((int)r.q[0], xi[e >> 2], 0));
+    int s1 = __dp4a((int)r.q[3], xi[(e + 3 * st) >> 2], __dp4a((int)r.q[2], xi[(e + 2 * st) >> 2], 0));
+    int s2 = __dp4a((int)r.q[4], xi[(e + 4 * st) >> 2], 0);
+    float t = __fmul_rn(xd[e >> 5], (float)s0);
+    t = __fmaf_rn(xd[(e + 2 * st) >> 5], (float)s1, t);
+    t = __fmaf_rn(xd[(e + 4 * st) >> 5], (float)s2, t);
+    return __fmul_rn(r.d, t);
+}
+struct Ptq1Tail { unsigned q0, q1; float d; int b; };
+__device__ __forceinline__ Ptq1Tail ptq1_tail(const unsigned char* wr, int b) {
+    const unsigned char* blk = wr + (size_t)b * 28;
+    // bytes [qh0 qh1 qh0 qh1]: values 120.. are digits 0 0 1 1, then 2 2 3 3
+    unsigned qh = *reinterpret_cast<const unsigned*>(blk + 24);
+    unsigned pk = (qh & 0xFFFFu) * 0x00010001u;
+    Ptq1Tail r;
+    r.q0 = __byte_perm(ptq1_digits(pk, 1), ptq1_digits(pk, 3), 0x5410);
+    r.q1 = __byte_perm(ptq1_digits(pk, 9), ptq1_digits(pk, 27), 0x5410);
+    r.d = h2f(qh >> 16);
+    r.b = b;
+    return r;
+}
+__device__ __forceinline__ float ptq1_tail_dot(const Ptq1Tail& r, const signed char* x, const float* xd, const int* xs) {
+    int2 xv = *reinterpret_cast<const int2*>(x + r.b * 128 + 120);
+    int dot = __dp4a((int)r.q1, xv.y, __dp4a((int)r.q0, xv.x, 0));
+    float4 db = *reinterpret_cast<const float4*>(xd + 4 * r.b);
+    int4 sb = *reinterpret_cast<const int4*>(xs + 4 * r.b);
+    float t = __fmul_rn(db.w, (float)(dot - sb.w));
+    t = __fmaf_rn(db.x, (float)(-sb.x), t);
+    t = __fmaf_rn(db.y, (float)(-sb.y), t);
+    t = __fmaf_rn(db.z, (float)(-sb.z), t);
+    return __fmul_rn(r.d, t);
+}
+// lane's word of a superblock: its five digits as signed bytes (0..2 to -1..1: + 0x7f, no carry, then the top bit
+// flipped) and the two scales it needs
+struct Ptq1Sb { int s[5]; float d0, d4; };
+// the raw loads of a lane's part of a superblock: its word and its two f16 scales (loaded ahead, see ptq1_raw)
+struct Ptq1Raw { unsigned v; unsigned short d0, d4; };
+__device__ __forceinline__ Ptq1Raw ptq1_raw(const unsigned char* sb, int lane) {
+    Ptq1Raw r;
+    r.v = *reinterpret_cast<const unsigned*>(sb + 4 * lane);
+    const unsigned short* d = reinterpret_cast<const unsigned short*>(sb + 128);
+    r.d0 = d[lane >> 3];
+    r.d4 = d[4];
+    return r;
+}
+__device__ __forceinline__ Ptq1Sb ptq1_dec(const Ptq1Raw& w) {
+    Ptq1Sb r;
+    unsigned lo = __byte_perm(w.v, 0, 0x4140), hi = __byte_perm(w.v, 0, 0x4342);
+#pragma unroll
+    for (int n = 0; n < 5; n++) r.s[n] = (int)((ptq1_step(lo, hi) + 0x7F7F7F7Fu) ^ 0x80808080u);
+    r.d0 = h2f(w.d0);
+    r.d4 = h2f(w.d4);
+    return r;
+}
+__device__ __forceinline__ Ptq1Sb ptq1_sb(const unsigned char* sb, int lane) { return ptq1_dec(ptq1_raw(sb, lane)); }
+// a lane's activations for a superblock (x: its 640, xd: their 20 scales): 16 + 4 values and their two scales.
+// Loaded once and used for PTQ1_R rows: the weights are 1.75 bits a value, the activations 8, so it is these
+// loads (L1 / L2) that bound the kernels, not the weights' (profile: 4 tokens at once cost 3.5 times one).
+#define PTQ1_R 1
+// superblocks whose weights a warp loads before using any (bytes in flight: the loads' latency, not their
+// number, was what bounded the batch kernel)
+#define PTQ1_U 2
+// tokens a batch kernel block takes (fewer than Q2_0_TB: registers, so occupancy)
+#define PTQ1_TB 4
+struct Ptq1X { int4 a; int b; float d0, d4; };
+__device__ __forceinline__ Ptq1X ptq1_x(const signed char* x, const float* xd, int lane) {
+    int g = lane >> 3, j = lane & 7;
+    Ptq1X r;
+    r.a = *reinterpret_cast<const int4*>(x + 128 * g + 16 * j);
+    r.b = *reinterpret_cast<const int*>(x + 512 + 4 * lane);
+    r.d0 = xd[4 * g + (j >> 1)];
+    r.d4 = xd[16 + g];
+    return r;
+}
+// acc plus the superblock's dot with the lane's activations
+__device__ __forceinline__ float ptq1_sb_dot(const Ptq1Sb& r, const Ptq1X& x, float acc) {
+    int dot0 = __dp4a(r.s[3], x.a.w, __dp4a(r.s[2], x.a.z, __dp4a(r.s[1], x.a.y, __dp4a(r.s[0], x.a.x, 0))));
+    int dot1 = __dp4a(r.s[4], x.b, 0);
+    acc = __fmaf_rn(__fmul_rn(r.d0, x.d0), (float)dot0, acc);
+    return __fmaf_rn(__fmul_rn(r.d4, x.d4), (float)dot1, acc);
+}
+__global__ void matmul_ptq1_dp4a(const unsigned char* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xd, const int* __restrict__ xsum, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    int nblk = cols >> 7, nsb = nblk / 5, rest = nblk - 5 * nsb;
+    const unsigned char* wr = w + (size_t)row * nblk * 28;
+    float acc = 0.f;
+#pragma unroll 4
+    for (int c = 0; c < nsb; c++) acc = ptq1_sb_dot(ptq1_sb(wr + (size_t)c * 140, lane), ptq1_x(xq + c * 640, xd + c * 20, lane), acc);
+    const unsigned char* wt = wr + (size_t)nsb * 140;
+    const signed char* xt = xq + nsb * 640;
+    const float* dt = xd + nsb * 20;
+    for (int wi = lane; wi < 6 * rest; wi += 32) acc = __fadd_rn(acc, ptq1_word_dot(ptq1_word(wt, wi), xt, dt));
+    for (int b = lane; b < rest; b += 32) acc = __fadd_rn(acc, ptq1_tail_dot(ptq1_tail(wt, b), xt, dt, xsum + nsb * 20));
+    float v = warp_sum(acc);
+    if (lane == 0) {
+        size_t i = (size_t)out_off + row;
+        out[i] = accumulate ? out[i] + v : v;
+    }
+}
+__global__ void matmul_ptq1_dp4a8(const unsigned char* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xd, const int* __restrict__ xsum, float* __restrict__ out, int rows, int cols, int n, int accumulate, int out_stride, int out_off) {
+    // a warp takes PTQ1_R rows and PTQ1_TB tokens: each weight word loaded once, each activation once per PTQ1_R
+    // rows; per (row, token) the same arithmetic in the same order as matmul_ptq1_dp4a
+    int r0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * PTQ1_R, lane = threadIdx.x & 31, t0 = blockIdx.y * PTQ1_TB;
+    if (r0 >= rows) return;
+    int nr = min(PTQ1_R, rows - r0), nt = min(PTQ1_TB, n - t0), nblk = cols >> 7, nb = cols >> 5, nsb = nblk / 5, rest = nblk - 5 * nsb;
+    size_t rb = (size_t)nblk * 28;
+    const unsigned char* w0 = w + (size_t)r0 * rb;
+    const signed char* x0 = xq + (size_t)t0 * cols;
+    const float* d0 = xd + (size_t)t0 * nb;
+    float acc[PTQ1_TB][PTQ1_R];
+#pragma unroll
+    for (int t = 0; t < PTQ1_TB; t++)
+#pragma unroll
+        for (int r = 0; r < PTQ1_R; r++) acc[t][r] = 0.f;
+    for (int c0 = 0; c0 < nsb; c0 += PTQ1_U) {
+        Ptq1Raw raw[PTQ1_U][PTQ1_R];
+#pragma unroll
+        for (int u = 0; u < PTQ1_U; u++)
+#pragma unroll
+            for (int r = 0; r < PTQ1_R; r++)
+                if (c0 + u < nsb && r < nr) raw[u][r] = ptq1_raw(w0 + r * rb + (size_t)(c0 + u) * 140, lane);
+#pragma unroll
+        for (int u = 0; u < PTQ1_U; u++) {
+            int c = c0 + u;
+            if (c >= nsb) break;
+            Ptq1Sb s[PTQ1_R];
+#pragma unroll
+            for (int r = 0; r < PTQ1_R; r++)
+                if (r < nr) s[r] = ptq1_dec(raw[u][r]);
+#pragma unroll
+            for (int t = 0; t < PTQ1_TB; t++) {
+                if (t < nt) {
+                    Ptq1X x = ptq1_x(x0 + (size_t)t * cols + c * 640, d0 + (size_t)t * nb + c * 20, lane);
+#pragma unroll
+                    for (int r = 0; r < PTQ1_R; r++)
+                        if (r < nr) acc[t][r] = ptq1_sb_dot(s[r], x, acc[t][r]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < PTQ1_R; r++) {
+        if (r >= nr) break;
+        const unsigned char* wt = w0 + r * rb + (size_t)nsb * 140;
+        for (int wi = lane; wi < 6 * rest; wi += 32) {
+            Ptq1Word q = ptq1_word(wt, wi);
+#pragma unroll
+            for (int t = 0; t < PTQ1_TB; t++)
+                if (t < nt) acc[t][r] = __fadd_rn(acc[t][r], ptq1_word_dot(q, x0 + (size_t)t * cols + nsb * 640, d0 + (size_t)t * nb + nsb * 20));
+        }
+        for (int b = lane; b < rest; b += 32) {
+            Ptq1Tail q = ptq1_tail(wt, b);
+#pragma unroll
+            for (int t = 0; t < PTQ1_TB; t++)
+                if (t < nt) acc[t][r] = __fadd_rn(acc[t][r], ptq1_tail_dot(q, x0 + (size_t)t * cols + nsb * 640, d0 + (size_t)t * nb + nsb * 20, xsum + (size_t)(t0 + t) * nb + nsb * 20));
+        }
+#pragma unroll
+        for (int t = 0; t < PTQ1_TB; t++) {
+            if (t < nt) {
+                float v = warp_sum(acc[t][r]);
+                if (lane == 0) {
+                    size_t i = (size_t)(t0 + t) * out_stride + out_off + r0 + r;
+                    out[i] = accumulate ? out[i] + v : v;
+                }
+            }
+        }
+    }
+}
+
+// Hadamard-folded weights (prism.hadamard, see hadamard.rs): a folded matmul's input rows, in place, each
+// `block`-wide piece times its signs (signs == 0: none), then the normalized Walsh-Hadamard transform (Sylvester
+// order). Grid (width / block, rows), up to 512 threads; block <= 1024.
+__global__ void hadamard_rows(float* __restrict__ x, const float* __restrict__ signs, int width, int block) {
+    __shared__ float v[1024];
+    float* p = x + (size_t)blockIdx.y * width + (size_t)blockIdx.x * block;
+    const float* sg = signs ? signs + (size_t)blockIdx.x * block : nullptr;
+    for (int i = threadIdx.x; i < block; i += blockDim.x) v[i] = sg ? p[i] * sg[i] : p[i];
+    __syncthreads();
+    for (int h = 1; h < block; h <<= 1) {
+        for (int i = threadIdx.x; i < (block >> 1); i += blockDim.x) {
+            int j = (i / h) * 2 * h + (i % h);
+            float a = v[j], b = v[j + h];
+            v[j] = a + b;
+            v[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+    float scale = rsqrtf((float)block);
+    for (int i = threadIdx.x; i < block; i += blockDim.x) p[i] = v[i] * scale;
+}
+
+// A DeltaNet ssm_out's input from tiled value heads [hd, nk, rep] to grouped [hd, rep, nk], in place (the order
+// its folding used). A block per row, the row in dynamic shared memory.
+__global__ void hadamard_perm(float* __restrict__ x, int width, int hd, int nk, int rep) {
+    extern __shared__ float hrow[];
+    float* p = x + (size_t)blockIdx.x * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) hrow[i] = p[i];
+    __syncthreads();
+    for (int e = threadIdx.x; e < width; e += blockDim.x) {
+        int j = e % hd, r = (e / hd) % rep, kk = e / (hd * rep);
+        p[e] = hrow[(r * nk + kk) * hd + j];
+    }
 }
 
 // ---- CSM speech (see CsmFrames) ----
@@ -4259,6 +4668,50 @@ impl Drop for DeviceBuf {
     }
 }
 
+/// Page-locked system memory (copies to and from the GPU at full PCIe speed): for data the GPU needs back only
+/// now and then, such as the DeltaNet snapshots, so it leaves GPU memory to the context.
+struct HostBuf {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+unsafe impl Send for HostBuf {}
+
+impl HostBuf {
+    fn alloc(bytes: usize) -> Result<HostBuf, String> {
+        let a = api()?;
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        a.check(unsafe { (a.f.cuMemAllocHost_v2)(&mut ptr, bytes.max(4)) }, &format!("alloc {} MB of pinned memory", bytes >> 20))?;
+        Ok(HostBuf { ptr, bytes })
+    }
+
+    /// Copies the buffer's size from device address `src` here, after the GPU work queued before it.
+    fn copy_from(&self, src: u64) -> Result<(), String> {
+        let a = api()?;
+        a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(self.ptr, src, self.bytes) }, "copy from GPU")
+    }
+
+    /// Copies this buffer to device address `dst`.
+    fn copy_to(&self, dst: u64) -> Result<(), String> {
+        let a = api()?;
+        a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(dst, self.ptr, self.bytes) }, "copy to GPU")
+    }
+}
+
+/// A session's state copied to system memory (GpuSession::keep), about 300 MB for a 4,000-token opening of a 27B.
+pub struct SavedState {
+    pos: usize,
+    parts: Vec<HostBuf>,
+}
+
+impl Drop for HostBuf {
+    fn drop(&mut self) {
+        if let Ok(a) = api() {
+            unsafe { (a.f.cuMemFreeHost)(self.ptr) };
+        }
+    }
+}
+
 /// CUmemAllocationProp: pinned device memory on the device.
 #[repr(C)]
 struct MemProp {
@@ -4425,7 +4878,12 @@ struct Kernels {
     moe_gate_up_iq2: Ptr,
     moe_down_iq2: Ptr,
     iq2_to_q8: Ptr,
+    ptq1_to_q8: Ptr,
     matmul_iq2_dp4a: Ptr,
+    matmul_q2_0_dp4a: [[Ptr; 2]; 2], // [Q2_0 | PTQ1_0][1 token | up to 8]
+    // Hadamard-folded weights' inputs
+    hadamard_rows: Ptr,
+    hadamard_perm: Ptr,
     matmul_q3k_dp4a: [Ptr; 2], // decode, Fmt::Q3K: [1 token | up to 8]
     /// every launch goes here (a blocking stream: the synchronous copies still order against it); CUDA
     /// graphs need a stream other than the legacy default one
@@ -4524,7 +4982,7 @@ impl Kernels {
             };
             // GHOST_INFER_KERNEL_INFO=1: registers and spills of the decode and verify kernels, for tuning
             if std::env::var_os("GHOST_INFER_KERNEL_INFO").is_some() {
-                for name in ["attention_partial_gqa", "matmul_q4k_dp4a", "matmul_q4k_dp4a8", "matmul_q4k_vfy1", "matmul_q4k_vfy2", "matmul_q4k_vfy4", "matmul_q6k_vfy1", "matmul_q6k_vfy2", "matmul_q6k_vfy4"] {
+                for name in ["attention_partial_gqa", "matmul_q4k_dp4a", "matmul_q4k_dp4a8", "matmul_q4k_vfy1", "matmul_q4k_vfy2", "matmul_q4k_vfy4", "matmul_q6k_vfy1", "matmul_q6k_vfy2", "matmul_q6k_vfy4", "matmul_q2_0_dp4a", "matmul_q2_0_dp4a8", "matmul_ptq1_dp4a", "matmul_ptq1_dp4a8"] {
                     let f = get(name)?;
                     let (mut regs, mut local) = (0, 0);
                     (a.f.cuFuncGetAttribute)(&mut regs, 4, f);
@@ -4631,7 +5089,11 @@ impl Kernels {
                 moe_gate_up_iq2: get("moe_gate_up_iq2")?,
                 moe_down_iq2: get("moe_down_iq2")?,
                 iq2_to_q8: get("iq2_to_q8")?,
+                ptq1_to_q8: get("ptq1_to_q8")?,
                 matmul_iq2_dp4a: get("matmul_iq2_dp4a")?,
+                matmul_q2_0_dp4a: [[get("matmul_q2_0_dp4a")?, get("matmul_q2_0_dp4a8")?], [get("matmul_ptq1_dp4a")?, get("matmul_ptq1_dp4a8")?]],
+                hadamard_rows: get("hadamard_rows")?,
+                hadamard_perm: get("hadamard_perm")?,
                 matmul_q3k_dp4a: [get("matmul_q3k_dp4a")?, get("matmul_q3k_dp4a8")?],
                 stream: {
                     let mut st: Ptr = std::ptr::null_mut();
@@ -4933,8 +5395,40 @@ struct GpuMatrix {
     cols: usize,
     /// Q8 converted from a 2-bit i-quant: decoding gives it int8 activations (no finer than its weights need)
     coarse: bool,
-    /// Fmt::Iq2: the kernels' fmt (0 IQ2_XXS, 1 IQ2_S, 2 IQ2_XS)
+    /// Fmt::Iq2: the kernels' fmt (0 IQ2_XXS, 1 IQ2_S, 2 IQ2_XS, 3 Q2_0)
     iq: i32,
+    /// a Hadamard-folded weight (prism.hadamard): its input goes through the transform first
+    fold: Option<Fold>,
+}
+
+/// The input transform of a Hadamard-folded matrix (see hadamard.rs).
+#[derive(Clone, Copy, PartialEq)]
+struct Fold {
+    /// the signs for its input width on the GPU (0: identity sign mode)
+    signs: u64,
+    block: usize,
+    /// a DeltaNet ssm_out: (head size, key heads, value heads per key head) from tiled to grouped; else 0s
+    perm: (usize, usize, usize),
+}
+
+/// Marks the matrices `upload_parts` made from `names` (one per run of one format) whose weights are all
+/// folded; a run folded in part is an error (its matmul could not transform half its input).
+fn mark_folded(parts: &mut [(GpuMatrix, usize)], g: &Gguf, names: &[String], folded: &dyn Fn(&str) -> bool, fold: &dyn Fn(usize) -> Fold) -> Result<(), String> {
+    let mut i = 0;
+    for (m, _) in parts.iter_mut() {
+        let ty = g.tensor(&names[i]).ok_or_else(|| format!("missing tensor {}", names[i]))?.ty;
+        let start = i;
+        while names.get(i).and_then(|n| g.tensor(n)).is_some_and(|t| t.ty == ty) {
+            i += 1;
+        }
+        let n_folded = names[start..i].iter().filter(|n| folded(n)).count();
+        if n_folded == i - start {
+            m.fold = Some(fold(m.cols));
+        } else if n_folded > 0 {
+            return Err(format!("prism.hadamard: {} share a matrix but are folded in part", names[start..i].join(", ")));
+        }
+    }
+    Ok(())
 }
 
 impl GpuMatrix {
@@ -4944,7 +5438,7 @@ impl GpuMatrix {
 
     /// A matrix in memory owned elsewhere (an expert slot, a scratch buffer); never freed through this.
     fn view(fmt: Fmt, q: u64, d: Option<u64>, rows: usize, cols: usize) -> std::mem::ManuallyDrop<GpuMatrix> {
-        std::mem::ManuallyDrop::new(GpuMatrix { fmt, q: DeviceBuf { ptr: q, bytes: 0, owned: false }, d: d.map(|ptr| DeviceBuf { ptr, bytes: 0, owned: false }), rows, cols, coarse: false, iq: -1 })
+        std::mem::ManuallyDrop::new(GpuMatrix { fmt, q: DeviceBuf { ptr: q, bytes: 0, owned: false }, d: d.map(|ptr| DeviceBuf { ptr, bytes: 0, owned: false }), rows, cols, coarse: false, iq: -1, fold: None })
     }
 }
 
@@ -4954,8 +5448,76 @@ fn iq2_kernel_fmt(ty: GgmlType) -> Option<i32> {
         GgmlType::Iq2Xxs => Some(0),
         GgmlType::Iq2S => Some(1),
         GgmlType::Iq2Xs => Some(2),
+        GgmlType::Q2_0 => Some(3),
+        GgmlType::Ptq1_0 => Some(4),
         _ => None,
     }
+}
+
+/// Bytes per 256 values of a Fmt::Iq2 matrix (the kernels' iq2_bytes).
+fn iq2_block_bytes(fmt: i32) -> usize {
+    match fmt {
+        0 => crate::iquant::IQ2_XXS_BYTES,
+        1 => crate::iquant::IQ2_S_BYTES,
+        3 => 72,
+        4 => 56,
+        _ => crate::iquant::IQ2_XS_BYTES,
+    }
+}
+
+/// One PTQ1_0 row (128-value blocks of 28 bytes) repacked for the GPU kernels, the same size: every five blocks
+/// become a 140-byte superblock of 32 four-byte digit words, the five f16 scales and 2 bytes of padding. Byte k of
+/// word i (g = i / 8, j = i % 8) holds, as base-3 digits 0..3, values 16j + 4n + k of block g and, as digit 4,
+/// value 4i + k of block 4 (see matmul_ptq1_dp4a). The last blocks % 5 blocks stay as they are.
+fn ptq1_repack_row(src: &[u8], dst: &mut [u8]) {
+    use crate::quant::trit;
+    // five digits (digit 0 first) to a byte that decodes to them: some byte of the 256 does, for each of the 243
+    static ENCODE: std::sync::OnceLock<[u8; 243]> = std::sync::OnceLock::new();
+    let enc = ENCODE.get_or_init(|| {
+        let mut t = [0u8; 243];
+        let mut seen = [false; 243];
+        for b in 0..=255u8 {
+            let q = (0..5).fold(0usize, |q, n| q * 3 + trit(b, n) as usize);
+            if !seen[q] {
+                seen[q] = true;
+                t[q] = b;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "PTQ1_0 digits: some five-digit pattern has no byte");
+        t
+    });
+    // digit of value o (0..128) of a file block
+    let file_trit = |blk: &[u8], o: usize| -> u8 {
+        let (byte, n) = match o {
+            0..80 => (blk[o % 16], o / 16),
+            80..120 => (blk[16 + (o - 80) % 8], (o - 80) / 8),
+            _ => (blk[24 + (o - 120) % 2], (o - 120) / 2),
+        };
+        trit(byte, n as u32)
+    };
+    let nblk = src.len() / 28;
+    let nsb = nblk / 5;
+    for s in 0..nsb {
+        let blocks: Vec<&[u8]> = (0..5).map(|b| &src[(5 * s + b) * 28..(5 * s + b + 1) * 28]).collect();
+        let out = &mut dst[s * 140..(s + 1) * 140];
+        for i in 0..32 {
+            let (g, j) = (i / 8, i % 8);
+            for k in 0..4 {
+                let mut q = 0usize;
+                for n in 0..4 {
+                    q = q * 3 + file_trit(blocks[g], 16 * j + 4 * n + k) as usize;
+                }
+                q = q * 3 + file_trit(blocks[4], 4 * i + k) as usize;
+                out[4 * i + k] = enc[q];
+            }
+        }
+        for (b, blk) in blocks.iter().enumerate() {
+            out[128 + 2 * b..130 + 2 * b].copy_from_slice(&blk[26..28]);
+        }
+        out[138] = 0;
+        out[139] = 0;
+    }
+    dst[nsb * 140..].copy_from_slice(&src[nsb * 140..]);
 }
 
 /// Uploads tensors whose rows are concatenated in one output (e.g. Q, K and V). Neighbours of the same
@@ -5005,6 +5567,15 @@ fn upload_parts_as(g: &Gguf, names: &[String], up: &mut Uploader, keep_iq2: bool
             let tf = std::time::Instant::now();
             let dst = q.ptr + off as u64;
             match fmt {
+                // PTQ1_0 rows repacked for the decode kernels (same size; see ptq1_repack_row)
+                Fmt::Iq2 if t.ty == GgmlType::Ptq1_0 => {
+                    let row_bytes = cols / 128 * 28;
+                    up.put_repacked(dst, &g.path, t.offset as u64, t.n_bytes, (row_bytes, row_bytes), &mut d, |i, o| {
+                        ptq1_repack_row(i, o);
+                        0.0
+                    })?;
+                    d.clear();
+                }
                 // the GGUF blocks as they are, straight from the file
                 Fmt::Q4K | Fmt::Iq2 => up.put_file(dst, &g.path, t.offset as u64, t.n_bytes)?,
                 // 210-byte blocks: the f16 d at the end goes to its own array
@@ -5039,8 +5610,8 @@ fn upload_parts_as(g: &Gguf, names: &[String], up: &mut Uploader, keep_iq2: bool
         let d = if !matches!(fmt, Fmt::Q4K | Fmt::Iq2 | Fmt::Q3K) { Some(up.put_vec(&d)?) } else { None };
         // requantised 3- and 5-bit weights decode with int8 activations like 2-bit ones (Q3_K_M keeps a few
         // Q5_K matrices beside its Q3_K ones: else those layers' decoding would leave the dp4a path)
-        let coarse = ty.is_iquant() || matches!(ty, GgmlType::Q3K | GgmlType::Q5K);
-        parts.push((GpuMatrix { fmt, q, d, rows, cols, coarse, iq: iq.unwrap_or(-1) }, row_off));
+        let coarse = ty.is_iquant() || matches!(ty, GgmlType::Q3K | GgmlType::Q5K | GgmlType::Q2_0 | GgmlType::Ptq1_0);
+        parts.push((GpuMatrix { fmt, q, d, rows, cols, coarse, iq: iq.unwrap_or(-1), fold: None }, row_off));
         row_off += rows;
     }
     Ok(parts)
@@ -6271,6 +6842,8 @@ impl GpuWhisper {
                 iq_scratch: None,
                 lora_t: None,
                 lora: None,
+                hadamard: None,
+                _fold_signs: Vec::new(),
                 _weights: None,
             },
             enc,
@@ -6549,6 +7122,10 @@ pub struct GpuModel {
     lora_t: Option<DeviceBuf>,
     /// the attached adapter's file, for the server's model description
     pub lora: Option<std::path::PathBuf>,
+    /// Hadamard-folded weights (prism.hadamard): the folding (the embedding's rows go back through it on the
+    /// CPU), and the signs the matrices' `Fold`s point at
+    hadamard: Option<crate::hadamard::Hadamard>,
+    _fold_signs: Vec<DeviceBuf>,
     /// the weights' memory (dropped after the buffers pointing into it, which free nothing)
     _weights: Option<Arena>,
 }
@@ -6579,11 +7156,43 @@ impl GpuModel {
         let t0 = std::time::Instant::now();
         let a = api()?;
         let t_api = t0.elapsed();
+        let free_mb = || {
+            let (mut free, mut total) = (0usize, 0usize);
+            unsafe { (a.f.cuMemGetInfo_v2)(&mut free, &mut total) };
+            free >> 20
+        };
+        let free_before = free_mb();
         let k = Arc::new(Kernels::compile_on(private)?);
         let t_kernels = t0.elapsed();
+        let free_kernels = free_mb();
         let mut up = Uploader::new()?;
         up.arena = Arena::new().ok();
         let up = &mut up;
+        // Hadamard-folded weights (prism.hadamard): checked as the CPU path checks them (every folded weight one
+        // whose input this pass transforms); each input width's signs go to the GPU once
+        let folding = match crate::hadamard::Hadamard::from_gguf(g)? {
+            Some(h) => Some(crate::model::Folding::new(g, &cfg, h)?),
+            None => None,
+        };
+        let mut fold_signs = Vec::new();
+        let mut sign_at = std::collections::HashMap::new();
+        if let Some(f) = &folding {
+            for w in f.h.widths() {
+                let buf = up.put_vec(f.h.signs(w)?.unwrap_or(&[]))?;
+                sign_at.insert(w, buf.ptr);
+                fold_signs.push(buf);
+            }
+        }
+        let is_folded = |n: &str| folding.as_ref().is_some_and(|f| f.h.is_folded(n));
+        let fold_with = |perm: (usize, usize, usize)| {
+            let (sign_at, folding) = (&sign_at, &folding);
+            move |cols: usize| Fold { signs: sign_at.get(&cols).copied().unwrap_or(0), block: folding.as_ref().map_or(0, |f| f.h.block), perm }
+        };
+        let fold_one = |m: &mut GpuMatrix, name: &str, perm: (usize, usize, usize)| {
+            if is_folded(name) {
+                m.fold = Some(fold_with(perm)(m.cols));
+            }
+        };
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}.weight");
@@ -6597,8 +7206,10 @@ impl GpuModel {
                 } else {
                     parts.push(p("ssm_ba"));
                 }
+                let mut proj = upload_parts(g, &parts, up)?;
+                mark_folded(&mut proj, g, &parts, &is_folded, &fold_with((0, 0, 0)))?;
                 Some(GpuDelta {
-                    proj: upload_parts(g, &parts, up)?,
+                    proj,
                     conv: upload_vec(g, &v("ssm_conv1d.weight"), up)?,
                     dt_bias: upload_vec(g, &v("ssm_dt.bias"), up)?,
                     a: upload_vec(g, &v("ssm_a"), up)?,
@@ -6621,11 +7232,19 @@ impl GpuModel {
                     };
                     (Vec::new(), Some(mla))
                 }
-                None => (upload_parts(g, &[p("attn_q"), p("attn_k"), p("attn_v")], up)?, None),
+                None => {
+                    let names = [p("attn_q"), p("attn_k"), p("attn_v")];
+                    let mut qkv = upload_parts(g, &names, up)?;
+                    mark_folded(&mut qkv, g, &names, &is_folded, &fold_with((0, 0, 0)))?;
+                    (qkv, None)
+                }
             };
             let q_norm = if g.tensor(&p("attn_q_norm")).is_some() { Some(upload_vec(g, &p("attn_q_norm"), up)?) } else { None };
             let k_norm = if g.tensor(&p("attn_k_norm")).is_some() { Some(upload_vec(g, &p("attn_k_norm"), up)?) } else { None };
-            let wo = upload_one(g, &p(if delta.is_some() { "ssm_out" } else { "attn_output" }), up)?;
+            let wo_name = p(if delta.is_some() { "ssm_out" } else { "attn_output" });
+            let mut wo = upload_one(g, &wo_name, up)?;
+            let perm = if delta.is_some() { folding.as_ref().and_then(|f| f.ssm_perm).unwrap_or((0, 0, 0)) } else { (0, 0, 0) };
+            fold_one(&mut wo, &wo_name, perm);
             // qwen3next names the norm before the feed-forward after the attention it follows
             let ffn_norm = upload_vec(g, &p(if g.tensor(&p("ffn_norm")).is_some() { "ffn_norm" } else { "post_attention_norm" }), up)?;
             let ffn = if cfg.is_moe() && i >= cfg.n_dense_lead {
@@ -6637,17 +7256,30 @@ impl GpuModel {
                 let gate = if g.tensor(&p("ffn_gate_inp_shexp")).is_some() { Some(upload_f32(g, &p("ffn_gate_inp_shexp"), up)?) } else { None };
                 GpuFfn::Moe { shared, gate }
             } else {
-                GpuFfn::Dense { gate_up: upload_parts(g, &[p("ffn_gate"), p("ffn_up")], up)?, down: upload_one(g, &p("ffn_down"), up)? }
+                let names = [p("ffn_gate"), p("ffn_up")];
+                let mut gate_up = upload_parts(g, &names, up)?;
+                mark_folded(&mut gate_up, g, &names, &is_folded, &fold_with((0, 0, 0)))?;
+                let mut down = upload_one(g, &p("ffn_down"), up)?;
+                fold_one(&mut down, &p("ffn_down"), (0, 0, 0));
+                GpuFfn::Dense { gate_up, down }
             };
             layers.push(GpuLayer { attn_norm, qkv, q_norm, k_norm, mla, delta, wo, ffn_norm, ffn, lora: GpuLayerLora::default() });
         }
         let moe = if cfg.is_moe() { Some(CpuMoe::load(g, &cfg)?) } else { None };
-        let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight", up)?) } else { None };
+        let output = if g.tensor("output.weight").is_some() {
+            let mut o = upload_one(g, "output.weight", up)?;
+            fold_one(&mut o, "output.weight", (0, 0, 0));
+            Some(o)
+        } else {
+            None
+        };
         // in RAM, a row read per token: a mixture of experts' (its GPU memory goes to the expert cache), a model
         // whose loader asks (ghost.embd_on_host, as maya1.rs does: it only ever reads its prompt's rows), or a
         // big table (Mistral Nemo's 131k rows are 360 MB at Q4_K: on an 8 GB card, 2300 more tokens of context)
         let big = g.tensor("token_embd.weight").is_some_and(|t| t.n_bytes >= 256 << 20);
-        let host = cfg.is_moe() || big || matches!(g.get("ghost.embd_on_host"), Some(crate::gguf::Value::Bool(true)));
+        // (a Hadamard-rotated table too: its rows go back to the model's basis on the CPU, see forward)
+        let rotated = folding.as_ref().is_some_and(|f| f.h.embd_inverse);
+        let host = cfg.is_moe() || big || rotated || matches!(g.get("ghost.embd_on_host"), Some(crate::gguf::Value::Bool(true)));
         let embd = match g.tensor("token_embd.weight") {
             Some(t) if host && output.is_some() && t.dims.len() == 2 && t.ty.block().is_some() => {
                 let file = std::fs::File::open(&g.path).map_err(|e| format!("cannot open {}: {e}", g.path.display()))?;
@@ -6657,21 +7289,21 @@ impl GpuModel {
             Some(_) => Embd::Gpu(upload_parts_as(g, &["token_embd.weight".to_string()], up, false)?.pop().unwrap().0),
             None => Embd::Vectors,
         };
+        if rotated && !matches!(embd, Embd::Host { .. }) {
+            return Err("prism.hadamard: a rotated token embedding needs its own output head (it is read back on the CPU)".into());
+        }
         let rope_freqs = match &cfg.rope_freqs {
             Some(f) => Some(up.put_vec(f)?),
             None => None,
         };
         // the conversion scratch of 2-bit weights (the most any one matmul converts) and of 3-bit ones (a matrix,
         // Q3K_CONV values at most)
+        // (both converted a slice of rows at a time: Q3K_CONV values at most)
         let one = |m: &GpuMatrix| match m.fmt {
-            Fmt::Iq2 => m.rows * m.cols,
-            Fmt::Q3K => (m.rows * m.cols).min(Q3K_CONV),
+            Fmt::Iq2 | Fmt::Q3K => (m.rows * m.cols).min(Q3K_CONV),
             _ => 0,
         };
-        let iq2 = |parts: &[(GpuMatrix, usize)]| {
-            let all = parts.iter().filter(|(m, _)| m.fmt == Fmt::Iq2).map(|(m, _)| m.rows * m.cols).sum::<usize>();
-            parts.iter().map(|(m, _)| one(m)).fold(all, usize::max)
-        };
+        let iq2 = |parts: &[(GpuMatrix, usize)]| parts.iter().map(|(m, _)| one(m)).max().unwrap_or(0);
         let most = layers
             .iter()
             .map(|l| {
@@ -6719,7 +7351,8 @@ impl GpuModel {
         // reused first when memory is short, read again from the file if anything touches them later.
         let ws_loaded = os::page_faults().1;
         os::release(&[(g.mmap.as_ptr() as usize, g.mmap.len())]);
-        let model = GpuModel { output_norm, rope_freqs, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false, iq_scratch, lora_t: None, lora: None, _weights: up.arena.take() };
+        let hadamard = folding.map(|f| f.h);
+        let model = GpuModel { output_norm, rope_freqs, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false, iq_scratch, lora_t: None, lora: None, hadamard, _fold_signs: fold_signs, _weights: up.arena.take() };
         if std::env::var_os("GHOST_INFER_LOAD_TIMES").is_some() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
@@ -6730,6 +7363,7 @@ impl GpuModel {
                 ws_loaded >> 20,
                 os::page_faults().1 >> 20
             );
+            eprintln!("[GPU memory free: {free_before} MB with the context, {free_kernels} MB after the kernels, {} MB after the weights]", free_mb());
         }
         Ok(model)
     }
@@ -6757,23 +7391,69 @@ impl GpuModel {
     }
 
     /// For each part, `out[t*out_stride + off + r] (+)= W[r] · x[t]` over `n` input rows of `cols` floats.
+    /// Hadamard-folded parts (prism.hadamard) read their input transformed: the plain parts go first, on `x`
+    /// as it is, then `x` is transformed in place (every caller's `x` is scratch that nothing reads afterwards)
+    /// for the folded ones.
     fn matmul(&self, parts: &[(&GpuMatrix, usize)], x: u64, out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
+        let Some(fold) = parts.iter().find_map(|(m, _)| m.fold) else {
+            return self.matmul_raw(parts, x, out, out_stride, n, accumulate, s);
+        };
+        if parts.iter().any(|(m, _)| m.fold.is_some_and(|f| f != fold)) {
+            return Err("folded matrices with different transforms share an input".into());
+        }
+        let plain: Vec<(&GpuMatrix, usize)> = parts.iter().filter(|(m, _)| m.fold.is_none()).copied().collect();
+        if !plain.is_empty() {
+            self.matmul_raw(&plain, x, out, out_stride, n, accumulate, s)?;
+        }
+        self.fold_input(x, parts[0].0.cols, n, fold)?;
+        let folded: Vec<(&GpuMatrix, usize)> = parts.iter().filter(|(m, _)| m.fold.is_some()).copied().collect();
+        self.matmul_raw(&folded, x, out, out_stride, n, accumulate, s)
+    }
+
+    /// `n` rows of `width` floats at `x` through a folded matrix's input transform, in place.
+    fn fold_input(&self, x: u64, width: usize, n: usize, f: Fold) -> Result<(), String> {
+        let k = &self.k;
+        let (hd, nk, rep) = f.perm;
+        if hd > 0 {
+            k.launch(k.hadamard_perm, (n as u32, 1), 256, (width * 4) as u32, &[Arg::P(x), Arg::I(width as i32), Arg::I(hd as i32), Arg::I(nk as i32), Arg::I(rep as i32)])?;
+        }
+        k.launch(k.hadamard_rows, ((width / f.block) as u32, n as u32), (f.block / 2).min(512) as u32, 0, &[Arg::P(x), Arg::P(f.signs), Arg::I(width as i32), Arg::I(f.block as i32)])
+    }
+
+    fn matmul_raw(&self, parts: &[(&GpuMatrix, usize)], x: u64, out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
         let cols = parts[0].0.cols;
+        // small Q2_0 batches: its dp4a kernel (a token's arithmetic the same in any batch)
+        if n <= Q2_0_KERNEL_MAX && parts.iter().all(|(m, _)| m.fmt == Fmt::Iq2 && m.iq >= 3) && !crate::quant::exact_mode() {
+            let blocks = n * cols / 32;
+            k.launch(k.quantize_q8, ((blocks * 32).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(blocks as i32)])?;
+            return self.matmul_dp4a(parts, out, out_stride, n, accumulate, s);
+        }
         // 2-bit weights outside decoding (prompt batches, exact mode): converted to Q8 in the scratch first
+        // (a slice of rows at a time, as 3-bit weights below: whole, a 27B's [gate | up] would take 200 MB of scratch)
         if parts.iter().any(|(m, _)| m.fmt == Fmt::Iq2) && !self.dp4a_path(parts, n, s) {
             let (sq, sd) = self.iq_scratch.as_ref().ok_or("no scratch for 2-bit weights")?;
-            let (mut qo, mut views) = (0usize, Vec::new());
-            for &(m, _) in parts.iter().filter(|(m, _)| m.fmt == Fmt::Iq2) {
-                let blocks = m.rows * m.cols / 32;
-                let (q, d) = (sq.ptr + qo as u64, sd.ptr + (qo / 32 * 4) as u64);
-                k.launch(k.iq2_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(m.q.ptr), Arg::P(q), Arg::P(d), Arg::I(blocks as i32), Arg::I(m.iq)])?;
-                views.push(GpuMatrix::view(Fmt::Q8, q, Some(d), m.rows, m.cols));
-                qo += blocks * 32;
+            for &(m, off) in parts {
+                if m.fmt != Fmt::Iq2 {
+                    self.matmul_raw(&[(m, off)], x, out, out_stride, n, accumulate, s)?;
+                    continue;
+                }
+                let slice = (sq.bytes / m.cols / TILE * TILE).max(TILE);
+                let row_bytes = m.cols / 256 * iq2_block_bytes(m.iq);
+                for r0 in (0..m.rows).step_by(slice) {
+                    let rows = slice.min(m.rows - r0);
+                    let blocks = rows * m.cols / 32;
+                    let w = m.q.ptr + (r0 * row_bytes) as u64;
+                    match m.iq {
+                        // PTQ1_0, repacked at upload: its conversion needs the row length
+                        4 => k.launch(k.ptq1_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(w), Arg::P(sq.ptr), Arg::P(sd.ptr), Arg::I(blocks as i32), Arg::I(m.cols as i32)])?,
+                        _ => k.launch(k.iq2_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(w), Arg::P(sq.ptr), Arg::P(sd.ptr), Arg::I(blocks as i32), Arg::I(m.iq)])?,
+                    }
+                    let v = GpuMatrix::view(Fmt::Q8, sq.ptr, Some(sd.ptr), rows, m.cols);
+                    self.matmul_raw(&[(&*v, off + r0)], x, out, out_stride, n, accumulate, s)?;
+                }
             }
-            let mut vs = views.iter();
-            let conv: Vec<(&GpuMatrix, usize)> = parts.iter().map(|&(m, off)| if m.fmt == Fmt::Iq2 { (&**vs.next().unwrap(), off) } else { (m, off) }).collect();
-            return self.matmul(&conv, x, out, out_stride, n, accumulate, s);
+            return Ok(());
         }
         // 3-bit weights likewise, a slice of rows at a time through the scratch (a 12B's [gate | up] whole would be
         // 150 MB); the launches queue in order, so a slice is converted only after the last one's matmul read it
@@ -6781,7 +7461,7 @@ impl GpuModel {
             let (sq, sd) = self.iq_scratch.as_ref().ok_or("no scratch for 3-bit weights")?;
             for &(m, off) in parts {
                 if m.fmt != Fmt::Q3K {
-                    self.matmul(&[(m, off)], x, out, out_stride, n, accumulate, s)?;
+                    self.matmul_raw(&[(m, off)], x, out, out_stride, n, accumulate, s)?;
                     continue;
                 }
                 let slice = (sq.bytes / m.cols / TILE * TILE).max(TILE);
@@ -6791,7 +7471,7 @@ impl GpuModel {
                     let w = m.q.ptr + (r0 * (m.cols / 256) * Q3K_GPU_BYTES) as u64;
                     k.launch(k.q3k_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(w), Arg::P(sq.ptr), Arg::P(sd.ptr), Arg::I(blocks as i32)])?;
                     let v = GpuMatrix::view(Fmt::Q8, sq.ptr, Some(sd.ptr), rows, m.cols);
-                    self.matmul(&[(&*v, off + r0)], x, out, out_stride, n, accumulate, s)?;
+                    self.matmul_raw(&[(&*v, off + r0)], x, out, out_stride, n, accumulate, s)?;
                 }
             }
             return Ok(());
@@ -6869,6 +7549,20 @@ impl GpuModel {
     fn matmul_dp4a(&self, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, accumulate: bool, s: &GpuSession) -> Result<(), String> {
         let k = &self.k;
         for &(m, off) in parts {
+            if m.fmt == Fmt::Iq2 && m.iq >= 3 {
+                const Q2_0_TB: usize = 8; // tokens per weight read (Q2_0_TB in the kernel source)
+                const PTQ1_R: usize = 1; // PTQ1_0: rows per warp (PTQ1_R in the kernel source)
+                const PTQ1_TB: usize = 4; // PTQ1_0: tokens per block (PTQ1_TB in the kernel source)
+                let rows_per_block = if m.iq == 4 { 8 * PTQ1_R } else { 8 };
+                k.launch(
+                    k.matmul_q2_0_dp4a[(m.iq - 3) as usize][(n > 1) as usize],
+                    (m.rows.div_ceil(rows_per_block) as u32, n.div_ceil(if m.iq == 4 { PTQ1_TB } else { Q2_0_TB }) as u32),
+                    256,
+                    0,
+                    &[Arg::P(m.q.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
+                )?;
+                continue;
+            }
             if m.fmt == Fmt::Iq2 {
                 k.launch(
                     k.matmul_iq2_dp4a,
@@ -6918,7 +7612,8 @@ impl GpuModel {
     /// int8 activations directly.
     fn norm_matmul(&self, norm: &DeviceBuf, parts: &[(&GpuMatrix, usize)], out: u64, out_stride: usize, n: usize, s: &GpuSession) -> Result<(), String> {
         let (k, c) = (&self.k, &self.cfg);
-        if self.dp4a_path(parts, n, s) {
+        // (folded weights need the f32 norm: their input is transformed before it is quantised)
+        if self.dp4a_path(parts, n, s) && parts.iter().all(|(m, _)| m.fold.is_none()) {
             k.launch(k.rmsnorm_q8, (n as u32, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
             return self.matmul_dp4a(parts, out, out_stride, n, false, s);
         }
@@ -6959,6 +7654,9 @@ impl GpuModel {
     pub fn attach_lora(&mut self, ad: &crate::lora::Adapter) -> Result<(), String> {
         use crate::lora::{Adapter, Pair};
         let c = &self.cfg;
+        if self.hadamard.is_some() {
+            return Err("a LoRA adapter cannot go on Hadamard-folded weights (prism.hadamard)".into());
+        }
         if ad.layers.len() > self.layers.len() {
             return Err(format!("the adapter has {} layers, the model {}", ad.layers.len(), self.layers.len()));
         }
@@ -7302,6 +8000,10 @@ impl GpuModel {
             let mut xs = vec![0f32; n * cols];
             for (&t, row) in tokens.iter().zip(xs.chunks_exact_mut(*cols)) {
                 m.row_f32(t as usize, row);
+            }
+            // a Hadamard-rotated table: the rows back to the model's basis
+            if let Some(h) = self.hadamard.as_ref().filter(|h| h.embd_inverse) {
+                h.inverse(&mut xs, *cols);
             }
             self.k.h2d(s.x.ptr, &xs)?; // ordered before the pass's kernels
         }
@@ -7782,7 +8484,7 @@ impl GpuModel {
             None => self.norm_matmul(norm, &gate_up, s.gu.ptr, 2 * hidden, n, s)?,
         }
         let down = [(down, 0)];
-        if self.dp4a_path(&down, n, s) {
+        if self.dp4a_path(&down, n, s) && down[0].0.fold.is_none() {
             // decoding: silu(gate) * up straight to int8 for the down projection
             let nv = (hidden / 4) as u32;
             k.launch(k.silu_q8, (nv.div_ceil(256), n as u32), 256, 0, &[Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(hidden as i32)])?;
@@ -8061,7 +8763,7 @@ pub struct GpuSession {
     /// copies of it at earlier positions (see model::Session::snapshot)
     delta: Option<DeviceBuf>,
     saved: Option<(usize, DeviceBuf)>, // save_state's copy of `delta`, and the position it was taken at
-    snaps: Vec<(usize, DeviceBuf)>,
+    snaps: Vec<(usize, HostBuf)>, // in system memory: read back only to go back in a conversation
     pub logits: Vec<f32>,
     pub rows: Vec<f32>, // Out::All: a batch's logits, one vocab-long row per token
 }
@@ -8246,9 +8948,10 @@ impl GpuSession {
         }
     }
 
-    /// Device memory of a session holding `ctx` positions (with room for the DeltaNet snapshots).
+    /// Device memory of a session holding `ctx` positions: the DeltaNet states and the copy save_state keeps
+    /// while guesses are checked (the snapshots live in system memory).
     fn bytes(cfg: &Config, ctx: usize) -> usize {
-        Self::sizes(cfg, ctx).iter().sum::<usize>() + cfg.n_attn_layers() * ctx * Self::cache_rows(cfg).iter().sum::<usize>() + (1 + MAX_SNAPS) * Self::delta_bytes(cfg)
+        Self::sizes(cfg, ctx).iter().sum::<usize>() + cfg.n_attn_layers() * ctx * Self::cache_rows(cfg).iter().sum::<usize>() + 2 * Self::delta_bytes(cfg)
     }
 
     /// Bytes of every DeltaNet layer's states (0 for other models).
@@ -8305,10 +9008,48 @@ impl GpuSession {
             return Ok(());
         }
         // full: the oldest after the earliest makes way
-        let copy = if self.snaps.len() == MAX_SNAPS { self.snaps.remove(1).1 } else { DeviceBuf::alloc(buf.bytes)? };
-        let a = api()?;
-        a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(copy.ptr, buf.ptr, buf.bytes) }, "DeltaNet snapshot")?;
+        let copy = if self.snaps.len() == MAX_SNAPS { self.snaps.remove(1).1 } else { HostBuf::alloc(buf.bytes)? };
+        copy.copy_from(buf.ptr)?;
         self.snaps.push((self.pos, copy));
+        Ok(())
+    }
+
+    /// A copy in system memory of everything the session holds (its first `pos` positions of every attention
+    /// cache, and the DeltaNet states), to come back to with `load` after other prompts have replaced it.
+    pub fn keep(&self) -> Result<SavedState, String> {
+        let mut parts = Vec::new();
+        for c in [&self.k_cache, &self.v_cache, &self.k_scale, &self.v_scale] {
+            for b in &c.layers {
+                let h = HostBuf::alloc(self.pos * c.row)?;
+                h.copy_from(b.ptr)?;
+                parts.push(h);
+            }
+        }
+        if let Some(d) = &self.delta {
+            let h = HostBuf::alloc(d.bytes)?;
+            h.copy_from(d.ptr)?;
+            parts.push(h);
+        }
+        Ok(SavedState { pos: self.pos, parts })
+    }
+
+    /// Back to a state `keep` copied (of this session); its snapshots go, as they were of other tokens.
+    pub fn load(&mut self, s: &SavedState) -> Result<(), String> {
+        if s.pos > self.cap {
+            return Err(format!("{} positions do not fit the {} the caches hold now", s.pos, self.cap));
+        }
+        let mut parts = s.parts.iter();
+        for c in [&self.k_cache, &self.v_cache, &self.k_scale, &self.v_scale] {
+            for b in &c.layers {
+                parts.next().ok_or("saved state of another model")?.copy_to(b.ptr)?;
+            }
+        }
+        if let Some(d) = &self.delta {
+            parts.next().ok_or("saved state of another model")?.copy_to(d.ptr)?;
+        }
+        self.pos = s.pos;
+        self.snaps.clear();
+        self.saved = None;
         Ok(())
     }
 
@@ -8325,8 +9066,7 @@ impl GpuSession {
         self.snaps.retain(|s| s.0 <= pos);
         match self.snaps.iter().max_by_key(|s| s.0) {
             Some((at, copy)) => {
-                let (a, buf) = (api()?, self.delta.as_ref().unwrap());
-                a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(buf.ptr, copy.ptr, buf.bytes) }, "DeltaNet restore")?;
+                copy.copy_to(self.delta.as_ref().unwrap().ptr)?;
                 self.pos = *at;
             }
             None => self.reset()?,
@@ -8629,4 +9369,60 @@ pub fn fit_ctx(cfgs: &[&Config]) -> Result<usize, String> {
         eprintln!("[note: only {} MB of GPU memory is free; a {ctx}-token context will partly live in system RAM and run slowly]", free >> 20);
     }
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Value v of a repacked PTQ1_0 row, read as the GPU kernels (ptq1_to_q8, matmul_ptq1_dp4a) read it.
+    fn repacked_value(row: &[u8], v: usize) -> f32 {
+        let nsb = row.len() / 28 / 5;
+        let (blk, o) = (v / 128, v % 128);
+        if blk < 5 * nsb {
+            let sb = &row[blk / 5 * 140..blk / 5 * 140 + 140];
+            let g = blk % 5;
+            let (byte, n) = if g < 4 { (sb[4 * (8 * g + o / 16) + o % 4], (o / 4) % 4) } else { (sb[o], 4) };
+            let d = f16_to_f32(u16::from_le_bytes([sb[128 + 2 * g], sb[129 + 2 * g]]));
+            (crate::quant::trit(byte, n as u32) as f32 - 1.0) * d
+        } else {
+            let fb = &row[nsb * 140 + (blk - 5 * nsb) * 28..];
+            let (byte, n) = match o {
+                0..80 => (fb[o % 16], o / 16),
+                80..120 => (fb[16 + (o - 80) % 8], (o - 80) / 8),
+                _ => (fb[24 + (o - 120) % 2], (o - 120) / 2),
+            };
+            (crate::quant::trit(byte, n as u32) as f32 - 1.0) * f16_to_f32(u16::from_le_bytes([fb[26], fb[27]]))
+        }
+    }
+
+    #[test]
+    fn ptq1_repack_keeps_every_value() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // 10 blocks (two superblocks), 12 (two and two left in the file's layout), 4 (none)
+        for cols in [1280usize, 1536, 512] {
+            let nblk = cols / 128;
+            let mut src = vec![0u8; nblk * 28];
+            for (i, b) in src.iter_mut().enumerate() {
+                *b = match i % 28 {
+                    26 => rnd() as u8,
+                    27 => 0x20 + (rnd() % 0x18) as u8, // a finite f16
+                    _ => rnd() as u8,
+                };
+            }
+            let mut want = vec![0f32; cols];
+            crate::quant::Matrix { data: &src, ty: GgmlType::Ptq1_0, rows: 1, cols }.row_f32(0, &mut want);
+            let mut dst = vec![0xAAu8; src.len()];
+            ptq1_repack_row(&src, &mut dst);
+            for (v, w) in want.iter().enumerate() {
+                assert_eq!(repacked_value(&dst, v).to_bits(), w.to_bits(), "cols {cols}, value {v}");
+            }
+        }
+    }
 }

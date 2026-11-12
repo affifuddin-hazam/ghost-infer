@@ -625,9 +625,13 @@ fn warm_agent(engine: &mut Engine, shared: &Shared) {
     let t = Instant::now();
     let ids = engine.tok.encode(&text);
     let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count();
-    let keep = engine.truncate(keep);
+    let cached = engine.truncate(keep);
+    // read up to the end of its system message and kept in system memory (Engine::opening), then the rest
+    let (keep, copied) = engine.opening(&ids, cached);
+    // tokens read: all past the cache, less an opening copied back
+    let read = ids.len() - if copied { keep } else { cached };
     match engine.read_in(&ids[keep..]) {
-        Ok(()) => eprintln!("[read the agent's opening in ahead: {} tokens in {:.2}s]", ids.len() - keep, t.elapsed().as_secs_f64()),
+        Ok(()) => eprintln!("[read the agent's opening in ahead: {read} tokens in {:.2}s]", t.elapsed().as_secs_f64()),
         Err(e) => eprintln!("[could not read the agent's opening in: {e}]"),
     }
 }
@@ -673,7 +677,11 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
     // which gives the logits for the first reply token)
     let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
     let keep = engine.truncate(keep);
-    let reused = keep;
+    // the opening (an agent's instructions and tools) copied back from system memory if it was kept
+    let (keep, reused) = match engine.opening(&ids, keep) {
+        (n, true) => (n, n),
+        (n, false) => (n, keep),
+    };
     // a recurrent (DeltaNet) model goes back only to a snapshot, and one is taken where a read ends: so the
     // prompt is read in two, up to the reply's own header and then the header. The next prompt may write this
     // turn's header differently (without its empty thinking once a message follows it, as the compaction's
