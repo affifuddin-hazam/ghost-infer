@@ -77,7 +77,9 @@ pub fn start_server(addr: &str, extra: &[String], last: Option<&str>) {
     }
     // 64K: the context's memory is taken only as a chat grows (from the experts kept on the GPU), and 32K left a
     // skill, a web page and its rewrite compacting round after round
-    for a in ["--gpu", "--ctx", "65536", "--port", &port] {
+    // --kv q4: a 4-bit cache for 256-wide heads (Qwen3.5 / 3.6 / 3.8; a 27B on 8 GB gets about half as much again
+    // context); other models keep int8
+    for a in ["--gpu", "--ctx", "65536", "--kv", "q4", "--port", &port] {
         args.push(a.into());
     }
     for d in &dirs {
