@@ -1316,6 +1316,12 @@ impl App {
                 // and the voice beside it too, if they fit
                 if !self.asked_pair && self.loading.is_none() && self.model.is_some() && self.call.is_none() && !self.call_pending && self.voice_models.0.is_some() && self.voice_models.1.is_some() {
                     self.asked_pair = true;
+                    // that model is the Code model now: the pair is loaded around it, not around the one last
+                    // picked here (which put the picked one back over a model loaded some other way)
+                    if let Some(id) = self.model.as_ref().map(|m| m.id.clone()).filter(|id| self.last_model.as_deref() != Some(id)) {
+                        self.last_model = Some(id);
+                        self.save_settings();
+                    }
                     if self.call_ready.is_none() {
                         return Task::batch([self.refresh_system(), self.load_models(false)]);
                     }
