@@ -3043,6 +3043,13 @@ impl App {
                 }
                 self.end_round(f("completion_tokens"));
             }
+            // a subagent's round ended: its speed, like a round's, not over its prompt reads and tools
+            "sub_round" => {
+                if let Some(m) = self.messages.last_mut() {
+                    m.writing = None;
+                }
+                self.end_round(ev.get("completion_tokens").and_then(Json::as_f64).unwrap_or(0.0));
+            }
             "done" => {
                 self.finish(&s("finish"));
                 return Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras()]); // the reply may have changed what the GPU holds

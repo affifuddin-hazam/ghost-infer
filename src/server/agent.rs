@@ -24,6 +24,7 @@
 //!   {"type":"approval","id","name","arguments","group"}  waiting for POST /api/agent/approve {"id","decision"}
 //!   {"type":"tool_result","id","name","result","denied","secs"?}  ("secs": how long it ran)
 //!   {"type":"context","prompt_tokens","completion_tokens","context_length"}  after each round
+//!   {"type":"sub_round","completion_tokens"}  after each round of a subagent
 //!   {"type":"done","finish"} or {"type":"error","message"}
 //!   {"type":"tasks","tasks"}                      the model's task list changed: [{"text","status"}]
 //!   {"type":"title","id","title"}                 after a chat's first reply: the title the model gave it
@@ -1503,6 +1504,9 @@ fn emit(out: &mut Out, ev: Json) -> Result<(), String> {
         match ev.get("type").and_then(Json::as_str) {
             Some("tool_call" | "tool_result" | "approval" | "preview" | "waiting") => ev,
             Some("text" | "calling") => obj(vec![("type", str("calling")), ("name", str("subagent"))]),
+            // its round ended: the app's speed stops counting over its prompt reads and tools (its own
+            // context stays out of the main chat's gauge)
+            Some("context") => obj(vec![("type", str("sub_round")), ("completion_tokens", ev.get("completion_tokens").cloned().unwrap_or(Json::Num(0.0)))]),
             _ => return Ok(()),
         }
     };
