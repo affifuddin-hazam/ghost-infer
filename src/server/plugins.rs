@@ -63,7 +63,7 @@ fn enabled(m: &Json) -> bool {
 }
 
 /// The Windows launcher for Python 3 (py.exe), which finds a real Python where "python" may be the Store's stub.
-fn py_launcher() -> Option<PathBuf> {
+pub fn py_launcher() -> Option<PathBuf> {
     let p = std::env::var_os("SystemRoot").map(|r| PathBuf::from(r).join("py.exe"))?;
     p.is_file().then_some(p)
 }
@@ -449,8 +449,73 @@ fn finish(d: &Path, name: &str, description: &str, written: usize) -> Result<Str
         }
         f.push(("enabled".into(), Json::Bool(true)));
     }
+    let merged = merge_ui(d, &mut m);
     std::fs::write(d.join("plugin.json"), m.to_string()).map_err(|e| e.to_string())?;
-    started(&name, &format!("Saved {} file(s) in {}.", written, d.display()))
+    let mut done = format!("Saved {} file(s) in {}.", written, d.display());
+    if !merged.is_empty() {
+        done.push_str(&format!(" (The {} settings were in {}; they belong in plugin.json, so they were moved there.)", merged.join(" and "), merged_from(d)));
+    }
+    // code that does not even parse: said plainly, with its line, instead of a failed start and a log
+    if let Some(err) = python_error(d) {
+        return Ok(format!("{done} But it was not started: {err}\nPython needs each block's lines indented one level more (4 spaces) than its def, if, for, try or with line. Fix the file, then save it whole again with plugin_manager save."));
+    }
+    started(name, &done)
+}
+
+/// "panel" and "badge" settings a model put in another JSON file of the plugin (panel.json, ui.json) instead of
+/// plugin.json: moved into the manifest (unless it has its own). Returns which were moved.
+fn merge_ui(d: &Path, m: &mut Json) -> Vec<&'static str> {
+    let mut moved = Vec::new();
+    let Json::Obj(f) = m else { return moved };
+    for p in std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()) {
+        let is_json = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        if !is_json || p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("plugin.json")) {
+            continue;
+        }
+        let Some(other) = std::fs::read_to_string(&p).ok().and_then(|t| Json::parse(t.trim_start_matches('\u{feff}')).ok()) else { continue };
+        for key in ["panel", "badge"] {
+            if let Some(v) = other.get(key).filter(|_| !f.iter().any(|(k, _)| k == key)) {
+                f.push((key.into(), v.clone()));
+                moved.push(key);
+            }
+        }
+    }
+    moved
+}
+
+/// The first JSON file besides plugin.json in a plugin's folder (where merge_ui found the settings).
+fn merged_from(d: &Path) -> String {
+    std::fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|n| n.to_lowercase().ends_with(".json") && !n.eq_ignore_ascii_case("plugin.json"))
+        .unwrap_or_else(|| "another file".into())
+}
+
+/// A syntax error in the plugin's Python files (its folder's top level), as "tools.py line 6: ...", checked
+/// with py -3 without running anything; None when they parse, or when Python cannot be found to check.
+fn python_error(d: &Path) -> Option<String> {
+    let py = py_launcher()?;
+    const CHECK: &str = "import ast,sys\nfor f in sys.argv[1:]:\n    try:\n        ast.parse(open(f,encoding='utf-8').read(),f)\n    except SyntaxError as e:\n        print(f\"{f} line {e.lineno}: {e.msg}: {(e.text or '').strip()}\")\n        sys.exit(1)\n";
+    let files: Vec<String> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("py"))).filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).collect();
+    if files.is_empty() {
+        return None;
+    }
+    let mut cmd = std::process::Command::new(py);
+    cmd.arg("-3").arg("-c").arg(CHECK).args(&files).current_dir(d);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // no console window
+    }
+    let out = cmd.output().ok()?;
+    if out.status.success() {
+        return None;
+    }
+    let msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(if msg.is_empty() { String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("a Python syntax error").to_string() } else { msg })
 }
 
 /// Starts (or restarts) a plugin and says how it went: its tools, or why it did not start and its log.
@@ -560,7 +625,9 @@ Rules:
 - Then test it: load the tool with tool_search ("select:mcp__<name>__<function>") and call it. Say it is done only once a call works. Each call asks the user first.
 - Other actions: list, show (a plugin's files and log), enable, disable, remove, install (a plugin folder on this computer). For a plugin tools.py cannot be (Node, or a server of its own), call guide with name "server" for the full template.
 
-A plugin can also show itself in the app (a dashboard, a status, a little app of its own). Add a plugin.json to the same save:
+- Python on this computer runs as py -3 (python and python3 open the Microsoft Store). Saving checks your .py files for syntax errors and says the line; indent each block 4 spaces.
+
+A plugin can also show itself in the app (a dashboard, a status, a little app of its own). Add a file named exactly plugin.json (not panel.json) to the same save:
 {"tools": "tools.py", "panel": {"title": "Site status", "icon": "status", "page": "panel.html"}, "badge": {"function": "status", "every": 60}}
 - panel: a row in the app's side bar, under New chat, with that icon; a click opens page (a web page in the plugin's folder, saved in the same files) in the app's preview pane. icon is one of: status, chart, globe, shield, bell, calendar, cloud, mail, money, music, home, people, shop, game, map, clock, news, code, chat, warning, heart, star, bolt, plug.
 - The page is plain HTML, CSS and JavaScript in one file (no build step; a CDN script is fine). To get data, its script calls the plugin's own functions, which can reach any site (a page cannot, the browser blocks it): const r = await fetch("/plugin/<name>/call/<function>", {method: "POST", body: JSON.stringify({...args})}); const {text, data} = await r.json(); (data is the result when it is JSON: return a dict or list from the function). Refresh it with setInterval when it shows live data. Match the app: a dark page (#1f1f1f background, #e8e8e8 text), system-ui font.
@@ -796,5 +863,25 @@ mod tests {
         assert_eq!(unescaped("a\nb\\n"), "a\nb\\n");
         assert!(read_only(r#"{"action":"list"}"#));
         assert!(!read_only(r#"{"action":"save"}"#));
+    }
+
+    /// What a 9B wrote on 2026-11-13: its panel and badge in panel.json, and tools.py indented one space.
+    #[test]
+    fn a_stray_panel_json_is_merged_and_bad_indents_are_caught() {
+        let d = std::env::temp_dir().join(format!("ghost-plugin-test-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("panel.json"), r#"{"tools": "tools.py", "panel": {"title": "S", "icon": "status"}, "badge": {"function": "status"}}"#).unwrap();
+        let mut m = Json::parse(r#"{"name": "x", "tools": "tools.py"}"#).unwrap();
+        assert_eq!(merge_ui(&d, &mut m), vec!["panel", "badge"]);
+        assert!(m.get("panel").is_some() && m.get("badge").is_some());
+        assert_eq!(merge_ui(&d, &mut m), Vec::<&str>::new()); // the manifest's own win
+        if py_launcher().is_some() {
+            std::fs::write(d.join("tools.py"), "def f() -> dict:\n try:\n x = 1\n except Exception:\n pass\n").unwrap();
+            let err = python_error(&d).expect("one-space blocks are a syntax error");
+            assert!(err.starts_with("tools.py line 3"), "{err}");
+            std::fs::write(d.join("tools.py"), "def f() -> dict:\n    return {}\n").unwrap();
+            assert_eq!(python_error(&d), None);
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

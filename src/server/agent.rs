@@ -347,6 +347,8 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String 
         Some((cwd, more)) => format!("Your working directory is {cwd}: relative paths and commands start there. You may also use files in {}.", more.join(", ")),
     };
     let check = if can_run { " After you change code, check it: run it or its tests with run_command. If something fails, fix it and run it again. Say it is done only once it works, and say how you checked." } else { "" };
+    // "python" on a Windows without it on PATH opens the Store's stub, and a model reads that as "no Python"
+    let check = if can_run && super::plugins::py_launcher().is_some() { format!("{check} Run Python as py -3 (python may open the Microsoft Store instead).") } else { check.to_string() };
     // ghost's own deferred tools are named; MCP servers' and plugins' are not (found with tool_search when a
     // task needs them), so installing more of them costs a chat nothing
     let names: Vec<&str> = deferred.iter().map(tool_name).filter(|n| !n.starts_with("mcp__")).collect();
