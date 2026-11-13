@@ -8266,6 +8266,9 @@ impl GpuModel {
                 s.graphs[slot] = exec;
             }
             a.check(unsafe { (a.f.cuGraphLaunch)(s.graphs[slot], k.stream) }, "graph launch")?;
+        } else if n == 1 && want != Out::None && graphs_enabled() && self.cfg.is_moe() && self.cfg.dim % 4 == 0 && moe_graphs_enabled() {
+            self.k.h2d(s.pos_dev.ptr, &[s.pos as i32])?;
+            self.moe_step_graphed(s, want)?;
         } else {
             self.launches(n, s, want, 0, false)?;
         }
@@ -8301,17 +8304,41 @@ impl GpuModel {
             let k = &self.k;
             k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(self.cfg.dim as i32), Arg::F(self.cfg.norm_eps)])?;
             for r in 0..n {
-                self.moe_ffn_rows(l, layer, 1, r, n, s)?;
+                self.moe_ffn_rows(l, layer, 1, r, n, s, false)?;
             }
             return Ok(());
         }
-        self.moe_ffn_rows(l, layer, n, 0, n, s)
+        self.moe_ffn_rows(l, layer, n, 0, n, s, false)
+    }
+
+    /// The expert cache, made on first use (a mixture of experts' first pass).
+    fn expert_cache_ready(&self) -> Result<(), String> {
+        let mut cache_ref = self.cache.borrow_mut();
+        if cache_ref.is_none() {
+            let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
+            *cache_ref = Some(ExpertCache::new(moe, &self.cfg, expert_cache_budget()?)?);
+        }
+        Ok(())
+    }
+
+    /// A one-token step's MoE kernels before the hand-off to the host, for a CUDA graph (moe_step_graphed): the
+    /// input normed (s.xb, and as int8 for the cached experts) and the router's logits after it. The step's
+    /// moe_ffn_rows then runs with `pre_done`.
+    fn moe_pre(&self, l: usize, layer: &GpuLayer, s: &GpuSession) -> Result<(), String> {
+        let (c, k) = (&self.cfg, &self.k);
+        let cache = self.cache.borrow();
+        let cache = cache.as_ref().ok_or("the expert cache is not made yet")?;
+        k.launch(k.rmsnorm, (1, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
+        k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
+        let ne = c.n_experts;
+        k.launch(k.router_logits1, (ne.div_ceil(2) as u32, 1), 64, 0, &[Arg::P(s.xb.ptr), Arg::P(cache.routers[l].ptr), Arg::P(s.xb.ptr + (c.dim * 4) as u64), Arg::I(c.dim as i32), Arg::I(ne as i32)])
     }
 
     /// moe_ffn on `n` rows of the session starting at row `row0`, of a batch of `rows`. One row of a larger
     /// batch (n == 1 < rows) finds its normed row in s.xb already, and puts its router logits after the batch's.
+    /// `pre_done`: a one-token step whose norm and router logits moe_pre has queued already (in a graph).
     #[allow(clippy::too_many_arguments)]
-    fn moe_ffn_rows(&self, l: usize, layer: &GpuLayer, n: usize, row0: usize, rows: usize, s: &GpuSession) -> Result<(), String> {
+    fn moe_ffn_rows(&self, l: usize, layer: &GpuLayer, n: usize, row0: usize, rows: usize, s: &GpuSession, pre_done: bool) -> Result<(), String> {
         let (c, k, a) = (&self.cfg, &self.k, api()?);
         let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
         let dim = c.dim;
@@ -8319,25 +8346,23 @@ impl GpuModel {
         let per_row = rows > n;
         let xbr = s.xb.ptr + (row0 * dim * 4) as u64; // this row's normed input
         let logits_at = s.xb.ptr + (rows * dim * 4) as u64; // the router logits, after every row
+        self.expert_cache_ready()?;
         let mut cache_ref = self.cache.borrow_mut();
-        if cache_ref.is_none() {
-            *cache_ref = Some(ExpertCache::new(moe, c, expert_cache_budget()?)?);
-        }
         let cache = cache_ref.as_mut().unwrap();
         if n >= MOE_GPU_MIN_BATCH && cache.batch_ok && row0 == 0 {
             return self.moe_ffn_batch(l, layer, n, s, cache, moe);
         }
         let on_gpu = n == 1 && cache.cacheable[l] && cache.slots() > 0;
-        if !per_row {
+        if !per_row && !pre_done {
             k.launch(k.rmsnorm, (n as u32, 1), 256, 0, &[Arg::P(x), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
         }
-        if on_gpu {
+        if on_gpu && !pre_done {
             k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(x), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
         }
         // one token's router logits come from the GPU, right after the normalised row (s.xb holds a batch)
         let ne = c.n_experts;
         let gpu_route = n == 1 && dim % 4 == 0;
-        if gpu_route {
+        if gpu_route && !pre_done {
             k.launch(k.router_logits1, (ne.div_ceil(2) as u32, 1), 64, 0, &[Arg::P(xbr), Arg::P(cache.routers[l].ptr), Arg::P(logits_at), Arg::I(dim as i32), Arg::I(ne as i32)])?;
         }
         let mut guard = s.moe.borrow_mut();
@@ -8666,8 +8691,18 @@ impl GpuModel {
     fn ffn(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession) -> Result<(), String> {
         match &layer.ffn {
             GpuFfn::Dense { gate_up, down } => self.swiglu_lora(gate_up, down, &layer.ffn_norm, &layer.lora, n, s),
-            GpuFfn::Moe { shared, gate } => {
+            GpuFfn::Moe { .. } => {
                 self.moe_ffn(l, layer, n, s)?;
+                self.moe_shared(layer, n, s)
+            }
+        }
+    }
+
+    /// A mixture-of-experts layer's shared expert (if it has one), after its routed experts.
+    fn moe_shared(&self, layer: &GpuLayer, n: usize, s: &GpuSession) -> Result<(), String> {
+        match &layer.ffn {
+            GpuFfn::Dense { .. } => Ok(()),
+            GpuFfn::Moe { shared, gate } => {
                 match (shared, gate) {
                     // the shared expert reads the same normed input, still in s.xb; a gated one goes to s.att
                     // first (free again: the experts' sums have been added), then in through its gate
@@ -8810,30 +8845,105 @@ impl GpuModel {
     /// instead, for graphs), ending with the last token's logits (Last) or every token's argmax (Argmax) on
     /// the device. Launches only, so it can be captured.
     fn launches(&self, n: usize, s: &GpuSession, want: Out, posp: u64, fixed_split: bool) -> Result<(), String> {
-        let c = &self.cfg;
-        let (dim, hd) = (c.dim, c.head_dim);
-        let k = &self.k;
-
         // profile buckets match profile::OPS; with profiling off `timed` is a plain call
-        // (an embedding left in the file: forward has copied the rows into s.x already)
-        if let Embd::Gpu(e) = &self.embd {
-            self.timed(0, || k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(e.fmt as i32), Arg::P(e.q.ptr), Arg::P(e.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(dim as i32)]))?;
-        }
-        let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
+        self.embed(n, s)?;
         for (l, layer) in self.layers.iter().enumerate() {
+            self.layer_attn(l, layer, n, s, posp, fixed_split)?;
+            self.timed(6, || self.ffn(l, layer, n, s))?;
+        }
+        self.output(n, s, want)
+    }
+
+    /// The tokens' embedding rows into s.x (an embedding left in the file: forward has copied them there).
+    fn embed(&self, n: usize, s: &GpuSession) -> Result<(), String> {
+        let k = &self.k;
+        match &self.embd {
+            Embd::Gpu(e) => self.timed(0, || k.launch(k.embed, (n as u32, 1), 256, 0, &[Arg::I(e.fmt as i32), Arg::P(e.q.ptr), Arg::P(e.d_ptr()), Arg::P(s.tokens.ptr), Arg::P(s.x.ptr), Arg::I(self.cfg.dim as i32)])),
+            _ => Ok(()),
+        }
+    }
+
+    /// A mixture of experts' one-token step on CUDA graphs: the GPU work between two host hand-offs is captured
+    /// once per layer (the last layer's shared expert, this layer's attention, its norm and router logits:
+    /// moe_pre) and replayed, so the GPU gets each stretch as one launch instead of a score of kernels the
+    /// host queues one by one after each hand-off. Between them, moe_ffn_rows routes on the host and queues the
+    /// experts (pre_done). The output is a graph of its own per kind (moe_tail). Kernels read the position from
+    /// s.pos_dev (set by the caller), as forward's one-token graphs do.
+    fn moe_step_graphed(&self, s: &mut GpuSession, want: Out) -> Result<(), String> {
+        let a = api()?;
+        self.expert_cache_ready()?; // the router weights' addresses go into the graphs
+        let layers = self.layers.len();
+        if s.moe_graphs.len() != layers {
+            s.drop_graphs();
+            s.moe_graphs = vec![std::ptr::null_mut(); layers];
+        }
+        let posp = s.pos_dev.ptr;
+        let capture = |f: &dyn Fn() -> Result<(), String>| -> Result<Ptr, String> {
+            const RELAXED: i32 = 2; // CU_STREAM_CAPTURE_MODE_RELAXED
+            a.check(unsafe { (a.f.cuStreamBeginCapture_v2)(self.k.stream, RELAXED) }, "begin graph capture")?;
+            let launched = f();
+            let mut graph: Ptr = std::ptr::null_mut();
+            let ended = unsafe { (a.f.cuStreamEndCapture)(self.k.stream, &mut graph) };
+            launched?;
+            a.check(ended, "end graph capture")?;
+            let mut exec: Ptr = std::ptr::null_mut();
+            let made = unsafe { (a.f.cuGraphInstantiateWithFlags)(&mut exec, graph, 0) };
+            unsafe { (a.f.cuGraphDestroy)(graph) };
+            a.check(made, "instantiate graph")?;
+            Ok(exec)
+        };
+        for (l, layer) in self.layers.iter().enumerate() {
+            let moe_layer = matches!(layer.ffn, GpuFfn::Moe { .. });
+            if s.moe_graphs[l].is_null() {
+                let sess = &*s;
+                let g = capture(&|| {
+                    match l {
+                        0 => self.embed(1, sess)?,
+                        _ => self.moe_shared(&self.layers[l - 1], 1, sess)?,
+                    }
+                    self.layer_attn(l, layer, 1, sess, posp, true)?;
+                    // a dense layer's whole feed-forward is GPU work: in the graph too
+                    if moe_layer { self.moe_pre(l, layer, sess) } else { self.ffn(l, layer, 1, sess) }
+                })?;
+                s.moe_graphs[l] = g;
+            }
+            a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_graphs[l], self.k.stream) }, "graph launch")?;
+            if moe_layer {
+                self.moe_ffn_rows(l, layer, 1, 0, 1, s, true)?;
+            }
+        }
+        let slot = match want {
+            Out::Argmax => 1,
+            Out::Hidden => 2,
+            _ => 0,
+        };
+        if s.moe_tail[slot].is_null() {
+            let sess = &*s;
+            let g = capture(&|| {
+                self.moe_shared(&self.layers[layers - 1], 1, sess)?;
+                self.output(1, sess, want)
+            })?;
+            s.moe_tail[slot] = g;
+        }
+        a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_tail[slot], self.k.stream) }, "graph launch")
+    }
+
+    /// Layer `l`'s attention (latent, Gated DeltaNet or full), its output projection added to s.x.
+    fn layer_attn(&self, l: usize, layer: &GpuLayer, n: usize, s: &GpuSession, posp: u64, fixed_split: bool) -> Result<(), String> {
+        let c = &self.cfg;
+        let hd = c.head_dim;
+        let k = &self.k;
+        let qkv_rows = (c.n_heads + 2 * c.n_kv_heads) * hd;
+        {
             if let Some(mla) = &layer.mla {
                 let cache = s.k_cache.at(l);
                 self.timed(2, || self.mla_in(layer, mla, cache, n, s, posp))?;
                 self.timed(4, || self.mla_attention(cache, n, s, posp, fixed_split))?;
-                self.timed(5, || self.mla_out(layer, mla, n, s))?;
-                self.timed(6, || self.ffn(l, layer, n, s))?;
-                continue;
+                return self.timed(5, || self.mla_out(layer, mla, n, s));
             }
             if let Some(d) = &layer.delta {
                 self.timed(2, || self.delta_net(l, layer, d, n, s))?;
-                self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s))?;
-                self.timed(6, || self.ffn(l, layer, n, s))?;
-                continue;
+                return self.timed(5, || self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s));
             }
             // the caches hold attention layers only (a DeltaNet layer keeps a state instead)
             let slot = c.slot(l);
@@ -8920,11 +9030,14 @@ impl GpuModel {
             self.timed(5, || {
                 self.matmul_one(&layer.wo, s.att.ptr, s.x.ptr, n, true, s)?;
                 layer.lora.o.as_ref().map_or(Ok(()), |p| self.lora_apply(p, s.att.ptr, s.x.ptr, c.dim, n))
-            })?;
-
-            self.timed(6, || self.ffn(l, layer, n, s))?;
+            })
         }
+    }
 
+    /// The pass's output: the last row normed (Hidden), and logits (Last, All) or their argmax (Argmax).
+    fn output(&self, n: usize, s: &GpuSession, want: Out) -> Result<(), String> {
+        let (c, k) = (&self.cfg, &self.k);
+        let dim = c.dim;
         if want != Out::None {
             self.timed(7, || {
                 // Last: the last token's logits; All: every token's; Argmax: every token's, reduced on the GPU;
@@ -8993,6 +9106,11 @@ pub struct GpuSession {
     moe: std::cell::RefCell<MoeHost>, // host scratch of the CPU expert path
     moe_tab: DeviceBuf,               // a token's GPU-resident experts: matrix addresses, then weights
     graphs: [Ptr; 3],      // captured one-token steps: Last, Argmax, Hidden
+    /// A mixture of experts' one-token steps (moe_step_graphed): per layer, the kernels from the last layer's
+    /// expert hand-off to this one's (the last layer's shared expert, attention, the norm and router); and the
+    /// last layer's shared expert with the output, for Last, Argmax and Hidden
+    moe_graphs: Vec<Ptr>,
+    moe_tail: [Ptr; 3],
     att_scr: DeviceBuf,    // the tiled verify attention's scores and weights (vfy_attention_fits models)
     exact: std::cell::Cell<bool>, // this pass checks a draft: verify kernels, no prompt kernels
     /// Gated DeltaNet layers: every layer's convolution state, then every layer's recurrent state (f32); and
@@ -9103,6 +9221,13 @@ impl LayerCache {
     }
 }
 
+/// A mixture of experts' one-token steps run on per-layer CUDA graphs (moe_step_graphed) unless
+/// GHOST_INFER_NO_MOE_GRAPH is set (or graphs are off altogether).
+fn moe_graphs_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_NO_MOE_GRAPH").is_none())
+}
+
 /// One-token steps replay CUDA graphs unless GHOST_INFER_NO_GRAPH is set or the profiler (which
 /// synchronises after every operation) is on.
 fn graphs_enabled() -> bool {
@@ -9153,6 +9278,8 @@ impl GpuSession {
             moe: Default::default(),
             moe_tab: DeviceBuf::alloc(4096)?,
             graphs: [std::ptr::null_mut(); 3],
+            moe_graphs: Vec::new(),
+            moe_tail: [std::ptr::null_mut(); 3],
             att_scr: att_scr?,
             exact: Default::default(),
             logits: vec![0.0; cfg.vocab],
@@ -9177,7 +9304,7 @@ impl GpuSession {
 
     fn drop_graphs(&mut self) {
         if let Ok(a) = api() {
-            for g in self.graphs.iter_mut().filter(|g| !g.is_null()) {
+            for g in self.graphs.iter_mut().chain(self.moe_graphs.iter_mut()).chain(self.moe_tail.iter_mut()).filter(|g| !g.is_null()) {
                 unsafe { (a.f.cuGraphExecDestroy)(*g) };
                 *g = std::ptr::null_mut();
             }
