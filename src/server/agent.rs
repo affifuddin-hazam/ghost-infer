@@ -91,7 +91,7 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"stop_process","description":"Stop a background process.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}}
  ],
  "mcp": [
-  {"type":"function","function":{"name":"plugin_manager","description":"Make and manage plugins: small programs you write that give you new tools, kept for every later chat (they run as MCP servers, their tools named mcp__<plugin>__<tool>). Use it when the user asks for a plugin or for a tool you do not have that code could do. Before writing one, call it with action guide for the rules and a template. Actions: guide, list, show (name), save (name, description, files), install (source folder), enable (name), disable (name), remove (name).","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["guide","list","show","save","install","enable","disable","remove"],"description":"What to do"},"name":{"type":"string","description":"The plugin's name: short, lowercase, words joined by -"},"description":{"type":"string","description":"save: one line saying what the plugin is for"},"files":{"type":"object","description":"save: relative path -> the file's whole content, such as {\"server.py\": \"...\"}. For a change to an existing plugin, only the files that change","additionalProperties":{"type":"string"}},"source":{"type":"string","description":"install: a folder on this computer holding a plugin.json"}},"required":["action"]}}}
+  {"type":"function","function":{"name":"plugin_manager","description":"Make and manage plugins: small programs you write that give you new tools, kept for every later chat (they run as MCP servers, their tools named mcp__<plugin>__<tool>). Use it when the user asks for a plugin, for a tool you do not have that code could do, or for something in this app itself: a page or dashboard in the app's side bar, or a status shown over every page. Before writing one, call it with action guide for the rules and a template. Actions: guide, list, show (name), save (name, description, files), install (source folder), enable (name), disable (name), remove (name).","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["guide","list","show","save","install","enable","disable","remove"],"description":"What to do"},"name":{"type":"string","description":"The plugin's name: short, lowercase, words joined by -"},"description":{"type":"string","description":"save: one line saying what the plugin is for"},"files":{"type":"object","description":"save: relative path -> the file's whole content, such as {\"server.py\": \"...\"}. For a change to an existing plugin, only the files that change","additionalProperties":{"type":"string"}},"source":{"type":"string","description":"install: a folder on this computer holding a plugin.json"}},"required":["action"]}}}
  ],
  "web": [
   {"type":"function","function":{"name":"web_search","description":"Search the web. Returns titles, addresses and snippets. When your reply uses these results, name the site each fact comes from and end it with a Sources list of the result links you used; a reply that uses no web results has no Sources list. To see what a site or page itself says, open it with fetch_url instead.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What to search for"}},"required":["query"]}}},
@@ -291,7 +291,9 @@ fn gate(mode: &str, group: &str, args: &Json) -> Gate {
     match (mode, group) {
         ("bypass", _) => Gate::Run,
         ("plan", "edit" | "cmd" | "skills" | "plugins") => Gate::Refuse(PLAN_REFUSAL),
-        ("accept_edits", "edit") | ("auto", "edit" | "web") => Gate::Run,
+        // auto: the user's own plugins (made, switched and called) go ahead as edits do; other MCP servers'
+        // tools and skill installs are still asked
+        ("accept_edits", "edit") | ("auto", "edit" | "web" | "plugins" | "plugin_tools") => Gate::Run,
         ("auto", "cmd") if !risky_command(args.get("command").and_then(Json::as_str).unwrap_or("")) => Gate::Run,
         _ => Gate::Ask,
     }
@@ -328,6 +330,8 @@ fn approval_group(name: &str) -> Option<&'static str> {
         "web_search" | "fetch_url" => Some("web"),
         "install_skill" => Some("skills"),
         "plugin_manager" => Some("plugins"),
+        // a tool of one of ghost's own plugins (mcp__<plugin>__<tool>): a group of its own, not an outside server's
+        n if n.strip_prefix("mcp__").and_then(|r| r.split_once("__")).is_some_and(|(server, _)| super::plugins::is_plugin(server)) => Some("plugin_tools"),
         n if n.starts_with("mcp__") => Some("mcp"),
         _ => None,
     }
@@ -351,6 +355,11 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String 
     } else {
         format!(" These tools are named here without their descriptions: {}. Before calling one of them for the first time in a chat, load it with tool_search (\"select:<name>\").", names.join(", "))
     };
+    // what a plugin can be is not guessable from its name: a request for something in the app itself (a
+    // dashboard in the side bar, a status over every page) would otherwise become a loose web page
+    if names.contains(&"plugin_manager") {
+        more.push_str(" To add something to this app itself (a page or dashboard in its side bar, a status shown over every page, a new tool of yours), make a plugin with plugin_manager (its guide first).");
+    }
     if deferred.iter().any(|t| tool_name(t).starts_with("mcp__")) {
         more.push_str(" More tools are installed (from MCP servers and plugins) and not listed here: when a task needs something your tools above cannot do, search for one with tool_search, using a few words saying what it should do.");
     }

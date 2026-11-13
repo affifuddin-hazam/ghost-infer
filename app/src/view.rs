@@ -2327,7 +2327,7 @@ impl App {
             if !t.open {
                 return line.into();
             }
-            let detail = container(scrollable(crate::select::text(tool_detail(t)).size(12.5).font(MONO).color(s.muted).line_height(1.45).width(Fill)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
+            let detail = container(crate::select::scroll(scrollable(crate::select::text(tool_detail(t)).size(12.5).font(MONO).color(s.muted).line_height(1.45).width(Fill)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st))))
                 .max_height(260)
                 .width(Fill)
                 .padding([8, 10])
@@ -2345,7 +2345,7 @@ impl App {
         let mut card = column![row![icon(tool_icon(&t.name), 13).color(s.accent), text(what).size(14).font(MEDIUM).color(s.text)].spacing(10).align_y(Alignment::Center)].spacing(10);
         if !preview.is_empty() {
             card = card.push(
-                container(scrollable(crate::select::text(preview).size(12.5).font(MONO).color(s.text).line_height(1.45).width(Fill)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
+                container(crate::select::scroll(scrollable(crate::select::text(preview).size(12.5).font(MONO).color(s.text).line_height(1.45).width(Fill)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st))))
                     .max_height(240)
                     .width(Fill)
                     .padding([8, 10])

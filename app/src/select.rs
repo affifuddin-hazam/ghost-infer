@@ -41,6 +41,112 @@ struct Global {
     copy: BTreeMap<u32, String>,   // the selected pieces' text, gathered on Ctrl+C
     shift: bool,
     color: Option<Color>,          // the selection's
+    scroller: Option<u32>,         // the scrolling box a drag began in (OUTER: the transcript), which scrolls with it
+}
+
+/// The transcript's own scroller's number ([`Scroll`]s inside it are numbered from 0 by [`begin`]).
+const OUTER: u32 = u32::MAX;
+
+thread_local! {
+    static SCROLLERS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// While a selection is dragged past a scrolling box's top or bottom edge: the box scrolls (faster the
+/// further out the pointer is), and the selection's end follows to the line now at that edge, as a browser
+/// does. Called after the box's content has had the event; a mouse move, or the next frame while the pointer
+/// stays out there (each scroll asks for another frame).
+#[allow(clippy::too_many_arguments)]
+fn autoscroll<Message>(content: &mut Element<'_, Message>, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, viewport: &Rectangle) {
+    if !matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }) | Event::Window(iced::window::Event::RedrawRequested(_))) || !G.with(|g| g.borrow().dragging) {
+        return;
+    }
+    let b = layout.bounds();
+    let Some(p) = cursor.land().position() else { return };
+    const EDGE: f32 = 24.0;
+    let out = if p.y < b.y + EDGE { b.y + EDGE - p.y } else if p.y > b.y + b.height - EDGE { -(p.y - (b.y + b.height - EDGE)) } else { return };
+    // pixels a frame: a slow crawl at the edge, quick far past it
+    let step = out.signum() * (2.0 + out.abs() * 0.35).min(40.0);
+    let y = p.y.clamp(b.y + 2.0, b.y + b.height - 2.0);
+    // the wheel at the box's left margin (not over a box inside it, which would scroll instead)
+    let at = Point::new(b.x + 2.0, y);
+    let wheel = Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Pixels { x: 0.0, y: step } });
+    content.as_widget_mut().update(tree, &wheel, layout, mouse::Cursor::Available(at), renderer, clipboard, shell, viewport);
+    let to = Point::new(p.x.clamp(b.x + 1.0, b.x + b.width - 1.0), y);
+    content.as_widget_mut().update(tree, &Event::Mouse(mouse::Event::CursorMoved { position: to }), layout, mouse::Cursor::Available(to), renderer, clipboard, shell, viewport);
+    shell.request_redraw();
+}
+
+/// A scrolling box inside the transcript (a tool's output, an approval's preview) whose text can be selected:
+/// a drag begun in it scrolls it past its edges.
+pub struct Scroll<'a, Message> {
+    id: u32,
+    content: Element<'a, Message>,
+}
+
+pub fn scroll<'a, Message>(content: impl Into<Element<'a, Message>>) -> Scroll<'a, Message> {
+    let id = SCROLLERS.with(|n| {
+        let id = n.get();
+        n.set(id + 1);
+        id
+    });
+    Scroll { id, content: content.into() }
+}
+
+impl<'a, Message> Widget<Message, Theme, Renderer> for Scroll<'a, Message> {
+    fn tag(&self) -> tree::Tag {
+        self.content.as_widget().tag()
+    }
+    fn state(&self) -> tree::State {
+        self.content.as_widget().state()
+    }
+    fn children(&self) -> Vec<Tree> {
+        self.content.as_widget().children()
+    }
+    fn diff(&self, tree: &mut Tree) {
+        self.content.as_widget().diff(tree);
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+        self.content.as_widget_mut().layout(tree, renderer, limits)
+    }
+    fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn widget::Operation) {
+        self.content.as_widget_mut().operate(tree, layout, renderer, operation);
+    }
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, viewport: &Rectangle) {
+        self.content.as_widget_mut().update(tree, event, layout, cursor, renderer, clipboard, shell, viewport);
+        // a drag begun on text in this box: this box scrolls with it (the innermost box claims it first)
+        if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) && cursor.is_over(layout.bounds()) {
+            G.with(|g| {
+                let mut g = g.borrow_mut();
+                if g.claimed && g.scroller.is_none() {
+                    g.scroller = Some(self.id);
+                }
+            });
+        }
+        if G.with(|g| g.borrow().scroller) == Some(self.id) {
+            autoscroll(&mut self.content, tree, event, layout, cursor, renderer, clipboard, shell, viewport);
+        }
+    }
+    fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle, renderer: &Renderer) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
+        self.content.as_widget().draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
+    fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(tree, layout, renderer, viewport, translation)
+    }
+}
+
+impl<'a, Message: 'a> From<Scroll<'a, Message>> for Element<'a, Message> {
+    fn from(s: Scroll<'a, Message>) -> Self {
+        Element::new(s)
+    }
 }
 
 thread_local! {
@@ -51,6 +157,7 @@ thread_local! {
 /// Before the transcript is built: its pieces are numbered from 0 again, in the order they are made.
 pub fn begin(color: Color) {
     NEXT.with(|n| n.set(0));
+    SCROLLERS.with(|n| n.set(0));
     G.with(|g| g.borrow_mut().color = Some(color));
 }
 
@@ -466,12 +573,25 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Area<'a, Message> {
             }
             if press {
                 g.claimed = false;
+                g.scroller = None;
             }
             if copy {
                 g.copy.clear();
             }
         });
         self.content.as_widget_mut().update(tree, event, layout, cursor, renderer, clipboard, shell, viewport);
+        // a drag begun in the transcript but in no box inside it: the transcript scrolls with it
+        if press {
+            G.with(|g| {
+                let mut g = g.borrow_mut();
+                if g.claimed && g.scroller.is_none() {
+                    g.scroller = Some(OUTER);
+                }
+            });
+        }
+        if G.with(|g| g.borrow().scroller) == Some(OUTER) {
+            autoscroll(&mut self.content, tree, event, layout, cursor, renderer, clipboard, shell, viewport);
+        }
         match event {
             _ if press && !G.with(|g| g.borrow().claimed) => {
                 if range().is_some() {

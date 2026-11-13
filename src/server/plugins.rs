@@ -156,6 +156,11 @@ pub fn status() -> Json {
     )
 }
 
+/// Whether an MCP server of that name is one of ghost's plugins (not one from mcp.json).
+pub fn is_plugin(server: &str) -> bool {
+    !server.is_empty() && clean_name(server) == server && !super::mcp::configured(server) && dir().is_ok_and(|d| d.join(server).join("plugin.json").is_file())
+}
+
 /// A plugin's panel for the app: {title, icon, url} (url: the page's path on this server), when it has one.
 fn panel(name: &str, m: &Json) -> Option<Json> {
     let p = m.get("panel")?;
@@ -375,10 +380,16 @@ fn save(name: &str, description: &str, files: Option<&Json>) -> Result<String, S
     if super::mcp::configured(&name) {
         return Err(format!("an MCP server in mcp.json is already called {name}: choose another name"));
     }
+    // the object written as a JSON string ("files": "{\"tools.py\": ...}"): a smaller model's habit
+    let parsed = match files {
+        Some(Json::Str(s)) => Json::parse(s.trim()).ok().filter(|j| matches!(j, Json::Obj(_))),
+        _ => None,
+    };
+    let files = parsed.as_ref().or(files);
     let files: Vec<(String, String)> = match files {
         Some(Json::Obj(f)) => f.iter().map(|(k, v)| (k.clone(), unescaped(&unfenced(&v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))))).collect(),
         None => Vec::new(),
-        _ => return Err("files must be an object of relative path -> file content".into()),
+        _ => return Err("files must be a JSON object (not a string) of relative path -> file content, such as \"files\": {\"tools.py\": \"...\", \"panel.html\": \"...\"}".into()),
     };
     let d = dir()?.join(&name);
     if files.is_empty() && !d.join("plugin.json").is_file() {

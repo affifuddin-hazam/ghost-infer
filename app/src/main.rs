@@ -214,6 +214,8 @@ fn group_name(group: &str) -> &'static str {
         "cmd" => tr("commands"),
         "mcp" => tr("MCP tools"),
         "skills" => tr("skill installs"),
+        "plugins" => tr("plugin changes"),
+        "plugin_tools" => tr("plugin tools"),
         _ => tr("web access"),
     }
 }
