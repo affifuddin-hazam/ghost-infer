@@ -1208,7 +1208,40 @@ fn respond_preview(conn: &mut TcpStream, req: &Request, rest: &str) -> Result<()
     });
     let Some(path) = found.filter(|p| p.is_file()) else { return respond(conn, 404, &error_body("not found")) };
     let body = std::fs::read(&path).map_err(|e| e.to_string())?;
-    let kind = match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    respond_file(conn, &body, content_type(&path), "no-store")
+}
+
+/// A plugin's panel page and what it loads (/plugin/<name>/<file>), and its functions called by that page
+/// (POST /plugin/<name>/call/<function>, the arguments as the body's JSON): as previews are, for this computer
+/// only, and not for other websites' pages.
+fn respond_plugin(conn: &mut TcpStream, req: &Request, rest: &str) -> Result<(), String> {
+    let host = req.host.rsplit_once(':').map_or(req.host.as_str(), |(h, _)| h);
+    if !conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) || !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return respond(conn, 403, &error_body("plugin pages are for this computer only"));
+    }
+    if !req.origin.is_empty() && !req.origin.ends_with(&format!("//{}", req.host)) {
+        return respond(conn, 403, &error_body("plugin pages do not answer other websites"));
+    }
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (name, file) = rest.split_once('/').unwrap_or((rest, ""));
+    if let Some(function) = file.strip_prefix("call/") {
+        if req.method != "POST" {
+            return respond(conn, 405, &error_body("call a plugin's function with POST"));
+        }
+        let args = std::str::from_utf8(&req.body).ok().and_then(|b| Json::parse(b).ok()).filter(|a| matches!(a, Json::Obj(_))).unwrap_or(obj(vec![]));
+        let text = plugins::call(name, &percent_decode(function), &args);
+        let data = Json::parse(text.trim()).unwrap_or(Json::Null);
+        let code = if text.starts_with("Error: ") { 500 } else { 200 };
+        return respond_private(conn, code, &obj(vec![("text", str(&text)), ("data", data)]));
+    }
+    let file = if file.is_empty() { "panel.html".to_string() } else { percent_decode(file) };
+    let Some(path) = plugins::file(name, &file) else { return respond(conn, 404, &error_body("not found")) };
+    let body = std::fs::read(&path).map_err(|e| e.to_string())?;
+    respond_file(conn, &body, content_type(&path), "no-store")
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
@@ -1223,8 +1256,7 @@ fn respond_preview(conn: &mut TcpStream, req: &Request, rest: &str) -> Result<()
         "woff" => "font/woff",
         "txt" | "md" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
-    };
-    respond_file(conn, &body, kind, "no-store")
+    }
 }
 
 /// "a%20b" -> "a b" (a URL path's escapes).
@@ -1295,6 +1327,9 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     let path = req.path.trim_end_matches('/');
     if req.method == "GET" && req.path.starts_with("/preview/") {
         return respond_preview(&mut conn, &req, &req.path["/preview/".len()..]);
+    }
+    if req.path.starts_with("/plugin/") {
+        return respond_plugin(&mut conn, &req, &req.path["/plugin/".len()..]);
     }
     // speech has a model of its own: it answers whether or not a language model runs
     if path == "/v1/audio/speech" {
@@ -1523,7 +1558,8 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             },
             // MCP servers: their state; reload after editing mcp.json; import Claude Desktop's
             // plugins (the MCP servers ghost wrote for itself): their state and tools
-            ("GET", "/api/plugins") => respond_private(&mut conn, 200, &obj(vec![("plugins", plugins::status()), ("folder", str(&plugins::dir().map(|d| d.display().to_string()).unwrap_or_default()))])),
+            ("GET", "/api/plugins/badges") => respond_private(&mut conn, 200, &obj(vec![("badges", plugins::badges())])),
+            ("GET", "/api/plugins") =>respond_private(&mut conn, 200, &obj(vec![("plugins", plugins::status()), ("folder", str(&plugins::dir().map(|d| d.display().to_string()).unwrap_or_default()))])),
             ("GET", "/api/mcp") => {
                 let config = mcp::ensure_config().unwrap_or_default();
                 respond_private(&mut conn, 200, &obj(vec![("servers", mcp::status()), ("config", str(&config))]))

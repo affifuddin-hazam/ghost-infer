@@ -8,8 +8,19 @@
 //! The plugin_manager tool lets the model write, install, switch and remove them during a chat; every change
 //! needs the user's OK, and saving starts the plugin and lists its tools, so the model sees at once whether it
 //! works (or the plugin's log when it does not).
+//!
+//! A plugin can also show itself in the app, as DeepSeek Harness's plugins do:
+//!   "panel": {"title": "PenipuMY status", "icon": "status", "page": "panel.html"}
+//!     a row in the app's side bar (under New chat, with that icon), opening the plugin's own web page in the
+//!     preview pane; the page is served at /plugin/<name>/<file>, and its script can call the plugin's
+//!     functions with fetch("/plugin/<name>/call/<function>", {method: "POST", body: JSON args}).
+//!   "badge": {"function": "status", "every": 60}
+//!     a short status the app shows over every page (a coloured dot and a few words), from one of its
+//!     functions, which returns {"text": "...", "color": "green" | "amber" | "red" | "gray"} (or plain text).
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::json::{obj, str, Json};
 
@@ -137,10 +148,90 @@ pub fn status() -> Json {
                     ("enabled", Json::Bool(enabled(&m))),
                     ("status", str(&status)),
                     ("tools", srv.and_then(|s| s.get("tools").cloned()).unwrap_or(Json::Arr(Vec::new()))),
+                    ("panel", panel(&name, &m).unwrap_or(Json::Null)),
+                    ("badge", Json::Bool(m.get("badge").is_some())),
                 ])
             })
             .collect(),
     )
+}
+
+/// A plugin's panel for the app: {title, icon, url} (url: the page's path on this server), when it has one.
+fn panel(name: &str, m: &Json) -> Option<Json> {
+    let p = m.get("panel")?;
+    let g = |k: &str| p.get(k).and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let page = g("page").unwrap_or("panel.html").trim_start_matches(['/', '\\']);
+    Some(obj(vec![("title", str(g("title").unwrap_or(name))), ("icon", str(g("icon").unwrap_or("plug"))), ("url", str(&format!("/plugin/{name}/{page}")))]))
+}
+
+/// A file of an enabled plugin's folder, for its panel page (and what that page loads), never outside it.
+pub fn file(name: &str, rel: &str) -> Option<PathBuf> {
+    let (name, d) = existing(name).ok()?;
+    let m = manifest(&d)?;
+    if !enabled(&m) || name.is_empty() {
+        return None;
+    }
+    let f = std::fs::canonicalize(inside(&d, rel).ok()?).ok()?;
+    (f.starts_with(std::fs::canonicalize(&d).ok()?) && f.is_file()).then_some(f)
+}
+
+/// One of an enabled plugin's functions (its tools), called by its panel page or for its badge.
+pub fn call(name: &str, function: &str, args: &Json) -> String {
+    match existing(name) {
+        Ok((name, d)) if manifest(&d).is_some_and(|m| enabled(&m)) => super::mcp::call(&format!("mcp__{name}__{}", function.trim()), args),
+        Ok((name, _)) => format!("Error: the plugin {name} is turned off"),
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// The badges' last answers: a plugin's, and when it came.
+static BADGES: Mutex<Vec<(String, Instant, Json)>> = Mutex::new(Vec::new());
+
+/// The badges of the enabled plugins that have one (GET /api/plugins/badges): each plugin's name, title, icon,
+/// panel url ("" without a panel), and its status {text, color}, asked again once `every` seconds have passed
+/// (60 unless it says, at least 10).
+pub fn badges() -> Json {
+    let mut out = Vec::new();
+    for (name, m) in all().into_iter().filter(|(_, m)| enabled(m)) {
+        let Some(b) = m.get("badge") else { continue };
+        let function = b.get("function").and_then(Json::as_str).unwrap_or("status").to_string();
+        let every = Duration::from_secs(b.get("every").and_then(Json::as_f64).unwrap_or(60.0).clamp(10.0, 86400.0) as u64);
+        let cached = BADGES.lock().unwrap().iter().find(|(n, at, _)| *n == name && at.elapsed() < every).map(|(_, _, j)| j.clone());
+        let status = cached.unwrap_or_else(|| {
+            let j = badge_status(&call(&name, &function, &obj(vec![])));
+            let mut list = BADGES.lock().unwrap();
+            list.retain(|(n, _, _)| *n != name);
+            list.push((name.clone(), Instant::now(), j.clone()));
+            j
+        });
+        let p = panel(&name, &m);
+        let pg = |k: &str| p.as_ref().and_then(|p| p.get(k)).and_then(Json::as_str).unwrap_or("").to_string();
+        out.push(obj(vec![
+            ("name", str(&name)),
+            ("title", str(&if pg("title").is_empty() { name.clone() } else { pg("title") })),
+            ("icon", str(&if pg("icon").is_empty() { "plug".to_string() } else { pg("icon") })),
+            ("url", str(&pg("url"))),
+            ("text", status.get("text").cloned().unwrap_or(str(""))),
+            ("color", status.get("color").cloned().unwrap_or(str("gray"))),
+        ]));
+    }
+    Json::Arr(out)
+}
+
+/// A badge function's answer as {text, color}: its JSON, or its text (the first line) in grey, or its error in red.
+fn badge_status(r: &str) -> Json {
+    let short = |t: &str| t.lines().next().unwrap_or("").trim().chars().take(60).collect::<String>();
+    if let Some(e) = r.strip_prefix("Error: ") {
+        return obj(vec![("text", str(&short(e))), ("color", str("red"))]);
+    }
+    match Json::parse(r.trim()) {
+        Ok(j @ Json::Obj(_)) => {
+            let text = j.get("text").and_then(Json::as_str).map(short).unwrap_or_default();
+            let color = j.get("color").and_then(Json::as_str).unwrap_or("gray").to_lowercase();
+            obj(vec![("text", str(&text)), ("color", str(&color))])
+        }
+        _ => obj(vec![("text", str(&short(r))), ("color", str("gray"))]),
+    }
 }
 
 fn list() -> String {
@@ -456,7 +547,14 @@ Rules:
 - Save: plugin_manager {"action": "save", "name": "short-name", "description": "one line", "files": {"tools.py": "<the code>"}}. Write the code as normal lines (in the JSON string, a line break is \n), with no ``` fence.
 - Saving starts the plugin and answers with its tools, or with the error. To fix one: read_file its tools.py (the path is in the answer), then save the corrected tools.py whole.
 - Then test it: load the tool with tool_search ("select:mcp__<name>__<function>") and call it. Say it is done only once a call works. Each call asks the user first.
-- Other actions: list, show (a plugin's files and log), enable, disable, remove, install (a plugin folder on this computer). For a plugin tools.py cannot be (Node, or a server of its own), call guide with name "server" for the full template."#;
+- Other actions: list, show (a plugin's files and log), enable, disable, remove, install (a plugin folder on this computer). For a plugin tools.py cannot be (Node, or a server of its own), call guide with name "server" for the full template.
+
+A plugin can also show itself in the app (a dashboard, a status, a little app of its own). Add a plugin.json to the same save:
+{"tools": "tools.py", "panel": {"title": "Site status", "icon": "status", "page": "panel.html"}, "badge": {"function": "status", "every": 60}}
+- panel: a row in the app's side bar, under New chat, with that icon; a click opens page (a web page in the plugin's folder, saved in the same files) in the app's preview pane. icon is one of: status, chart, globe, shield, bell, calendar, cloud, mail, money, music, home, people, shop, game, map, clock, news, code, chat, warning, heart, star, bolt, plug.
+- The page is plain HTML, CSS and JavaScript in one file (no build step; a CDN script is fine). To get data, its script calls the plugin's own functions, which can reach any site (a page cannot, the browser blocks it): const r = await fetch("/plugin/<name>/call/<function>", {method: "POST", body: JSON.stringify({...args})}); const {text, data} = await r.json(); (data is the result when it is JSON: return a dict or list from the function). Refresh it with setInterval when it shows live data. Match the app: a dark page (#1f1f1f background, #e8e8e8 text), system-ui font.
+- badge: a short status shown over every page of the app (a coloured dot and a few words; a click opens the panel). function is a function in tools.py with no required arguments that returns {"text": "All up", "color": "green"} (color: green, amber, red or gray); the app asks it again every `every` seconds (at least 10).
+- Fetch with urllib.request (standard library), with a timeout of 10 to 20 seconds, and catch errors: a badge function should return {"text": "can't reach it", "color": "red"}, not raise."#;
 
 const TEMPLATE: &str = r#""""A ghost plugin: a small MCP server. ghost runs it and talks JSON-RPC on stdin/stdout, one message a line."""
 import json

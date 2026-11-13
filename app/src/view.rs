@@ -154,6 +154,36 @@ fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
     text(c.to_string()).font(ICONS).size(size).line_height(1.0)
 }
 
+/// The icon a plugin picked for its row and badge, by name (the names plugins.rs's guide lists; Segoe MDL2).
+fn plugin_icon(name: &str) -> char {
+    match name.trim().to_lowercase().as_str() {
+        "status" | "health" | "uptime" | "pulse" | "monitor" => '\u{E9D9}',
+        "chart" | "stats" | "dashboard" | "graph" => '\u{E9D2}',
+        "globe" | "web" | "site" => ic::GLOBE,
+        "shield" | "security" => '\u{EA18}',
+        "bell" | "alert" | "alerts" => '\u{EA8F}',
+        "calendar" => '\u{E787}',
+        "cloud" | "weather" => '\u{E753}',
+        "mail" | "email" => '\u{E715}',
+        "money" | "finance" | "payment" => '\u{E8C7}',
+        "music" | "audio" => '\u{E8D6}',
+        "home" => '\u{E80F}',
+        "people" | "users" | "contacts" => '\u{E716}',
+        "shop" | "store" | "cart" => '\u{E719}',
+        "game" | "games" => '\u{E7FC}',
+        "map" | "location" => '\u{E707}',
+        "clock" | "time" => ic::CLOCK,
+        "news" | "doc" | "document" => ic::FILE,
+        "code" => ic::CODE,
+        "chat" => ic::CHAT,
+        "warning" => '\u{E7BA}',
+        "heart" => '\u{EB51}',
+        "star" => ic::MEMORY,
+        "bolt" => ic::BOLT,
+        _ => ic::PLUG,
+    }
+}
+
 /// The icon for a tool's call in the reply.
 fn tool_icon(name: &str) -> char {
     match name {
@@ -268,7 +298,7 @@ impl App {
         if self.sidebar {
             body = body.push(self.sidebar());
         }
-        body = body.push(self.main());
+        body = body.push(self.with_badges(self.main()));
         if self.preview_shown() {
             body = body.push(self.preview_pane());
         }
@@ -1365,6 +1395,37 @@ impl App {
         .into()
     }
 
+    /// The plugins' badges floating over the main area's top right, on every page: a coloured dot, the plugin's
+    /// icon and its status in a few words; a click opens its page.
+    fn with_badges<'a>(&'a self, main: Element<'a, Message>) -> Element<'a, Message> {
+        if self.badges.is_empty() {
+            return main;
+        }
+        let s = self.skin();
+        let pills = row(self.badges.iter().map(|b| {
+            let dot = match b.color.as_str() {
+                "green" => s.ok,
+                "amber" | "yellow" | "orange" => s.warn,
+                "red" => s.bad,
+                _ => s.faint,
+            };
+            let words = if b.text.is_empty() { b.title.clone() } else { b.text.clone() };
+            let pill = row![text("●").size(10).color(dot), icon(plugin_icon(&b.icon), 11).color(s.muted), text(words).size(12.5).color(s.text).wrapping(text::Wrapping::None)].spacing(7).align_y(Alignment::Center);
+            let mut btn = button(pill).padding([5, 11]).style(move |_, st| button::Style {
+                background: Some(Background::Color(if hovered(st) { s.raise2 } else { s.raise })),
+                border: Border { radius: 14.0.into(), width: 1.0, color: s.line2 },
+                ..Default::default()
+            });
+            if !b.url.is_empty() {
+                btn = btn.on_press(Message::OpenPanel(b.url.clone()));
+            }
+            tooltip(btn, container(text(b.title.as_str()).size(12).color(s.text)).padding([4, 8]).style(move |_| container::Style { background: Some(Background::Color(s.raise)), border: border::rounded(6), ..Default::default() }), tooltip::Position::Bottom).into()
+        }))
+        .spacing(6);
+        let top = container(pills).width(Fill).align_x(Alignment::End).padding(Padding { top: 52.0, right: 16.0, bottom: 0.0, left: 0.0 });
+        stack![main, top].into()
+    }
+
     fn sidebar(&self) -> Element<'_, Message> {
         let s = self.skin();
         // the title bar's left part: drag the window by it, double-click to maximize
@@ -1376,7 +1437,19 @@ impl App {
                 .padding([7, 10])
                 .style(move |_, st| row_style(s, st, false))
         };
-        let mut col = column![chrome, nav(ic::ADD, tr("New chat"), Message::NewChat), nav(ic::SEARCH, tr("Search"), Message::ToggleSearch)].spacing(1);
+        let mut col = column![chrome, nav(ic::ADD, tr("New chat"), Message::NewChat)].spacing(1);
+        // the plugins' pages, under New chat: each with the icon its plugin picked
+        for p in &self.panels {
+            let open = self.preview_shown() && self.preview_url.as_deref().is_some_and(|u| u.ends_with(&p.url));
+            col = col.push(
+                button(row![icon(plugin_icon(&p.icon), 14).color(s.muted), container(text(p.title.as_str()).size(14).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true)].spacing(12).align_y(Alignment::Center))
+                    .on_press(Message::OpenPanel(p.url.clone()))
+                    .width(Fill)
+                    .padding([7, 10])
+                    .style(move |_, st| row_style(s, st, open)),
+            );
+        }
+        col = col.push(nav(ic::SEARCH, tr("Search"), Message::ToggleSearch));
         if self.searching {
             col = col.push(
                 text_input(tr("Search chats"), &self.filter)

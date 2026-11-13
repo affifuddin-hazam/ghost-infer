@@ -229,6 +229,22 @@ pub struct Round {
     pub think_open: bool,      // its thinking shown (each round opens on its own)
 }
 
+/// A plugin's page: a row in the side bar (its title and icon name) opening `url` (a path on the server).
+pub struct Panel {
+    pub title: String,
+    pub icon: String,
+    pub url: String,
+}
+
+/// A plugin's status, shown over every page: a coloured dot and a few words; a click opens its page.
+pub struct Badge {
+    pub title: String,
+    pub icon: String,
+    pub url: String,
+    pub text: String,
+    pub color: String, // green, amber, red or gray
+}
+
 /// A tool call the model is writing (its text streams for minutes when it is a whole file): what the reply
 /// shows of it until it comes whole as a tool line.
 #[derive(Debug)]
@@ -753,6 +769,9 @@ struct App {
     editing: Option<usize>,  // the user message being edited in the box: sending replaces it and the replies after it
     preview_url: Option<String>, // the web page the agent last wrote, for the preview pane
     preview_open: bool,      // the pane is shown
+    panels: Vec<Panel>,      // the plugins' pages: rows in the side bar under New chat
+    badges: Vec<Badge>,      // the plugins' statuses, shown over every page
+    badges_at: Option<u64>,  // when the badges were last asked (the clock); None while an answer is pending
     chip: Option<String>,    // a command or skill picked with /: a chip before the text, sent as /name
     attached: Vec<attach::Attachment>, // files attached to the message being written
     slash_pick: usize,       // the / list's highlighted line
@@ -945,6 +964,9 @@ enum Message {
     SkillsRead(Result<Json, String>), // the list read again when a / is typed (a failure says nothing)
     RemoveSkill(String),
     Mcp(Result<Json, String>),
+    Plugins(Result<Json, String>),
+    Badges(Result<Json, String>),
+    OpenPanel(String), // a plugin's page (its path on the server) in the preview pane
     McpReload,
     McpImport,
     McpEdit,
@@ -1091,6 +1113,9 @@ impl App {
             editing: None,
             preview_url: None,
             preview_open: false,
+            panels: Vec::new(),
+            badges: Vec::new(),
+            badges_at: Some(0),
             voice: false,
             orb: orb::Sim::new(),
             voice_models: (None, None),
@@ -1394,6 +1419,11 @@ impl App {
                 if self.voice {
                     let (phase, level) = self.orb_input();
                     self.orb.step(self.clock, phase, level);
+                }
+                // the plugins' badges (and panels, which a reply may have added): a look every 15 seconds
+                if self.api.is_some() && self.badges_at.is_some_and(|t| t == 0 || self.clock.saturating_sub(t) > 15_000) {
+                    self.badges_at = None;
+                    return Task::batch([self.call(|api| api.get("/api/plugins/badges"), Message::Badges), self.call(|api| api.get("/api/plugins"), Message::Plugins)]);
                 }
                 // a model downloading: a look every second
                 let downloading = self.download.get("state").and_then(Json::as_str) == Some("downloading");
@@ -2144,6 +2174,29 @@ impl App {
                 }
             }
             Message::Mcp(Err(_)) => {}
+            Message::Plugins(Ok(j)) => {
+                self.panels = j.get("plugins").and_then(Json::as_array).unwrap_or(&[]).iter().filter(|p| p.get("enabled").and_then(Json::as_bool) == Some(true)).filter_map(|p| {
+                    let panel = p.get("panel")?;
+                    let g = |k: &str| panel.get(k).and_then(Json::as_str).map(String::from);
+                    Some(Panel { title: g("title")?, icon: g("icon").unwrap_or_default(), url: g("url")? })
+                }).collect();
+            }
+            Message::Plugins(Err(_)) => {}
+            Message::Badges(r) => {
+                self.badges_at = Some(self.clock);
+                if let Ok(j) = r {
+                    self.badges = j.get("badges").and_then(Json::as_array).unwrap_or(&[]).iter().map(|b| {
+                        let g = |k: &str| b.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+                        Badge { title: g("title"), icon: g("icon"), url: g("url"), text: g("text"), color: g("color") }
+                    }).collect();
+                }
+            }
+            Message::OpenPanel(path) => {
+                if let Some(api) = &self.api {
+                    let url = format!("http://{}{path}", api.addr);
+                    return self.show_preview(url);
+                }
+            }
             Message::McpReload => {
                 return self.call(|api| { api.post("/api/mcp/reload", &Json::Null)?; std::thread::sleep(std::time::Duration::from_millis(500)); api.get("/api/mcp") }, Message::Mcp);
             }
@@ -2295,7 +2348,7 @@ impl App {
 
     /// The installed skills, the MCP servers and the GHOST.md files (the rail lists them).
     fn refresh_extras(&self) -> Task<Message> {
-        Task::batch([self.call(|api| api.get("/api/skills"), Message::Skills), self.call(|api| api.get("/api/mcp"), Message::Mcp), self.refresh_instructions()])
+        Task::batch([self.call(|api| api.get("/api/skills"), Message::Skills), self.call(|api| api.get("/api/mcp"), Message::Mcp), self.call(|api| api.get("/api/plugins"), Message::Plugins), self.refresh_instructions()])
     }
 
     /// Whether the plan above the message box shows its steps: as set by hand, else until every step is done.
