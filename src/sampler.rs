@@ -134,10 +134,52 @@ impl Sampler {
 
     /// The most likely token, after the penalty.
     fn best(&self, logits: &[f32]) -> u32 {
-        logits.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &v)| {
-            let v = self.score(i, v);
-            if v > b.1 { (i, v) } else { b }
-        }).0 as u32
+        let pen = self.penalised();
+        let mut cand = self.candidates(logits, 1, &pen);
+        // the first of the highest, as a plain scan in order would pick
+        cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        cand.first().map_or(0, |c| c.0)
+    }
+
+    /// The tokens a penalty (or a ban) may change, sorted: every other token's score is its logit.
+    fn penalised(&self) -> Vec<u32> {
+        let mut p: Vec<u32> = self.banned.iter().copied().chain(self.held.keys().copied()).collect();
+        if self.repetition > 1.0 {
+            p.extend(self.used.iter().copied());
+        }
+        p.sort_unstable();
+        p.dedup();
+        p
+    }
+
+    /// The k best tokens by score (more when scores tie), as (id, score), unordered: the penalised tokens
+    /// scored, and the others from the logits' k + penalised largest, found in one pass that keeps a short
+    /// list (a token outside those cannot beat k unpenalised ones). Scoring every token instead took ~1.5 ms
+    /// for a 248K vocabulary.
+    fn candidates(&self, logits: &[f32], k: usize, pen: &[u32]) -> Vec<(u32, f32)> {
+        let m = (k + pen.len()).min(logits.len());
+        let mut top: Vec<(u32, f32)> = Vec::with_capacity(4 * m + 64);
+        let cap = 4 * m + 64;
+        let mut floor = f32::NEG_INFINITY;
+        let mut full = false;
+        for (i, &v) in logits.iter().enumerate() {
+            if full && v.total_cmp(&floor).is_le() {
+                continue;
+            }
+            top.push((i as u32, v));
+            if top.len() == cap {
+                top.select_nth_unstable_by(m - 1, |a, b| b.1.total_cmp(&a.1));
+                floor = top[m - 1].1;
+                // keep the ties with the m-th too: which of them counts is decided by the score below
+                let keep = m + top[m..].iter().filter(|c| c.1.total_cmp(&floor).is_eq()).count();
+                top[m..].sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                top.truncate(keep);
+                full = keep < cap - 1;
+            }
+        }
+        let mut cand: Vec<(u32, f32)> = top.into_iter().filter(|c| pen.binary_search(&c.0).is_err()).collect();
+        cand.extend(pen.iter().filter(|&&id| (id as usize) < logits.len()).map(|&id| (id, self.score(id as usize, logits[id as usize]))));
+        cand
     }
 
     fn next_f32(&mut self) -> f32 {
@@ -215,7 +257,11 @@ impl Sampler {
     /// The tokens sampling can pick, most likely first, with their weights (temperature, then top-k and
     /// top-p), and the sum of the weights.
     fn distribution(&self, logits: &[f32]) -> (Vec<(u32, f32)>, f32) {
-        let mut cand: Vec<(u32, f32)> = logits.iter().enumerate().map(|(i, &v)| (i as u32, self.score(i, v))).collect();
+        let mut cand: Vec<(u32, f32)> = if self.top_k == 0 || self.top_k >= logits.len() {
+            logits.iter().enumerate().map(|(i, &v)| (i as u32, self.score(i, v))).collect()
+        } else {
+            self.candidates(logits, self.top_k, &self.penalised())
+        };
         let k = if self.top_k == 0 { cand.len() } else { self.top_k.min(cand.len()) };
         if k < cand.len() {
             cand.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
@@ -311,6 +357,44 @@ mod tests {
             }
         }
         assert_eq!(want[5], 0.0);
+    }
+
+    /// The short-list picks are those of scoring every token: the best, and top-k's candidates, with penalties
+    /// that move tokens in and out of the top.
+    #[test]
+    fn short_list_matches_scoring_everything() {
+        for seed in 1..40u32 {
+            let logits: Vec<f32> = (0..5000u32).map(|i| (((i ^ seed).wrapping_mul(2_654_435_761) >> 12) % 997) as f32 / 50.0).collect();
+            let used: Vec<u32> = (0..60u32).map(|i| (i * 7919 + seed * 31) % 5000).collect();
+            for rep in [1.0f32, 1.3] {
+                let mut s = Sampler::new(0.7, 30, 1.0, 1).with_repetition(rep, used.iter().copied()).with_ban([used[0] + 1]);
+                s.weigh();
+                let naive_best = logits.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &v)| {
+                    let v = s.score(i, v);
+                    if v > b.1 { (i, v) } else { b }
+                }).0 as u32;
+                assert_eq!(s.best(&logits), naive_best, "seed {seed} rep {rep}");
+                let mut all: Vec<f32> = (0..logits.len()).map(|i| s.score(i, logits[i])).collect();
+                all.sort_unstable_by(|a, b| b.total_cmp(a));
+                let mut got: Vec<f32> = s.candidates(&logits, 30, &s.penalised()).iter().map(|c| c.1).collect();
+                got.sort_unstable_by(|a, b| b.total_cmp(a));
+                assert_eq!(&got[..30], &all[..30], "seed {seed} rep {rep}");
+            }
+        }
+    }
+
+    /// cargo test --release sampler_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sampler_speed() {
+        let logits: Vec<f32> = (0..248_320u32).map(|i| ((i.wrapping_mul(2_654_435_761) >> 8) as f32 / 16_777_216.0) * 12.0 - 6.0).collect();
+        for (name, mut s) in [("greedy", Sampler::new(0.0, 40, 0.95, 1)), ("t0.7 k40", Sampler::new(0.7, 40, 0.95, 1)), ("t0.7 k40 rep", Sampler::new(0.7, 40, 0.95, 1).with_repetition(1.1, 0..2000u32))] {
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(s.sample(&logits));
+            }
+            eprintln!("{name}: {:.0} us per token", t.elapsed().as_secs_f64() * 1e4);
+        }
     }
 
     #[test]

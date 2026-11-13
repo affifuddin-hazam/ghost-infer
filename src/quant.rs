@@ -1253,6 +1253,80 @@ mod tests {
         }
     }
 
+    /// One expert of a 35B-A3B (gate, up 512 x 2048 Q3_K, down 2048 x 512 Q4_K) through experts_one: from cache
+    /// (the same expert again and again) and from RAM (a different one of 96 each time, ~140 MB).
+    /// cargo test --release expert_cpu_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn expert_cpu_speed() {
+        let (dim, hidden, n) = (2048usize, 512usize, 96usize);
+        let mut seed = 0x2545_f491u32;
+        let mut make = |ty: GgmlType, rows: usize, cols: usize| -> Vec<u8> {
+            let (per, bytes) = ty.block().unwrap();
+            let mut d: Vec<u8> = (0..rows * cols / per * bytes)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect();
+            for blk in d.chunks_exact_mut(bytes) {
+                match ty {
+                    GgmlType::Q4K => {
+                        blk[0..2].copy_from_slice(&f32_to_f16(0.01).to_le_bytes());
+                        blk[2..4].copy_from_slice(&f32_to_f16(0.004).to_le_bytes());
+                    }
+                    _ => blk[108..110].copy_from_slice(&f32_to_f16(0.01).to_le_bytes()),
+                }
+            }
+            d
+        };
+        let store: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..n).map(|_| (make(GgmlType::Q3K, hidden, dim), make(GgmlType::Q3K, hidden, dim), make(GgmlType::Q4K, dim, hidden))).collect();
+        let ex = |i: usize| (Matrix { data: &store[i].0, ty: GgmlType::Q3K, rows: hidden, cols: dim }, Matrix { data: &store[i].1, ty: GgmlType::Q3K, rows: hidden, cols: dim }, Matrix { data: &store[i].2, ty: GgmlType::Q4K, rows: dim, cols: hidden }, 0.5f32);
+        let x: Vec<f32> = (0..dim).map(|i| ((i * 37 % 97) as f32 - 48.0) * 0.03).collect();
+        let mut acc = vec![0f32; dim];
+        let mut sc = ExpertScratch::default();
+        let pool = crate::pool::pool();
+        let t = std::time::Instant::now();
+        for _ in 0..2000 {
+            pool.run(&|_, _| {});
+        }
+        eprintln!("empty pool run: {:.1} us ({} threads)", t.elapsed().as_secs_f64() * 1e6 / 2000.0, rayon::current_num_threads());
+        let t = std::time::Instant::now();
+        let es1 = vec![ex(0)];
+        let mut xq = QuantizedBatch::default();
+        xq.quantize(&x, dim);
+        for _ in 0..400 {
+            for r in 0..hidden {
+                std::hint::black_box(dot1(&es1[0].0, r, xq.row3(0), &x, has_avx2()));
+            }
+        }
+        eprintln!("one Q3_K 2048-wide row dot, one thread: {:.3} us", t.elapsed().as_secs_f64() * 1e6 / 400.0 / hidden as f64);
+        let mut hq = QuantizedBatch::default();
+        hq.quantize(&x[..hidden], hidden);
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            for r in 0..dim {
+                std::hint::black_box(dot1(&es1[0].2, r, hq.row3(0), &x[..hidden], has_avx2()));
+            }
+        }
+        eprintln!("one Q4_K 512-wide row dot, one thread: {:.3} us", t.elapsed().as_secs_f64() * 1e6 / 100.0 / dim as f64);
+        for k in [1usize, 2] {
+            for (name, hot) in [("hot", true), ("from RAM", false)] {
+                let reps = 400;
+                let t = std::time::Instant::now();
+                for r in 0..reps {
+                    let es: Vec<_> = (0..k).map(|j| ex(if hot { j } else { (r * k + j) % n })).collect();
+                    experts_one(&es, &x, &mut acc, &mut sc);
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                let mb = k as f64 * (store[0].0.len() * 2 + store[0].2.len()) as f64 / 1e6;
+                eprintln!("{k} expert(s) {name}: {us:.0} us per call, {:.1} GB/s", mb * 1e3 / us);
+            }
+        }
+    }
+
     /// cargo test --release dispatch -- --ignored --nocapture
     #[test]
     #[ignore]

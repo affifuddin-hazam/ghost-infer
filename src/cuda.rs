@@ -539,6 +539,38 @@ __global__ void rmsnorm_q8(const float* __restrict__ x, const float* __restrict_
     }
 }
 
+// rmsnorm (f32 into out) and rmsnorm_q8 (int8) of one token in one launch (1024 threads), each with its own
+// kernel's arithmetic: the f32 scale from the first 256 threads as rmsnorm sums it (the other warps add zeros
+// to the same tree), the int8 one as rmsnorm_q8 does.
+__global__ void rmsnorm_both(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out, signed char* __restrict__ xq,
+                             float* __restrict__ xd, int* __restrict__ xsum, int cols, float eps) {
+    __shared__ float sh[32];
+    const float* xs = x;
+    const float4* xr = reinterpret_cast<const float4*>(x);
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    int nv = cols >> 2;
+    float sa = 0.f;
+    if (threadIdx.x < 256)
+        for (int i = threadIdx.x; i < cols; i += 256) sa += xs[i] * xs[i];
+    sa = block_sum(sa, sh);
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < nv; i += blockDim.x) { float4 v = xr[i]; ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w; }
+    ss = block_sum(ss, sh);
+    float fa = rsqrtf(sa / cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) out[i] = xs[i] * fa * w[i];
+    float scale = rsqrtf(ss / cols + eps);
+    for (int base = 0; base < nv; base += blockDim.x) {
+        int i = base + threadIdx.x;
+        bool ok = i < nv;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (ok) {
+            float4 a = xr[i], g = w4[i];
+            v = make_float4(a.x * scale * g.x, a.y * scale * g.y, a.z * scale * g.z, a.w * scale * g.w);
+        }
+        quant8x4(v, ok, i, xq, xd, xsum);
+    }
+}
+
 // Generation matmuls: out[b*out_stride + out_off + r] (+)= dot(W[r], x[b]), f32 activations.
 // One warp per row, TB tokens per block in y.
 
@@ -759,14 +791,17 @@ __device__ __forceinline__ float tree4(const float* s) {
 // super-block, so the warp walks four super-blocks per step. The R rows of a warp are decoded first, then
 // each token's activations are loaded once for all of them. Lane pairs swap halves for whole sub-block
 // sums and keep the same accumulator (the "min" term uses the activation block sums from the quantiser).
-template <int NT, int R>
+// S = 2 (rows of at most 2 super-blocks, e.g. 512-wide expert downs): each half-warp takes its own rows, so
+// no lane idles; the chains past the row's end were zero anyway, so the sums are the same.
+template <int NT, int R, int S = 1>
 __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
-    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
     int lane = threadIdx.x & 31;
-    if (row0 >= rows) return;
+    int wrow = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R * S;
+    if (wrow >= rows) return;
+    int row0 = wrow + (S == 2 ? (lane >> 4) * R : 0);
     unsigned grp = 0xFFu << (lane & 24); // the 8 lanes on the same super-blocks (shuffles inside the loop)
     int nsb = cols >> 8;
-    int qsel = lane >> 3, l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
+    int qsel = (lane >> 3) & (4 / S - 1), l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
     size_t row_bytes = (size_t)nsb * Q4K_BYTES;
     float acc[R][NT];
     #pragma unroll
@@ -774,7 +809,7 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
         #pragma unroll
         for (int j = 0; j < NT; j++) acc[r][j] = 0.f;
     #pragma unroll 2 // more super-blocks' loads in flight before any is used
-    for (int sb = qsel; sb < nsb; sb += 4) {
+    for (int sb = qsel; sb < nsb; sb += 4 / S) {
         int pos = sb * 256 + 64 * j2 + 16 * hf;
         int4 lo4[R], hi4[R];
         float d[R], dmin[R];
@@ -818,8 +853,8 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
             // the pairs (lane bits 1-2), then the chains (bits 3-4): ((A0 + A1) + (A2 + A3)) per chain, (T0 + T1) + (T2 + T3)
             float v = acc[r][j];
             #pragma unroll
-            for (int o = 2; o < 32; o <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o));
-            if (lane == 0 && j < n && row0 + r < rows) {
+            for (int o = 2; o < 32 / S; o <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o));
+            if ((lane & (32 / S - 1)) == 0 && j < n && row0 + r < rows) {
                 size_t idx = (size_t)j * out_stride + out_off + row0 + r;
                 out[idx] = accumulate ? out[idx] + v : v;
             }
@@ -831,14 +866,15 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
 // nibbles at 48. A lane's 16 nibble bytes are values 16 hf .. + 15 of sub-blocks 2 j2 (low) and 2 j2 + 1
 // (high), whose fifth bits are bits 2 j2 and 2 j2 + 1 of the same 16 high-bit bytes.
 #define Q5K_BYTES 176
-template <int NT, int R>
+template <int NT, int R, int S = 1>
 __device__ __forceinline__ void q5k_dp4a(DP4A_PARAMS) {
-    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
     int lane = threadIdx.x & 31;
-    if (row0 >= rows) return;
+    int wrow = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R * S;
+    if (wrow >= rows) return;
+    int row0 = wrow + (S == 2 ? (lane >> 4) * R : 0);
     unsigned grp = 0xFFu << (lane & 24);
     int nsb = cols >> 8;
-    int qsel = lane >> 3, l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
+    int qsel = (lane >> 3) & (4 / S - 1), l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
     size_t row_bytes = (size_t)nsb * Q5K_BYTES;
     float acc[R][NT];
     #pragma unroll
@@ -846,7 +882,7 @@ __device__ __forceinline__ void q5k_dp4a(DP4A_PARAMS) {
         #pragma unroll
         for (int j = 0; j < NT; j++) acc[r][j] = 0.f;
     #pragma unroll 2
-    for (int sb = qsel; sb < nsb; sb += 4) {
+    for (int sb = qsel; sb < nsb; sb += 4 / S) {
         int pos = sb * 256 + 64 * j2 + 16 * hf;
         int4 lo4[R], hi4[R];
         float d[R], dmin[R];
@@ -893,8 +929,8 @@ __device__ __forceinline__ void q5k_dp4a(DP4A_PARAMS) {
         for (int j = 0; j < NT; j++) {
             float v = acc[r][j];
             #pragma unroll
-            for (int o = 2; o < 32; o <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o));
-            if (lane == 0 && j < n && row0 + r < rows) {
+            for (int o = 2; o < 32 / S; o <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o));
+            if ((lane & (32 / S - 1)) == 0 && j < n && row0 + r < rows) {
                 size_t idx = (size_t)j * out_stride + out_off + row0 + r;
                 out[idx] = accumulate ? out[idx] + v : v;
             }
@@ -1387,6 +1423,8 @@ extern "C" {
 // the batch instances get a register budget, so the compiler cannot hoist every token's loads at once
 #define DP4A_ARGS w, wd, xq, xd, xs, out, rows, cols, n, accumulate, out_stride, out_off
 __global__ void matmul_q4k_dp4a(DP4A_PARAMS) { q4k_dp4a<1, RPW>(DP4A_ARGS); }
+__global__ void matmul_q4k_dp4a_s2(DP4A_PARAMS) { q4k_dp4a<1, 2, 2>(DP4A_ARGS); } // rows of at most 2 super-blocks (32 rows a block)
+__global__ void matmul_q3k_dp4a_r4(DP4A_PARAMS) { q3k_dp4a<1, 4>(DP4A_ARGS); } // tall Q3_K matrices: 4 rows a warp (measured faster from 4096 rows)
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q4k_dp4a8(DP4A_PARAMS) { q4k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
 __global__ void matmul_q6k_dp4a(DP4A_PARAMS) { q6k_dp4a<1, RPW>(DP4A_ARGS); }
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q6k_dp4a8(DP4A_PARAMS) { q6k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
@@ -1434,7 +1472,8 @@ __global__ void moe_down_q5k(const unsigned long long* __restrict__ ptrs, int nk
 __global__ void moe_topk(const float* __restrict__ logits, int ne, int k, const unsigned long long* __restrict__ tab,
                          unsigned long long gb, unsigned long long* __restrict__ ptrs, int* __restrict__ nkp,
                          const float* __restrict__ xb, int dim, int* back) {
-    __shared__ int skey[256];
+    // each logit's key with its index under it (the lower index ranking higher on a tie): one compare a key
+    __shared__ long long skey[256];
     __shared__ int pe[8];
     __shared__ unsigned long long pa[8];
     __shared__ int snk;
@@ -1442,15 +1481,14 @@ __global__ void moe_topk(const float* __restrict__ logits, int ne, int k, const 
     float lv = t < ne ? logits[t] : 0.f;
     if (t < ne) {
         int b = __float_as_int(lv);
-        skey[t] = b ^ (int)(((unsigned)(b >> 31)) >> 1);
+        skey[t] = ((long long)(b ^ (int)(((unsigned)(b >> 31)) >> 1)) << 8) | (255 - t);
     }
     __syncthreads();
     if (t < ne) {
-        int key = skey[t], rank = 0;
-        for (int j = 0; j < ne; j++) {
-            int kj = skey[j];
-            rank += (kj > key) || (kj == key && j < t);
-        }
+        long long key = skey[t];
+        int rank = 0;
+        #pragma unroll 8
+        for (int j = 0; j < ne; j++) rank += skey[j] > key;
         if (rank < k) {
             pe[rank] = t;
             back[rank] = t;
@@ -1503,6 +1541,21 @@ __global__ void moe_down_q4k_n(const unsigned long long* __restrict__ ptrs, cons
     q4k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
                    xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
 }
+// the same for rows of at most 2 super-blocks (16 rows per block: each half-warp its own row)
+__global__ void moe_down_q4k_n2(const unsigned long long* __restrict__ ptrs, const int* __restrict__ nkp, const signed char* __restrict__ xq,
+                                const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    int k = blockIdx.y, nk = *nkp;
+    if (k >= nk) return;
+    q4k_dp4a<1, 1, 2>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
+                      xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
+}
+__global__ void moe_down_q5k_n2(const unsigned long long* __restrict__ ptrs, const int* __restrict__ nkp, const signed char* __restrict__ xq,
+                                const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    int k = blockIdx.y, nk = *nkp;
+    if (k >= nk) return;
+    q5k_dp4a<1, 1, 2>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
+                      xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
+}
 __global__ void moe_down_q5k_n(const unsigned long long* __restrict__ ptrs, const int* __restrict__ nkp, const signed char* __restrict__ xq,
                                const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
     int k = blockIdx.y, nk = *nkp;
@@ -1527,6 +1580,36 @@ __global__ void moe_combine_n(float* __restrict__ x, const float* __restrict__ o
     float v = cpu ? in[32 + i] : 0.f;
     for (int k = 0; k < nk; k++) v += w[k] * outs[(size_t)k * dim + i];
     x[i] += v;
+}
+// the shared expert's gate for gated_add's arithmetic, ahead of it: g[0] = sigmoid(w . xb) (one block of 256)
+__global__ void gate_sigmoid(const float* __restrict__ w, const float* __restrict__ xb, float* __restrict__ g, int dim) {
+    __shared__ float sh[32];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) s += w[i] * xb[i];
+    s = block_sum(s, sh);
+    if (threadIdx.x == 0) g[0] = 1.f / (1.f + __expf(-s));
+}
+// moe_combine_n, then gated_add's sum with its gate from gate_sigmoid: one launch, the same arithmetic
+__global__ void moe_combine_gated_n(float* __restrict__ x, const float* __restrict__ outs, const float* __restrict__ in, const int* __restrict__ nkp,
+                                    const float* __restrict__ y, const float* __restrict__ gp, int dim) {
+    __shared__ float w[8];
+    __shared__ int nk, cpu;
+    __shared__ float g;
+    if (threadIdx.x < 8) w[threadIdx.x] = in[threadIdx.x];
+    if (threadIdx.x == 0) {
+        nk = *nkp;
+        cpu = __float_as_int(in[8]) != 0;
+        g = *gp;
+    }
+    __syncthreads();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+    float v = cpu ? in[32 + i] : 0.f;
+    for (int k = 0; k < nk; k++) v += w[k] * outs[(size_t)k * dim + i];
+    float xv = x[i];
+    xv += v;
+    xv += g * y[i];
+    x[i] = xv;
 }
 // x += cpu (the experts computed on the CPU; may be null) + sum over k of wts[k] * outs[k]
 __global__ void moe_combine(float* __restrict__ x, const float* __restrict__ outs, const float* __restrict__ wts, int nk,
@@ -3546,6 +3629,7 @@ __global__ void router_logits1(const float* __restrict__ x, const float* __restr
     const float4* r = reinterpret_cast<const float4*>(R + (size_t)e * dim);
     const float4* v = reinterpret_cast<const float4*>(x);
     float acc = 0.f;
+    #pragma unroll 8 // more loads in flight (the sums keep their order)
     for (int d = lane; d < dim / 4; d += 32) {
         float4 a = r[d], b = v[d];
         acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
@@ -5317,6 +5401,12 @@ struct Kernels {
     silu_q8_n: Ptr,
     moe_down_q4k_n: Ptr,
     moe_down_q5k_n: Ptr,
+    rmsnorm_both: Ptr,
+    gate_sigmoid: Ptr,
+    moe_combine_gated_n: Ptr,
+    moe_down_n2: [Ptr; 2], // [Q4_K | Q5_K] downs of rows of at most 2 super-blocks
+    matmul_q4k_dp4a_s2: Ptr,
+    matmul_q3k_dp4a_r4: Ptr,
     moe_combine_n: Ptr,
     moe_combine: Ptr,
     router_logits: Ptr,
@@ -5553,6 +5643,12 @@ impl Kernels {
                 silu_q8_n: get("silu_q8_n")?,
                 moe_down_q4k_n: get("moe_down_q4k_n")?,
                 moe_down_q5k_n: get("moe_down_q5k_n")?,
+                rmsnorm_both: get("rmsnorm_both")?,
+                gate_sigmoid: get("gate_sigmoid")?,
+                moe_combine_gated_n: get("moe_combine_gated_n")?,
+                moe_down_n2: [get("moe_down_q4k_n2")?, get("moe_down_q5k_n2")?],
+                matmul_q4k_dp4a_s2: get("matmul_q4k_dp4a_s2")?,
+                matmul_q3k_dp4a_r4: get("matmul_q3k_dp4a_r4")?,
                 moe_combine_n: get("moe_combine_n")?,
                 moe_combine: get("moe_combine")?,
                 router_logits: get("router_logits")?,
@@ -8149,10 +8245,13 @@ impl GpuModel {
                 continue;
             }
             let rpw = if m.fmt == Fmt::Q8 { 1 } else if n > 1 { batch_rpw() } else { kq_rpw() };
-            let func = if m.fmt == Fmt::Q3K { k.matmul_q3k_dp4a[(n > 1) as usize] } else { k.matmul_dp4a[m.fmt as usize][(n > 1) as usize] };
+            let s2 = n == 1 && m.fmt == Fmt::Q4K && m.cols <= 512; // half a warp per row, 2 rows each
+            let r4 = n == 1 && m.fmt == Fmt::Q3K && m.rows >= 4096 && kq_rpw() == 1;
+            let func = if s2 { k.matmul_q4k_dp4a_s2 } else if r4 { k.matmul_q3k_dp4a_r4 } else if m.fmt == Fmt::Q3K { k.matmul_q3k_dp4a[(n > 1) as usize] } else { k.matmul_dp4a[m.fmt as usize][(n > 1) as usize] };
+            let per_block = if s2 { 32 } else if r4 { 32 } else { 8 * rpw };
             k.launch(
                 func,
-                (m.rows.div_ceil(8 * rpw) as u32, 1),
+                (m.rows.div_ceil(per_block) as u32, 1),
                 256,
                 0,
                 &[Arg::P(m.q.ptr), Arg::P(m.d_ptr()), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(m.rows as i32), Arg::I(m.cols as i32), Arg::I(n as i32), Arg::I(accumulate as i32), Arg::I(out_stride as i32), Arg::I(off as i32)],
@@ -8600,18 +8699,30 @@ impl GpuModel {
         }
         let mut picks = Vec::new();
         if want == Out::Last {
+            let tw = moe_stats_on().then(Instant::now);
             self.k.d2h(&mut s.logits, s.logits_dev.ptr)?;
+            if let Some(t) = tw {
+                moe_stat(MS_TAILWAIT, t.elapsed().as_nanos() as u64);
+            }
         } else if want == Out::All {
             s.rows.resize(n * s.logits.len(), 0.0);
             self.k.d2h(&mut s.rows, s.logits_dev.ptr)?;
         } else if want == Out::Argmax {
             let mut ids = vec![0i32; n];
+            let tw = moe_stats_on().then(Instant::now);
             self.k.d2h(&mut ids, s.picks.ptr)?;
+            if let Some(t) = tw {
+                moe_stat(MS_TAILWAIT, t.elapsed().as_nanos() as u64);
+            }
             picks = ids.into_iter().map(|i| i as u32).collect();
         }
         s.pos += n;
+        let tt = moe_stats_on().then(Instant::now);
         if let Some(cache) = self.cache.borrow_mut().as_mut() {
             cache.tick(n);
+        }
+        if let Some(t) = tt {
+            moe_stat(MS_TICK, t.elapsed().as_nanos() as u64);
         }
         Ok(picks)
     }
@@ -8654,8 +8765,8 @@ impl GpuModel {
         let (c, k) = (&self.cfg, &self.k);
         let cache = self.cache.borrow();
         let cache = cache.as_ref().ok_or("the expert cache is not made yet")?;
-        k.launch(k.rmsnorm, (1, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
-        k.launch(k.rmsnorm_q8, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
+        // rmsnorm and rmsnorm_q8 as one launch (each one's arithmetic)
+        k.launch(k.rmsnorm_both, (1, 1), 1024, 0, &[Arg::P(s.x.ptr), Arg::P(layer.ffn_norm.ptr), Arg::P(s.xb.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(c.dim as i32), Arg::F(c.norm_eps)])?;
         let ne = c.n_experts;
         k.launch(k.router_logits1, (ne.div_ceil(2) as u32, 1), 64, 0, &[Arg::P(s.xb.ptr), Arg::P(cache.routers[l].ptr), Arg::P(s.xb.ptr + (c.dim * 4) as u64), Arg::I(c.dim as i32), Arg::I(ne as i32)])
     }
@@ -9055,6 +9166,28 @@ impl GpuModel {
         }
     }
 
+    /// A gated shared expert in two parts, for moe_step_routed: its SwiGLU into s.att (`compute`, queued after the
+    /// layer's cached experts, so it runs while the CPU computes the others), then its gated sum into s.x (after
+    /// the experts' sums, as moe_shared adds it). Ok(false): not a gated shared expert (moe_shared as one piece).
+    fn moe_shared_part(&self, layer: &GpuLayer, s: &GpuSession, compute: bool) -> Result<bool, String> {
+        static LATE: OnceLock<bool> = OnceLock::new(); // GHOST_INFER_SHARED_LATE=1: the whole shared expert at the next graph's head
+        let GpuFfn::Moe { shared: Some((gate_up, down)), gate: Some(g) } = &layer.ffn else { return Ok(false) };
+        if *LATE.get_or_init(|| std::env::var_os("GHOST_INFER_SHARED_LATE").is_some()) {
+            return Ok(false);
+        }
+        let (k, dim) = (&self.k, self.cfg.dim);
+        if compute {
+            self.swiglu_to(gate_up, down, &layer.ffn_norm, Some(s.xb.ptr), 1, s, s.att.ptr, false)?;
+            if s.att.bytes >= (dim + 1) * 4 {
+                // its gate too (after the output in s.att), for moe_combine_gated_n
+                k.launch(k.gate_sigmoid, (1, 1), 256, 0, &[Arg::P(g.ptr), Arg::P(s.xb.ptr), Arg::P(s.att.ptr + (dim * 4) as u64), Arg::I(dim as i32)])?;
+            }
+        } else {
+            k.launch(k.gated_add, (1, 1), 256, 0, &[Arg::P(s.x.ptr), Arg::P(s.att.ptr), Arg::P(g.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32)])?;
+        }
+        Ok(true)
+    }
+
     /// A SwiGLU block added to s.x: [gate | up] from RMSNorm(s.x) with `norm` (or from `normed`, already
     /// normed input), then down.
     fn swiglu(&self, gate_up: &[(GpuMatrix, usize)], down: &GpuMatrix, norm: &DeviceBuf, normed: Option<u64>, n: usize, s: &GpuSession) -> Result<(), String> {
@@ -9313,6 +9446,15 @@ impl GpuModel {
         let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
         let (dim, ne, top, ffn) = (c.dim, c.n_experts, c.n_experts_used, c.expert_ffn_dim);
         let layers = self.layers.len();
+        let t_step = moe_stats_on().then(Instant::now);
+        if let Some(t) = t_step {
+            if let Some(e) = MS_LAST_END.lock().unwrap().take() {
+                let ns = (t - e).as_nanos() as u64;
+                if ns < 200_000_000 {
+                    moe_stat(MS_BETWEEN, ns);
+                }
+            }
+        }
         if s.moe_graphs.len() != layers || s.route_back.is_none() {
             s.drop_graphs(); // graphs of moe_step_graphed, if any: other kernels
             s.moe_graphs = vec![std::ptr::null_mut(); layers];
@@ -9342,7 +9484,15 @@ impl GpuModel {
         // the last layer's experts and shared expert, at the head of the next stretch
         let finish = |l: usize, sess: &GpuSession| -> Result<(), String> {
             if is_moe(l) {
+                let gated = matches!(&self.layers[l].ffn, GpuFfn::Moe { shared: Some(_), gate: Some(_) });
+                if gated && std::env::var_os("GHOST_INFER_SHARED_LATE").is_none() && sess.att.bytes >= (dim + 1) * 4 {
+                    // the experts' sums and the shared expert's gated one (computed in the last graph) in one launch
+                    return k.launch(k.moe_combine_gated_n, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(sess.x.ptr), Arg::P(sess.h.ptr), Arg::P(input), Arg::P(nkp), Arg::P(sess.att.ptr), Arg::P(sess.att.ptr + (dim * 4) as u64), Arg::I(dim as i32)]);
+                }
                 k.launch(k.moe_combine_n, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(sess.x.ptr), Arg::P(sess.h.ptr), Arg::P(input), Arg::P(nkp), Arg::I(dim as i32)])?;
+                if self.moe_shared_part(&self.layers[l], sess, false)? {
+                    return Ok(());
+                }
             }
             self.moe_shared(&self.layers[l], 1, sess)
         };
@@ -9350,7 +9500,9 @@ impl GpuModel {
             let moe_layer = is_moe(l);
             if s.moe_graphs[l].is_null() {
                 let gb = self.cache.borrow().as_ref().map_or(0, |c| c.gate_bytes[l]) as u64;
-                let down = if moe_layer && moe.tensors[l][2].ty == GgmlType::Q5K { k.moe_down_q5k_n } else { k.moe_down_q4k_n };
+                let q5 = moe_layer && moe.tensors[l][2].ty == GgmlType::Q5K;
+                let half = ffn <= 512; // half a warp per row: twice the rows per block
+                let down = if half { k.moe_down_n2[q5 as usize] } else if q5 { k.moe_down_q5k_n } else { k.moe_down_q4k_n };
                 let sess = &*s;
                 let g = capture(&|| {
                     match l {
@@ -9367,7 +9519,9 @@ impl GpuModel {
                     k.launch(k.moe_topk, (1, 1), 256, 0, &[Arg::P(logits), Arg::I(ne as i32), Arg::I(top as i32), Arg::P(tab + (l * ne * 8) as u64), Arg::P(gb), Arg::P(ptrs), Arg::P(nkp), Arg::P(sess.xb.ptr), Arg::I(dim as i32), Arg::P(back)])?;
                     k.launch(k.moe_gate_up_q3k_n, (rows.div_ceil(8) as u32, (2 * top) as u32), 256, 0, &[Arg::P(ptrs), Arg::P(nkp), Arg::P(sess.xq.ptr), Arg::P(sess.xd.ptr), Arg::P(sess.xsum.ptr), Arg::P(sess.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
                     k.launch(k.silu_q8_n, ((ffn / 4).div_ceil(256) as u32, top as u32), 256, 0, &[Arg::P(sess.gu.ptr), Arg::P(sess.xq.ptr), Arg::P(sess.xd.ptr), Arg::P(sess.xsum.ptr), Arg::I(ffn as i32), Arg::P(nkp)])?;
-                    k.launch(down, (dim.div_ceil(8) as u32, top as u32), 256, 0, &[Arg::P(ptrs), Arg::P(nkp), Arg::P(sess.xq.ptr), Arg::P(sess.xd.ptr), Arg::P(sess.xsum.ptr), Arg::P(sess.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32)])
+                    k.launch(down, (dim.div_ceil(if half { 16 } else { 8 }) as u32, top as u32), 256, 0, &[Arg::P(ptrs), Arg::P(nkp), Arg::P(sess.xq.ptr), Arg::P(sess.xd.ptr), Arg::P(sess.xsum.ptr), Arg::P(sess.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32)])?;
+                    // the shared expert's matmuls now, while the CPU works (its sum goes in at the next graph's head)
+                    self.moe_shared_part(layer, sess, true).map(|_| ())
                 })?;
                 s.moe_graphs[l] = g;
             }
@@ -9398,7 +9552,12 @@ impl GpuModel {
             s.moe_tail[slot] = g;
         }
         std::sync::atomic::fence(Ordering::SeqCst);
-        a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_tail[slot], k.stream) }, "graph launch")
+        a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_tail[slot], k.stream) }, "graph launch")?;
+        if let Some(t) = t_step {
+            moe_stat(MS_STEP, t.elapsed().as_nanos() as u64);
+            *MS_LAST_END.lock().unwrap() = Some(Instant::now());
+        }
+        Ok(())
     }
 
     /// The host's part of a GPU-routed layer step: waits for moe_topk's word, weights its picks as model::route
@@ -10215,7 +10374,12 @@ const MOE_GPU_MIN_BATCH: usize = 32;
 /// GHOST_INFER_MOE_STATS=1: where a mixture of experts' one-token steps go. Per layer step: picks found in the
 /// expert cache and not; time waiting for the GPU (the copy to the host), routing, the CPU's experts, the copy
 /// back, and the cache's bookkeeping; uploads queued.
-static MOE_STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static MOE_STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+const MS_TAILWAIT: usize = 14; // the step's result copied back (waits for the tail)
+const MS_TICK: usize = 15; // the expert cache's tick after a step
+const MS_STEP: usize = 12; // a GPU-routed token's step, entry to its last launch
+const MS_BETWEEN: usize = 13; // from one routed step's end to the next's start (the tail on the GPU, the caller's work)
+static MS_LAST_END: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 const MS_GRAPH: usize = 11; // host time inside the per-layer graph launches (moe_step_graphed)
 const MS_UPLOADS: usize = 8;
 const MS_DISPATCH: usize = 9; // the cached experts' table written and their kernels queued
@@ -10264,7 +10428,7 @@ pub fn moe_stats_take(tokens: usize) -> Option<String> {
     let (faults, working_set) = os::page_faults();
     let new_faults = faults.saturating_sub(FAULTS.swap(faults, Ordering::Relaxed));
     Some(format!(
-        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache, {:.1} uploads and {:.0} page faults per token (working set {} MB); per token: waiting for the GPU {:.2} ms, routing {:.2} ms, GPU experts queued {:.2} ms, CPU experts {:.2} ms in {:.1} calls of {:.0} us, copy back {:.2} ms, cache upkeep {:.2} ms, graph launches {:.2} ms{}]",
+        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache, {:.1} uploads and {:.0} page faults per token (working set {} MB); per token: waiting for the GPU {:.2} ms, routing {:.2} ms, GPU experts queued {:.2} ms, CPU experts {:.2} ms in {:.1} calls of {:.0} us, copy back {:.2} ms, cache upkeep {:.2} ms, graph launches {:.2} ms; routed step {:.2} ms, between steps {:.2} ms (result copy {:.2}, cache tick {:.2}){}]",
         v[MS_STEPS],
         100.0 * hits,
         v[MS_UPLOADS] as f64 / tokens,
@@ -10279,6 +10443,10 @@ pub fn moe_stats_take(tokens: usize) -> Option<String> {
         ms(MS_BACK),
         ms(MS_NOTE),
         ms(MS_GRAPH),
+        ms(MS_STEP),
+        ms(MS_BETWEEN),
+        ms(MS_TAILWAIT),
+        ms(MS_TICK),
         match ram_floor_mb() {
             0 => String::new(),
             mb => format!("; RAM floor {mb} MB, {} MB of experts released for it so far, {} MB available", RAM_RELEASED.load(Ordering::Relaxed) >> 20, os::available_ram() >> 20),
