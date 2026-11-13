@@ -1422,6 +1422,112 @@ __global__ void moe_down_q5k(const unsigned long long* __restrict__ ptrs, int nk
     q5k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
                    xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
 }
+// ---- GPU routing: a one-token MoE step whose router, expert choice and cached experts run inside the
+// layer's graph (GpuModel::moe_step_routed), the host only computing the uncached experts in between ----
+// The token's k experts as model::route picks them: descending logit in f32 total order (Rust's total_cmp:
+// the bits, the magnitude flipped for negatives, compared as signed ints), ties to the lower index. Each
+// pick's cache slot address comes from tab (mapped host memory: the layer's row, 0 when not cached); the
+// cached picks' table (gate, up per pick, then the downs) goes to ptrs and their count to *nkp, in pick
+// order. back (mapped host memory, ints): [0, 8) the picks, [8, 16) their logits' bits, [16, 24) cached
+// or not, [24] the count, from 32 the normed row (only when some pick is not cached: the CPU needs it), and
+// [31] = 1 last, after every thread's writes are fenced.
+__global__ void moe_topk(const float* __restrict__ logits, int ne, int k, const unsigned long long* __restrict__ tab,
+                         unsigned long long gb, unsigned long long* __restrict__ ptrs, int* __restrict__ nkp,
+                         const float* __restrict__ xb, int dim, int* back) {
+    __shared__ int skey[256];
+    __shared__ int pe[8];
+    __shared__ unsigned long long pa[8];
+    __shared__ int snk;
+    int t = threadIdx.x;
+    float lv = t < ne ? logits[t] : 0.f;
+    if (t < ne) {
+        int b = __float_as_int(lv);
+        skey[t] = b ^ (int)(((unsigned)(b >> 31)) >> 1);
+    }
+    __syncthreads();
+    if (t < ne) {
+        int key = skey[t], rank = 0;
+        for (int j = 0; j < ne; j++) {
+            int kj = skey[j];
+            rank += (kj > key) || (kj == key && j < t);
+        }
+        if (rank < k) {
+            pe[rank] = t;
+            back[rank] = t;
+            back[8 + rank] = __float_as_int(lv);
+        }
+    }
+    __syncthreads();
+    if (t < k) {
+        pa[t] = tab[pe[t]];
+        back[16 + t] = pa[t] != 0ull;
+    }
+    __syncthreads();
+    if (t == 0) {
+        int nk = 0;
+        for (int r = 0; r < k; r++) nk += pa[r] != 0ull;
+        int h = 0;
+        for (int r = 0; r < k; r++)
+            if (pa[r]) {
+                ptrs[2 * h] = pa[r];
+                ptrs[2 * h + 1] = pa[r] + gb;
+                ptrs[2 * nk + h] = pa[r] + 2 * gb;
+                h++;
+            }
+        *nkp = nk;
+        back[24] = nk;
+        snk = nk;
+    }
+    __syncthreads();
+    if (snk < k) {
+        float* row = reinterpret_cast<float*>(back + 32);
+        for (int i = t; i < dim; i += blockDim.x) row[i] = xb[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        __threadfence_system();
+        *reinterpret_cast<volatile int*>(back + 31) = 1;
+    }
+}
+// the cached experts with their count from the router (*nkp): blocks past it do nothing
+__global__ void moe_gate_up_q3k_n(const unsigned long long* __restrict__ ptrs, const int* __restrict__ nkp, const signed char* __restrict__ xq,
+                                  const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    if ((int)blockIdx.y >= 2 * *nkp) return;
+    q3k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[blockIdx.y]), nullptr, xq, xd, xs, out + (size_t)blockIdx.y * rows, rows, cols, 1, 0, 0, 0);
+}
+__global__ void moe_down_q4k_n(const unsigned long long* __restrict__ ptrs, const int* __restrict__ nkp, const signed char* __restrict__ xq,
+                               const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    int k = blockIdx.y, nk = *nkp;
+    if (k >= nk) return;
+    q4k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
+                   xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
+}
+__global__ void moe_down_q5k_n(const unsigned long long* __restrict__ ptrs, const int* __restrict__ nkp, const signed char* __restrict__ xq,
+                               const float* __restrict__ xd, const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    int k = blockIdx.y, nk = *nkp;
+    if (k >= nk) return;
+    q5k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
+                   xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
+}
+// moe_combine for the GPU-routed step, at the head of the next layer's graph: the cached experts' weights and
+// the CPU's sum come from mapped host memory (in: [0, 8) the weights in pick order, [8] whether the CPU added
+// anything, from 32 its sum), the count from the router. The same arithmetic as moe_combine.
+__global__ void moe_combine_n(float* __restrict__ x, const float* __restrict__ outs, const float* __restrict__ in, const int* __restrict__ nkp, int dim) {
+    __shared__ float w[8];
+    __shared__ int nk, cpu;
+    if (threadIdx.x < 8) w[threadIdx.x] = in[threadIdx.x];
+    if (threadIdx.x == 0) {
+        nk = *nkp;
+        cpu = __float_as_int(in[8]) != 0;
+    }
+    __syncthreads();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+    float v = cpu ? in[32 + i] : 0.f;
+    for (int k = 0; k < nk; k++) v += w[k] * outs[(size_t)k * dim + i];
+    x[i] += v;
+}
 // x += cpu (the experts computed on the CPU; may be null) + sum over k of wts[k] * outs[k]
 __global__ void moe_combine(float* __restrict__ x, const float* __restrict__ outs, const float* __restrict__ wts, int nk,
                             const float* __restrict__ cpu, int dim) {
@@ -3317,10 +3423,21 @@ __global__ void __launch_bounds__(128) matmul_mma_q6k(MMA_K_ARGS) { mma_kquant<2
 
 // Decode: h = silu(gate) * up straight to int8 activations for the down projection (ffn a multiple of 32),
 // one token per grid row.
+__device__ __forceinline__ void silu_q8_row(const float* __restrict__ gu, signed char* __restrict__ xq, float* __restrict__ xd,
+                                            int* __restrict__ xsum, int ffn, size_t r);
 __global__ void silu_q8(const float* __restrict__ gu, signed char* __restrict__ xq, float* __restrict__ xd,
                         int* __restrict__ xsum, int ffn) {
+    silu_q8_row(gu, xq, xd, xsum, ffn, blockIdx.y);
+}
+// silu_q8 for the GPU-routed step's cached experts: rows past the count the router wrote (*nkp) do nothing
+__global__ void silu_q8_n(const float* __restrict__ gu, signed char* __restrict__ xq, float* __restrict__ xd,
+                          int* __restrict__ xsum, int ffn, const int* __restrict__ nkp) {
+    if ((int)blockIdx.y >= *nkp) return;
+    silu_q8_row(gu, xq, xd, xsum, ffn, blockIdx.y);
+}
+__device__ __forceinline__ void silu_q8_row(const float* __restrict__ gu, signed char* __restrict__ xq, float* __restrict__ xd,
+                                            int* __restrict__ xsum, int ffn, size_t r) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, nv = ffn >> 2;
-    size_t r = blockIdx.y;
     gu += r * 2 * ffn;
     xq += r * ffn;
     xd += r * (ffn >> 5);
@@ -4816,6 +4933,8 @@ api! {
     cuStreamSynchronize: fn(Ptr) -> CuResult;
     cuStreamDestroy_v2: fn(Ptr) -> CuResult;
     cuMemAllocHost_v2: fn(*mut *mut c_void, usize) -> CuResult;
+    cuMemHostAlloc: fn(*mut *mut c_void, usize, u32) -> CuResult;
+    cuMemHostGetDevicePointer_v2: fn(*mut u64, *mut c_void, u32) -> CuResult;
     cuMemFreeHost: fn(*mut c_void) -> CuResult;
     cuMemcpyHtoDAsync_v2: fn(u64, *const c_void, usize, Ptr) -> CuResult;
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, u64, usize, Ptr) -> CuResult;
@@ -4994,6 +5113,52 @@ impl HostBuf {
     }
 }
 
+/// Page-locked system memory mapped into the GPU's address space: kernels read and write it in place over PCIe
+/// (no copy call), for the few bytes a GPU-routed MoE step passes each layer (GpuModel::moe_step_routed).
+struct MappedBuf {
+    host: *mut c_void,
+    dev: u64,
+    bytes: usize,
+}
+
+unsafe impl Send for MappedBuf {}
+
+impl MappedBuf {
+    fn alloc(bytes: usize) -> Result<MappedBuf, String> {
+        let a = api()?;
+        const DEVICEMAP: u32 = 0x02; // CU_MEMHOSTALLOC_DEVICEMAP
+        let mut host: *mut c_void = std::ptr::null_mut();
+        a.check(unsafe { (a.f.cuMemHostAlloc)(&mut host, bytes.max(4), DEVICEMAP) }, "alloc mapped memory")?;
+        unsafe { std::ptr::write_bytes(host as *mut u8, 0, bytes.max(4)) };
+        let mut dev = 0u64;
+        let got = unsafe { (a.f.cuMemHostGetDevicePointer_v2)(&mut dev, host, 0) };
+        if got != 0 {
+            unsafe { (a.f.cuMemFreeHost)(host) };
+            a.check(got, "map host memory")?;
+        }
+        Ok(MappedBuf { host, dev, bytes })
+    }
+
+    /// Element `i` of the buffer as `T`s, read as the GPU may have written it.
+    fn get<T: Copy>(&self, i: usize) -> T {
+        debug_assert!((i + 1) * size_of::<T>() <= self.bytes);
+        unsafe { std::ptr::read_volatile((self.host as *const T).add(i)) }
+    }
+
+    fn set<T: Copy>(&self, i: usize, v: T) {
+        debug_assert!((i + 1) * size_of::<T>() <= self.bytes);
+        unsafe { std::ptr::write_volatile((self.host as *mut T).add(i), v) };
+    }
+}
+
+impl Drop for MappedBuf {
+    fn drop(&mut self) {
+        if let Ok(a) = api() {
+            unsafe { (a.f.cuMemFreeHost)(self.host) };
+        }
+    }
+}
+
 /// A session's state copied to system memory (GpuSession::keep), about 300 MB for a 4,000-token opening of a 27B.
 pub struct SavedState {
     pos: usize,
@@ -5147,6 +5312,12 @@ struct Kernels {
     moe_gate_up_q3k: Ptr,
     moe_down_q4k: Ptr,
     moe_down_q5k: Ptr,
+    moe_topk: Ptr,
+    moe_gate_up_q3k_n: Ptr,
+    silu_q8_n: Ptr,
+    moe_down_q4k_n: Ptr,
+    moe_down_q5k_n: Ptr,
+    moe_combine_n: Ptr,
     moe_combine: Ptr,
     router_logits: Ptr,
     router_logits1: Ptr,
@@ -5377,6 +5548,12 @@ impl Kernels {
                 moe_gate_up_q3k: get("moe_gate_up_q3k")?,
                 moe_down_q4k: get("moe_down_q4k")?,
                 moe_down_q5k: get("moe_down_q5k")?,
+                moe_topk: get("moe_topk")?,
+                moe_gate_up_q3k_n: get("moe_gate_up_q3k_n")?,
+                silu_q8_n: get("silu_q8_n")?,
+                moe_down_q4k_n: get("moe_down_q4k_n")?,
+                moe_down_q5k_n: get("moe_down_q5k_n")?,
+                moe_combine_n: get("moe_combine_n")?,
                 moe_combine: get("moe_combine")?,
                 router_logits: get("router_logits")?,
                 router_logits1: get("router_logits1")?,
@@ -6625,6 +6802,9 @@ struct ExpertCache {
     /// per layer: its gate (= up) matrix as it sits in a slot (Q3_K repacked; 2-bit as in the file), down after both
     gate_bytes: Vec<usize>,
     slot_of: Vec<Vec<i32>>,             // [layer][expert] -> slot, or -1
+    /// slot_of as the GPU-routed step reads it (moe_topk): per (layer, expert), its slot's address or 0, in mapped
+    /// host memory; made by route_table, then kept in step by set_slot
+    dev_tab: Option<MappedBuf>,
     owner: Vec<Option<(usize, usize)>>, // per slot: (layer, expert)
     free: Vec<usize>,
     used: Vec<u64>,          // per slot: the layer step that last picked its expert (u64::MAX: being copied)
@@ -6720,6 +6900,7 @@ impl ExpertCache {
             slot_bytes,
             gate_bytes,
             slot_of: vec![vec![-1; cfg.n_experts]; cfg.n_layers],
+            dev_tab: None,
             freq: vec![vec![0; cfg.n_experts]; cfg.n_layers],
             owner: Vec::new(),
             free: Vec::new(),
@@ -6780,8 +6961,9 @@ impl ExpertCache {
         let mut freed = 0;
         while freed < bytes {
             let Some((buf, first)) = self.blocks.pop() else { break };
-            for (l, e) in self.owner.drain(first..).flatten() {
-                self.slot_of[l][e] = -1;
+            let gone: Vec<(usize, usize)> = self.owner.drain(first..).flatten().collect();
+            for (l, e) in gone {
+                self.set_slot(l, e, -1);
                 os::prefetch(&moe.tensors[l].map(|t| (base + t.offset + e * t.stride, t.stride)));
             }
             self.addr.truncate(first);
@@ -6867,6 +7049,30 @@ impl ExpertCache {
     }
 
     /// Device addresses of a cached expert's gate, up and down (a layer-`l` expert).
+    /// Expert e of layer l now in `slot` (-1: in none), in slot_of and in the GPU router's table.
+    fn set_slot(&mut self, l: usize, e: usize, slot: i32) {
+        self.slot_of[l][e] = slot;
+        if let Some(t) = &self.dev_tab {
+            let ne = self.slot_of[0].len();
+            t.set::<u64>(l * ne + e, if slot >= 0 { self.addr[slot as usize] } else { 0 });
+        }
+    }
+
+    /// The GPU router's slot table (made from slot_of on first use): its device address.
+    fn route_table(&mut self) -> Result<u64, String> {
+        if self.dev_tab.is_none() {
+            let (nl, ne) = (self.slot_of.len(), self.slot_of[0].len());
+            let t = MappedBuf::alloc(nl * ne * 8)?;
+            for (l, row) in self.slot_of.iter().enumerate() {
+                for (e, &slot) in row.iter().enumerate() {
+                    t.set::<u64>(l * ne + e, if slot >= 0 { self.addr[slot as usize] } else { 0 });
+                }
+            }
+            self.dev_tab = Some(t);
+        }
+        Ok(self.dev_tab.as_ref().unwrap().dev)
+    }
+
     fn ptrs(&self, slot: usize, l: usize) -> [u64; 3] {
         let (base, gb) = (self.addr[slot], self.gate_bytes[l] as u64);
         [base, base + gb, base + 2 * gb]
@@ -6880,7 +7086,7 @@ impl ExpertCache {
     }
 
     fn landed(&mut self, (l, e, slot): (usize, usize, usize)) {
-        self.slot_of[l][e] = slot as i32;
+        self.set_slot(l, e, slot as i32);
         self.queued[l][e] = false;
         self.used[slot] = self.clock;
         self.uploads += 1;
@@ -6935,7 +7141,7 @@ impl ExpertCache {
                     if !cache_lru() && self.freq[l][e] <= self.freq[ol][oe] {
                         continue;
                     }
-                    self.slot_of[ol][oe] = -1;
+                    self.set_slot(ol, oe, -1);
                     evicted = Some(ranges(ol, oe));
                     s
                 }
@@ -8383,7 +8589,12 @@ impl GpuModel {
             a.check(unsafe { (a.f.cuGraphLaunch)(s.graphs[slot], k.stream) }, "graph launch")?;
         } else if n == 1 && want != Out::None && graphs_enabled() && self.cfg.is_moe() && self.cfg.dim % 4 == 0 && moe_graphs_enabled() {
             self.k.h2d(s.pos_dev.ptr, &[s.pos as i32])?;
-            self.moe_step_graphed(s, want)?;
+            self.expert_cache_ready()?;
+            if self.routed_ok() {
+                self.moe_step_routed(s, want)?;
+            } else {
+                self.moe_step_graphed(s, want)?;
+            }
         } else {
             self.launches(n, s, want, 0, false)?;
         }
@@ -8999,9 +9210,10 @@ impl GpuModel {
         let a = api()?;
         self.expert_cache_ready()?; // the router weights' addresses go into the graphs
         let layers = self.layers.len();
-        if s.moe_graphs.len() != layers {
-            s.drop_graphs();
+        if s.moe_graphs.len() != layers || s.route_back.is_some() {
+            s.drop_graphs(); // (or moe_step_routed's graphs: other kernels)
             s.moe_graphs = vec![std::ptr::null_mut(); layers];
+            (s.route_back, s.route_in) = (None, None);
         }
         let posp = s.pos_dev.ptr;
         let capture = |f: &dyn Fn() -> Result<(), String>| -> Result<Ptr, String> {
@@ -9065,6 +9277,200 @@ impl GpuModel {
         a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_tail[slot], self.k.stream) }, "graph launch")?;
         if let Some(p) = pending {
             self.moe_note(p, s)?;
+        }
+        Ok(())
+    }
+
+    /// Whether one-token steps route on the GPU (moe_step_routed): experts routed by model::route (softmax, not
+    /// deepseek's) among at most 256, at most 8 picked; every MoE layer's experts Q3_K with a Q4_K or Q5_K down
+    /// (the _n kernels) and cacheable; the uncached ones computed on the CPU (not GPU-only). GHOST_INFER_NO_GPU_ROUTE=1
+    /// keeps the host's routing (moe_step_graphed).
+    fn routed_ok(&self) -> bool {
+        static OFF: OnceLock<bool> = OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("GHOST_INFER_NO_GPU_ROUTE").is_some()) {
+            return false;
+        }
+        let c = &self.cfg;
+        let Some(moe) = self.moe.as_ref() else { return false };
+        if c.mla.is_some() || c.n_experts > 256 || c.n_experts_used == 0 || c.n_experts_used > 8 || c.dim % 4 != 0 || c.expert_ffn_dim % 256 != 0 {
+            return false;
+        }
+        let cache = self.cache.borrow();
+        let Some(cache) = cache.as_ref() else { return false };
+        cache.miss_dev.is_empty() && self.layers.iter().enumerate().all(|(l, layer)| !matches!(layer.ffn, GpuFfn::Moe { .. }) || (cache.cacheable[l] && iq2_fmt(&moe.tensors[l]).is_none()))
+    }
+
+    /// A mixture of experts' one-token step with its routing on the GPU: per layer one graph holds the last
+    /// layer's experts summed in (moe_combine_n: its cached ones' outputs, the CPU's sum) and its shared expert,
+    /// this layer's attention, norm and router logits, the expert choice (moe_topk, as model::route makes it, with
+    /// the expert cache's slots from a mapped table) and the cached experts themselves (the _n kernels, sized for
+    /// k picks, reading their count from the GPU). The host waits for the router's word in mapped memory, takes its
+    /// picks, computes the uncached ones (its weights the softmax model::route computes over the same picks), and
+    /// leaves the weights and its sum in mapped memory for the next graph's combine: one launch a layer, no copy
+    /// calls, and the GPU's experts run while the CPU computes its own. The tokens are those of moe_step_graphed.
+    fn moe_step_routed(&self, s: &mut GpuSession, want: Out) -> Result<(), String> {
+        let (a, c, k) = (api()?, &self.cfg, &self.k);
+        let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
+        let (dim, ne, top, ffn) = (c.dim, c.n_experts, c.n_experts_used, c.expert_ffn_dim);
+        let layers = self.layers.len();
+        if s.moe_graphs.len() != layers || s.route_back.is_none() {
+            s.drop_graphs(); // graphs of moe_step_graphed, if any: other kernels
+            s.moe_graphs = vec![std::ptr::null_mut(); layers];
+        }
+        if s.route_back.is_none() {
+            s.route_back = Some(MappedBuf::alloc((ROUTE_ROW + dim) * 4)?);
+            s.route_in = Some(MappedBuf::alloc((ROUTE_ROW + dim) * 4)?);
+        }
+        let tab = self.cache.borrow_mut().as_mut().ok_or("the expert cache is not made yet")?.route_table()?;
+        let (back, input) = (s.route_back.as_ref().unwrap().dev, s.route_in.as_ref().unwrap().dev);
+        let (posp, ptrs, nkp) = (s.pos_dev.ptr, s.moe_tab.ptr, s.moe_tab.ptr + ROUTE_NK as u64);
+        let capture = |f: &dyn Fn() -> Result<(), String>| -> Result<Ptr, String> {
+            const RELAXED: i32 = 2; // CU_STREAM_CAPTURE_MODE_RELAXED
+            a.check(unsafe { (a.f.cuStreamBeginCapture_v2)(k.stream, RELAXED) }, "begin graph capture")?;
+            let launched = f();
+            let mut graph: Ptr = std::ptr::null_mut();
+            let ended = unsafe { (a.f.cuStreamEndCapture)(k.stream, &mut graph) };
+            launched?;
+            a.check(ended, "end graph capture")?;
+            let mut exec: Ptr = std::ptr::null_mut();
+            let made = unsafe { (a.f.cuGraphInstantiateWithFlags)(&mut exec, graph, 0) };
+            unsafe { (a.f.cuGraphDestroy)(graph) };
+            a.check(made, "instantiate graph")?;
+            Ok(exec)
+        };
+        let is_moe = |l: usize| matches!(self.layers[l].ffn, GpuFfn::Moe { .. });
+        // the last layer's experts and shared expert, at the head of the next stretch
+        let finish = |l: usize, sess: &GpuSession| -> Result<(), String> {
+            if is_moe(l) {
+                k.launch(k.moe_combine_n, (dim.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(sess.x.ptr), Arg::P(sess.h.ptr), Arg::P(input), Arg::P(nkp), Arg::I(dim as i32)])?;
+            }
+            self.moe_shared(&self.layers[l], 1, sess)
+        };
+        for (l, layer) in self.layers.iter().enumerate() {
+            let moe_layer = is_moe(l);
+            if s.moe_graphs[l].is_null() {
+                let gb = self.cache.borrow().as_ref().map_or(0, |c| c.gate_bytes[l]) as u64;
+                let down = if moe_layer && moe.tensors[l][2].ty == GgmlType::Q5K { k.moe_down_q5k_n } else { k.moe_down_q4k_n };
+                let sess = &*s;
+                let g = capture(&|| {
+                    match l {
+                        0 => self.embed(1, sess)?,
+                        _ => finish(l - 1, sess)?,
+                    }
+                    self.layer_attn(l, layer, 1, sess, posp, true)?;
+                    if !moe_layer {
+                        return self.ffn(l, layer, 1, sess);
+                    }
+                    self.moe_pre(l, layer, sess)?;
+                    let logits = sess.xb.ptr + (dim * 4) as u64;
+                    let rows = moe.tensors[l][0].rows;
+                    k.launch(k.moe_topk, (1, 1), 256, 0, &[Arg::P(logits), Arg::I(ne as i32), Arg::I(top as i32), Arg::P(tab + (l * ne * 8) as u64), Arg::P(gb), Arg::P(ptrs), Arg::P(nkp), Arg::P(sess.xb.ptr), Arg::I(dim as i32), Arg::P(back)])?;
+                    k.launch(k.moe_gate_up_q3k_n, (rows.div_ceil(8) as u32, (2 * top) as u32), 256, 0, &[Arg::P(ptrs), Arg::P(nkp), Arg::P(sess.xq.ptr), Arg::P(sess.xd.ptr), Arg::P(sess.xsum.ptr), Arg::P(sess.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
+                    k.launch(k.silu_q8_n, ((ffn / 4).div_ceil(256) as u32, top as u32), 256, 0, &[Arg::P(sess.gu.ptr), Arg::P(sess.xq.ptr), Arg::P(sess.xd.ptr), Arg::P(sess.xsum.ptr), Arg::I(ffn as i32), Arg::P(nkp)])?;
+                    k.launch(down, (dim.div_ceil(8) as u32, top as u32), 256, 0, &[Arg::P(ptrs), Arg::P(nkp), Arg::P(sess.xq.ptr), Arg::P(sess.xd.ptr), Arg::P(sess.xsum.ptr), Arg::P(sess.h.ptr), Arg::I(dim as i32), Arg::I(ffn as i32)])
+                })?;
+                s.moe_graphs[l] = g;
+            }
+            if moe_layer {
+                s.route_back.as_ref().unwrap().set::<i32>(ROUTE_READY, 0);
+            }
+            std::sync::atomic::fence(Ordering::SeqCst); // the host's writes to the mapped buffers before the launch
+            let tg = moe_stats_on().then(Instant::now);
+            a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_graphs[l], k.stream) }, "graph launch")?;
+            if let Some(t) = tg {
+                moe_stat(MS_GRAPH, t.elapsed().as_nanos() as u64);
+            }
+            if moe_layer {
+                self.moe_routed_host(l, s)?;
+            }
+        }
+        let slot = match want {
+            Out::Argmax => 1,
+            Out::Hidden => 2,
+            _ => 0,
+        };
+        if s.moe_tail[slot].is_null() {
+            let sess = &*s;
+            let g = capture(&|| {
+                finish(layers - 1, sess)?;
+                self.output(1, sess, want)
+            })?;
+            s.moe_tail[slot] = g;
+        }
+        std::sync::atomic::fence(Ordering::SeqCst);
+        a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_tail[slot], k.stream) }, "graph launch")
+    }
+
+    /// The host's part of a GPU-routed layer step: waits for moe_topk's word, weights its picks as model::route
+    /// does, computes the uncached ones on the CPU and leaves the cached ones' weights and its sum for
+    /// moe_combine_n; then notes the picks in the expert cache (before the next layer's router reads its table).
+    fn moe_routed_host(&self, l: usize, s: &GpuSession) -> Result<(), String> {
+        let c = &self.cfg;
+        let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
+        let (dim, top) = (c.dim, c.n_experts_used);
+        let (back, input) = (s.route_back.as_ref().unwrap(), s.route_in.as_ref().unwrap());
+        let stats = moe_stats_on();
+        let t0 = stats.then(Instant::now);
+        let start = Instant::now();
+        let mut spins = 0u32;
+        while back.get::<i32>(ROUTE_READY) == 0 {
+            spins = spins.wrapping_add(1);
+            if spins % 4096 == 0 && start.elapsed() > std::time::Duration::from_secs(20) {
+                return Err(format!("the GPU router of layer {l} did not answer"));
+            }
+            std::hint::spin_loop();
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        let t1 = stats.then(Instant::now);
+        let mut guard = s.moe.borrow_mut();
+        let h = &mut *guard;
+        // model::route's weights over the GPU's picks (the same picks in the same order: its arithmetic exactly)
+        let logit = |r: usize| f32::from_bits(back.get::<i32>(8 + r) as u32);
+        let max = logit(0);
+        let total: f32 = (0..top).map(|r| (logit(r) - max).exp()).sum();
+        h.picks.clear();
+        h.cpu_picks.clear();
+        let mut nk = 0;
+        for r in 0..top {
+            let (e, w) = (back.get::<i32>(r) as usize, (logit(r) - max).exp() / total);
+            h.picks.push((e, w));
+            if back.get::<i32>(16 + r) != 0 {
+                input.set::<f32>(nk, w);
+                nk += 1;
+            } else {
+                h.cpu_picks.push((e, w));
+            }
+        }
+        debug_assert_eq!(nk as i32, back.get::<i32>(24));
+        let t2 = stats.then(Instant::now);
+        let cpu_k = h.cpu_picks.len();
+        if cpu_k > 0 {
+            h.xb.resize(dim, 0.0);
+            for i in 0..dim {
+                h.xb[i] = back.get::<f32>(ROUTE_ROW + i);
+            }
+            h.acc.clear();
+            h.acc.resize(dim, 0.0);
+            crate::model::moe_experts(c.n_experts, |e| moe.expert(l, e), &h.cpu_picks, cpu_k, &h.xb, dim, &mut h.acc, &mut h.scratch);
+            for (i, &v) in h.acc.iter().enumerate() {
+                input.set::<f32>(ROUTE_ROW + i, v);
+            }
+        }
+        input.set::<i32>(8, (cpu_k > 0) as i32);
+        let t3 = stats.then(Instant::now);
+        if let Some(cache) = self.cache.borrow_mut().as_mut() {
+            cache.note(moe, l, &h.picks, false);
+        }
+        if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
+            let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
+            moe_stat(MS_HITS, nk as u64);
+            moe_stat(MS_MISSES, cpu_k as u64);
+            moe_stat(MS_STEPS, 1);
+            moe_stat(MS_WAIT, ns(t0, t1));
+            moe_stat(MS_ROUTE, ns(t1, t2));
+            moe_stat(MS_CPU, ns(t2, t3));
+            moe_stat(MS_CPU_CALLS, (cpu_k > 0) as u64);
+            moe_stat(MS_NOTE, ns(t3, Instant::now()));
         }
         Ok(())
     }
@@ -9266,6 +9672,10 @@ pub struct GpuSession {
     /// last layer's shared expert with the output, for Last, Argmax and Hidden
     moe_graphs: Vec<Ptr>,
     moe_tail: [Ptr; 3],
+    /// the GPU-routed step's mapped buffers: what moe_topk hands the host (back), and the weights and CPU sum
+    /// moe_combine_n reads (route_in)
+    route_back: Option<MappedBuf>,
+    route_in: Option<MappedBuf>,
     att_scr: DeviceBuf,    // the tiled verify attention's scores and weights (vfy_attention_fits models)
     exact: std::cell::Cell<bool>, // this pass checks a draft: verify kernels, no prompt kernels
     /// Gated DeltaNet layers: every layer's convolution state, then every layer's recurrent state (f32); and
@@ -9376,6 +9786,13 @@ impl LayerCache {
     }
 }
 
+/// The GPU-routed step's mapped buffers (moe_topk, moe_combine_n): the 32-bit word (back) the router sets last,
+/// where the normed row (back) or the CPU's sum (route_in) starts, and where in moe_tab the cached count sits
+/// (after the pointer table's 3 x 8 addresses).
+const ROUTE_READY: usize = 31;
+const ROUTE_ROW: usize = 32;
+const ROUTE_NK: usize = 768;
+
 /// A mixture of experts' one-token steps run on per-layer CUDA graphs (moe_step_graphed) unless
 /// GHOST_INFER_NO_MOE_GRAPH is set (or graphs are off altogether).
 fn moe_graphs_enabled() -> bool {
@@ -9435,6 +9852,8 @@ impl GpuSession {
             graphs: [std::ptr::null_mut(); 3],
             moe_graphs: Vec::new(),
             moe_tail: [std::ptr::null_mut(); 3],
+            route_back: None,
+            route_in: None,
             att_scr: att_scr?,
             exact: Default::default(),
             logits: vec![0.0; cfg.vocab],
