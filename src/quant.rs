@@ -1081,47 +1081,56 @@ pub fn experts_one(experts: &[(Matrix, Matrix, Matrix, f32)], x: &[f32], acc: &m
     sc.h.resize(k * hidden, 0.0);
     sc.hq.shape(k, hidden);
     let pool = crate::pool::pool();
+    // Rows go out in small chunks to whichever thread asks next (an atomic counter), not in equal shares: a
+    // thread slowed by something else on its core (an upload, the driver, the other hyper-thread) then takes
+    // fewer, instead of the whole pass waiting for it. Each row's arithmetic is the same either way.
+    const GU_CHUNK: usize = 48;
+    const DOWN_CHUNK: usize = 128;
     {
-        let (xq, units) = (&sc.xq, k * hidden / QK8_0);
+        let (xq, rows) = (&sc.xq, k * hidden);
         let h = Raw(sc.h.as_mut_ptr());
-        let (hq, hd, hs) = (Raw(sc.hq.quants.as_mut_ptr()), Raw(sc.hq.scales.as_mut_ptr()), Raw(sc.hq.sums.as_mut_ptr()));
-        pool.run(&|t, n| {
-            let mut gv = [0f32; QK8_0];
-            for u in units * t / n..units * (t + 1) / n {
-                let (e, r0) = (u * QK8_0 / hidden, u * QK8_0 % hidden);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        pool.run(&|_, _| loop {
+            let r0 = next.fetch_add(GU_CHUNK, std::sync::atomic::Ordering::Relaxed);
+            if r0 >= rows {
+                break;
+            }
+            for u in r0..(r0 + GU_CHUNK).min(rows) {
+                let (e, r) = (u / hidden, u % hidden);
                 let (gate, up, _, _) = &experts[e];
-                // SAFETY: 32-value block u (of h and of its quantised copy) belongs to this task only
-                let hv = unsafe { std::slice::from_raw_parts_mut(h.at(u * QK8_0), QK8_0) };
-                for (i, (o, g)) in hv.iter_mut().zip(gv.iter_mut()).enumerate() {
-                    *g = dot1(gate, r0 + i, xq.row3(0), x, avx2);
-                    let v = dot1(up, r0 + i, xq.row3(0), x, avx2);
-                    *o = *g / (1.0 + (-*g).exp()) * v;
-                }
-                let q = unsafe { std::slice::from_raw_parts_mut(hq.at(u * QK8_0), QK8_0) };
-                let (d, s) = quantize_block(hv, q);
-                unsafe {
-                    *hd.at(u) = d;
-                    *hs.at(u) = s;
-                }
+                let g = dot1(gate, r, xq.row3(0), x, avx2);
+                let v = dot1(up, r, xq.row3(0), x, avx2);
+                // SAFETY: row u of h belongs to the chunk's thread only
+                unsafe { *h.at(u) = g / (1.0 + (-g).exp()) * v };
             }
         });
+        // the hidden activations quantised here (a microsecond), in 32-value blocks as before
+        for (u, (hv, q)) in sc.h.chunks_exact(QK8_0).zip(sc.hq.quants.chunks_exact_mut(QK8_0)).enumerate() {
+            let (d, s) = quantize_block(hv, q);
+            sc.hq.scales[u] = d;
+            sc.hq.sums[u] = s;
+        }
     }
     {
         let (hq, hf) = (&sc.hq, &sc.h);
         let out = Raw(acc.as_mut_ptr());
-        pool.run(&|t, n| {
-            for r in dim * t / n..dim * (t + 1) / n {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        pool.run(&|_, _| loop {
+            let r0 = next.fetch_add(DOWN_CHUNK, std::sync::atomic::Ordering::Relaxed);
+            if r0 >= dim {
+                break;
+            }
+            for r in r0..(r0 + DOWN_CHUNK).min(dim) {
                 let mut v = 0f32;
                 for (e, (_, _, down, w)) in experts.iter().enumerate() {
                     v += w * dot1(down, r, hq.row3(e), &hf[e * hidden..(e + 1) * hidden], avx2);
                 }
-                // SAFETY: output row r belongs to this task only
+                // SAFETY: output row r belongs to the chunk's thread only
                 unsafe { *out.at(r) += v };
             }
         });
     }
 }
-
 /// SwiGLU front half in one pass: `h[b * rows + r] = silu(gate[r] · x[b]) * (up[r] · x[b])`.
 pub fn gate_up_silu(gate: &Matrix, up: &Matrix, x: &[f32], xq: &QuantizedBatch, h: &mut [f32]) {
     let avx2 = has_avx2();
@@ -1288,6 +1297,41 @@ mod tests {
         let mut acc = vec![0f32; dim];
         let mut sc = ExpertScratch::default();
         let pool = crate::pool::pool();
+        {
+            // the pool on pure arithmetic: each thread the same work, so the wall time stays flat if it scales
+            let mut ts: Vec<f64> = (0..300)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    pool.run(&|i, _| {
+                        let mut v = i as f32 + 1.0;
+                        for _ in 0..40_000 {
+                            v = std::hint::black_box(v * 1.000001 + 0.5);
+                        }
+                        std::hint::black_box(v);
+                    });
+                    t.elapsed().as_secs_f64() * 1e6
+                })
+                .collect();
+            ts.sort_by(f64::total_cmp);
+            eprintln!("pool, same arithmetic per thread: {:.0} us", ts[150]);
+            // per-thread time inside one expert call, through the per-row dots on the thread's own rows
+            let e0 = ex(0);
+            let mut xq0 = QuantizedBatch::default();
+            xq0.quantize(&x, dim);
+            let per: Vec<std::sync::atomic::AtomicU64> = (0..64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+            for _ in 0..300 {
+                pool.run(&|i, nn| {
+                    let t = std::time::Instant::now();
+                    for r in hidden * i / nn..hidden * (i + 1) / nn {
+                        std::hint::black_box(dot1(&e0.0, r, xq0.row3(0), &x, has_avx2()));
+                        std::hint::black_box(dot1(&e0.1, r, xq0.row3(0), &x, has_avx2()));
+                    }
+                    per[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+            let v: Vec<String> = (0..rayon::current_num_threads()).map(|i| format!("{:.0}", per[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 300.0 / 1e3)).collect();
+            eprintln!("gate/up pass per thread (us): {}", v.join(" "));
+        }
         let t = std::time::Instant::now();
         for _ in 0..2000 {
             pool.run(&|_, _| {});
@@ -1314,13 +1358,17 @@ mod tests {
         eprintln!("one Q4_K 512-wide row dot, one thread: {:.3} us", t.elapsed().as_secs_f64() * 1e6 / 100.0 / dim as f64);
         for k in [1usize, 2] {
             for (name, hot) in [("hot", true), ("from RAM", false)] {
-                let reps = 400;
-                let t = std::time::Instant::now();
-                for r in 0..reps {
-                    let es: Vec<_> = (0..k).map(|j| ex(if hot { j } else { (r * k + j) % n })).collect();
-                    experts_one(&es, &x, &mut acc, &mut sc);
-                }
-                let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                // the median of 2000 calls (single calls are noisy: clocks, other programs)
+                let mut times: Vec<f64> = (0..2000)
+                    .map(|r| {
+                        let es: Vec<_> = (0..k).map(|j| ex(if hot { j } else { (r * k + j) % n })).collect();
+                        let t = std::time::Instant::now();
+                        experts_one(&es, &x, &mut acc, &mut sc);
+                        t.elapsed().as_secs_f64() * 1e6
+                    })
+                    .collect();
+                times.sort_by(f64::total_cmp);
+                let us = times[times.len() / 2];
                 let mb = k as f64 * (store[0].0.len() * 2 + store[0].2.len()) as f64 / 1e6;
                 eprintln!("{k} expert(s) {name}: {us:.0} us per call, {:.1} GB/s", mb * 1e3 / us);
             }

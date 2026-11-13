@@ -63,6 +63,14 @@ impl Pool {
         if self.n == 1 {
             return f(0, 1);
         }
+        // a thread that runs pool work does its share on core 0, off the workers' cores: on a worker's other
+        // hyper-thread both would run at half speed, and the pass waits for the slowest
+        CALLER_PINNED.with(|p| {
+            if !p.get() {
+                p.set(true);
+                pin(0, self.n);
+            }
+        });
         // SAFETY: the workers use the job only until they decrement `pending`, and this waits for that
         unsafe { *s.job.get() = std::mem::transmute::<*const (dyn Fn(usize, usize) + Sync + '_), *const Job>(f) };
         s.pending.store(self.n - 1, Ordering::SeqCst);
@@ -97,8 +105,34 @@ fn lower_priority() {
     }
 }
 
+/// Worker i on its own physical core (logical CPU 2i: Windows numbers a core's two hyper-threads next to each
+/// other), so two workers never share one: a parallel pass is as slow as its slowest thread. Only when the
+/// pool has at most one thread per core; GHOST_INFER_POOL_PIN=0 leaves placement to Windows.
+fn pin(i: usize, n: usize) {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn SetThreadAffinityMask(thread: *mut std::ffi::c_void, mask: usize) -> usize;
+        }
+        let logical = thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        if std::env::var("GHOST_INFER_POOL_PIN").is_ok_and(|v| v == "0") || 2 * n > logical || 2 * i >= usize::BITS as usize {
+            return;
+        }
+        // the caller (thread 0) on core 0, both its hyper-threads allowed; workers on cores 1..n
+        let mask = if i == 0 { 3usize } else { 1usize << (2 * i) };
+        unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
+    }
+}
+
+thread_local! {
+    static CALLER_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn worker(s: &'static Shared, i: usize, n: usize) {
     lower_priority();
+    pin(i, n);
     let mut seen = 0u64;
     loop {
         let mut since = Instant::now();
