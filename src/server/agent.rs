@@ -339,7 +339,8 @@ fn approval_group(name: &str) -> Option<&'static str> {
 
 /// Told to the model when tools are on: where it may work, how this computer runs commands, and (when it may
 /// run them) to check what it changes.
-fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String {
+/// `pane`: the client shows web pages itself (the app's preview pane).
+fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json], pane: bool) -> String {
     let list: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
     let where_ = match list.split_first() {
         None => "No working directory is set, so file tools will fail; if you need files, ask the user to pick a folder for this chat.".to_string(),
@@ -361,6 +362,11 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String 
     // dashboard in the side bar, a status over every page) would otherwise become a loose web page
     if names.contains(&"plugin_manager") {
         more.push_str(" To add something to this app itself (a page or dashboard in its side bar, a status shown over every page, a new tool of yours), make a plugin with plugin_manager (its guide first).");
+    }
+    // models open what they make in a browser (start, Start-Process), one window after another, though the
+    // app shows it already
+    if pane {
+        more.push_str(" The app shows web pages beside the chat in its preview pane: an .html file you write or edit appears there by itself. Never open a page or address in a browser yourself (start, Start-Process, explorer); to show the user a page or a web address, open it with run_command (start <file or address>) and ghost shows it in the pane instead.");
     }
     if deferred.iter().any(|t| tool_name(t).starts_with("mcp__")) {
         more.push_str(" More tools are installed (from MCP servers and plugins) and not listed here: when a task needs something your tools above cannot do, search for one with tool_search, using a few words saying what it should do.");
@@ -1677,7 +1683,7 @@ fn prompt_parts(req: &Request, loaded: &Loaded) -> Json {
         (String::new(), String::new())
     } else {
         let schemas = tools.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("\n");
-        (schemas, tool_prompt(&req.folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups)))
+        (schemas, tool_prompt(&req.folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups), req.preview))
     };
     obj(vec![
         ("system", num(n(&req.system) + n(&guide))),
@@ -1842,7 +1848,7 @@ fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, s
     } else {
         req.persona.clone()
     };
-    let system = [me, req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&req.folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups)) },if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let system = [me, req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&req.folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups), req.preview) },if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut messages = Vec::new();
     if !system.is_empty() {
         messages.push(obj(vec![("role", str("system")), ("content", str(&system))]));
@@ -2384,6 +2390,12 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
     }
     if name.starts_with("mcp__") {
         let args = if arguments.trim().is_empty() { Json::Obj(Vec::new()) } else { Json::parse(arguments).unwrap_or(Json::Null) };
+        // a browser server's page shown in the pane too, so the user sees what the model looks at
+        if req.preview && name.ends_with("__browser_navigate") {
+            if let Some(url) = args.get("url").and_then(Json::as_str).filter(|u| u.starts_with("http")) {
+                let _ = emit(out, obj(vec![("type", str("preview")), ("url", str(url))]));
+            }
+        }
         return Ok((super::mcp::call(name, &args), false));
     }
     if name == "remember" || name == "forget" {
@@ -2405,6 +2417,21 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
     // a copy of the settings: a command may run for minutes, and the settings must stay usable meanwhile;
     // the chat's own folders, its working directory first
     let settings = crate::tools::Settings { folders: req.folders.clone(), ..shared.harness.lock().unwrap().clone() };
+    // a command that would open a page in a browser: shown in the app's preview pane instead
+    if req.preview && matches!(name, "run_command" | "start_process") {
+        if let Some(target) = args.get("command").and_then(Json::as_str).and_then(browser_target) {
+            let url = if target.contains("://") && !target.starts_with("file:") {
+                Some(target.clone())
+            } else {
+                let path = target.trim_start_matches("file:///").trim_start_matches("file://");
+                settings.resolve_read(path).ok().and_then(|p| super::preview_url(&p))
+            };
+            if let Some(url) = url {
+                emit(out, obj(vec![("type", str("preview")), ("url", str(&url))]))?;
+                return Ok((format!("Not opened in a browser: {url} is showing in the app's preview pane, beside the chat, where the user sees it. Pages go there; do not open browsers."), false));
+            }
+        }
+    }
     let t = std::time::Instant::now();
     // whole: one too long for the context is saved to a file after (spill)
     let result = crate::tools::run_full(name, &args, &settings, checkpoint).unwrap_or_else(|e| format!("Error: {e}"));
@@ -2414,6 +2441,24 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
         None => result,
     };
     Ok((result, false))
+}
+
+/// The page or web address a command would open in a browser (start, Start-Process, Invoke-Item, explorer, or a
+/// browser's own program, given an address or an .html file), if it is one.
+fn browser_target(command: &str) -> Option<String> {
+    let low = command.to_ascii_lowercase();
+    const OPENERS: [&str; 14] = ["start ", "start-process", "saps ", "invoke-item", "ii ", "explorer", "msedge", "chrome", "firefox", "opera", "brave", "webbrowser", "url.dll", "process]::start"];
+    if !OPENERS.iter().any(|o| low.starts_with(o) || low.contains(&format!(" {o}")) || low.contains(&format!(";{o}")) || low.contains(&format!("&{o}")) || low.contains(&format!("({o}")) || low.contains(&format!("\\{o}")) || low.contains(&format!("/{o}")) || o.contains('.') && low.contains(o) || o.contains(']') && low.contains(o)) {
+        return None;
+    }
+    command
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '(' || c == ')' || c == ',' || c == ';')
+        .map(|w| w.trim_end_matches(['.', '}', '&']))
+        .find(|w| {
+            let l = w.to_ascii_lowercase();
+            l.starts_with("http://") || l.starts_with("https://") || l.starts_with("file:") || l.ends_with(".html") || l.ends_with(".htm")
+        })
+        .map(str::to_string)
 }
 
 /// A web page the model just wrote, shown to the user as it is made, without asking for it: an .html file
@@ -2443,6 +2488,26 @@ fn show_page(out: &mut Out, client_shows: bool, name: &str, args: &Json, setting
     };
     *LAST.lock().unwrap() = Some(url);
     Some(note)
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::browser_target;
+
+    #[test]
+    fn commands_that_open_pages() {
+        assert_eq!(browser_target("start index.html").as_deref(), Some("index.html"));
+        assert_eq!(browser_target("Start-Process \"http://localhost:5173\"").as_deref(), Some("http://localhost:5173"));
+        assert_eq!(browser_target("cd game; start msedge snake.html").as_deref(), Some("snake.html"));
+        assert_eq!(browser_target("& \"C:\\Program Files\\Opera\\opera.exe\" file:///E:/x/a.html").as_deref(), Some("file:///E:/x/a.html"));
+        assert_eq!(browser_target("py -3 -m webbrowser https://example.com").as_deref(), Some("https://example.com"));
+        assert_eq!(browser_target("Invoke-Item .\\out\\report.htm").as_deref(), Some(".\\out\\report.htm"));
+        // not opening anything
+        assert_eq!(browser_target("py -3 -m http.server 8000"), None);
+        assert_eq!(browser_target("Get-Content index.html"), None);
+        assert_eq!(browser_target("curl https://example.com"), None);
+        assert_eq!(browser_target("restart-service x"), None);
+    }
 }
 
 #[cfg(test)]

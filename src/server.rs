@@ -744,7 +744,9 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
     let limit = job.style.sentences;
     let mut all = String::new(); // the reply so far, for its sentences
     let mut tags = job.style.spoken.then(VoiceTags::default);
+    speed::start(ids.len() - reused, t0);
     let result = engine.generate_with(&ids[keep..], max_new, &mut sampler, &mut |id| {
+        speed::token();
         let piece = utf8.push(&tok.token_bytes(id, true));
         let piece = match tags.as_mut() {
             Some(t) => t.push(&piece),
@@ -779,6 +781,7 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
         }
         Ok(true)
     });
+    speed::finish(result.as_ref().ok().map(|st| (st.gen_tokens, st.gen_secs)));
     match result {
         Ok(st) => {
             if !held.is_empty() {
@@ -1649,6 +1652,8 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             }
             return respond(&mut conn, 200, &crate::sysinfo::report(first));
         }
+        // generation speed for a status line (claude-local's): the reply being written (live) or the last one
+        ("GET", "/api/speed") => return respond(&mut conn, 200, &speed::report(current.as_ref().map(|c| c.id.as_str()))),
         ("GET", "/api/progress") => {
             let (done, total, disk_ms, disk) = crate::cuda::PROGRESS.get();
             let body = obj(vec![("done", num(done as f64)), ("total", num(total as f64)), ("disk_ms", num(disk_ms as f64)), ("disk", Json::Bool(disk))]);
@@ -1810,6 +1815,9 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     };
     // tool calls (chat requests with tools): split out of the text, sent as OpenAI's `tool_calls`
     let mut calls = (chat && !request_tools(&body).is_empty()).then(ToolCalls::default);
+    // "reasoning_format": "deepseek" (as llama.cpp takes it; claude-local's router sends it): the thinking goes
+    // out as `reasoning_content`, not inside the content between <think> tags
+    let mut think = (chat && body.get("reasoning_format").and_then(Json::as_str).is_some_and(|f| f != "none")).then(ThinkSplit::default);
     let call_json = |index: usize, name: &str, arguments: &str| -> Json {
         obj(vec![
             ("index", num(index as f64)),
@@ -1840,8 +1848,17 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 Event::Text(t) => text.push_str(&t),
                 Event::Error(code, e) => return respond(&mut conn, code, &error_body(&e)),
                 Event::Done { finish, prompt_tokens, completion_tokens } => {
+                    let mut reasoning = String::new();
+                    if let Some(th) = think.as_mut() {
+                        let (r, c) = th.push(&text);
+                        let (r2, c2) = th.finish();
+                        (reasoning, text) = (r + &r2, c + &c2);
+                    }
                     let c = if chat {
                         let mut message = vec![("role", str("assistant")), ("content", str(&text))];
+                        if !reasoning.is_empty() {
+                            message.push(("reasoning_content", str(reasoning.trim())));
+                        }
                         let mut finish = finish;
                         if let Some(tc) = calls.as_mut() {
                             let (mut content, mut found) = (String::new(), Vec::new());
@@ -1905,6 +1922,20 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         match ev {
             Event::Text(t) if t.is_empty() => {}
             Event::Text(t) => {
+                let t = match think.as_mut() {
+                    Some(th) => {
+                        let (reasoning, content) = th.push(&t);
+                        if !reasoning.is_empty() {
+                            let d = obj(vec![("index", num(0)), ("delta", obj(vec![("reasoning_content", str(&reasoning))])), ("finish_reason", Json::Null)]);
+                            sse(&mut conn, &chunk(vec![d], None)).map_err(|e| e.to_string())?;
+                        }
+                        content
+                    }
+                    None => t,
+                };
+                if t.is_empty() {
+                    continue;
+                }
                 let parts = match calls.as_mut() {
                     Some(tc) => tc.push(&t),
                     None => vec![Part::Text(t)],
@@ -1916,6 +1947,20 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 break;
             }
             Event::Done { finish, prompt_tokens, completion_tokens } => {
+                if let Some(th) = think.as_mut() {
+                    let (reasoning, content) = th.finish();
+                    if !reasoning.is_empty() {
+                        let d = obj(vec![("index", num(0)), ("delta", obj(vec![("reasoning_content", str(&reasoning))])), ("finish_reason", Json::Null)]);
+                        sse(&mut conn, &chunk(vec![d], None)).map_err(|e| e.to_string())?;
+                    }
+                    if !content.is_empty() {
+                        let parts = match calls.as_mut() {
+                            Some(tc) => tc.push(&content),
+                            None => vec![Part::Text(content)],
+                        };
+                        send_parts(&mut conn, parts, &mut first)?;
+                    }
+                }
                 if let Some(tc) = calls.as_mut() {
                     send_parts(&mut conn, tc.finish(), &mut first)?;
                 }
@@ -1931,6 +1976,43 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     }
     sse(&mut conn, "[DONE]").map_err(|e| e.to_string())?;
     conn.write_all(b"0\r\n\r\n").map_err(|e| e.to_string())
+}
+
+/// A streamed reply split into its thinking (inside <think> ... </think>) and the rest, with a tag cut across two
+/// pieces held back until it is whole.
+#[derive(Default)]
+struct ThinkSplit {
+    inside: bool,
+    held: String,
+}
+
+impl ThinkSplit {
+    /// (thinking, content) of this piece
+    fn push(&mut self, piece: &str) -> (String, String) {
+        self.held.push_str(piece);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        loop {
+            let tag = if self.inside { "</think>" } else { "<think>" };
+            if let Some(at) = self.held.find(tag) {
+                let before: String = self.held.drain(..at + tag.len()).take(at).collect();
+                if self.inside { reasoning.push_str(&before) } else { content.push_str(&before) }
+                self.inside = !self.inside;
+                continue;
+            }
+            // keep back a tail that could be the start of the tag
+            let keep = (1..tag.len()).rev().find(|&n| self.held.len() >= n && self.held.is_char_boundary(self.held.len() - n) && tag.starts_with(&self.held[self.held.len() - n..])).unwrap_or(0);
+            let out: String = self.held.drain(..self.held.len() - keep).collect();
+            if self.inside { reasoning.push_str(&out) } else { content.push_str(&out) }
+            break;
+        }
+        // the content's first line break after </think> is the template's, not the reply's
+        (reasoning, content)
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.held);
+        if self.inside { (rest, String::new()) } else { (String::new(), rest) }
+    }
 }
 
 fn rand_suffix() -> u32 {
@@ -2996,5 +3078,96 @@ mod tests {
         parts.extend(tc.finish());
         assert_eq!(parts, vec![Part::Text("Checking.\n".into()), Part::Call { name: "get_time".into(), arguments: r#"{"tz":"UTC","n":2}"#.into() }]);
         assert!(glm_call("get_system_info").is_some_and(|p| p == Part::Call { name: "get_system_info".into(), arguments: "{}".into() }));
+    }
+}
+
+/// Generation speed for /api/speed: the reply being written now, or the last one.
+mod speed {
+    use crate::json::{num, obj, str, Json};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    struct S {
+        live: bool,
+        prompt_new: usize,
+        started: Option<Instant>,  // the request's start (the prompt is read first)
+        first: Option<Instant>,    // its first reply token
+        tokens: usize,
+        last_rate: f64,
+        last_tokens: usize,
+        last_prompt_new: usize,
+        last_prompt_secs: f64,
+    }
+
+    static S: Mutex<S> = Mutex::new(S { live: false, prompt_new: 0, started: None, first: None, tokens: 0, last_rate: 0.0, last_tokens: 0, last_prompt_new: 0, last_prompt_secs: 0.0 });
+
+    /// `started`: when the request began (the prompt it read since then counts for the prompt speed)
+    pub fn start(prompt_new: usize, started: Instant) {
+        let mut s = S.lock().unwrap();
+        (s.live, s.prompt_new, s.started, s.first, s.tokens) = (true, prompt_new, Some(started), None, 0);
+    }
+
+    pub fn token() {
+        let mut s = S.lock().unwrap();
+        if s.first.is_none() {
+            s.first = Some(Instant::now());
+            s.last_prompt_secs = s.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            s.last_prompt_new = s.prompt_new;
+        }
+        s.tokens += 1;
+    }
+
+    /// (tokens, seconds) of the finished reply; None when it failed
+    pub fn finish(done: Option<(usize, f64)>) {
+        let mut s = S.lock().unwrap();
+        s.live = false;
+        if let Some((n, secs)) = done.filter(|&(n, secs)| n > 1 && secs > 0.0) {
+            (s.last_rate, s.last_tokens) = (n as f64 / secs, n);
+        }
+    }
+
+    pub fn report(model: Option<&str>) -> Json {
+        let s = S.lock().unwrap();
+        // live: tokens after the first over the time since it (the first one waits for the prompt)
+        let live_rate = match (s.live, s.first) {
+            (true, Some(f)) if s.tokens > 1 => (s.tokens - 1) as f64 / f.elapsed().as_secs_f64().max(1e-6),
+            _ => 0.0,
+        };
+        let reading = s.live && s.first.is_none();
+        let prompt_rate = if s.last_prompt_secs > 0.0 { s.last_prompt_new as f64 / s.last_prompt_secs } else { 0.0 };
+        obj(vec![
+            ("model", model.map_or(Json::Null, str)),
+            ("generating", Json::Bool(s.live && !reading)),
+            ("reading_prompt", Json::Bool(reading)),
+            ("tok_s", num(if s.live && !reading { live_rate } else { s.last_rate })),
+            ("tokens", num((if s.live { s.tokens } else { s.last_tokens }) as f64)),
+            ("last_tok_s", num(s.last_rate)),
+            ("prompt_tokens", num(s.last_prompt_new as f64)),
+            ("prompt_tok_s", num(prompt_rate)),
+        ])
+    }
+}
+
+#[cfg(test)]
+mod think_split_tests {
+    use super::ThinkSplit;
+
+    /// Thinking and content come apart however the stream cuts the tags.
+    #[test]
+    fn tags_cut_anywhere() {
+        let whole = "<think>\nplan it\n</think>\n\nThe answer <b>.";
+        for cut in 1..whole.len() {
+            if !whole.is_char_boundary(cut) {
+                continue;
+            }
+            let mut s = ThinkSplit::default();
+            let (mut r, mut c) = s.push(&whole[..cut]);
+            let (r2, c2) = s.push(&whole[cut..]);
+            let (r3, c3) = s.finish();
+            r += &(r2 + &r3);
+            c += &(c2 + &c3);
+            assert_eq!(r, "\nplan it\n", "cut {cut}");
+            assert_eq!(c, "\n\nThe answer <b>.", "cut {cut}");
+        }
     }
 }

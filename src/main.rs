@@ -9,6 +9,7 @@ mod lora;
 mod maya1;
 mod mimi;
 mod model;
+mod monitor;
 mod pool;
 mod profile;
 mod quant;
@@ -199,6 +200,8 @@ fn main() -> ExitCode {
         Some("tokenize") if rest.len() == 2 => tokenize(&PathBuf::from(&rest[0]), &rest[1]),
         Some("top") if rest.len() == 2 || (rest.len() == 3 && rest[2] == "--gpu") => top(&PathBuf::from(&rest[0]), &rest[1], rest.len() == 3),
         Some("bench") if !rest.is_empty() => parse_opts(rest).and_then(|o| bench(&o)),
+        // a live view of a running engine's speed: ghost-infer monitor [host:port]
+        Some("monitor") => monitor::run(rest.first().map_or("127.0.0.1:8080", String::as_str)),
         Some("kvcheck") if rest.len() == 4 => rest[3].parse().map_err(|e| format!("tail: {e}")).and_then(|t| kvcheck(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1]), &PathBuf::from(&rest[2]), t)),
         Some("run") if !rest.is_empty() => parse_opts(rest).and_then(|o| run(&o)),
         Some("chat") if !rest.is_empty() => parse_opts(rest).and_then(|o| chat(&o)),
