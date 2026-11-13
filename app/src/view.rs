@@ -371,7 +371,10 @@ impl App {
             }
             list = list.push(button(line).on_press(it.msg).width(Fill).padding([7, 10]).style(move |_, st| row_style(s, st, false)));
         }
-        let card = container(list).padding(6).width(width).style(move |_| container::Style {
+        // a long list (many models) scrolls within the room the window leaves it, else its far end is cut off
+        let room = (self.window.height - pad.top - pad.bottom - 12.0).max(120.0);
+        let list = scrollable(list).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st));
+        let card = container(list).padding(6).width(width).max_height(room).style(move |_| container::Style {
             background: Some(Background::Color(s.menu)),
             border: Border { radius: 12.0.into(), width: 1.0, color: s.line2 },
             ..Default::default()
@@ -1146,7 +1149,8 @@ impl App {
         let changes = card("changes", tr("Changes"), changed, ch.into());
 
         // the model's task list, while it keeps one
-        let done = self.tasks.iter().filter(|t| t.1 == "done").count();
+        // (its own count: `total` above is the context's size)
+        let (done, total) = (self.tasks.iter().filter(|t| t.1 == "done").count(), self.tasks.len());
         let tasks = column(self.tasks.iter().map(|(task, status)| {
             let (mark, mc, tc) = match status.as_str() {
                 "done" => (ic::CHECK, s.ok, s.faint),
@@ -1491,6 +1495,8 @@ impl App {
         }
 
         let first = self.messages.len().saturating_sub(self.shown);
+        // the transcript's text can be selected anywhere and copied (crate::select): its pieces numbered from here
+        crate::select::begin(Color { a: 0.45, ..s.accent });
         let mut items: Vec<Element<'_, Message>> = Vec::new();
         if first > 0 {
             items.push(container(button(text(tf!("Show {} earlier messages", "显示更早的 {} 条消息", first.min(crate::SHOWN))).size(13).color(s.muted)).on_press(Message::ShowEarlier).padding([6, 14]).style(move |_, st| pill(s, st, false))).center_x(Fill).into());
@@ -1503,7 +1509,7 @@ impl App {
             .height(Fill)
             .style(move |t, st| scroll_style(s, t, st));
         let dock = container(column![self.dock_parts()].max_width(740)).center_x(Fill).padding(Padding { top: 0.0, right: 24.0, bottom: 12.0, left: 24.0 });
-        container(column![top, transcript, dock]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into()
+        container(column![top, crate::select::area(transcript), dock]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into()
     }
 
     /// The top-left switch between the app's two modes, as Claude Desktop's: a voice call, or the chat that
@@ -2079,7 +2085,7 @@ impl App {
                     at = r.end;
                 }
                 words.push(iced::widget::span(&t[at..]).color(s.text));
-                rich_text(words).size(15).line_height(1.5).into()
+                crate::select::rich(words).size(15).line_height(1.5).into()
             };
             // files attached to it: chips under the words (the model got them whole, inside the message)
             let (raw, files) = crate::attach::split(m.raw.as_str());
@@ -2095,22 +2101,13 @@ impl App {
                 let chips = row(files.into_iter().map(|(name, lines)| self.file_chip(name, crate::attach::lines(lines), None))).spacing(6).wrap();
                 if raw.is_empty() { chips.into() } else { column![content, chips].spacing(8).into() }
             };
-            // selecting it: the words as text that can be selected and copied
-            let content = match self.selecting.as_ref().filter(|(j, _)| *j == i) {
-                Some((_, c)) => selectable(s, c),
-                None => content,
-            };
             let bubble = container(content).padding([10, 16]).max_width(560).style(move |_| container::Style {
                 background: Some(Background::Color(s.bubble)),
                 border: border::rounded(16),
                 ..Default::default()
             });
-            // under it, shown while the pointer is on it: copy, edit and resend, select text
-            let tools = row![
-                tip_button(s, ic::COPY, tr("Copy"), Message::CopyUser(i)),
-                tip_button(s, ic::EDIT, tr("Edit"), Message::EditMsg(i)),
-                tip_button(s, ic::FILE, tr("Select text"), Message::SelectText(i)),
-            ]
+            // under it, shown while the pointer is on it: copy, edit and resend (its words can be selected as they are)
+            let tools = row![tip_button(s, ic::COPY, tr("Copy"), Message::CopyUser(i)), tip_button(s, ic::EDIT, tr("Edit"), Message::EditMsg(i)),]
             .spacing(2);
             let base = column![row![Space::new().width(Fill), bubble], Space::new().height(30)];
             let top = column![Space::new().height(Fill), row![Space::new().width(Fill), tools]];
@@ -2147,7 +2144,7 @@ impl App {
                         .into(),
                 );
                 if r.think_open {
-                    parts.push(container(text(r.think.as_str()).size(13.5).color(s.muted).line_height(1.55)).padding(Padding { left: 14.0, ..Padding::ZERO }).into());
+                    parts.push(container(crate::select::text(r.think.as_str()).size(13.5).color(s.muted).line_height(1.55).width(Fill)).padding(Padding { left: 14.0, ..Padding::ZERO }).into());
                 }
             }
             if !r.answer.is_empty() {
@@ -2165,13 +2162,8 @@ impl App {
         if !m.plan.is_empty() {
             parts.push(self.finished_plan(&m.plan));
         }
-        // selecting it: its words as text that can be selected and copied, in place of the reply as drawn
-        if let Some((_, c)) = self.selecting.as_ref().filter(|(j, _)| *j == i) {
-            parts.clear();
-            parts.push(selectable(s, c));
-        }
         if !live && (m.rounds.iter().any(|r| !r.answer.is_empty()) || m.changed) {
-            let mut foot = row![tip_button(s, ic::COPY, tr("Copy"), Message::Copy(i)), tip_button(s, ic::FILE, tr("Select text"), Message::SelectText(i))].spacing(2).align_y(Alignment::Center);
+            let mut foot = row![tip_button(s, ic::COPY, tr("Copy"), Message::Copy(i))].spacing(2).align_y(Alignment::Center);
             // any reply can be answered again (an earlier one: what came after it goes)
             if self.busy.is_none() {
                 foot = foot.push(tip_button(s, ic::RETRY, tr("Regenerate"), Message::RegenerateAt(i)));
@@ -2262,7 +2254,7 @@ impl App {
             if !t.open {
                 return line.into();
             }
-            let detail = container(scrollable(text(tool_detail(t)).size(12.5).font(MONO).color(s.muted).line_height(1.45)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
+            let detail = container(scrollable(crate::select::text(tool_detail(t)).size(12.5).font(MONO).color(s.muted).line_height(1.45).width(Fill)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
                 .max_height(260)
                 .width(Fill)
                 .padding([8, 10])
@@ -2280,7 +2272,7 @@ impl App {
         let mut card = column![row![icon(tool_icon(&t.name), 13).color(s.accent), text(what).size(14).font(MEDIUM).color(s.text)].spacing(10).align_y(Alignment::Center)].spacing(10);
         if !preview.is_empty() {
             card = card.push(
-                container(scrollable(text(preview).size(12.5).font(MONO).color(s.text).line_height(1.45)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
+                container(scrollable(crate::select::text(preview).size(12.5).font(MONO).color(s.text).line_height(1.45).width(Fill)).height(Length::Shrink).style(move |t, st| scroll_style(s, t, st)))
                     .max_height(240)
                     .width(Fill)
                     .padding([8, 10])
@@ -2351,9 +2343,28 @@ impl<'a> markdown::Viewer<'a, Message> for Md {
         Message::Link(url)
     }
 
+    // paragraphs, headings and code lines as text that can be selected (crate::select), not iced's rich text
+    fn paragraph(&self, settings: markdown::Settings, t: &markdown::Text) -> Element<'a, Message> {
+        crate::select::rich(t.spans(settings.style)).size(settings.text_size).width(Fill).on_link_click(Self::on_link_click).into()
+    }
+
+    fn heading(&self, settings: markdown::Settings, level: &'a markdown::HeadingLevel, t: &'a markdown::Text, index: usize) -> Element<'a, Message> {
+        use markdown::HeadingLevel as H;
+        let size = match level {
+            H::H1 => settings.h1_size,
+            H::H2 => settings.h2_size,
+            H::H3 => settings.h3_size,
+            H::H4 => settings.h4_size,
+            H::H5 => settings.h5_size,
+            H::H6 => settings.h6_size,
+        };
+        let top = if index > 0 { settings.text_size.0 / 2.0 } else { 0.0 };
+        container(crate::select::rich(t.spans(settings.style)).size(size).width(Fill).on_link_click(Self::on_link_click)).padding(Padding { top, ..Padding::ZERO }).into()
+    }
+
     fn code_block(&self, settings: markdown::Settings, _: Option<&'a str>, _: &'a str, lines: &'a [markdown::Text]) -> Element<'a, Message> {
         let s = self.0;
-        let code = column(lines.iter().map(|line| rich_text(line.spans(settings.style)).on_link_click(Self::on_link_click).font(settings.style.code_block_font).size(settings.code_size).into()));
+        let code = column(lines.iter().map(|line| crate::select::rich(line.spans(settings.style)).on_link_click(Self::on_link_click).font(settings.style.code_block_font).size(settings.code_size).into()));
         let bar = scrollable::Scrollbar::default().width(6).scroller_width(6);
         container(scrollable(container(code).padding([12, 14])).direction(scrollable::Direction::Horizontal(bar)).style(move |t, st| scroll_style(s, t, st)))
             .width(Fill)
@@ -2401,22 +2412,6 @@ fn tip_button<'a>(s: &'static Skin, c: char, tip: &'static str, on_press: Messag
     tooltip(small_button(s, c, on_press), tip, tooltip::Position::Bottom).gap(4).into()
 }
 
-/// A message as selectable text: a read-only editor (iced's text cannot be selected), for copying a part of it.
-fn selectable<'a>(s: &'static Skin, content: &'a text_editor::Content) -> Element<'a, Message> {
-    text_editor(content)
-        .on_action(Message::SelectAction)
-        .size(14.5)
-        .padding([8, 10])
-        .height(Length::Shrink)
-        .style(move |_, _| text_editor::Style {
-            background: Background::Color(s.raise),
-            border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
-            placeholder: s.faint,
-            value: s.text,
-            selection: Color { a: 0.35, ..s.accent },
-        })
-        .into()
-}
 
 // ---- styles
 

@@ -15,6 +15,7 @@ mod i18n;
 mod json;
 mod orb;
 mod preview;
+mod select;
 mod setup;
 mod tray;
 mod view;
@@ -750,7 +751,6 @@ struct App {
     nightly: Json,           // sleep training's settings and state (GET /api/nightly), for its settings page
     learned: Json,           // what it has learned: facts and nights (GET /api/nightly/learned)
     editing: Option<usize>,  // the user message being edited in the box: sending replaces it and the replies after it
-    selecting: Option<(usize, text_editor::Content)>, // a message shown as selectable text (iced text cannot be selected)
     preview_url: Option<String>, // the web page the agent last wrote, for the preview pane
     preview_open: bool,      // the pane is shown
     chip: Option<String>,    // a command or skill picked with /: a chip before the text, sent as /name
@@ -921,8 +921,6 @@ enum Message {
     EditMsg(usize),
     CancelEdit,
     RegenerateAt(usize),
-    SelectText(usize),
-    SelectAction(text_editor::Action),
     Quit,
     System(Result<Json, String>),
     UndoAll,
@@ -1091,7 +1089,6 @@ impl App {
             nightly: Json::Null,
             learned: Json::Null,
             editing: None,
-            selecting: None,
             preview_url: None,
             preview_open: false,
             voice: false,
@@ -1380,6 +1377,7 @@ impl App {
             }
             Message::Agent(ev) => return self.on_event(ev),
             Message::ToggleThinkView(i, k) => {
+                select::clear(); // the pieces after it are numbered anew
                 if let Some(r) = self.messages.get_mut(i).and_then(|m| m.rounds.get_mut(k)) {
                     r.think_open = !r.think_open;
                 }
@@ -1509,6 +1507,7 @@ impl App {
             }
             Message::ToggleCallTyping => self.call_typing = !self.call_typing,
             Message::ToggleTool(i, j) => {
+                select::clear(); // the pieces after it are numbered anew
                 if let Some(t) = self.messages.get_mut(i).and_then(|m| m.tools.get_mut(j)) {
                     t.open = !t.open;
                 }
@@ -1732,20 +1731,6 @@ impl App {
                     self.chip = None;
                     self.editing = Some(j);
                     return self.send(None);
-                }
-            }
-            Message::SelectText(i) => {
-                if self.selecting.as_ref().is_some_and(|(j, _)| *j == i) {
-                    self.selecting = None;
-                } else if let Some(m) = self.messages.get(i) {
-                    let text = if m.role == Role::User { m.raw.clone() } else { m.answer_text() };
-                    self.selecting = Some((i, text_editor::Content::with_text(&text)));
-                }
-            }
-            // read-only: selecting, moving and copying (the editor copies on Ctrl+C itself), never changing it
-            Message::SelectAction(a) => {
-                if let Some((_, content)) = self.selecting.as_mut().filter(|_| !a.is_edit()) {
-                    content.perform(a);
                 }
             }
             Message::ForgetFact(name) => {
@@ -2676,7 +2661,8 @@ impl App {
         self.tasks = tasks_of(chat.get("tasks"));
         self.plan_open = None;
         self.messages.clear();
-        (self.editing, self.selecting) = (None, None);
+        self.editing = None;
+        select::clear();
         self.shown = window();
         for m in chat.get("messages").and_then(Json::as_array).unwrap_or(&[]) {
             let content = m.get("content").and_then(Json::as_str).unwrap_or("");
@@ -2748,7 +2734,8 @@ impl App {
         self.goal = None;
         self.parts = Json::Null;
         self.messages.clear();
-        (self.editing, self.selecting) = (None, None);
+        self.editing = None;
+        select::clear();
         self.shown = window();
         self.context.0 = 0.0;
         self.tasks.clear();
@@ -2877,7 +2864,7 @@ impl App {
                 if let Some(i) = self.editing.take().filter(|&i| i < self.messages.len()) {
                     let nth = self.messages[..i].iter().filter(|m| m.role == Role::User).count();
                     self.messages.truncate(i);
-                    self.selecting = None;
+                    select::clear();
                     body.push(("edit", num(nth as f64)));
                 }
                 self.messages.push(Msg::user(&text));
