@@ -826,6 +826,81 @@ __device__ __forceinline__ void q4k_dp4a(DP4A_PARAMS) {
         }
 }
 
+// Q5_K: Q4_K's lanes and arithmetic (d sc q - dmin m over the same sub-block pairs), on 176-byte blocks: the
+// 16-byte header as Q4_K's, then 32 bytes of fifth bits (byte l: bit k for value l of sub-block k), then the
+// nibbles at 48. A lane's 16 nibble bytes are values 16 hf .. + 15 of sub-blocks 2 j2 (low) and 2 j2 + 1
+// (high), whose fifth bits are bits 2 j2 and 2 j2 + 1 of the same 16 high-bit bytes.
+#define Q5K_BYTES 176
+template <int NT, int R>
+__device__ __forceinline__ void q5k_dp4a(DP4A_PARAMS) {
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
+    int lane = threadIdx.x & 31;
+    if (row0 >= rows) return;
+    unsigned grp = 0xFFu << (lane & 24);
+    int nsb = cols >> 8;
+    int qsel = lane >> 3, l8 = lane & 7, j2 = l8 >> 1, hf = l8 & 1;
+    size_t row_bytes = (size_t)nsb * Q5K_BYTES;
+    float acc[R][NT];
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) acc[r][j] = 0.f;
+    #pragma unroll 2
+    for (int sb = qsel; sb < nsb; sb += 4) {
+        int pos = sb * 256 + 64 * j2 + 16 * hf;
+        int4 lo4[R], hi4[R];
+        float d[R], dmin[R];
+        int sc1[R], m1[R], sc2[R], m2[R];
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            int row = min(row0 + r, rows - 1);
+            const unsigned char* b = w + (size_t)row * row_bytes + (size_t)sb * Q5K_BYTES;
+            int4 hdr = *reinterpret_cast<const int4*>(b);
+            int4 qh = *reinterpret_cast<const int4*>(b + 16 + 16 * hf);
+            int4 p = *reinterpret_cast<const int4*>(b + 48 + 32 * j2 + 16 * hf);
+            d[r] = h2f((unsigned)hdr.x & 0xFFFF);
+            dmin[r] = h2f((unsigned)hdr.x >> 16);
+            q4k_scale_min2w(2 * j2, hdr.y, hdr.z, hdr.w, &sc1[r], &m1[r], &sc2[r], &m2[r]);
+            int sl = 2 * j2, sh = 2 * j2 + 1;
+            lo4[r] = make_int4((p.x & 0x0F0F0F0F) | (((qh.x >> sl) & 0x01010101) << 4), (p.y & 0x0F0F0F0F) | (((qh.y >> sl) & 0x01010101) << 4),
+                               (p.z & 0x0F0F0F0F) | (((qh.z >> sl) & 0x01010101) << 4), (p.w & 0x0F0F0F0F) | (((qh.w >> sl) & 0x01010101) << 4));
+            hi4[r] = make_int4(((p.x >> 4) & 0x0F0F0F0F) | (((qh.x >> sh) & 0x01010101) << 4), ((p.y >> 4) & 0x0F0F0F0F) | (((qh.y >> sh) & 0x01010101) << 4),
+                               ((p.z >> 4) & 0x0F0F0F0F) | (((qh.z >> sh) & 0x01010101) << 4), ((p.w >> 4) & 0x0F0F0F0F) | (((qh.w >> sh) & 0x01010101) << 4));
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            if (j < n) {
+                const signed char* x = xq + (size_t)j * cols;
+                const float* dx = xd + (size_t)j * (cols >> 5);
+                const int* sx = xs + (size_t)j * (cols >> 5);
+                int4 xl = *reinterpret_cast<const int4*>(x + pos), xh = *reinterpret_cast<const int4*>(x + pos + 32);
+                float dl = dx[pos >> 5], dh = dx[(pos >> 5) + 1];
+                float sl = __fmul_rn(dl, (float)sx[pos >> 5]), sh = __fmul_rn(dh, (float)sx[(pos >> 5) + 1]);
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    int lo = __dp4a(lo4[r].x, xl.x, __dp4a(lo4[r].y, xl.y, __dp4a(lo4[r].z, xl.z, __dp4a(lo4[r].w, xl.w, 0))));
+                    int hi = __dp4a(hi4[r].x, xh.x, __dp4a(hi4[r].y, xh.y, __dp4a(hi4[r].z, xh.z, __dp4a(hi4[r].w, xh.w, 0))));
+                    lo += __shfl_xor_sync(grp, lo, 1);
+                    hi += __shfl_xor_sync(grp, hi, 1);
+                    acc[r][j] = q4k_step(acc[r][j], d[r], dmin[r], pair_s(sc1[r], sc2[r], dl, dh, lo, hi), q4k_pair_m(m1[r], m2[r], sl, sh));
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < NT; j++) {
+            float v = acc[r][j];
+            #pragma unroll
+            for (int o = 2; o < 32; o <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o));
+            if (lane == 0 && j < n && row0 + r < rows) {
+                size_t idx = (size_t)j * out_stride + out_off + row0 + r;
+                out[idx] = accumulate ? out[idx] + v : v;
+            }
+        }
+}
+
 // Q6_K: per 128-value half, 4 lanes take groups {0,2} and 4 lanes groups {1,3}; each lane 8 consecutive
 // positions of both groups (they share the low-nibble bytes: low nibble = first group, high = second).
 // A half-warp covers a super-block, so the warp walks two super-blocks per step. R rows decoded first.
@@ -1338,6 +1413,13 @@ __global__ void moe_down_q4k(const unsigned long long* __restrict__ ptrs, int nk
                              const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
     int k = blockIdx.y;
     q4k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
+                   xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
+}
+// down in Q5_K (some layers of a Q3_K_M file): as moe_down_q4k
+__global__ void moe_down_q5k(const unsigned long long* __restrict__ ptrs, int nk, const signed char* __restrict__ xq, const float* __restrict__ xd,
+                             const int* __restrict__ xs, float* __restrict__ out, int rows, int cols) {
+    int k = blockIdx.y;
+    q5k_dp4a<1, 1>(reinterpret_cast<const unsigned char*>(ptrs[2 * nk + k]), nullptr, xq + (size_t)k * cols, xd + (size_t)k * (cols >> 5),
                    xs + (size_t)k * (cols >> 5), out + (size_t)k * rows, rows, cols, 1, 0, 0, 0);
 }
 // x += cpu (the experts computed on the CPU; may be null) + sum over k of wts[k] * outs[k]
@@ -5064,6 +5146,7 @@ struct Kernels {
     add_rows: Ptr,
     moe_gate_up_q3k: Ptr,
     moe_down_q4k: Ptr,
+    moe_down_q5k: Ptr,
     moe_combine: Ptr,
     router_logits: Ptr,
     router_logits1: Ptr,
@@ -5293,6 +5376,7 @@ impl Kernels {
                 add_rows: get("add_rows")?,
                 moe_gate_up_q3k: get("moe_gate_up_q3k")?,
                 moe_down_q4k: get("moe_down_q4k")?,
+                moe_down_q5k: get("moe_down_q5k")?,
                 moe_combine: get("moe_combine")?,
                 router_logits: get("router_logits")?,
                 router_logits1: get("router_logits1")?,
@@ -6352,6 +6436,34 @@ struct MoeHost {
     picks: Vec<(usize, f32)>,
     cpu_picks: Vec<(usize, f32)>,
     scratch: crate::model::MoeScratch,
+    // a step's GPU-expert table, built here each layer (kept: no allocation per layer)
+    ptrs: Vec<u64>,
+    downs: Vec<u64>,
+    wts: Vec<f32>,
+    tab: Vec<u8>,
+    // pinned copies of the table and of the CPU's sum for one token, sent with asynchronous copies on the
+    // compute stream (a plain copy from pageable memory waits and stages through the driver: ~20 us a layer).
+    // Refilled only after the next layer's synchronous read-back, so a copy never reads one being refilled.
+    tab_pinned: Option<HostBuf>,
+    acc_pinned: Option<HostBuf>,
+}
+
+impl MoeHost {
+    /// `data` to device address `dst` through the pinned buffer `slot` (made at `cap` bytes on first use),
+    /// queued on `stream` after the work before it; a larger `data` than `cap` goes the plain, waiting way.
+    fn send<T: Copy>(slot: &mut Option<HostBuf>, cap: usize, data: &[T], dst: u64, stream: Ptr) -> Result<(), String> {
+        let a = api()?;
+        let bytes = std::mem::size_of_val(data);
+        if bytes > cap {
+            return a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(dst, data.as_ptr() as *const c_void, bytes) }, "copy to GPU");
+        }
+        if slot.is_none() {
+            *slot = Some(HostBuf::alloc(cap)?);
+        }
+        let host = slot.as_ref().unwrap();
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, host.ptr as *mut u8, bytes) };
+        a.check(unsafe { (a.f.cuMemcpyHtoDAsync_v2)(dst, host.ptr, bytes, stream) }, "copy to GPU")
+    }
 }
 
 /// Experts queued for upload per token at most (GHOST_INFER_UPLOADS_PER_TOKEN): each moves ~2 MB through RAM
@@ -6564,7 +6676,10 @@ impl ExpertCache {
     fn new(moe: &CpuMoe, cfg: &Config, budget: usize) -> Result<ExpertCache, String> {
         let a = api()?;
         let q3k = |[g, u, _]: &[ExpertTensor; 3]| g.ty == GgmlType::Q3K && u.ty == GgmlType::Q3K;
-        let cacheable: Vec<bool> = moe.tensors.iter().map(|t| (q3k(t) && t[2].ty == GgmlType::Q4K) || iq2_fmt(t).is_some()).collect();
+        // Q3_K gate and up with a Q4_K or Q5_K down (a Q3_K_M file gives its first layers Q5_K downs), or IQ2
+        // (GHOST_INFER_NO_Q5K_CACHE=1: Q5_K downs stay on the CPU, as before)
+        let q5k = std::env::var_os("GHOST_INFER_NO_Q5K_CACHE").is_none();
+        let cacheable: Vec<bool> = moe.tensors.iter().map(|t| (q3k(t) && (t[2].ty == GgmlType::Q4K || (q5k && t[2].ty == GgmlType::Q5K))) || iq2_fmt(t).is_some()).collect();
         let batch_ok = moe.tensors.iter().filter(|t| t[0].rows > 0).all(|t| (q3k(t) && matches!(t[2].ty, GgmlType::Q4K | GgmlType::Q5K)) || iq2_fmt(t).is_some());
         moe.tensors.iter().find(|t| t[0].rows > 0).ok_or("no expert layers")?;
         let gate_bytes: Vec<usize> = moe.tensors.iter().map(|t| if q3k(t) { t[0].rows * (t[0].cols / 256) * Q3K_GPU_BYTES } else { t[0].stride }).collect();
@@ -8398,22 +8513,22 @@ impl GpuModel {
         let t2 = stats.then(Instant::now);
 
         // the token's GPU-resident experts: table of matrix addresses, then their weights
-        let mut ptrs: Vec<u64> = Vec::new();
-        let mut downs: Vec<u64> = Vec::new();
-        let mut wts: Vec<f32> = Vec::new();
+        h.ptrs.clear();
+        h.downs.clear();
+        h.wts.clear();
         h.cpu_picks.clear();
         for &(e, w) in &h.picks {
             match cache.slot_of[l][e] {
                 slot if on_gpu && slot >= 0 => {
                     let [g, u, d] = cache.ptrs(slot as usize, l);
-                    ptrs.extend([g, u]);
-                    downs.push(d);
-                    wts.push(w);
+                    h.ptrs.extend([g, u]);
+                    h.downs.push(d);
+                    h.wts.push(w);
                 }
                 _ => h.cpu_picks.push((e, w)),
             }
         }
-        let nk = wts.len();
+        let nk = h.wts.len();
         // GPU-only experts: the token's experts that are not cached are copied into the two scratch slots in
         // turn and run there with the same kernels, instead of on the CPU (which then only routes and copies)
         // (the cache's own choice, made when it was built: the setting may have changed since)
@@ -8424,8 +8539,10 @@ impl GpuModel {
         const MISS_TAB: usize = 256;
         const WTS_TAB: usize = 1024;
         if total > 0 {
-            ptrs.extend(&downs);
-            let mut tab: Vec<u8> = ptrs.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let MoeHost { ptrs, downs, wts, tab, tab_pinned, .. } = h;
+            ptrs.extend_from_slice(downs);
+            tab.clear();
+            tab.extend(ptrs.iter().flat_map(|p| p.to_le_bytes()));
             if !misses.is_empty() {
                 tab.resize(MISS_TAB, 0);
                 let gb = cache.gate_bytes[l] as u64;
@@ -8435,7 +8552,7 @@ impl GpuModel {
             }
             tab.resize(WTS_TAB, 0);
             tab.extend(wts.iter().chain(misses.iter().map(|(_, w)| w)).flat_map(|w| w.to_le_bytes()));
-            s.moe_tab.write(&tab)?;
+            MoeHost::send(tab_pinned, s.moe_tab.bytes, tab, s.moe_tab.ptr, k.stream)?;
             let (ex, ffn) = (moe.tensors[l][0], c.expert_ffn_dim);
             let silu = [Arg::P(s.gu.ptr), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::I(ffn as i32)];
             let fmt = iq2_fmt(&moe.tensors[l]);
@@ -8451,7 +8568,8 @@ impl GpuModel {
                     None => {
                         k.launch(k.moe_gate_up_q3k, (ex.rows.div_ceil(8) as u32, (2 * count) as u32), 256, 0, &[Arg::P(tab), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(s.gu.ptr), Arg::I(ffn as i32), Arg::I(dim as i32)])?;
                         k.launch(k.silu_q8, ((ffn / 4).div_ceil(256) as u32, count as u32), 256, 0, &silu)?;
-                        k.launch(k.moe_down_q4k, (dim.div_ceil(8) as u32, count as u32), 256, 0, &[Arg::P(tab), Arg::I(count as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(dim as i32), Arg::I(ffn as i32)])
+                        let down = if moe.tensors[l][2].ty == GgmlType::Q5K { k.moe_down_q5k } else { k.moe_down_q4k };
+                        k.launch(down,(dim.div_ceil(8) as u32, count as u32), 256, 0, &[Arg::P(tab), Arg::I(count as i32), Arg::P(s.xq.ptr), Arg::P(s.xd.ptr), Arg::P(s.xsum.ptr), Arg::P(out), Arg::I(dim as i32), Arg::I(ffn as i32)])
                     }
                 }
             };
@@ -8503,6 +8621,7 @@ impl GpuModel {
                 a.check(unsafe { (a.f.cuEventRecord)(cache.miss_event, k.stream) }, "event record")?;
             }
         }
+        let t_disp = stats.then(Instant::now);
         // the CPU's share, computed while the GPU works on its own
         let cpu_k = if on_gpu { h.cpu_picks.len() } else { c.n_experts_used };
         let cpu_picks = if on_gpu { &h.cpu_picks } else { &h.picks };
@@ -8512,7 +8631,8 @@ impl GpuModel {
             h.acc.resize(len, 0.0);
             crate::model::moe_experts(c.n_experts, |e| moe.expert(l, e), cpu_picks, cpu_k, &h.xb, dim, &mut h.acc, &mut h.scratch);
             t3 = stats.then(Instant::now);
-            s.att.write(&h.acc)?; // free here: the attention output was consumed by the output projection
+            // into s.att, free here: the attention output was consumed by the output projection
+            MoeHost::send(&mut h.acc_pinned, c.dim * 4, &h.acc, s.att.ptr, k.stream)?;
             s.att.ptr
         } else {
             0
@@ -8542,7 +8662,10 @@ impl GpuModel {
         } else {
             k.launch(k.add_rows, (len.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(cpu), Arg::I(len as i32)])?;
         }
-        cache.note(moe, l, &h.picks, false);
+        // a graphed step notes the picks later (moe_note), while the GPU runs the next layer
+        if !pre_done {
+            cache.note(moe, l, &h.picks, false);
+        }
         if let (Some(t0), Some(t1), Some(t2), Some(t4)) = (t0, t1, t2, t4) {
             let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
             let t3 = t3.unwrap_or(t4);
@@ -8551,7 +8674,10 @@ impl GpuModel {
             moe_stat(MS_STEPS, 1);
             moe_stat(MS_WAIT, ns(t0, t1));
             moe_stat(MS_ROUTE, ns(t1, t2));
-            moe_stat(MS_CPU, ns(t2, t3));
+            let td = t_disp.unwrap_or(t2);
+            moe_stat(MS_DISPATCH, ns(t2, td));
+            moe_stat(MS_CPU, ns(td, t3));
+            moe_stat(MS_CPU_CALLS, (cpu_k > 0) as u64);
             moe_stat(MS_BACK, ns(t3, t4));
             moe_stat(MS_NOTE, ns(t4, Instant::now()));
         }
@@ -8892,6 +9018,9 @@ impl GpuModel {
             a.check(made, "instantiate graph")?;
             Ok(exec)
         };
+        // the last MoE layer's picks, noted in the expert cache once the next stretch is queued (its bookkeeping
+        // and uploads then overlap the GPU's work instead of holding up the launch)
+        let mut pending: Option<usize> = None;
         for (l, layer) in self.layers.iter().enumerate() {
             let moe_layer = matches!(layer.ffn, GpuFfn::Moe { .. });
             if s.moe_graphs[l].is_null() {
@@ -8907,9 +9036,17 @@ impl GpuModel {
                 })?;
                 s.moe_graphs[l] = g;
             }
+            let tg = moe_stats_on().then(Instant::now);
             a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_graphs[l], self.k.stream) }, "graph launch")?;
+            if let Some(t) = tg {
+                moe_stat(MS_GRAPH, t.elapsed().as_nanos() as u64);
+            }
+            if let Some(p) = pending.take() {
+                self.moe_note(p, s)?;
+            }
             if moe_layer {
                 self.moe_ffn_rows(l, layer, 1, 0, 1, s, true)?;
+                pending = Some(l);
             }
         }
         let slot = match want {
@@ -8925,7 +9062,25 @@ impl GpuModel {
             })?;
             s.moe_tail[slot] = g;
         }
-        a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_tail[slot], self.k.stream) }, "graph launch")
+        a.check(unsafe { (a.f.cuGraphLaunch)(s.moe_tail[slot], self.k.stream) }, "graph launch")?;
+        if let Some(p) = pending {
+            self.moe_note(p, s)?;
+        }
+        Ok(())
+    }
+
+    /// Layer `l`'s picks (still in the session's MoE scratch) noted in the expert cache: moe_ffn_rows' last step,
+    /// deferred by moe_step_graphed.
+    fn moe_note(&self, l: usize, s: &GpuSession) -> Result<(), String> {
+        let moe = self.moe.as_ref().ok_or("mixture of experts without its experts")?;
+        let t = moe_stats_on().then(Instant::now);
+        if let Some(cache) = self.cache.borrow_mut().as_mut() {
+            cache.note(moe, l, &s.moe.borrow().picks, false);
+        }
+        if let Some(t) = t {
+            moe_stat(MS_NOTE, t.elapsed().as_nanos() as u64);
+        }
+        Ok(())
     }
 
     /// Layer `l`'s attention (latent, Gated DeltaNet or full), its output projection added to s.x.
@@ -9641,8 +9796,11 @@ const MOE_GPU_MIN_BATCH: usize = 32;
 /// GHOST_INFER_MOE_STATS=1: where a mixture of experts' one-token steps go. Per layer step: picks found in the
 /// expert cache and not; time waiting for the GPU (the copy to the host), routing, the CPU's experts, the copy
 /// back, and the cache's bookkeeping; uploads queued.
-static MOE_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static MOE_STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+const MS_GRAPH: usize = 11; // host time inside the per-layer graph launches (moe_step_graphed)
 const MS_UPLOADS: usize = 8;
+const MS_DISPATCH: usize = 9; // the cached experts' table written and their kernels queued
+const MS_CPU_CALLS: usize = 10; // layer steps with any expert on the CPU
 const MS_HITS: usize = 0;
 const MS_MISSES: usize = 1;
 const MS_STEPS: usize = 2;
@@ -9687,7 +9845,7 @@ pub fn moe_stats_take(tokens: usize) -> Option<String> {
     let (faults, working_set) = os::page_faults();
     let new_faults = faults.saturating_sub(FAULTS.swap(faults, Ordering::Relaxed));
     Some(format!(
-        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache, {:.1} uploads and {:.0} page faults per token (working set {} MB); per token: waiting for the GPU {:.2} ms, routing {:.2} ms, CPU experts {:.2} ms, copy back {:.2} ms, cache upkeep {:.2} ms{}]",
+        "[moe: {} layer steps, {:.1}% of expert picks in the GPU cache, {:.1} uploads and {:.0} page faults per token (working set {} MB); per token: waiting for the GPU {:.2} ms, routing {:.2} ms, GPU experts queued {:.2} ms, CPU experts {:.2} ms in {:.1} calls of {:.0} us, copy back {:.2} ms, cache upkeep {:.2} ms, graph launches {:.2} ms{}]",
         v[MS_STEPS],
         100.0 * hits,
         v[MS_UPLOADS] as f64 / tokens,
@@ -9695,9 +9853,13 @@ pub fn moe_stats_take(tokens: usize) -> Option<String> {
         working_set >> 20,
         ms(MS_WAIT),
         ms(MS_ROUTE),
+        ms(MS_DISPATCH),
         ms(MS_CPU),
+        v[MS_CPU_CALLS] as f64 / tokens,
+        v[MS_CPU] as f64 / 1e3 / v[MS_CPU_CALLS].max(1) as f64,
         ms(MS_BACK),
         ms(MS_NOTE),
+        ms(MS_GRAPH),
         match ram_floor_mb() {
             0 => String::new(),
             mb => format!("; RAM floor {mb} MB, {} MB of experts released for it so far, {} MB available", RAM_RELEASED.load(Ordering::Relaxed) >> 20, os::available_ram() >> 20),
