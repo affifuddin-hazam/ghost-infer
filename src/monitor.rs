@@ -92,7 +92,12 @@ pub fn run(addr: &str) -> Result<(), String> {
         let Some(s) = speed else {
             line(&format!("{BOLD} GHOST-INFER{RESET}  {DIM}live speed{RESET}"));
             line("");
+            // The installer places start-engine.bat beside the monitor on Windows;
+            // on other platforms the user starts `ghost-infer serve` themselves.
+            #[cfg(windows)]
             line(&format!(" {DIM}waiting for the engine at {addr} (start-engine.bat)...{RESET}"));
+            #[cfg(not(windows))]
+            line(&format!(" {DIM}waiting for the engine at {addr} (run `ghost-infer serve`)...{RESET}"));
             f.push_str("\x1b[J");
             let _ = out.write_all(f.as_bytes());
             let _ = out.flush();
@@ -263,13 +268,73 @@ mod os {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+mod os {
+    use std::ffi::c_ulong;
+
+    // SIGINT number is 2 on every current Unix.
+    const SIGINT: i32 = 2;
+    // TIOCGWINSZ is 0x5413 on Linux (all archs). BSDs and macOS use a different
+    // encoding; those targets fall through to the $COLUMNS / 80x24 path.
+    #[cfg(target_os = "linux")]
+    const TIOCGWINSZ: c_ulong = 0x5413;
+    const STDOUT_FD: i32 = 1;
+
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn ioctl(fd: i32, request: c_ulong, arg: *mut Winsize) -> i32;
+    }
+
+    type SigHandler = unsafe extern "C" fn(i32);
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: SigHandler) -> SigHandler;
+    }
+
+    /// Restore the cursor and sane attrs on Ctrl+C, then exit. Mirrors the
+    /// Windows SetConsoleCtrlHandler path.
+    unsafe extern "C" fn on_sigint(_: i32) {
+        print!("\x1b[0m\x1b[?25h\n");
+        std::process::exit(0);
+    }
+
+    /// Unix terminals already handle ANSI escapes and UTF-8; all setup needs
+    /// to do is clear the screen, hide the cursor, and install the Ctrl+C
+    /// handler that puts them back.
+    pub fn setup() {
+        unsafe { signal(SIGINT, on_sigint) };
+        print!("\x1b[2J\x1b[?25l");
+    }
+
+    /// Columns and lines from the controlling terminal via TIOCGWINSZ (Linux),
+    /// else $COLUMNS, else 80x24. Minimum returned size is 20x10 so the graph
+    /// still draws when the window is tiny.
+    pub fn size() -> (usize, usize) {
+        #[cfg(target_os = "linux")]
+        {
+            let mut ws = Winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+            if unsafe { ioctl(STDOUT_FD, TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                return ((ws.ws_col as usize).max(20), (ws.ws_row as usize).max(10));
+            }
+        }
+        let w = std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+        (w, 24)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod os {
     pub fn setup() {
         print!("\x1b[2J\x1b[?25l");
     }
     pub fn size() -> (usize, usize) {
-        let w = std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
-        (w, 24)
+        (80, 24)
     }
 }
