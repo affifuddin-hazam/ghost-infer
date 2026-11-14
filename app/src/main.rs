@@ -13,6 +13,7 @@ mod i18n;
 #[path = "../../src/json.rs"]
 #[allow(dead_code)]
 mod json;
+mod mdtable;
 mod orb;
 mod preview;
 mod select;
@@ -227,7 +228,7 @@ pub struct Round {
     raw: String, // as streamed (a thinking one starts with <think>)
     pub think: String,
     pub answer: String,
-    pub md: markdown::Content, // the answer parsed
+    pub md: Vec<mdtable::Part>, // the answer parsed: its text, and its tables apart (issue #3)
     pub think_open: bool,      // its thinking shown (each round opens on its own)
 }
 
@@ -301,7 +302,7 @@ impl Msg {
     /// (it only ever grows at its end, so the Markdown is fed just the new part).
     fn push(&mut self, more: &str) {
         if self.new_round || self.rounds.is_empty() {
-            self.rounds.push(Round { raw: String::new(), think: String::new(), answer: String::new(), md: markdown::Content::new(), think_open: false });
+            self.rounds.push(Round { raw: String::new(), think: String::new(), answer: String::new(), md: Vec::new(), think_open: false });
             self.new_round = false;
         }
         let r = self.rounds.last_mut().unwrap();
@@ -311,12 +312,19 @@ impl Msg {
         r.think = think;
         if let Some(new) = answer.strip_prefix(r.answer.as_str()) {
             if !new.is_empty() {
-                r.md.push_str(new);
+                if mdtable::has_table(&answer) {
+                    // a table: parsed again whole, so it is taken out of the text as it is written
+                    r.md = mdtable::parts(&answer);
+                } else if let Some(mdtable::Part::Text(c)) = r.md.last_mut() {
+                    c.push_str(new);
+                } else {
+                    r.md.push(mdtable::Part::Text(markdown::Content::parse(&answer)));
+                }
                 r.answer = answer;
             }
         } else {
             // trailing spaces trimmed away later: parse it all again
-            r.md = markdown::Content::parse(&answer);
+            r.md = mdtable::parts(&answer);
             r.answer = answer;
         }
     }

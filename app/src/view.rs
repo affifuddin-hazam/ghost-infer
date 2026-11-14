@@ -2222,7 +2222,15 @@ impl App {
             }
             if !r.answer.is_empty() {
                 flush(&mut group, &mut parts);
-                parts.push(markdown::view_with(r.md.items(), settings, &Md(s)));
+                let mut body: Vec<Element<'a, Message>> = r
+                    .md
+                    .iter()
+                    .map(|p| match p {
+                        crate::mdtable::Part::Text(c) => markdown::view_with(c.items(), settings, &Md(s)),
+                        crate::mdtable::Part::Table(t) => md_table(s, t, settings),
+                    })
+                    .collect();
+                parts.push(if body.len() == 1 { body.pop().unwrap() } else { column(body).spacing(settings.spacing.0).into() });
             }
             // task list updates show in the rail, not as lines in the reply
             group.extend(m.tools.iter().enumerate().filter(|(_, t)| t.round == k && t.name != "update_tasks").map(|(j, _)| j));
@@ -2444,6 +2452,26 @@ impl<'a> markdown::Viewer<'a, Message> for Md {
             .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(10), text_color: Some(s.text), ..Default::default() })
             .into()
     }
+}
+
+/// A reply's table: equal columns across the reply's width, the header row shaded, a line under each row.
+/// Not iced's markdown table, which aborts the app (see crate::mdtable).
+fn md_table<'a>(s: &'static Skin, t: &'a crate::mdtable::Table, settings: markdown::Settings) -> Element<'a, Message> {
+    let cell = |c: &'a markdown::Content, a: Alignment| -> Element<'a, Message> {
+        container(markdown::view_with(c.items(), settings, &Md(s))).width(Length::FillPortion(1)).padding([6, 10]).align_x(a).into()
+    };
+    let line = || -> Element<'a, Message> { container(Space::new()).width(Fill).height(1).style(move |_| container::Style { background: Some(Background::Color(s.line2)), ..Default::default() }).into() };
+    let header = row(t.header.iter().zip(&t.align).map(|(c, a)| cell(c, *a)));
+    let mut rows: Vec<Element<'a, Message>> = vec![container(header).width(Fill).style(move |_| container::Style { background: Some(Background::Color(s.raise2)), ..Default::default() }).into()];
+    for r in &t.rows {
+        rows.push(line());
+        rows.push(row(r.iter().zip(&t.align).map(|(c, a)| cell(c, *a))).width(Fill).into());
+    }
+    container(column(rows).width(Fill))
+        .width(Fill)
+        .clip(true)
+        .style(move |_| container::Style { border: Border { color: s.line2, width: 1.0, radius: 8.0.into() }, ..Default::default() })
+        .into()
 }
 
 /// A box in the rail.
