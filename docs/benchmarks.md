@@ -11,7 +11,7 @@ Measured with [GuideLLM](https://github.com/vllm-project/guidellm), vLLM's bench
 |---|---|
 | GPU | NVIDIA GeForce RTX 2060 SUPER, 8 GB (Turing, sm_75), driver 577.00 |
 | CPU | AMD Ryzen 5 3600, 6 cores / 12 threads |
-| RAM | 16 GB DDR4-2133 (2 × 8 GB) |
+| RAM | 24 GB DDR4-3200 (3 × 8 GB) since 2026-11-11; 16 GB DDR4-2133 (2 × 8 GB) for results dated before it |
 | Storage | the 4B and 8B on a USB 3.0 external hard drive (read once, at load); the 30B on an NVMe SSD (part of it is read again from the disk while it runs) |
 | OS | Windows 10 Pro 22H2 (build 19045), nothing else running (11.7–12.5 GB of RAM free at the start) |
 | Engines | ghost-infer (this repo), llama.cpp b11747 (`llama-server` and `llama-bench`, CUDA 12.4), Ollama 0.40.13 |
@@ -75,38 +75,47 @@ the 8B, and llama.cpp is 4% faster on the 4B.
 
 ## Mixture of experts bigger than the GPU
 
-Qwen3-30B-A3B-Instruct-2507 Q3_K_M (13.7 GB) on the same 8 GB card with 16 GB of RAM, read from an NVMe
-SSD. ghost-infer keeps attention and the router on the GPU, the experts in RAM, and about a third of them
-(5.1 GB) in a VRAM cache: the ones picked most recently, since consecutive tokens reuse many experts.
-The CPU runs the others, and a background thread copies them into the cache as they are used. llama.cpp
-runs it the way its users do: every layer on the GPU, with the experts of some layers left in RAM and
-computed on the CPU (`--n-cpu-moe`; a sweep from 16 to 48 layers picked 28). Ollama fits the model the
-same way by itself (here the experts of 32 of the 49 layers in RAM, 5.5 GB on the GPU).
+Measured 2026-11-14 with ghost-infer 0.4.0 and 24 GB of RAM, every engine in one run
+([`scripts/bench-all.ps1`](../scripts/bench-all.ps1)). ghost-infer keeps attention and the router on the GPU,
+the experts in RAM, and about a third of them in a VRAM cache: the ones a reply keeps using. Each layer runs as
+one CUDA graph that also picks the experts (the router's top-k runs on the GPU), so the cached ones never wait for
+the CPU; the CPU runs the others meanwhile, its threads pinned to cores of their own, and a background thread
+copies them into the cache as they are used. llama.cpp runs these models the way its users do: every layer on the
+GPU, with the experts of some layers left in RAM and computed on the CPU (`--n-cpu-moe`; a sweep from 16 to 48
+layers picked 24 for both models). Ollama fits the model the same way by itself (Qwen3.6: the experts of 29 of
+its 41 layers in RAM, 5.7 GB on the GPU).
 
-Seven varied prompts (writing code, an explanation, a code review with 2,194 tokens of pasted code, a
+Seven varied prompts (writing code, an explanation, a code review with about 2,000 tokens of pasted code, a
 document to summarise, a chat, a word problem, SQL), each through the engine's `/v1/chat/completions`,
 streamed, greedy, 256 tokens; a warm-up round, then two measured rounds
-([`scripts/bench-moe.py`](../scripts/bench-moe.py); `bench-readme.ps1 -SkipDense -Stage <folder on an SSD>`):
+([`scripts/bench-moe.py`](../scripts/bench-moe.py)):
 
-| Generation, tokens/s | ghost-infer | llama.cpp b11747 (`--n-cpu-moe 28`) | Ollama 0.40.13 |
+| Generation, tokens/s | ghost-infer | llama.cpp b11747 (`--n-cpu-moe 24`) | Ollama 0.40.13 |
 |---|---|---|---|
-| Median of the 14 measured replies | **38.0** | 23.7 | 21.7 |
-| Range | 34.5–45.5 | 23.5–23.9 | 21.4–21.9 |
-| Writing code / explaining / SQL | **40 / 38 / 38** | 24 | 22 |
-| Code review (2,194-token paste) | **36** | 24 | 22 |
-| Summarising a document | **45** | 24 | 22 |
-| Chat / word problem | **45** / **35** | 24 / 24 | 22 / 22 |
+| **Qwen3.6-35B-A3B** i1-Q3_K_M (16.8 GB), median | **80.5** | 39.5 | 34.7 |
+| Range | 76–87 | 38–40 | 34–35 |
+| Writing code / explaining / SQL | **85 / 81 / 77** | 40 / 40 / 40 | 35 |
+| Code review / summarising | **80 / 83** | 38 / 39 | 35 |
+| Chat / word problem | **81 / 77** | 40 / 40 | 35 / 34 |
+| **Qwen3-30B-A3B-Instruct-2507** Q3_K_M (13.7 GB), median | **68.7** | 29.5 | 26.9 |
+| Range | 50–81 | 27–30 | 26–27 |
+| Writing code / explaining / SQL | **80 / 66 / 59** | 29 / 30 / 30 | 26 / 27 / 27 |
+| Code review / summarising | **69 / 75** | 27 / 27 | 27 / 27 |
+| Chat / word problem | **70 / 51** | 30 / 30 | 27 / 27 |
 
-Reading the 2,194-token paste: ghost-infer 414–418 tokens/s, llama.cpp 409–416, Ollama 441–450. Short
-prompts (42–72 tokens) reach their first token sooner in llama.cpp and Ollama, 0.6–0.8 s against
-ghost-infer's 0.9–1.1 s: such a prompt already touches most of the experts, and ghost-infer runs them all
-on the GPU, copying in the ones its cache does not hold.
+Reading the ~2,000-token pastes, tokens/s: Qwen3.6 ghost-infer 601, llama.cpp 396, Ollama 455; Qwen3-30B
+ghost-infer 446, llama.cpp 161, Ollama 515. Short prompts reach their first token sooner in llama.cpp and Ollama,
+about 0.6 s against ghost-infer's 0.9–1.0 s: such a prompt already touches most of the experts, and ghost-infer
+runs them all on the GPU, copying in the ones its cache does not hold.
 
 llama.cpp's and Ollama's speed hardly depends on the text, since each expert stays where it was put.
-ghost-infer's does a little: a reply that keeps reaching for new experts (here the word problem) runs
-slower than one that stays with a few (the chat, the summary). `ghost-infer bench` shows higher numbers
-still: its prompt is one sentence repeated, which keeps the same few experts busy, the cache's best case
-rather than a real chat.
+ghost-infer's does: a reply that keeps reaching for new experts (here the word problem) runs slower than one that
+stays with a few (writing code, the summary). `ghost-infer bench` shows higher numbers still (about 100 tokens/s
+on these models): its prompt is one sentence repeated, which keeps the same few experts busy, the cache's best
+case rather than a real chat.
+
+Before the RAM upgrade (2026-11-10, 16 GB DDR4-2133, ghost-infer 0.3.0) Qwen3-30B-A3B ran at 38.0 tokens/s in
+ghost-infer, 23.7 in llama.cpp (`--n-cpu-moe 28`) and 21.7 in Ollama; Qwen3.6-35B-A3B at 45.3, 25.1 and 26.1.
 
 ## Speculative decoding
 

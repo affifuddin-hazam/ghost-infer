@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <img src="design/readme/stats.svg" width="860" alt="On an RTX 2060 SUPER: 1.8 times llama.cpp's speed on a model bigger than the GPU; an 80B model on an 8 GB GPU; long prompts read 6.6 times faster; 4 times faster at a 64K context">
+  <img src="design/readme/stats.svg" width="860" alt="On an RTX 2060 SUPER: 2 times llama.cpp's speed on a model bigger than the GPU; an 80B model on an 8 GB GPU; long prompts read 6.6 times faster; 4 times faster at a 64K context">
 </p>
 
 Most inference engines are built for data centres: many users, big GPUs, batching. ghost-infer is built
@@ -34,24 +34,27 @@ for the other case: **one person, one consumer GPU, one model at a time**, and i
 ## Speed
 
 <p align="center">
-  <img src="design/readme/race.svg" width="860" alt="A race to 256 tokens on Qwen3.6-35B-A3B, replayed from each engine's recorded token times: ghost-infer 45.8 tokens/s, done in 6.6 s; llama.cpp 25.3, 10.9 s; Ollama 26.0, 11.1 s">
+  <img src="design/readme/race.svg" width="860" alt="A race to 256 tokens on Qwen3.6-35B-A3B, replayed from each engine's recorded token times: ghost-infer 82.5 tokens/s, done in 4.0 s; llama.cpp 39.5, 7.0 s; Ollama 34.7, 7.9 s">
 </p>
 
-On an 8 GB RTX 2060 SUPER with 16 GB of RAM, on the same GGUF files:
+On an 8 GB RTX 2060 SUPER with 24 GB of RAM, on the same GGUF files:
 
 | Generation speed | ghost-infer | llama.cpp | Ollama |
 |---|---|---|---|
-| Qwen3 8B, 5 GB: fits in the GPU | **70.2 tokens/s** | 64.3 | 66.0 |
-| Qwen3.6-35B-A3B, 16.8 GB: bigger than the GPU | **45.3 tokens/s** | 25.1 | 26.1 |
-| Qwen3-30B-A3B, 13.7 GB: bigger than the GPU | **38.0 tokens/s** | 23.7 | 21.7 |
+| Qwen3 8B, 5 GB: fits in the GPU | **75.3 tokens/s** | 64.7 | 65.8 |
+| Qwen3.6-35B-A3B, 16.8 GB: bigger than the GPU | **80.5 tokens/s** | 39.5 | 34.7 |
+| Qwen3-30B-A3B, 13.7 GB: bigger than the GPU | **68.7 tokens/s** | 29.5 | 26.9 |
+| Qwen3.5-35B-A3B Claude-4.6-Opus distill, 16.8 GB | **76.4 tokens/s** | not measured | not measured |
 | Qwen3-Coder-30B-A3B, 14.7 GB \* | **32.7 / 47.3** | not measured | not measured |
 | Qwen3-Coder-Next 80B, 22 GB: bigger than the RAM \* | **11.8 / 14.5** | 9.3 / 12.4 | not measured |
 
-<sub>llama.cpp b11747 and Ollama 0.40.13. Qwen3 8B: GuideLLM, a ~264-token chat prompt and 128 tokens, measured
-2026-11-10. The two A3B rows: seven varied prompts (code, an explanation, a code review, a summary, a chat, a word
-problem, SQL) through each engine's API, llama.cpp at its best `--n-cpu-moe` setting; Qwen3.6-35B-A3B
-(i1-Q3_K_M) measured 2026-11-10. Rows marked \*: tokens/s writing code / writing a long answer, the second (warm)
-of two runs, llama.cpp with its automatic GPU split. Method and more results in [Benchmarks](docs/benchmarks.md).</sub>
+<sub>ghost-infer 0.4.0, llama.cpp b11747 and Ollama 0.40.13, all measured 2026-11-14 in one run
+(`scripts/bench-all.ps1`). Qwen3 8B: GuideLLM, a ~264-token chat prompt and 128 tokens. The A3B rows: seven varied
+prompts (code, an explanation, a code review, a summary, a chat, a word problem, SQL) through each engine's API,
+the median of two rounds, llama.cpp at its best `--n-cpu-moe` setting (24); i1-Q3_K_M files. Rows marked \*:
+measured 2026-11-10 with 16 GB of RAM and ghost-infer 0.3.0, tokens/s writing code / writing a long answer, the
+second (warm) of two runs, llama.cpp with its automatic GPU split. Method and more results in
+[Benchmarks](docs/benchmarks.md).</sub>
 
 ## Models bigger than your GPU
 
@@ -61,7 +64,9 @@ of two runs, llama.cpp with its automatic GPU split. Method and more results in 
 
 A mixture-of-experts model uses only a few of its experts for each token. ghost-infer keeps attention on the GPU
 and the experts in RAM, caches on the GPU the ones a reply keeps reaching for, and runs the others on the CPU
-meanwhile. So Qwen3.6-35B-A3B (16.8 GB) runs on an 8 GB card at 45 tokens/s, and an 80B model runs at all.
+meanwhile. Each layer runs as one CUDA graph and the GPU picks its own experts, so the cached ones never wait for
+the CPU. So Qwen3.6-35B-A3B (16.8 GB) runs on an 8 GB card at 80 tokens/s, twice llama.cpp's speed, and an 80B
+model runs at all.
 
 ## Long chats stay fast
 
@@ -162,6 +167,20 @@ Experimental, and for now from source only: it trains with Python and PyTorch on
 (`scripts/nightly`, about 25 minutes a night on an 8 GB card), and the installer does not include it yet.
 
 ## What's new
+
+New in 0.4.0:
+
+- **About twice as fast on models bigger than the GPU.** Each layer runs as one CUDA graph, the GPU picks its own
+  experts, small kernels are fused, and the CPU's expert threads each keep a core of their own: Qwen3.6-35B-A3B
+  on an RTX 2060 SUPER went from about 45 to 80 tokens/s, twice llama.cpp's speed, with the same tokens as before.
+- **Faster sampling.** Picking a token with temperature, top-k or a repetition penalty no longer scans the whole
+  vocabulary: up to 3 ms less per token.
+- **Ternary Bonsai 27B on the GPU** (Q2_0 and PTQ1_0), about 40 tokens/s on an 8 GB card.
+- **4-bit KV cache** (`--kv q4`, the app's default): about half the memory per token, so longer chats fit.
+- **Plugins in the app**: a side-bar row with its own page, and a status badge over every page.
+- **Select and copy anywhere** in a chat, tool output included; pages the model opens go to the side pane.
+- **`ghost-infer monitor`** draws a live tokens/s graph in a terminal, and `claude-local.bat` runs Claude Code on
+  your own model (from source).
 
 New in 0.3.0:
 

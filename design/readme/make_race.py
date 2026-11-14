@@ -185,13 +185,13 @@ def esc(s):
 def main():
     global TAG_H, TAG_LETTERS, TAG_WEIGHT
     p = argparse.ArgumentParser()
-    p.add_argument("--ghost", default=ROOT / "bench-readme-20261110-093701" / "moe" / "ghost-infer.json")
-    p.add_argument("--llama", default=ROOT / "bench-readme-20261110-093701" / "moe" / "llama.cpp.json")
-    p.add_argument("--ollama", default=ROOT / "bench-readme-20261110-110949" / "moe" / "ollama.json")
+    p.add_argument("--ghost", default=ROOT / "bench-readme-20261114-081509" / "moe" / "ghost-infer.json")
+    p.add_argument("--llama", default=ROOT / "bench-readme-20261114-081509" / "moe" / "llama.cpp.json")
+    p.add_argument("--ollama", default=ROOT / "bench-readme-20261114-081509" / "moe" / "ollama.json")
     p.add_argument("--prompt", default="explain")
     p.add_argument("--round", type=int, default=1)
     p.add_argument("--model", default="Qwen3.6-35B-A3B Q3_K_M, a 16.8 GB model")
-    p.add_argument("--versions", default="llama.cpp b11747 (--n-cpu-moe 32), Ollama 0.40.13")
+    p.add_argument("--versions", default="llama.cpp b11747 (--n-cpu-moe 24), Ollama 0.40.13")
     p.add_argument("--tag-h", type=float, help=f"the infer tag's height in px (default {TAG_H})")
     p.add_argument("--tag-letters", type=float, help=f"its letters' size inside it, 1 = as drawn (default {TAG_LETTERS})")
     p.add_argument("--tag-weight", type=float, help=f"its letters' stroke, tag units (default {TAG_WEIGHT})")

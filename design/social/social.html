@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ghost-infer social preview</title>
+<style>
+  @font-face { font-family: "Instrument Sans"; src: url("file:///E:/AI/betterllama/app/fonts/InstrumentSans.ttf"); }
+  :root {
+    --bg: #1d1d1f; --side: #17171a; --raise: #2a2a2d; --line: rgba(255,255,255,.10);
+    --text: #ececee; --muted: #a3a3aa; --faint: #6f6f77; --accent: #b9c7ff; --ok: #8fd6a2;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 640px; overflow: hidden; background: var(--bg); }
+  body {
+    position: relative;
+    font-family: "Instrument Sans", "Segoe UI", sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(620px 420px at 170px 150px, rgba(185,199,255,.14), transparent 70%),
+      radial-gradient(700px 500px at 1050px 560px, rgba(185,199,255,.07), transparent 70%),
+      linear-gradient(180deg, #1f1f22 0%, #19191b 100%);
+  }
+  .left { position: absolute; left: 76px; top: 70px; width: 560px; }
+  .brand { display: flex; align-items: center; gap: 22px; }
+  .brand img { width: 104px; height: 104px; border-radius: 26px; box-shadow: 0 12px 40px rgba(0,0,0,.45); }
+  h1 { font-family: Georgia, serif; font-weight: 400; font-size: 78px; letter-spacing: -1px; line-height: 1; }
+  .tag { margin-top: 30px; font-size: 31px; line-height: 1.28; color: var(--text); font-weight: 500; }
+  .tag span { color: var(--muted); }
+  .stat { margin-top: 22px; font-size: 21px; color: var(--accent); }
+  .chips { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 10px; }
+  .chip { font-size: 17.5px; color: var(--muted); padding: 8px 15px; border: 1px solid var(--line); border-radius: 99px; background: rgba(255,255,255,.03); }
+  .chip b { color: var(--text); font-weight: 500; }
+  .foot { position: absolute; left: 76px; bottom: 46px; font-size: 17px; color: var(--faint); letter-spacing: .2px; }
+  .foot span + span::before { content: "·"; margin: 0 12px; color: #4a4a52; }
+  /* the app without its chat list: the reply and the rail (tasks, changes, scheduled), at 0.65 scale */
+  .shot {
+    position: absolute; right: 56px; top: 69px; width: 596px; height: 507px;
+    border-radius: 16px; overflow: hidden;
+    border: 1px solid var(--line);
+    box-shadow: 0 30px 80px rgba(0,0,0,.55), 0 0 0 1px rgba(0,0,0,.4);
+  }
+  .shot img { display: block; width: 767px; margin-left: -172px; }
+</style>
+</head>
+<body>
+  <div class="left">
+    <div class="brand">
+      <img src="file:///E:/AI/betterllama/docs/ghost.png" alt="">
+      <h1>ghost-infer</h1>
+    </div>
+    <p class="tag">Fast local LLM inference<br><span>for the GPU you already have.</span></p>
+    <p class="stat">A 35B model at 80 tokens/s on an 8 GB GPU,<br>twice llama.cpp's speed, and an agent for your files</p>
+    <div class="chips">
+      <span class="chip"><b>OpenAI-compatible</b> API</span>
+      <span class="chip"><b>Desktop app</b> with an agent</span>
+      <span class="chip"><b>MoE</b> bigger than your RAM</span>
+      <span class="chip"><b>One-click</b> install</span>
+    </div>
+  </div>
+  <div class="foot"><span>Windows</span><span>NVIDIA GPUs</span><span>GGUF models</span><span>MIT or Apache-2.0</span></div>
+  <div class="shot"><img src="app-new.png" alt=""></div>
+</body>
+</html>
