@@ -1,7 +1,8 @@
 //! A snapshot of this computer for the chat page's get_system_info tool (GET /api/system): CPU, memory,
-//! GPU, operating system and drives. Windows only for now (like the GPU backend); elsewhere it reports
-//! what the standard library knows. The GPU is read through NVML (nvml.dll, installed with the NVIDIA
-//! driver), which works from any thread, unlike CUDA's memory queries.
+//! GPU, operating system and drives. On Windows the numbers come from kernel32 and the registry; on
+//! Linux from /proc, /sys, /etc/os-release and statvfs. The GPU is read through NVML (nvml.dll /
+//! libnvidia-ml.so.1, installed with the NVIDIA driver), which works from any thread, unlike CUDA's
+//! memory queries.
 
 use crate::json::{Json, num, obj, str};
 
@@ -13,7 +14,9 @@ pub fn report(first: Vec<(&'static str, Json)>) -> Json {
     fields.push(("cpu_threads", num(threads as f64)));
     #[cfg(windows)]
     win::fill(&mut fields);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    linux::fill(&mut fields);
+    #[cfg(not(any(windows, target_os = "linux")))]
     fields.push(("os", str(std::env::consts::OS)));
     obj(fields)
 }
@@ -22,7 +25,9 @@ pub fn report(first: Vec<(&'static str, Json)>) -> Json {
 pub fn available_ram() -> Option<u64> {
     #[cfg(windows)]
     return win::available_ram();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    return linux::available_ram();
+    #[cfg(not(any(windows, target_os = "linux")))]
     None
 }
 
@@ -212,6 +217,299 @@ mod win {
                 (!p.is_null()).then_some(p)
             };
             let init: unsafe extern "system" fn() -> i32 = std::mem::transmute(sym("nvmlInit_v2")?);
+            if init() != 0 {
+                return None;
+            }
+            Some(Nvml {
+                count: std::mem::transmute(sym("nvmlDeviceGetCount_v2")?),
+                handle: std::mem::transmute(sym("nvmlDeviceGetHandleByIndex_v2")?),
+                name: std::mem::transmute(sym("nvmlDeviceGetName")?),
+                memory: std::mem::transmute(sym("nvmlDeviceGetMemoryInfo")?),
+                temperature: std::mem::transmute(sym("nvmlDeviceGetTemperature")?),
+                utilization: std::mem::transmute(sym("nvmlDeviceGetUtilizationRates")?),
+                driver: std::mem::transmute(sym("nvmlSystemGetDriverVersion")?),
+            })
+        })
+        .as_ref()
+    }
+
+    fn c_string(buf: &[u8]) -> String {
+        String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(buf.len())]).into_owned()
+    }
+
+    fn nvml() -> Option<Vec<Json>> {
+        let n = nvml_lib()?;
+        let mut driver = [0u8; 96];
+        let driver = if unsafe { (n.driver)(driver.as_mut_ptr(), driver.len() as u32) } == 0 { c_string(&driver) } else { String::new() };
+        let mut count = 0u32;
+        if unsafe { (n.count)(&mut count) } != 0 {
+            return None;
+        }
+        Some(
+            (0..count)
+                .filter_map(|i| {
+                    let mut dev = std::ptr::null_mut();
+                    if unsafe { (n.handle)(i, &mut dev) } != 0 {
+                        return None;
+                    }
+                    let mut name = [0u8; 96];
+                    unsafe { (n.name)(dev, name.as_mut_ptr(), name.len() as u32) };
+                    let mut g = vec![("name", str(&c_string(&name))), ("driver", str(&driver))];
+                    let mut mem = NvmlMemory { total: 0, free: 0, used: 0 };
+                    if unsafe { (n.memory)(dev, &mut mem) } == 0 {
+                        g.push(("vram_total_gb", gb(mem.total)));
+                        g.push(("vram_used_gb", gb(mem.used)));
+                        g.push(("vram_free_gb", gb(mem.free)));
+                    }
+                    let mut temp = 0u32;
+                    if unsafe { (n.temperature)(dev, 0, &mut temp) } == 0 {
+                        g.push(("temperature_c", num(temp as f64)));
+                    }
+                    let mut util = NvmlUtilization { gpu: 0, memory: 0 };
+                    if unsafe { (n.utilization)(dev, &mut util) } == 0 {
+                        g.push(("load_percent", num(util.gpu as f64)));
+                    }
+                    Some(obj(g))
+                })
+                .collect(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{Json, num, obj, str};
+    use std::ffi::{c_void, CString};
+    use std::sync::OnceLock;
+
+    const GB: f64 = 1073741824.0;
+
+    fn gb(bytes: u64) -> Json {
+        num((bytes as f64 / GB * 10.0).round() / 10.0)
+    }
+
+    /// Read a `key: value` pair out of a `/proc/*info`-style file, picking the
+    /// first match. Values are trimmed of leading whitespace only.
+    fn read_proc_field(path: &str, key: &str) -> Option<String> {
+        let s = std::fs::read_to_string(path).ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix(key).and_then(|r| r.trim_start().strip_prefix(':')) {
+                return Some(rest.trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn mem_kib(key: &str) -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix(key).and_then(|r| r.trim_start().strip_prefix(':')) {
+                return rest.split_whitespace().next()?.parse().ok();
+            }
+        }
+        None
+    }
+
+    pub fn available_ram() -> Option<u64> {
+        mem_kib("MemAvailable").map(|kib| kib * 1024)
+    }
+
+    /// Number of distinct physical cores, from the shared pool helper.
+    fn physical_cores() -> usize {
+        crate::pool::physical_cores().len()
+    }
+
+    /// `/etc/os-release` PRETTY_NAME, or just "Linux" if the file is missing.
+    fn os_pretty_name() -> String {
+        let Ok(s) = std::fs::read_to_string("/etc/os-release") else { return "Linux".into() };
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                return rest.trim().trim_matches('"').to_string();
+            }
+        }
+        "Linux".into()
+    }
+
+    /// `uname -r`, as a string, for the OS field.
+    fn kernel_release() -> Option<String> {
+        #[repr(C)]
+        struct Utsname {
+            sysname: [u8; 65],
+            nodename: [u8; 65],
+            release: [u8; 65],
+            version: [u8; 65],
+            machine: [u8; 65],
+            domainname: [u8; 65],
+        }
+        unsafe extern "C" {
+            fn uname(buf: *mut Utsname) -> i32;
+        }
+        let mut u: Utsname = unsafe { std::mem::zeroed() };
+        if unsafe { uname(&mut u) } != 0 {
+            return None;
+        }
+        let end = u.release.iter().position(|&b| b == 0).unwrap_or(u.release.len());
+        Some(String::from_utf8_lossy(&u.release[..end]).into_owned())
+    }
+
+    /// Mounts of real block-backed filesystems (ext4, xfs, btrfs, f2fs, zfs,
+    /// ntfs3, exfat, vfat): their mount point, total size and free size in
+    /// bytes. Skips tmpfs, devtmpfs, proc, sys, cgroup and friends.
+    fn real_mounts() -> Vec<(String, u64, u64)> {
+        const REAL_FS: &[&str] = &[
+            "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "zfs", "jfs",
+            "ntfs", "ntfs3", "exfat", "vfat", "fuseblk", "reiserfs", "bcachefs",
+        ];
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else { return Vec::new() };
+        let mut out: Vec<(String, u64, u64)> = Vec::new();
+        for line in mounts.lines() {
+            // device mountpoint fstype opts freq passno
+            let mut it = line.split_whitespace();
+            let _dev = it.next().unwrap_or("");
+            let Some(mount) = it.next() else { continue };
+            let Some(fs) = it.next() else { continue };
+            if !REAL_FS.contains(&fs) {
+                continue;
+            }
+            // Deduplicate: a block device bind-mounted twice should appear once.
+            if out.iter().any(|(m, _, _)| m == mount) {
+                continue;
+            }
+            if let Some((total, free)) = statvfs_bytes(mount) {
+                out.push((mount.to_string(), total, free));
+            }
+        }
+        out
+    }
+
+    /// `(total_bytes, available_bytes)` for a mount point via statvfs.
+    fn statvfs_bytes(path: &str) -> Option<(u64, u64)> {
+        // glibc statvfs is ABI-stable; `statvfs64` is identical on 64-bit Linux.
+        // 128 bytes covers every field we need (bsize, frsize, blocks, bfree,
+        // bavail, files, ffree, favail, fsid, flag, namemax) with room to spare.
+        #[repr(C)]
+        struct Statvfs {
+            f_bsize: u64,
+            f_frsize: u64,
+            f_blocks: u64,
+            f_bfree: u64,
+            f_bavail: u64,
+            f_files: u64,
+            f_ffree: u64,
+            f_favail: u64,
+            f_fsid: u64,
+            f_flag: u64,
+            f_namemax: u64,
+            _pad: [u64; 6],
+        }
+        unsafe extern "C" {
+            fn statvfs(path: *const i8, buf: *mut Statvfs) -> i32;
+        }
+        let c = CString::new(path).ok()?;
+        let mut s: Statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { statvfs(c.as_ptr(), &mut s) } != 0 {
+            return None;
+        }
+        Some((s.f_blocks * s.f_frsize, s.f_bavail * s.f_frsize))
+    }
+
+    /// This process's resident set in bytes, from `/proc/self/statm` (second
+    /// field is resident pages).
+    fn self_rss() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4096)
+    }
+
+    pub fn fill(f: &mut Vec<(&'static str, Json)>) {
+        if let Some(name) = read_proc_field("/proc/cpuinfo", "model name") {
+            f.push(("cpu", str(&name)));
+        }
+        let cores = physical_cores();
+        if cores > 0 {
+            f.push(("cpu_cores", num(cores as f64)));
+        }
+        if let Some(mhz) = read_proc_field("/proc/cpuinfo", "cpu MHz").and_then(|s| s.parse::<f64>().ok()) {
+            f.push(("cpu_mhz", num(mhz.round())));
+        }
+
+        if let (Some(total_kib), Some(avail_kib)) = (mem_kib("MemTotal"), mem_kib("MemAvailable")) {
+            let total = total_kib * 1024;
+            let avail = avail_kib * 1024;
+            f.push(("ram_total_gb", gb(total)));
+            f.push(("ram_available_gb", gb(avail)));
+            if total > 0 {
+                let pct = ((total - avail) as f64 / total as f64 * 100.0).round();
+                f.push(("ram_in_use_percent", num(pct)));
+            }
+        }
+        if let Some(rss) = self_rss() {
+            f.push(("ghost_infer_ram_gb", gb(rss)));
+        }
+
+        let os = match kernel_release() {
+            Some(k) => format!("{} (kernel {})", os_pretty_name(), k),
+            None => os_pretty_name(),
+        };
+        f.push(("os", str(&os)));
+
+        if let Some(gpus) = nvml() {
+            f.push(("gpus", Json::Arr(gpus)));
+        }
+
+        let drives: Vec<Json> = real_mounts()
+            .into_iter()
+            .map(|(mount, total, free)| obj(vec![("drive", str(&mount)), ("total_gb", gb(total)), ("free_gb", gb(free))]))
+            .collect();
+        f.push(("drives", Json::Arr(drives)));
+    }
+
+    // ---- NVML (libnvidia-ml.so.1): the Windows-side struct, reloaded here against the Linux SONAME.
+
+    #[repr(C)]
+    struct NvmlMemory {
+        total: u64,
+        free: u64,
+        used: u64,
+    }
+    #[repr(C)]
+    struct NvmlUtilization {
+        gpu: u32,
+        memory: u32,
+    }
+
+    #[allow(clippy::type_complexity)]
+    struct Nvml {
+        count: unsafe extern "C" fn(*mut u32) -> i32,
+        handle: unsafe extern "C" fn(u32, *mut *mut c_void) -> i32,
+        name: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> i32,
+        memory: unsafe extern "C" fn(*mut c_void, *mut NvmlMemory) -> i32,
+        temperature: unsafe extern "C" fn(*mut c_void, u32, *mut u32) -> i32,
+        utilization: unsafe extern "C" fn(*mut c_void, *mut NvmlUtilization) -> i32,
+        driver: unsafe extern "C" fn(*mut u8, u32) -> i32,
+    }
+
+    #[link(name = "dl")]
+    unsafe extern "C" {
+        fn dlopen(path: *const i8, flags: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, name: *const i8) -> *mut c_void;
+    }
+    const RTLD_NOW: i32 = 2;
+
+    fn nvml_lib() -> Option<&'static Nvml> {
+        static LIB: OnceLock<Option<Nvml>> = OnceLock::new();
+        LIB.get_or_init(|| unsafe {
+            let name = CString::new("libnvidia-ml.so.1").ok()?;
+            let lib = dlopen(name.as_ptr(), RTLD_NOW);
+            if lib.is_null() {
+                return None;
+            }
+            let sym = |n: &str| {
+                let c = CString::new(n).ok()?;
+                let p = dlsym(lib, c.as_ptr());
+                (!p.is_null()).then_some(p)
+            };
+            let init: unsafe extern "C" fn() -> i32 = std::mem::transmute(sym("nvmlInit_v2")?);
             if init() != 0 {
                 return None;
             }

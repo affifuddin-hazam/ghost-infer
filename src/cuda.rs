@@ -5023,19 +5023,10 @@ mod os {
         (faults, rss)
     }
 
-    /// Physical memory available to programs now, in bytes, from
-    /// `/proc/meminfo`'s `MemAvailable`. Unknown: `u64::MAX`, so the RAM floor
-    /// does nothing.
+    /// Physical memory available to programs now, in bytes. Unknown: `u64::MAX`,
+    /// so the RAM floor does nothing.
     pub fn available_ram() -> u64 {
-        let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return u64::MAX };
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                if let Some(kb) = rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) {
-                    return kb * 1024;
-                }
-            }
-        }
-        u64::MAX
+        crate::sysinfo::available_ram().unwrap_or(u64::MAX)
     }
 
     /// `dlopen(path, RTLD_NOW)`.

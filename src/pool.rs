@@ -225,7 +225,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-fn physical_cores() -> &'static [Vec<usize>] {
+pub fn physical_cores() -> &'static [Vec<usize>] {
     unix::physical_cores()
 }
 
