@@ -24,7 +24,7 @@ const START: Duration = Duration::from_secs(90);
 const CALL: Duration = Duration::from_secs(300);
 
 pub fn config_file() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer")).ok_or("LOCALAPPDATA is not set")?;
+    let d = crate::paths::data_dir().ok_or(crate::paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     Ok(d.join("mcp.json"))
 }
@@ -234,7 +234,7 @@ fn start(name: &str, cfg: &Json) -> Result<(Conn, Vec<Json>), String> {
         // code 0: our own error (the process ended), not the server's
         Err(Some(e)) if e.code == 0 => {
             conn.stop();
-            return Err("it stopped as it started (see its log in %LOCALAPPDATA%\\ghost-infer)".into());
+            return Err("it stopped as it started (see its log in the ghost-infer data directory)".into());
         }
         // anything else: a legacy server, which wants the initialize handshake
         Err(_) => {

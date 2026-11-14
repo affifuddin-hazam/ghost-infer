@@ -3,35 +3,15 @@
 //! dependency: without a GPU the binary still works on the CPU.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::model::Config;
+use crate::paths;
 use crate::profile;
 use crate::quant::f16_to_f32;
-
-/// Where ghost-infer caches compiled kernel binaries between runs.
-/// Phase 3 of the Linux port moves this into a shared `paths` module.
-fn cache_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer"))
-    }
-    #[cfg(unix)]
-    {
-        if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
-            return Some(PathBuf::from(d).join("ghost-infer"));
-        }
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("ghost-infer"))
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        None
-    }
-}
 
 const MAX_BATCH: usize = 1024; // prompt tokens per GPU pass: big batches keep the attention kernel busy
 
@@ -5748,7 +5728,7 @@ impl Kernels {
             format!("{:016x}", h.finish())
         };
         let use_cache = std::env::var_os("GHOST_INFER_NO_KERNEL_CACHE").is_none();
-        let dir = cache_dir().map(|d| d.join("kernels"));
+        let dir = paths::cache_dir().map(|d| d.join("kernels"));
         let file = dir.as_ref().map(|d| d.join(format!("{key}.cubin")));
         if let (true, Some(file)) = (use_cache, &file) {
             if let Ok(bin) = std::fs::read(file) {

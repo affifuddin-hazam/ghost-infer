@@ -18,7 +18,7 @@ const QUIET_MS: u64 = 30 * 60 * 1000;
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("nightly"))
+    crate::paths::data_dir().map(|d| d.join("nightly"))
 }
 
 fn read(name: &str) -> Json {
@@ -60,7 +60,7 @@ pub fn launch(shared: &Shared) -> Result<(), String> {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return Err("a nightly run is going on".into());
     }
-    let log = home().map(|h| h.join("server-run.log")).ok_or("LOCALAPPDATA is not set")?;
+    let log = home().map(|h| h.join("server-run.log")).ok_or(crate::paths::NO_DATA_DIR)?;
     let out = std::fs::File::create(&log).map_err(|e| format!("cannot write {}: {e}", log.display()))?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
     let mut command = Command::new(&python);
@@ -89,7 +89,7 @@ pub fn launch(shared: &Shared) -> Result<(), String> {
 /// Changes the settings a client may change: {"enabled"?: bool, "hour"?: 0-23}. The rest of nightly.json (the
 /// script's own settings) is kept as it is.
 pub fn set(b: &Json) -> Result<Json, String> {
-    let path = home().ok_or("LOCALAPPDATA is not set")?.join("nightly.json");
+    let path = home().ok_or(crate::paths::NO_DATA_DIR)?.join("nightly.json");
     let mut fields: Vec<(String, Json)> = match read("nightly.json") {
         Json::Obj(f) => f,
         _ => Vec::new(),
@@ -133,7 +133,7 @@ pub fn learned() -> Json {
             None => latest.push(r.clone()),
         }
     }
-    let chats = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("chats"));
+    let chats = crate::paths::data_dir().map(|d| d.join("chats"));
     let title = |id: &str| -> String {
         chats.as_ref().and_then(|c| std::fs::read_to_string(c.join(format!("{id}.json"))).ok()).and_then(|t| Json::parse(&t).ok()).and_then(|j| j.get("title").and_then(Json::as_str).map(String::from)).unwrap_or_default()
     };
@@ -211,7 +211,7 @@ pub fn forget(b: &Json) -> Result<Json, String> {
         ("at", Json::Num(now)),
         ("v", Json::Num(latest.get("v").and_then(Json::as_f64).unwrap_or(0.0) + 1.0)),
     ]);
-    let path = home().ok_or("LOCALAPPDATA is not set")?.join("facts.jsonl");
+    let path = home().ok_or(crate::paths::NO_DATA_DIR)?.join("facts.jsonl");
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     writeln!(f, "{}", row.to_string()).map_err(|e| e.to_string())?;

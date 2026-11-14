@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::json::{obj, str, Json};
 
 pub fn dir() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("plugins")).ok_or("LOCALAPPDATA is not set")?;
+    let d = crate::paths::data_dir().map(|d| d.join("plugins")).ok_or(crate::paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     Ok(d)
 }

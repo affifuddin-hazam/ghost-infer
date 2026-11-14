@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::json::{num, obj, str, Json};
+use crate::paths;
 
 /// Characters a tool result may hand the model; longer ones keep their start and end.
 pub const MAX_RESULT: usize = 16_000;
@@ -47,26 +48,26 @@ impl Default for Settings {
     }
 }
 
-/// Where installed skills live (%LOCALAPPDATA%\ghost-infer\skills): the file tools may read there, and
-/// commands may run there (for a skill's scripts), but nothing is written there except by installing.
+/// Where installed skills live (`<data_dir>/skills`): the file tools may read there, and commands may run
+/// there (for a skill's scripts), but nothing is written there except by installing.
 pub fn skills_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("skills"))
+    paths::data_dir().map(|d| d.join("skills"))
 }
 
 /// The plugins ghost wrote for itself (server/plugins.rs): readable by the file tools, so a broken one can be
 /// read and fixed, but written only through plugin_manager (whose saves the user approves).
 pub fn plugins_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("plugins"))
+    paths::data_dir().map(|d| d.join("plugins"))
 }
 
 /// Where tool outputs too long for the model's context are saved, a folder per chat
-/// (%LOCALAPPDATA%\ghost-infer\outputs): the file tools may read there, as in the skills folder.
+/// (`<data_dir>/outputs`): the file tools may read there, as in the skills folder.
 pub fn outputs_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("outputs"))
+    paths::data_dir().map(|d| d.join("outputs"))
 }
 
 fn settings_file() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("harness.json"))
+    paths::data_dir().map(|d| d.join("harness.json"))
 }
 
 impl Settings {
@@ -87,7 +88,7 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = settings_file().ok_or("LOCALAPPDATA is not set")?;
+        let path = settings_file().ok_or(paths::NO_DATA_DIR)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -390,10 +391,10 @@ fn search_files(s: &Settings, pattern: &str, dir: &Path, glob: Option<&str>, ign
 
 // ---- changing files, with undo
 
-/// Where file changes are journalled for undo: %LOCALAPPDATA%\ghost-infer\checkpoints, one line per change
+/// Where file changes are journalled for undo: `<data_dir>/checkpoints`, one line per change
 /// in journal.txt (checkpoint, sequence, path, whether the file existed) and the old content in <seq>.bak.
 fn journal_dir() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("checkpoints")).ok_or("LOCALAPPDATA is not set")?;
+    let d = paths::data_dir().map(|d| d.join("checkpoints")).ok_or(paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     Ok(d)
 }

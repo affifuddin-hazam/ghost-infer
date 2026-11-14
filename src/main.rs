@@ -10,6 +10,7 @@ mod maya1;
 mod mimi;
 mod model;
 mod monitor;
+mod paths;
 mod platform;
 mod pool;
 mod profile;
@@ -69,8 +70,9 @@ OPTIONS:
         --no-lookup       GPU: one token per step, no guesses copied from the context to check in a batch
                           (also GHOST_INFER_NO_LOOKUP=1)
         --lora <file>[:s] a LoRA adapter (llama.cpp's GGUF adapter format) on top of the model, at strength s [1];
-                          without it, %LOCALAPPDATA%\\ghost-infer\\lora\\<model name>.gguf is used when it exists
-                          (GHOST_INFER_NO_LORA=1 turns that off)
+                          without it, <data_dir>/lora/<model name>.gguf is used when it exists
+                          (<data_dir> is %LOCALAPPDATA%\\ghost-infer on Windows, $XDG_DATA_HOME/ghost-infer
+                          or ~/.local/share/ghost-infer on Linux; GHOST_INFER_NO_LORA=1 turns that off)
         --kv <f16|int8>   GPU KV cache: int8 holds about twice the context  [int8, or GHOST_INFER_KV]
         --ram-floor <GB>  mixture of experts on the GPU: keep this much RAM free for other programs, releasing
                           the experts used least recently (read again when needed); 0 fills RAM, the fastest
