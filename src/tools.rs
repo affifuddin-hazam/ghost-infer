@@ -1110,7 +1110,9 @@ pub fn status(s: &Settings) -> Json {
 mod tests {
     use super::*;
 
-    /// The id start_process gave, from its answer.
+    /// The id start_process gave, from its answer. Only used by the PowerShell tests below,
+    /// which are gated to Windows; dead on Unix.
+    #[cfg(windows)]
     fn started(answer: &str) -> usize {
         answer.split_whitespace().nth(3).and_then(|n| n.trim_end_matches(';').parse().ok()).unwrap()
     }
@@ -1132,6 +1134,10 @@ mod tests {
         assert!(end.contains("finished after") && end.contains("exit code 3"), "{end}");
     }
 
+    // Uses a PowerShell range pipeline (1..20000 | ForEach-Object {...}); the
+    // sh fallback on Unix would need a different fixture. Phase 5 of the Linux
+    // port scopes shell() but leaves the Windows-authored test alone.
+    #[cfg(windows)]
     #[test]
     fn new_output_shows_after_the_kept_tail_is_full() {
         let dir = std::env::temp_dir();
