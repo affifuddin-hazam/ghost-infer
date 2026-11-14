@@ -856,7 +856,7 @@ pub fn process_output(id: usize) -> Option<String> {
     Some(clip(&text_of(&out), MAX_RESULT))
 }
 
-// ---- web (through Windows' own curl.exe: no TLS library here)
+// ---- web (through the system `curl`: no TLS library linked here)
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 
@@ -1115,6 +1115,9 @@ mod tests {
         answer.split_whitespace().nth(3).and_then(|n| n.trim_end_matches(';').parse().ok()).unwrap()
     }
 
+    // Uses PowerShell cmdlets; on Unix the equivalent would be rewritten against sh.
+    // Phase 5 of the Linux port scopes shell() but leaves the Windows-authored test alone.
+    #[cfg(windows)]
     #[test]
     fn check_process_waits_for_news_and_tells_how_it_ended() {
         let dir = std::env::temp_dir();
@@ -1219,7 +1222,11 @@ mod tests {
         assert!(s.resolve("sub/new.txt").is_ok());
         assert!(s.resolve("..").is_err());
         assert!(s.resolve("sub/../../x").is_err());
+        // Each platform's "obviously absolute, obviously outside" sentinel.
+        #[cfg(windows)]
         assert!(s.resolve(r"C:\Windows\win.ini").is_err());
+        #[cfg(unix)]
+        assert!(s.resolve("/etc/hostname").is_err());
         assert!(Settings::default().resolve("a").is_err());
     }
 }

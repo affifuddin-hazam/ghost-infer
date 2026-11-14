@@ -1,6 +1,7 @@
-//! A model download for the app's first run: one GGUF file from Hugging Face into the models folder, through
-//! Windows' own curl.exe (no TLS library here). It goes to `<name>.gguf.part` and takes its name once whole,
-//! so the model list never shows half a file, and a download that stops resumes from that part.
+//! A model download for the app's first run: one GGUF file from Hugging Face into the models folder,
+//! through the system `curl` (Windows 10+ ships one as `curl.exe`; Linux relies on the package). No TLS
+//! library is linked in. It goes to `<name>.gguf.part` and takes its name once whole, so the model list
+//! never shows half a file, and a download that stops resumes from that part.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
