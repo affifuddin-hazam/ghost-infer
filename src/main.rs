@@ -10,6 +10,7 @@ mod maya1;
 mod mimi;
 mod model;
 mod monitor;
+mod platform;
 mod pool;
 mod profile;
 mod quant;

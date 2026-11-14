@@ -160,8 +160,7 @@ fn servers() -> &'static Mutex<Vec<Arc<Mutex<Server>>>> {
 /// The server process, started without a window. A command Windows cannot start by itself (npx, uvx: they
 /// are .cmd files) goes through cmd.
 fn spawn(name: &str, cfg: &Json) -> Result<Conn, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    use crate::platform::NoConsole;
     let command = cfg.get("command").and_then(Json::as_str).ok_or("no command")?;
     let args: Vec<String> = cfg.get("args").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
     let env: Vec<(String, String)> = match cfg.get("env") {
@@ -179,7 +178,7 @@ fn spawn(name: &str, cfg: &Json) -> Result<Conn, String> {
             c.arg("/C").arg(command).args(&args);
             c
         };
-        c.envs(env.iter().cloned()).stdin(Stdio::piped()).stdout(Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
+        c.envs(env.iter().cloned()).stdin(Stdio::piped()).stdout(Stdio::piped()).no_console();
         if let Some(d) = cfg.get("cwd").and_then(Json::as_str) {
             c.current_dir(d);
         }

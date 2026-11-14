@@ -41,8 +41,8 @@ pub fn start(url: &str, file: &str, total: u64, dir: &Path) -> Result<(), String
         return Ok(());
     }
     let part = dir.join(format!("{file}.part"));
-    use std::os::windows::process::CommandExt;
-    let child = Command::new("curl.exe")
+    use crate::platform::{NoConsole, CURL};
+    let child = Command::new(CURL)
         // follow the redirect to the file's host, fail on an HTTP error, retry a dropped connection, and go
         // on from the part already there
         .args(["-L", "--fail", "--silent", "--show-error", "--retry", "5", "--retry-delay", "3", "-C", "-", "-o"])
@@ -51,9 +51,9 @@ pub fn start(url: &str, file: &str, total: u64, dir: &Path) -> Result<(), String
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .creation_flags(0x0800_0000) // no console window
+        .no_console()
         .spawn()
-        .map_err(|e| format!("cannot run curl.exe: {e}"))?;
+        .map_err(|e| format!("cannot run {CURL}: {e}"))?;
     *job = Some(Job { file: file.into(), part: part.clone(), total, state: "downloading", error: String::new(), child: Some(child) });
     drop(job);
     std::thread::spawn(move || watch(part, target));

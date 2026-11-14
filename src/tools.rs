@@ -596,10 +596,11 @@ fn and_chains(command: &str) -> String {
     out
 }
 
-/// `command` in Windows PowerShell, started in `cwd`, stdout and stderr captured together.
+/// `command` in Windows PowerShell (or `/bin/sh -c` on Unix), started in `cwd`,
+/// stdout and stderr captured together.
+#[cfg(windows)]
 fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    use crate::platform::NoConsole;
     Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
         .arg(format!("{PREAMBLE}\n{}", and_chains(command)))
@@ -607,9 +608,25 @@ fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
+        .no_console()
         .spawn()
         .map_err(|e| format!("cannot start PowerShell: {e}"))
+}
+
+#[cfg(not(windows))]
+fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
+    // sh understands && and || natively; the Windows and_chains() rewrite and the
+    // PowerShell PREAMBLE are both Windows-only. Silence the unused warnings.
+    let _ = (PREAMBLE, and_chains as fn(&str) -> String);
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start /bin/sh: {e}"))
 }
 
 /// Reads a child's stdout and stderr on two threads into one shared buffer, keeping its last `keep` bytes.
@@ -645,10 +662,20 @@ fn collect_counted(child: &mut std::process::Child, keep: usize) -> (std::sync::
     (buf, total)
 }
 
-/// Ends a process and everything it started (taskkill /T), by process id.
+/// Ends a process and everything it started (taskkill /T on Windows, kill on Unix),
+/// by process id.
+#[cfg(windows)]
 fn kill_tree(pid: u32) {
-    use std::os::windows::process::CommandExt;
-    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(0x0800_0000).output();
+    use crate::platform::NoConsole;
+    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).no_console().output();
+}
+
+#[cfg(not(windows))]
+fn kill_tree(pid: u32) {
+    // taskkill /T walks Windows' job object; on Unix the nearest equivalent is
+    // killing the process group, but the server does not call setsid on children
+    // yet, so fall back to signalling the direct child. Phase 5 refactors this.
+    let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
 }
 
 /// Runs a command to completion (or `secs`), then its exit code and output.
@@ -834,18 +861,18 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 /// GET `url` (http or https), at most 5 MB in 20 s: the body and its Content-Type.
 fn http_get(url: &str) -> Result<(Vec<u8>, String), String> {
-    use std::os::windows::process::CommandExt;
+    use crate::platform::{NoConsole, CURL};
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("{url} is not an http(s) address"));
     }
     const MARK: &[u8] = b"\n__ghost_infer_content_type__:";
-    let out = Command::new("curl.exe")
+    let out = Command::new(CURL)
         .args(["-sSL", "--compressed", "--max-time", "20", "--max-filesize", "5000000", "-A", USER_AGENT, "-w"])
         .arg(format!("{}%{{content_type}}", String::from_utf8_lossy(MARK)))
         .arg(url)
-        .creation_flags(0x0800_0000)
+        .no_console()
         .output()
-        .map_err(|e| format!("cannot run curl.exe: {e}"))?;
+        .map_err(|e| format!("cannot run {CURL}: {e}"))?;
     if !out.status.success() {
         return Err(format!("could not fetch {url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -1168,6 +1195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn and_chains_in_powershell() {
         assert_eq!(and_chains("cd site && dir"), "cd site; if ($?) { dir }");
         assert_eq!(and_chains("a && b && c"), "a; if ($?) { b; if ($?) { c } }");

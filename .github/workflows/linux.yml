@@ -1,0 +1,23 @@
+name: linux
+
+on:
+  push:
+    branches: [main, linux]
+  pull_request:
+
+jobs:
+  build:
+    name: cargo build + test (ubuntu, CPU-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # CUDA and NVRTC are loaded at runtime via dlopen; the build does not need
+      # the CUDA toolkit. Serve --gpu will fail at runtime without an NVIDIA
+      # driver, which the CPU runners do not have, and is not expected to be
+      # exercised here.
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: cargo test
+        run: cargo test --release --locked
