@@ -310,6 +310,25 @@ fn list_models(dirs: &[PathBuf]) -> Vec<(String, PathBuf, u64)> {
     found
 }
 
+/// Where the server on `port` keeps its run token for this user's other programs (the app, the monitor):
+/// run-token-<port> beside the chats, one per server, since several may run at once.
+pub fn run_token_path(port: u16) -> Option<PathBuf> {
+    agent::data_dir().ok().map(|d| d.join(format!("run-token-{port}")))
+}
+
+/// Writes a file only this user can read (unix: mode 0600; Windows: %LOCALAPPDATA% is the user's already).
+fn write_private(path: &Path, text: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path).and_then(|mut f| f.write_all(text.as_bytes()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 /// Whether the saved settings have the server listen on every address when no --host is given.
 pub fn network_wanted() -> bool {
     auth::network_wanted()
@@ -345,8 +364,8 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     });
     // who may come in (auth.rs); this run's token goes where programs of this user can read it
     let made = auth::init(host, port, o.api_key.clone());
-    if let Ok(d) = agent::data_dir() {
-        let _ = std::fs::write(d.join("run-token"), &shared.token);
+    if let Some(f) = run_token_path(port) {
+        write_private(&f, &shared.token);
     }
     if let Some(key) = made {
         let shown = if host == "0.0.0.0" || host == "::" { "<this computer's address>" } else { host };
@@ -1506,6 +1525,12 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             return respond_file(&mut conn, page.as_bytes(), "text/html; charset=utf-8", "no-store");
         }
         if p.starts_with("/api/access") {
+            // as guarded as the agent tools (a key made here opens them): this computer's own page, or a key
+            if p != "/api/access/logout" {
+                if let Err(e) = tools_allowed(&req, &conn, &shared.token, who.as_ref()) {
+                    return respond_private(&mut conn, 403, &error_body(e));
+                }
+            }
             return access_request(&mut conn, &req, p, who.as_ref().unwrap_or(&auth::Who::Open));
         }
     }

@@ -448,11 +448,11 @@ const day = (ms) => new Date(ms).toLocaleDateString(undefined, { month: "short",
 const baseName = (p) => String(p).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || String(p);
 
 // ================================================================ talking to the server
-async function api(path, { method, body, raw } = {}) {
+async function api(path, { method, body, raw, signal } = {}) {
   const r = await fetch(path, {
     method: method || (body !== undefined ? "POST" : "GET"),
     headers: { "X-Ghost-Token": TOKEN, ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
-    body: body !== undefined ? JSON.stringify(body) : undefined, credentials: "same-origin",
+    body: body !== undefined ? JSON.stringify(body) : undefined, credentials: "same-origin", signal,
   });
   if (r.status === 401) { location.reload(); throw new Error("Signed out"); }
   if (raw) return r;
@@ -639,7 +639,7 @@ function toolLabel(p) {
   if (L) return { verb: L[0], what: L[1], icon: L[2] };
   return { verb: p.name.replace(/^mcp__([^_]+)__/, "$1: ").replace(/_/g, " "), what: "", icon: "bolt" };
 }
-const ASK_WORDS = { edit: ["Make this change?", "edits"], cmd: ["Run a command?", "commands"], web: ["Use the web?", "web access"] };
+const ASK_WORDS = { edit: ["Make this change?", "edits"], cmd: ["Run a command?", "commands"], web: ["Use the web?", "web access"] }; // "always" holds in every chat until Settings, General
 
 // ================================================================ drawing the conversation
 const log = $("log"), scroller = $("scroll");
@@ -974,7 +974,7 @@ async function send(again) {
   const turn = currentTurn(), t0 = performance.now();
   let firstTok = 0, outTokens = 0;
   try {
-    const r = await api("/api/agent", { body, raw: true });
+    const r = await api("/api/agent", { body, raw: true, signal: ctrl.signal }); // aborting closes it, which stops the server's work
     if (!r.ok) { const j = await r.json().catch(() => null); throw new Error((j && j.error && j.error.message) || `HTTP ${r.status}`); }
     const reader = r.body.getReader(), dec = new TextDecoder();
     ctrl.signal.addEventListener("abort", () => reader.cancel().catch(() => {}));
@@ -1079,6 +1079,10 @@ async function drawSettings() {
       + `<div class="gtitle">Folders the agent may use</div><div class="gcard">`
       + (f.length ? f.map((x, i) => srow(esc(baseName(x)), esc(x), `<button class="btn sm" data-rmf="${i}">Remove</button>`)).join("") : srow('<span class="faint">None yet</span>', "The agent can read and change files only inside these folders", ""))
       + `<div class="srow"><form class="field" id="addF" style="flex:1"><input class="mono" placeholder="Add a folder on ${where()} by its path" spellcheck="false" aria-label="Folder path"><button class="btn sm pri">Add</button></form></div></div>`
+      + `<div class="gtitle">Always allowed</div><div class="gcard">`
+      + ((S.harness.always || []).length ? S.harness.always.map((g) => srow(esc({ edit: "File edits", cmd: "Commands", web: "Web access" }[g] || g), "In every chat, without asking (from “Always allow” on an approval card)", `<button class="btn sm" data-unalways="${esc(g)}">Ask again</button>`)).join("")
+        : srow('<span class="faint">Nothing</span>', "“Always allow” on an approval card lands here, for every chat", ""))
+      + `</div>`
       + `<div class="gtitle">Memory</div><div class="gcard">`
       + ((mem.facts || []).length ? mem.facts.map((x, i) => srow(esc(x), "", `<button class="btn sm" data-forget="${i}">Forget</button>`)).join("") : srow('<span class="faint">Nothing remembered yet</span>', "What the agent saves with its remember tool shows here, for every chat", ""))
       + `</div><div class="gtitle">Server</div><div class="gcard">`
@@ -1088,6 +1092,9 @@ async function drawSettings() {
     $("swWarm").onclick = async () => { try { S.harness = await api("/api/harness", { body: { folders: f, warm_up: S.harness.warm_up === false } }); drawSettings(); } catch (e) { toast(e.message); } };
     P.querySelectorAll("[data-rmf]").forEach((b) => b.onclick = async () => { try { await setFolders(f.filter((_, i) => i !== +b.dataset.rmf)); drawSettings(); drawChips(); } catch (e) { toast(e.message); } });
     P.querySelector("#addF").onsubmit = async (e) => { e.preventDefault(); const v = e.target.querySelector("input").value.trim(); if (!v) return; try { await setFolders([...f, v]); drawSettings(); drawChips(); } catch (err) { toast(err.message); } };
+    P.querySelectorAll("[data-unalways]").forEach((b) => b.onclick = async () => {
+      try { S.harness = await api("/api/harness", { body: { folders: f, always: (S.harness.always || []).filter((g) => g !== b.dataset.unalways) } }); drawSettings(); } catch (e) { toast(e.message); }
+    });
     P.querySelectorAll("[data-forget]").forEach((b) => b.onclick = async () => { try { await api("/api/memory/forget", { body: { index: +b.dataset.forget } }); drawSettings(); } catch (e) { toast(e.message); } });
   } else if (page === "appearance") {
     const t = store.get("theme", "system"), notif = "Notification" in window ? Notification.permission : "none";

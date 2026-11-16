@@ -24,11 +24,9 @@ fn get(addr: &str, path: &str) -> Option<Json> {
     let sock = addr.to_socket_addrs().ok()?.next()?;
     let mut s = TcpStream::connect_timeout(&sock, Duration::from_millis(500)).ok()?;
     s.set_read_timeout(Some(Duration::from_millis(800))).ok()?;
-    // this run's token (a server with access keys asks for one; it is beside the chats, readable by this user)
-    let token = std::env::var_os("LOCALAPPDATA")
-        .and_then(|d| std::fs::read_to_string(std::path::PathBuf::from(d).join("ghost-infer").join("run-token")).ok())
-        .map(|t| t.trim().to_string())
-        .unwrap_or_default();
+    // that server's run token (one with access keys asks for one; it is beside the chats, readable by this user)
+    let port = sock.port();
+    let token = crate::server::run_token_path(port).and_then(|f| std::fs::read_to_string(f).ok()).map(|t| t.trim().to_string()).unwrap_or_default();
     write!(s, "GET {path} HTTP/1.1\r\nHost: {addr}\r\nX-Ghost-Token: {token}\r\nConnection: close\r\n\r\n").ok()?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).ok()?;

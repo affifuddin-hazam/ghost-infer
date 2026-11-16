@@ -32,9 +32,10 @@ impl Api {
         let at = page.find(marker).ok_or(tr("this server has no tool token (is it an older ghost-infer?)"))? + marker.len();
         api.token = page[at..].split('"').next().unwrap_or("").to_string();
         // a server with access keys leaves it out of the page for anyone not signed in: this user's programs
-        // read it from the run-token file beside the chats instead
+        // read it from that server's run-token-<port> file beside the chats instead
         if api.token.is_empty() {
-            let file = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("ghost-infer").join("run-token"));
+            let port = addr.rsplit(':').next().unwrap_or("8080");
+            let file = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("ghost-infer").join(format!("run-token-{port}")));
             api.token = file.and_then(|f| std::fs::read_to_string(f).ok()).map(|t| t.trim().to_string()).unwrap_or_default();
         }
         Ok(api)
