@@ -76,7 +76,11 @@ OPTIONS:
                           [the server's saved setting, else 0; or GHOST_INFER_RAM_FLOOR]
         --threads <n>     CPU worker threads                 [physical cores]
         --special         print special tokens
-        --host <addr>     serve: address to listen on        [127.0.0.1]
+        --host <addr>     serve: address to listen on        [127.0.0.1; 0.0.0.0 when the chat page's
+                          Reachable from other devices is on]. Any address but this computer's needs an
+                          access key: one is made and printed as a sign-in link if none exists
+        --api-key <key>   serve: an access key requests may bring (Authorization: Bearer <key>), besides
+                          the ones made in the chat page          [GHOST_INFER_API_KEY]
         --port <n>        serve: port                        [8080]
         --no-think        serve: Qwen3 answers without thinking unless a request asks for it
         --models <dir>    serve: another folder of GGUF files for the model picker (repeatable)
@@ -105,6 +109,8 @@ struct Opts {
     draft: Option<PathBuf>,
     draft_k: usize,
     host: String,
+    host_given: bool,        // serve: --host was given (else the saved "reachable from other devices" decides)
+    api_key: Option<String>, // serve: --api-key or GHOST_INFER_API_KEY
     port: u16,
     models: Vec<PathBuf>, // serve: more folders of GGUF files to switch to, besides the model's own
     tts: Option<PathBuf>, // serve: a CSM folder for /v1/audio/speech
@@ -138,6 +144,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         draft: None,
         draft_k: 3,
         host: "127.0.0.1".into(),
+        host_given: false,
+        api_key: std::env::var("GHOST_INFER_API_KEY").ok().filter(|k| !k.trim().is_empty()),
         port: 8080,
         models: Vec::new(),
         tts: None,
@@ -171,7 +179,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--draft" => o.draft = Some(PathBuf::from(val(a)?)),
             "--draft-k" => o.draft_k = num(val(a)?, a)? as usize,
             "--no-lookup" => lookup::set_off(),
-            "--host" => o.host = val(a)?,
+            "--host" => {
+                o.host = val(a)?;
+                o.host_given = true;
+            }
+            "--api-key" => o.api_key = Some(val(a)?),
             "--port" => o.port = num(val(a)?, a)? as u16,
             "--models" => o.models.push(PathBuf::from(val(a)?)),
             "--tts" => o.tts = Some(PathBuf::from(val(a)?)),
@@ -215,7 +227,11 @@ fn main() -> ExitCode {
         Some("serve") => {
             let given = rest.first().is_some_and(|a| !a.starts_with('-'));
             let args: Vec<String> = if given { rest.to_vec() } else { std::iter::once(String::new()).chain(rest.iter().cloned()).collect() };
-            parse_opts(&args).and_then(|o| server::serve(&o, &o.host, o.port))
+            parse_opts(&args).and_then(|o| {
+                // no --host: the chat page's "Reachable from other devices" setting decides
+                let host = if !o.host_given && server::network_wanted() { "0.0.0.0".to_string() } else { o.host.clone() };
+                server::serve(&o, &host, o.port)
+            })
         }
         _ => {
             eprint!("{USAGE}");

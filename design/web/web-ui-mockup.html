@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web UI mockup</title>
+<style>
+  @font-face { font-family: "Instrument Sans"; src: url("../../src/vendor/instrument-sans.woff2") format("woff2"); font-weight: 400 700; }
+  :root {
+    --bg: #1d1d1f; --side: #171719; --raise: #2a2a2d; --raise2: #333337; --hover: #262629; --menu: #2b2b2f;
+    --line: rgba(255,255,255,.06); --line2: rgba(255,255,255,.10);
+    --text: #ececee; --muted: #a3a3aa; --faint: #6f6f77; --accent: #b9c7ff; --ink: #14172a;
+    --ok: #8fd6a2; --bad: #ff8f80; --warn: #f2c27a; --bubble: #2f2f33; --code: #141416;
+    --accent-soft: rgba(185,199,255,.12); --warn-soft: rgba(242,194,122,.10); --ok-soft: rgba(143,214,162,.10);
+    --shadow: 0 18px 50px rgba(0,0,0,.45);
+    --sans: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+    --mono: "Cascadia Code", Consolas, ui-monospace, monospace;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f5f7; --side: #ececef; --raise: #ffffff; --raise2: #e9e9ee; --hover: #e4e4ea; --menu: #ffffff;
+    --line: rgba(20,22,30,.07); --line2: rgba(20,22,30,.12);
+    --text: #18191f; --muted: #5c5e6b; --faint: #92949f; --accent: #3d4aa8; --ink: #ffffff;
+    --ok: #1f8a4c; --bad: #c4452f; --warn: #a86a12; --bubble: #e9e9ee; --code: #f0f0f3;
+    --accent-soft: rgba(61,74,168,.08); --warn-soft: rgba(168,106,18,.08); --ok-soft: rgba(31,138,76,.08);
+    --shadow: 0 18px 50px rgba(20,22,40,.14);
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: #0e0e10; color: var(--text); font: 14px/1.55 var(--sans); -webkit-font-smoothing: antialiased; }
+  :root[data-theme="light"] body { background: #d9d9de; }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+  code, pre { font-family: var(--mono); }
+
+  /* ---- the mockup's own chrome (not part of the design) */
+  .deck { max-width: 1320px; margin: 0 auto; padding: 28px 16px 60px; }
+  .deck-head { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: end; justify-content: space-between; margin-bottom: 18px; color: #c9c9cf; }
+  :root[data-theme="light"] .deck-head { color: #2a2b33; }
+  .deck-head h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  .deck-head p { margin: 4px 0 0; font-size: 13px; opacity: .75; max-width: 720px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tabs button { padding: 6px 12px; border-radius: 999px; font-size: 12.5px; color: inherit; border: 1px solid rgba(128,128,140,.35); }
+  .tabs button.on { background: #b9c7ff; color: #14172a; border-color: transparent; }
+  .legend { display: flex; gap: 14px; font-size: 12px; margin: 0 0 12px; color: #a3a3aa; flex-wrap: wrap; }
+  .p1, .p2 { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; font-weight: 600; letter-spacing: .02em; padding: 1px 7px; border-radius: 999px; vertical-align: 2px; white-space: nowrap; }
+  .p1 { background: rgba(143,214,162,.16); color: #8fd6a2; }
+  .p2 { background: rgba(185,199,255,.14); color: #b9c7ff; }
+  :root[data-theme="light"] .p1 { color: #1f8a4c; } :root[data-theme="light"] .p2 { color: #3d4aa8; }
+  .screen { display: none; } .screen.on { display: block; }
+  .note { font-size: 12.5px; color: #a3a3aa; margin: 12px 4px 0; max-width: 900px; }
+  :root[data-theme="light"] .note { color: #4a4b55; }
+
+  /* ---- the window */
+  .win { background: var(--bg); border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); border: 1px solid var(--line2); height: 780px; display: grid; grid-template-columns: 252px 1fr 288px; position: relative; }
+  .icon { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+  /* sidebar */
+  .side { background: var(--side); display: flex; flex-direction: column; padding: 12px 10px; min-width: 0; }
+  .brand { display: flex; align-items: center; gap: 9px; padding: 4px 8px 14px; font-weight: 600; font-size: 15px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 8px; color: var(--text); font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row:hover { background: var(--hover); }
+  .row.on { background: var(--raise); }
+  .row .icon { color: var(--muted); }
+  .group { font-size: 11.5px; color: var(--faint); padding: 14px 10px 4px; display: flex; justify-content: space-between; }
+  .side .grow { flex: 1; overflow: hidden; }
+  .row .ell { overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .run-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+  .me { display: flex; align-items: center; gap: 10px; padding: 10px; border-top: 1px solid var(--line); margin: 0 -10px -12px; padding: 12px 18px; }
+  .me .t { flex: 1; min-width: 0; }
+  .me .t b { display: block; font-weight: 500; font-size: 13px; }
+  .me .t span { font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .remote-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--ok); background: var(--ok-soft); padding: 1px 7px; border-radius: 999px; margin-left: 4px; font-weight: 500; }
+
+  /* main column */
+  .main { display: flex; flex-direction: column; min-width: 0; }
+  .bar { display: flex; align-items: center; gap: 8px; padding: 10px 18px; height: 50px; }
+  .bar .title { font-weight: 500; font-size: 14.5px; display: flex; gap: 6px; align-items: center; }
+  .bar .sp { flex: 1; }
+  .ibtn { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--muted); }
+  .ibtn:hover { background: var(--hover); color: var(--text); }
+  .scroll { flex: 1; overflow: hidden; padding: 4px 0 0; }
+  .col { width: min(680px, calc(100% - 48px)); margin: 0 auto; }
+  .user { display: flex; justify-content: flex-end; margin: 6px 0 18px; }
+  .user div { background: var(--bubble); padding: 10px 16px; border-radius: 16px; max-width: 80%; }
+  .thought { color: var(--muted); font-size: 13px; display: inline-flex; gap: 4px; align-items: center; margin: 4px 0 6px; }
+  .tools { background: var(--raise); border: 1px solid var(--line); border-radius: 10px; padding: 3px; margin-bottom: 12px; }
+  .tool { display: flex; align-items: center; gap: 10px; padding: 7px 10px; font-size: 13px; color: var(--muted); border-radius: 7px; }
+  .tool:hover { background: var(--hover); }
+  .tool .ell { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool .ok { color: var(--ok); }
+  .p { margin: 0 0 12px; }
+  .p code { background: var(--raise); padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+  .ask { border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); border-radius: 12px; padding: 12px 14px; margin: 4px 0 14px; }
+  .ask .h { display: flex; gap: 8px; align-items: center; font-weight: 500; font-size: 13.5px; }
+  .ask pre { margin: 8px 0 10px; background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; overflow: hidden; }
+  .ask .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 8px; font-size: 13px; border: 1px solid var(--line2); background: var(--raise); }
+  .btn:hover { background: var(--raise2); }
+  .btn.pri { background: var(--accent); color: var(--ink); border-color: transparent; font-weight: 500; }
+  .btn.danger { color: var(--bad); }
+  .btn.sm { padding: 4px 10px; font-size: 12.5px; }
+  .meta { display: flex; gap: 10px; align-items: center; color: var(--faint); font-size: 12px; margin: -2px 0 18px; }
+  .ghost { margin: 8px 0 -4px 22px; }
+  .composer { width: min(680px, calc(100% - 48px)); margin: 0 auto 10px; }
+  .box { background: var(--raise); border: 1px solid var(--line2); border-radius: 16px; padding: 12px 12px 10px 16px; }
+  .box .ph { color: var(--faint); padding: 2px 0 14px; }
+  .box .tools-row { display: flex; align-items: center; gap: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 12.5px; color: var(--muted); }
+  .chip:hover { background: var(--hover); color: var(--text); }
+  .chip.on { color: var(--text); background: var(--raise2); }
+  .send { width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--ink); display: grid; place-items: center; margin-left: auto; }
+  .under { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--faint); padding: 6px 4px 0; }
+
+  /* right rail */
+  .rail { background: var(--bg); border-left: 1px solid var(--line); padding: 12px; display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
+  .card { background: var(--raise); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+  .card h4 { margin: 0 0 8px; font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+  .kv { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 3px 0; }
+  .kv .k { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kv .v { color: var(--faint); }
+  .meter { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: var(--raise2); margin: 8px 0 6px; gap: 2px; }
+  .add { color: var(--ok); } .del { color: var(--bad); }
+
+  /* settings */
+  .shade { position: absolute; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; }
+  :root[data-theme="light"] .shade { background: rgba(0,0,0,.28); }
+  .sheet { width: min(980px, calc(100% - 48px)); height: 680px; background: var(--bg); border: 1px solid var(--line2); border-radius: 14px; display: grid; grid-template-columns: 210px 1fr; overflow: hidden; box-shadow: var(--shadow); }
+  .snav { background: var(--side); padding: 18px 12px; display: flex; flex-direction: column; gap: 2px; }
+  .snav .h { font-weight: 500; font-size: 15px; padding: 4px 10px 14px; }
+  .snav .row { color: var(--muted); }
+  .snav .row.on { color: var(--text); font-weight: 500; }
+  .snav .off { opacity: .45; }
+  .snav .foot { margin-top: auto; font-size: 11.5px; color: var(--faint); padding: 10px; }
+  .spage { padding: 22px 28px; overflow: auto; }
+  .spage h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .spage .sub { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
+  .gtitle { font-size: 12.5px; font-weight: 500; color: var(--muted); margin: 18px 0 8px; display: flex; justify-content: space-between; align-items: center; }
+  .group-card { background: var(--raise); border: 1px solid var(--line2); border-radius: 12px; }
+  .srow { display: flex; align-items: center; gap: 20px; padding: 13px 18px; }
+  .srow + .srow { border-top: 1px solid var(--line); }
+  .srow .w { flex: 1; min-width: 0; }
+  .srow .w b { display: block; font-weight: 400; font-size: 14px; }
+  .srow .w span { display: block; font-size: 12.5px; color: var(--faint); }
+  .switch { width: 34px; height: 20px; border-radius: 10px; background: var(--raise2); position: relative; flex: none; }
+  .switch::after { content: ""; position: absolute; width: 14px; height: 14px; border-radius: 50%; background: var(--muted); top: 3px; left: 3px; }
+  .switch.on { background: var(--accent); } .switch.on::after { left: 17px; background: var(--ink); }
+  .status { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stat { background: var(--raise); border: 1px solid var(--line2); border-radius: 12px; padding: 12px 14px; }
+  .stat .l { font-size: 11.5px; color: var(--faint); display: flex; align-items: center; gap: 6px; }
+  .stat .v { font-size: 14px; margin-top: 4px; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .warnbox { display: flex; gap: 12px; align-items: flex-start; background: var(--warn-soft); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); border-radius: 12px; padding: 12px 14px; margin-top: 10px; font-size: 13px; }
+  .warnbox .icon { color: var(--warn); margin-top: 2px; }
+  .warnbox b { font-weight: 500; }
+  .warnbox code, .copy code { font-size: 12px; }
+  .copy { display: flex; align-items: center; gap: 10px; background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px 7px 12px; }
+  .copy code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .keyrow { display: grid; grid-template-columns: 1.3fr 1.2fr 1fr 1fr auto; gap: 12px; align-items: center; padding: 11px 18px; font-size: 13px; }
+  .keyrow + .keyrow { border-top: 1px solid var(--line); }
+  .keyrow.head { font-size: 11.5px; color: var(--faint); padding-bottom: 6px; }
+  .keyrow code { color: var(--muted); }
+  .muted { color: var(--muted); } .faint { color: var(--faint); }
+  .seg { display: inline-flex; background: var(--raise2); border-radius: 8px; padding: 2px; }
+  .seg button { padding: 4px 10px; border-radius: 6px; font-size: 12.5px; color: var(--muted); }
+  .seg button.on { background: var(--raise); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+  .snippet { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font-size: 12.5px; line-height: 1.6; margin: 0; overflow: auto; white-space: pre; position: relative; }
+  .snippet .c { color: var(--faint); }
+  .snippet .s { color: var(--ok); }
+  .snippet .copybtn { position: absolute; right: 8px; top: 8px; }
+  .reveal { position: absolute; inset: 0; background: rgba(0,0,0,.5); display: grid; place-items: center; }
+  .dialog { width: 460px; background: var(--menu); border: 1px solid var(--line2); border-radius: 14px; padding: 20px; box-shadow: var(--shadow); }
+  .dialog h3 { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
+  .dialog p { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+  .bigkey { font-family: var(--mono); font-size: 13.5px; background: var(--code); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); border-radius: 8px; padding: 10px 12px; word-break: break-all; margin-bottom: 14px; }
+  .model-row { display: grid; grid-template-columns: 1fr auto auto auto; gap: 14px; align-items: center; padding: 11px 18px; font-size: 13.5px; }
+  .model-row + .model-row { border-top: 1px solid var(--line); }
+  .bar2 { height: 4px; background: var(--raise2); border-radius: 2px; overflow: hidden; margin-top: 6px; }
+  .bar2 i { display: block; height: 100%; background: var(--accent); }
+  .tag { white-space: nowrap; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--raise2); color: var(--muted); }
+  .tag.ok { background: var(--ok-soft); color: var(--ok); }
+
+  /* sign in */
+  .signin { display: grid; place-items: center; height: 100%; background: var(--bg); grid-column: 1 / -1; }
+  .signin .c { width: 380px; text-align: center; }
+  .signin h2 { font-size: 20px; font-weight: 600; margin: 16px 0 6px; }
+  .signin p { color: var(--muted); font-size: 13.5px; margin: 0 0 18px; }
+  .field { display: flex; align-items: center; gap: 8px; background: var(--raise); border: 1px solid var(--line2); border-radius: 12px; padding: 4px 4px 4px 14px; text-align: left; }
+  .field input { flex: 1; background: none; border: 0; outline: 0; color: var(--text); font: 14px var(--mono); padding: 8px 0; }
+  .signin .hint { font-size: 12.5px; color: var(--faint); margin-top: 16px; text-align: left; background: var(--raise); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .signin .hint code { color: var(--muted); }
+
+  /* phone */
+  .phones { display: flex; gap: 28px; justify-content: center; flex-wrap: wrap; }
+  .phone { width: 360px; height: 740px; border-radius: 38px; border: 10px solid #000; background: var(--bg); overflow: hidden; position: relative; display: flex; flex-direction: column; box-shadow: var(--shadow); }
+  .phone .bar { padding: 30px 12px 6px; height: auto; }
+  .phone .col { width: calc(100% - 28px); }
+  .phone .composer { width: calc(100% - 20px); }
+  .phone .drawer { position: absolute; inset: 0; display: grid; grid-template-columns: 290px 1fr; }
+  .phone .drawer .side { padding-top: 34px; }
+  .phone .drawer .dim { background: rgba(0,0,0,.5); }
+
+  @media (max-width: 1100px) { .win { grid-template-columns: 220px 1fr; } .rail { display: none; } }
+  @media (max-width: 760px) { .win { grid-template-columns: 1fr; height: auto; min-height: 640px; } .side { display: none; } .sheet { grid-template-columns: 1fr; height: auto; } .snav { display: none; } .status { grid-template-columns: 1fr; } .keyrow { grid-template-columns: 1fr auto; } .keyrow > :nth-child(2), .keyrow > :nth-child(3), .keyrow > :nth-child(4) { display: none; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></symbol>
+    <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></symbol>
+    <symbol id="i-gpu" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="12" rx="2"/><circle cx="9" cy="12" r="2.5"/><path d="M15 10h3M15 14h3"/></symbol>
+    <symbol id="i-chip" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M17 6l3 3M14.5 8.5l2 2"/></symbol>
+    <symbol id="i-color" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></symbol>
+    <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 6 1V5a3 3 0 0 0-3-1zM15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-6 1"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.01"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0zM12 17v5"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8.3 8 9 4.6-.7 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+    <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17v.01"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
+    <symbol id="i-dl" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="ghost" viewBox="0 0 40 44"><path d="M20 2C10 2 4 9 4 19v22l5-4 5 4 6-4 6 4 5-4 5 4V19C36 9 30 2 20 2z" fill="#f4f4f6"/><circle cx="15" cy="19" r="2.4" fill="#1d1d1f"/><circle cx="25" cy="19" r="2.4" fill="#1d1d1f"/></symbol>
+  </defs>
+</svg>
+
+<div class="deck">
+  <div class="deck-head">
+    <div>
+      <h1>ghost-infer web UI: mockup</h1>
+      <p>The chat page rebuilt in the desktop app's look, so Linux, remote VMs and phones get the same app. Static mock: nothing is wired.</p>
+    </div>
+    <div class="tabs" id="tabs">
+      <button data-s="chat" class="on">Chat</button>
+      <button data-s="access">API &amp; access</button>
+      <button data-s="newkey">New key</button>
+      <button data-s="models">Models</button>
+      <button data-s="signin">Sign in</button>
+      <button data-s="phone">Phone</button>
+      <button id="theme">Light / dark</button>
+    </div>
+  </div>
+  <div class="legend"><span><span class="p1">Phase 1</span> daily use, built first</span><span><span class="p2">Phase 2</span> the rest of the app</span></div>
+
+  <!-- ================= CHAT ================= -->
+  <section class="screen on" id="s-chat">
+    <div class="win">
+      <aside class="side">
+        <div class="brand"><svg width="20" height="22"><use href="#ghost"/></svg>ghost-infer</div>
+        <button class="row"><svg class="icon"><use href="#i-plus"/></svg>New chat</button>
+        <button class="row"><svg class="icon"><use href="#i-search"/></svg>Search <span class="p1" style="margin-left:auto">Phase 1</span></button>
+        <div class="grow">
+          <div class="group"><span>Today</span><span class="p1">Phase 1</span></div>
+          <button class="row on"><span class="ell">Fix discount calculation in cart</span><span class="run-dot" title="replying"></span></button>
+          <button class="row"><span class="ell">Write a prime checker in Python</span></button>
+          <div class="group"><span>Yesterday</span></div>
+          <button class="row"><span class="ell">Explain the MoE expert cache</span></button>
+          <button class="row"><span class="ell">Bash script to rotate logs</span></button>
+          <button class="row"><span class="ell">Summarise the RunPod pricing page</span></button>
+          <div class="group"><span>Previous 7 days</span></div>
+          <button class="row"><span class="ell">React table with sorting</span></button>
+          <button class="row"><span class="ell">Translate README to Malay</span></button>
+        </div>
+        <div class="me">
+          <svg width="22" height="24"><use href="#ghost"/></svg>
+          <div class="t"><b>gpu-box <span class="remote-pill"><svg class="icon" style="width:10px;height:10px"><use href="#i-lock"/></svg>key</span></b><span>Qwen3.6-35B-A3B · RTX 3070</span></div>
+          <button class="ibtn" data-go="access"><svg class="icon"><use href="#i-gear"/></svg></button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="bar">
+          <div class="title">Fix discount calculation in cart <svg class="icon" style="width:14px"><use href="#i-down"/></svg></div>
+          <div class="sp"></div>
+          <button class="ibtn"><svg class="icon"><use href="#i-panel"/></svg></button>
+        </div>
+        <div class="scroll">
+          <div class="col">
+            <div class="user"><div>The cart total is wrong when a discount code is used. Find the bug and fix it, then run the tests.</div></div>
+            <div class="thought">Thought <svg class="icon" style="width:12px"><use href="#i-chev"/></svg></div>
+            <div class="tools">
+              <div class="tool"><svg class="icon"><use href="#i-file"/></svg><span class="ell">Read ~/projects/cart/cart.py</span><svg class="icon ok"><use href="#i-check"/></svg></div>
+              <div class="tool"><svg class="icon"><use href="#i-file"/></svg><span class="ell">Read ~/projects/cart/test_cart.py</span><svg class="icon ok"><use href="#i-check"/></svg></div>
+            </div>
+            <p class="p">The bug: <code>total()</code> subtracts the raw percentage instead of a percentage of the subtotal. With 25% off $40 it takes off 25, not 10.</p>
+            <div class="tools">
+              <div class="tool"><svg class="icon"><use href="#i-edit"/></svg><span class="ell">Edited cart.py</span><span class="add">+1</span><span class="del">−1</span><svg class="icon ok"><use href="#i-check"/></svg></div>
+            </div>
+            <div class="ask">
+              <div class="h"><svg class="icon"><use href="#i-term"/></svg>Run a command? <span class="p1">Phase 1</span></div>
+              <pre>python3 -m unittest -v</pre>
+              <div class="acts">
+                <button class="btn pri">Allow once</button>
+                <button class="btn">Always allow in this folder</button>
+                <button class="btn danger">Deny</button>
+              </div>
+            </div>
+            <div class="meta"><svg class="icon"><use href="#i-copy"/></svg><svg class="icon"><use href="#i-redo"/></svg><button class="btn sm">Undo file changes</button><span>671 tokens · 6.0 s · 112 tok/s</span></div>
+          </div>
+        </div>
+        <div class="ghost"><svg width="34" height="38"><use href="#ghost"/></svg></div>
+        <div class="composer">
+          <div class="box">
+            <div class="ph">Reply to ghost-infer</div>
+            <div class="tools-row">
+              <button class="chip"><svg class="icon"><use href="#i-plus"/></svg></button>
+              <button class="chip on"><svg class="icon"><use href="#i-folder"/></svg>cart</button>
+              <button class="chip">Qwen3.6-35B-A3B <svg class="icon" style="width:12px"><use href="#i-down"/></svg></button>
+              <button class="chip"><svg class="icon"><use href="#i-bolt"/></svg>Think</button>
+              <button class="chip on">Manual</button>
+              <button class="send"><svg class="icon"><use href="#i-up"/></svg></button>
+            </div>
+          </div>
+          <div class="under"><span>Chats are saved on gpu-box, not in this browser</span><span>Shift+Enter for a new line</span></div>
+        </div>
+      </main>
+
+      <aside class="rail">
+        <div class="card">
+          <h4>Environment <svg class="icon" style="width:12px"><use href="#i-down"/></svg></h4>
+          <div class="kv"><svg class="icon"><use href="#i-gpu"/></svg><span class="k">RTX 3070</span><span class="v">6.9 / 8 GB</span></div>
+          <div class="kv"><svg class="icon"><use href="#i-chip"/></svg><span class="k">Memory</span><span class="v">21 / 32 GB</span></div>
+          <div class="kv"><svg class="icon"><use href="#i-bolt"/></svg><span class="k">Qwen3.6-35B-A3B</span><span class="v">GPU</span></div>
+          <div class="kv"><svg class="icon"><use href="#i-folder"/></svg><span class="k">cart · ~/projects/cart</span></div>
+        </div>
+        <div class="card">
+          <h4>Context</h4>
+          <div class="kv"><span class="k">23% used</span><span class="v">3.7k / 16.4k</span></div>
+          <div class="meter"><i style="width:11%;background:#7aa2ff"></i><i style="width:9%;background:#f29a52"></i><i style="width:3%;background:var(--faint)"></i></div>
+          <div class="kv"><span class="k faint">Trimmed in 8.6k tokens</span><button class="btn sm">Trim now</button></div>
+        </div>
+        <div class="card">
+          <h4>Changes</h4>
+          <div class="kv"><svg class="icon"><use href="#i-file"/></svg><span class="k">cart.py</span><span class="add">+1</span><span class="del">−1</span></div>
+          <div class="kv" style="justify-content:flex-end"><button class="btn sm">Undo all</button></div>
+        </div>
+        <div class="card">
+          <h4>Background tasks <span class="p1">Phase 1</span></h4>
+          <div class="kv"><span class="run-dot"></span><span class="k">npm run dev</span><span class="v">:5173</span></div>
+          <div class="kv"><svg class="icon"><use href="#i-list"/></svg><span class="k">1 finished</span></div>
+        </div>
+      </aside>
+    </div>
+    <p class="note">Same three columns as the desktop app. The rail collapses under 1100 px and the sidebar becomes a drawer on phones. The footer of the sidebar says which server you're on and whether it's locked with a key.</p>
+  </section>
+
+  <!-- ================= API & ACCESS ================= -->
+  <section class="screen" id="s-access">
+    <div class="win" style="grid-template-columns:1fr">
+      <div class="shade" style="position:relative;inset:auto;height:100%">
+        <div class="sheet">
+          <nav class="snav">
+            <div class="h">Settings</div>
+            <button class="row"><svg class="icon"><use href="#i-gear"/></svg>General</button>
+            <button class="row"><svg class="icon"><use href="#i-color"/></svg>Appearance</button>
+            <button class="row"><svg class="icon"><use href="#i-folder"/></svg>Models</button>
+            <button class="row on"><svg class="icon"><use href="#i-key"/></svg>API &amp; access</button>
+            <button class="row"><svg class="icon"><use href="#i-plug"/></svg>Tools &amp; MCP</button>
+            <button class="row off"><svg class="icon"><use href="#i-mic"/></svg>Voice</button>
+            <button class="row off"><svg class="icon"><use href="#i-brain"/></svg>Maya</button>
+            <button class="row off"><svg class="icon"><use href="#i-clock"/></svg>Sleep training</button>
+            <button class="row"><svg class="icon"><use href="#i-info"/></svg>About</button>
+            <div class="foot">Greyed out: not available on this server (Linux, no voice models).</div>
+          </nav>
+          <div class="spage">
+            <h2>API &amp; access <span class="p1">Phase 1</span></h2>
+            <p class="sub">Who can reach this server, and the keys apps and browsers use to get in.</p>
+
+            <div class="status">
+              <div class="stat"><div class="l"><svg class="icon"><use href="#i-globe"/></svg>Listening on</div><div class="v"><span class="dot" style="background:var(--warn)"></span>0.0.0.0:8080 · whole network</div></div>
+              <div class="stat"><div class="l"><svg class="icon"><use href="#i-shield"/></svg>Access</div><div class="v"><span class="dot" style="background:var(--ok)"></span>Key required on every request</div></div>
+              <div class="stat"><div class="l"><svg class="icon"><use href="#i-unlock"/></svg>Connection</div><div class="v"><span class="dot" style="background:var(--warn)"></span>HTTP, not encrypted</div></div>
+            </div>
+            <div class="warnbox">
+              <svg class="icon"><use href="#i-warn"/></svg>
+              <div><b>Keys and chats travel unencrypted.</b> Fine on your own network. Over the internet, reach it through an SSH tunnel instead, or put it behind HTTPS (Cloudflare Tunnel, Caddy).<div class="copy" style="margin-top:8px"><code>ssh -L 8080:localhost:8080 you@gpu-box</code><button class="btn sm"><svg class="icon"><use href="#i-copy"/></svg>Copy</button></div></div>
+            </div>
+
+            <div class="gtitle">Server address</div>
+            <div class="group-card">
+              <div class="srow"><div class="w"><b>OpenAI-compatible API</b><span>Base URL for any OpenAI client, Claude Code router, Continue, Open WebUI</span></div><div class="copy" style="width:300px"><code>http://192.168.1.40:8080/v1</code><button class="btn sm"><svg class="icon"><use href="#i-copy"/></svg></button></div></div>
+              <div class="srow"><div class="w"><b>Reachable from other devices</b><span>Off: only this computer (127.0.0.1). Needs a restart; turning it on creates a key if there's none.</span></div><div class="switch on"></div></div>
+            </div>
+
+            <div class="gtitle"><span>API keys</span><button class="btn sm pri" data-go="newkey"><svg class="icon"><use href="#i-plus"/></svg>Create key</button></div>
+            <div class="group-card">
+              <div class="keyrow head"><span>Name</span><span>Key</span><span>Created</span><span>Last used</span><span></span></div>
+              <div class="keyrow"><span>Server start <span class="tag">from --api-key</span></span><code>gi_…7d2a</code><span class="muted">Nov 16</span><span class="muted">2 min ago</span><span class="faint">Set in the command line</span></div>
+              <div class="keyrow"><span>Laptop browser</span><code>gi_…91fc</code><span class="muted">Nov 16</span><span class="muted">now <span class="tag ok">this browser</span></span><button class="btn sm danger">Revoke</button></div>
+              <div class="keyrow"><span>Claude Code (router)</span><code>gi_…0b44</code><span class="muted">Nov 15</span><span class="muted">1 h ago</span><button class="btn sm danger">Revoke</button></div>
+              <div class="keyrow"><span>Phone</span><code>gi_…e3a0</code><span class="muted">Nov 12</span><span class="muted">3 days ago</span><button class="btn sm danger">Revoke</button></div>
+            </div>
+
+            <div class="gtitle"><span>Connect an app</span><span class="seg"><button class="on">curl</button><button>Python</button><button>JavaScript</button><button>Claude Code</button></span></div>
+<pre class="snippet"><button class="btn sm copybtn"><svg class="icon"><use href="#i-copy"/></svg>Copy</button><span class="c"># any OpenAI-style client: the key goes in the Authorization header</span>
+curl http://192.168.1.40:8080/v1/chat/completions \
+  -H <span class="s">"Authorization: Bearer $GHOST_KEY"</span> \
+  -H <span class="s">"Content-Type: application/json"</span> \
+  -d <span class="s">'{"messages":[{"role":"user","content":"hi"}],"stream":true}'</span></pre>
+
+            <div class="gtitle">Signed-in browsers</div>
+            <div class="group-card">
+              <div class="srow"><div class="w"><b>Firefox on Linux <span class="tag ok">this browser</span></b><span>192.168.1.23 · signed in Nov 16, 09:12</span></div><button class="btn sm">Sign out</button></div>
+              <div class="srow"><div class="w"><b>Safari on iPhone</b><span>192.168.1.51 · signed in Nov 12, 22:40</span></div><button class="btn sm">Sign out</button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note">How it works: a server bound to localhost behaves as today (no key, the desktop app keeps working). Reaching it from other devices needs a key: from <code>--api-key</code> / <code>GHOST_INFER_API_KEY</code>, or made at first start and printed in the terminal as a sign-in link. Once a key exists, every <code>/v1</code> and <code>/api</code> request needs one, from localhost too, because tunnels arrive as localhost. Browsers trade the key for a cookie once; apps send <code>Authorization: Bearer</code>.</p>
+  </section>
+
+  <!-- ================= NEW KEY ================= -->
+  <section class="screen" id="s-newkey">
+    <div class="win" style="grid-template-columns:1fr">
+      <div class="shade" style="position:relative;inset:auto;height:100%">
+        <div class="dialog">
+          <h3>Key created</h3>
+          <p>Copy it now: it's shown only once. ghost-infer keeps a hash, not the key.</p>
+          <div class="bigkey">gi_4Kq9wZr2Tn7vXb1LsE8pYc3MhD6uFa0J</div>
+          <div class="group-card" style="margin-bottom:16px">
+            <div class="srow"><div class="w"><b>Name</b><span>Claude Code (router)</span></div></div>
+            <div class="srow"><div class="w"><b>Sign-in link for a phone or another browser</b><span>Opens the chat already signed in</span></div><button class="btn sm"><svg class="icon"><use href="#i-copy"/></svg>Copy link</button></div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn"><svg class="icon"><use href="#i-copy"/></svg>Copy key</button><button class="btn pri" data-go="access">Done</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= MODELS ================= -->
+  <section class="screen" id="s-models">
+    <div class="win" style="grid-template-columns:1fr">
+      <div class="shade" style="position:relative;inset:auto;height:100%">
+        <div class="sheet">
+          <nav class="snav">
+            <div class="h">Settings</div>
+            <button class="row"><svg class="icon"><use href="#i-gear"/></svg>General</button>
+            <button class="row"><svg class="icon"><use href="#i-color"/></svg>Appearance</button>
+            <button class="row on"><svg class="icon"><use href="#i-folder"/></svg>Models</button>
+            <button class="row"><svg class="icon"><use href="#i-key"/></svg>API &amp; access</button>
+            <button class="row"><svg class="icon"><use href="#i-plug"/></svg>Tools &amp; MCP</button>
+            <button class="row off"><svg class="icon"><use href="#i-mic"/></svg>Voice</button>
+            <button class="row off"><svg class="icon"><use href="#i-brain"/></svg>Maya</button>
+            <button class="row off"><svg class="icon"><use href="#i-clock"/></svg>Sleep training</button>
+            <button class="row"><svg class="icon"><use href="#i-info"/></svg>About</button>
+          </nav>
+          <div class="spage">
+            <h2>Models <span class="p1">Phase 1</span></h2>
+            <p class="sub">Models on gpu-box. Loading one swaps it in for every chat.</p>
+            <div class="gtitle">On this server</div>
+            <div class="group-card">
+              <div class="model-row"><div><b style="font-weight:500">Qwen3.6-35B-A3B-abliterated</b> <span class="tag ok">loaded · GPU</span><div class="faint" style="font-size:12px">Q3_K_M · 16.0 GB · MoE, experts in RAM</div></div><span class="muted">112 tok/s</span><button class="btn sm">Unload</button><span></span></div>
+              <div class="model-row"><div><b style="font-weight:400">Qwen3-8B</b><div class="faint" style="font-size:12px">Q4_K_M · 4.7 GB</div></div><span class="muted">—</span><button class="btn sm">Load</button><button class="ibtn"><svg class="icon"><use href="#i-x"/></svg></button></div>
+              <div class="model-row"><div><b style="font-weight:400">Qwen3-4B</b><div class="faint" style="font-size:12px">Q4_K_M · 2.5 GB</div></div><span class="muted">—</span><button class="btn sm">Load</button><button class="ibtn"><svg class="icon"><use href="#i-x"/></svg></button></div>
+            </div>
+            <div class="gtitle"><span>Downloading</span></div>
+            <div class="group-card">
+              <div class="model-row" style="grid-template-columns:1fr auto"><div><b style="font-weight:400">Qwen3-30B-A3B-Q4_K_M.gguf</b><div class="faint" style="font-size:12px">from huggingface.co · 7.9 of 18.6 GB · 42 MB/s · 4 min left</div><div class="bar2"><i style="width:42%"></i></div></div><button class="btn sm">Cancel</button></div>
+            </div>
+            <div class="gtitle">Get a model</div>
+            <div class="field" style="border-radius:10px"><svg class="icon faint"><use href="#i-search"/></svg><input placeholder="Paste a Hugging Face link, or search: qwen3 gguf"><button class="btn sm pri"><svg class="icon"><use href="#i-dl"/></svg>Download</button></div>
+            <div class="gtitle">Folders</div>
+            <div class="group-card">
+              <div class="srow"><div class="w"><b>~/models</b><span>3 models · 23.2 GB</span></div><button class="btn sm">Remove</button></div>
+              <div class="srow"><div class="w"><b>/mnt/data/gguf</b><span>12 models · 140 GB</span></div><button class="btn sm">Remove</button></div>
+              <div class="srow"><div class="w"><span>Add a folder on the server by its path</span></div><button class="btn sm"><svg class="icon"><use href="#i-plus"/></svg>Add folder</button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SIGN IN ================= -->
+  <section class="screen" id="s-signin">
+    <div class="win" style="grid-template-columns:1fr">
+      <div class="signin">
+        <div class="c">
+          <svg width="48" height="53"><use href="#ghost"/></svg>
+          <h2>This ghost-infer is locked</h2>
+          <p>Enter an access key for <b style="font-weight:500;color:var(--text)">gpu-box</b> to chat with it.</p>
+          <div class="field"><svg class="icon faint"><use href="#i-key"/></svg><input value="gi_4Kq9wZr2Tn7vX" aria-label="Access key"><button class="btn pri">Sign in</button></div>
+          <div class="hint">Where to find one: the server printed a sign-in link when it started. Lost it? On the server run <code>ghost-infer key new</code>.</div>
+        </div>
+      </div>
+    </div>
+    <p class="note">Only appears when a key is set and this browser has no cookie. Opening the printed link (<code>http://gpu-box:8080/?key=…</code>) skips it: the key becomes a cookie and is removed from the address bar.</p>
+  </section>
+
+  <!-- ================= PHONE ================= -->
+  <section class="screen" id="s-phone">
+    <div class="phones">
+      <div class="phone">
+        <div class="bar"><button class="ibtn"><svg class="icon"><use href="#i-menu"/></svg></button><div class="title" style="font-size:13.5px">Fix discount calculation…</div><div class="sp"></div><button class="ibtn"><svg class="icon"><use href="#i-panel"/></svg></button></div>
+        <div class="scroll"><div class="col">
+          <div class="user"><div>Cart total is wrong with a discount code. Fix it and run the tests.</div></div>
+          <div class="tools"><div class="tool"><svg class="icon"><use href="#i-edit"/></svg><span class="ell">Edited cart.py</span><span class="add">+1</span><span class="del">−1</span></div></div>
+          <div class="ask"><div class="h"><svg class="icon"><use href="#i-term"/></svg>Run a command?</div><pre>python3 -m unittest -v</pre><div class="acts"><button class="btn pri">Allow once</button><button class="btn danger">Deny</button></div></div>
+        </div></div>
+        <div class="composer"><div class="box"><div class="ph">Reply to ghost-infer</div><div class="tools-row"><button class="chip"><svg class="icon"><use href="#i-plus"/></svg></button><button class="chip on"><svg class="icon"><use href="#i-folder"/></svg>cart</button><button class="chip">Manual</button><button class="send"><svg class="icon"><use href="#i-up"/></svg></button></div></div></div>
+      </div>
+      <div class="phone">
+        <div class="bar"><div class="title">x</div></div>
+        <div class="drawer">
+          <aside class="side">
+            <div class="brand"><svg width="20" height="22"><use href="#ghost"/></svg>ghost-infer</div>
+            <button class="row"><svg class="icon"><use href="#i-plus"/></svg>New chat</button>
+            <button class="row"><svg class="icon"><use href="#i-search"/></svg>Search</button>
+            <div class="grow">
+              <div class="group">Today</div>
+              <button class="row on"><span class="ell">Fix discount calculation in cart</span><span class="run-dot"></span></button>
+              <button class="row"><span class="ell">Write a prime checker in Python</span></button>
+              <div class="group">Yesterday</div>
+              <button class="row"><span class="ell">Explain the MoE expert cache</span></button>
+            </div>
+            <div class="me"><svg width="22" height="24"><use href="#ghost"/></svg><div class="t"><b>gpu-box <span class="remote-pill">key</span></b><span>Qwen3.6-35B-A3B</span></div><button class="ibtn"><svg class="icon"><use href="#i-gear"/></svg></button></div>
+          </aside>
+          <div class="dim"></div>
+        </div>
+      </div>
+    </div>
+    <p class="note">On a phone the sidebar is a drawer and the rail opens as a sheet from the panel button. Tool approvals work from the phone, so a long agent run can be supervised from the couch.</p>
+  </section>
+</div>
+
+<script>
+  const show = (s) => {
+    document.querySelectorAll(".screen").forEach((e) => e.classList.toggle("on", e.id === "s-" + s));
+    document.querySelectorAll("#tabs [data-s]").forEach((b) => b.classList.toggle("on", b.dataset.s === s));
+  };
+  document.querySelectorAll("[data-s]").forEach((b) => b.onclick = () => show(b.dataset.s));
+  document.querySelectorAll("[data-go]").forEach((b) => b.onclick = () => show(b.dataset.go));
+  document.getElementById("theme").onclick = () => {
+    const r = document.documentElement;
+    r.dataset.theme = r.dataset.theme === "light" ? "dark" : "light";
+  };
+</script>
+</body>
+</html>

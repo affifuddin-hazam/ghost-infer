@@ -17,6 +17,7 @@ use crate::tokenizer::Utf8Stream;
 use crate::{ChatFormat, Engine, Opts};
 
 mod agent;
+mod auth;
 mod download;
 mod maya;
 mod mcp;
@@ -309,6 +310,11 @@ fn list_models(dirs: &[PathBuf]) -> Vec<(String, PathBuf, u64)> {
     found
 }
 
+/// Whether the saved settings have the server listen on every address when no --host is given.
+pub fn network_wanted() -> bool {
+    auth::network_wanted()
+}
+
 pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind((host, port)).map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
     let _ = PORT.set(port);
@@ -337,6 +343,19 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         token: new_token(),
         voice: Mutex::new(speech::Voice { tts: o.tts.clone(), stt: o.stt.clone(), ..Default::default() }),
     });
+    // who may come in (auth.rs); this run's token goes where programs of this user can read it
+    let made = auth::init(host, port, o.api_key.clone());
+    if let Ok(d) = agent::data_dir() {
+        let _ = std::fs::write(d.join("run-token"), &shared.token);
+    }
+    if let Some(key) = made {
+        let shown = if host == "0.0.0.0" || host == "::" { "<this computer's address>" } else { host };
+        eprintln!("[other devices can reach this server, so it needs an access key; one was made just now]");
+        eprintln!("sign in from a browser: http://{shown}:{port}/?key={key}");
+        eprintln!("or give apps this key: {key}   (it is shown only this once; manage keys in Settings, API & access)");
+    } else if auth::enabled() {
+        eprintln!("[access keys are on: requests need one; manage them in the chat page's Settings, API & access]");
+    }
     std::thread::spawn(mcp::start_all); // the MCP servers in mcp.json, while the model loads
     let (work, rx) = mpsc::channel::<Work>();
     schedule::start(work.clone(), shared.clone()); // scheduled tasks, once a model runs
@@ -950,6 +969,17 @@ struct Request {
     host: String,   // the Host header
     origin: String, // the Origin header (empty if none)
     token: String,  // the X-Ghost-Token header (empty if none)
+    query: String,  // what follows the path's "?" (empty if none)
+    bearer: String, // the key in Authorization: Bearer <key> or X-Api-Key (empty if none)
+    cookie: String, // the ghost_session cookie (empty if none)
+    agent: String,  // the User-Agent header
+}
+
+impl Request {
+    /// A query parameter's value, percent-decoded.
+    fn param(&self, name: &str) -> Option<String> {
+        self.query.split('&').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == name).map(|(_, v)| percent_decode(&v.replace('+', " "))))
+    }
 }
 
 fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
@@ -958,9 +988,12 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
     let mut parts = line.split_whitespace();
     let method = parts.next().ok_or("empty request")?.to_string();
-    let path = parts.next().ok_or("no path")?.split('?').next().unwrap_or("").to_string();
+    let target = parts.next().ok_or("no path")?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let (path, query) = (path.to_string(), query.to_string());
     let (mut len, mut expect_continue) = (0usize, false);
     let (mut host, mut origin, mut token) = (String::new(), String::new(), String::new());
+    let (mut bearer, mut cookie, mut agent) = (String::new(), String::new(), String::new());
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).map_err(|e| e.to_string())? == 0 || h.trim().is_empty() {
@@ -973,6 +1006,19 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
                 "host" => host = v.trim().to_string(),
                 "origin" => origin = v.trim().to_string(),
                 "x-ghost-token" => token = v.trim().to_string(),
+                "authorization" => {
+                    let v = v.trim();
+                    if v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer ") {
+                        bearer = v[7..].trim().to_string();
+                    }
+                }
+                "x-api-key" => bearer = v.trim().to_string(),
+                "cookie" => {
+                    if let Some(c) = v.split(';').find_map(|c| c.trim().strip_prefix(&format!("{}=", auth::COOKIE)).map(|s| s.to_string())) {
+                        cookie = c;
+                    }
+                }
+                "user-agent" => agent = v.trim().to_string(),
                 _ => {}
             }
         }
@@ -985,7 +1031,7 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
     }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).map_err(|e| e.to_string())?;
-    Ok(Request { method, path, body, host, origin, token })
+    Ok(Request { method, path, body, host, origin, token, query, bearer, cookie, agent })
 }
 
 const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
@@ -1137,9 +1183,84 @@ fn write_chunk(conn: &mut TcpStream, bytes: &[u8]) -> Result<(), String> {
     conn.write_all(format!("{:x}\r\n", bytes.len()).as_bytes()).and_then(|()| conn.write_all(bytes)).and_then(|()| conn.write_all(b"\r\n")).map_err(|e| e.to_string())
 }
 
-fn respond_page(conn: &mut TcpStream, token: &str) -> Result<(), String> {
-    let page = include_str!("chat.html").replace("__GHOST_TOKEN__", token);
+fn respond_page(conn: &mut TcpStream, token: &str, signed_in: bool) -> Result<(), String> {
+    let locked = auth::enabled();
+    // GHOST_INFER_PAGE=<chat.html on disk>: the page read fresh on every load, for working on it
+    let page = std::env::var_os("GHOST_INFER_PAGE").and_then(|p| std::fs::read_to_string(p).ok());
+    let page = page
+        .as_deref()
+        .unwrap_or(include_str!("chat.html"))
+        .replace("__GHOST_TOKEN__", token)
+        .replace("__GHOST_ACCESS__", if !signed_in { "signin" } else if locked { "key" } else { "open" });
     respond_file(conn, page.as_bytes(), "text/html; charset=utf-8", "no-store")
+}
+
+/// The Set-Cookie header for a signed-in browser (an empty value clears it).
+fn session_cookie(value: &str) -> String {
+    let age = if value.is_empty() { 0 } else { 30 * 86_400 };
+    format!("Set-Cookie: {}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}", auth::COOKIE)
+}
+
+fn redirect_with_cookie(conn: &mut TcpStream, to: &str, cookie: &str) -> Result<(), String> {
+    let set = if cookie.is_empty() { String::new() } else { format!("{}\r\n", session_cookie(cookie)) };
+    let head = format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\n{set}Cache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    conn.write_all(head.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// The API & access settings (auth.rs):
+///   GET /api/access                    who may come in, the keys and the signed-in browsers
+///   POST /api/access/keys {"name"}     a new key: {"id", "key"} (the key is shown this once)
+///   DELETE /api/access/keys/<id>       revoke a key (and sign out the browsers that used it)
+///   DELETE /api/access/sessions/<id>   sign a browser out
+///   POST /api/access/logout            sign this browser out
+///   POST /api/access/network {"on"}    listen on every address from the next start (or this computer only);
+///                                      turning it on with no key makes one: {"key"}
+fn access_request(conn: &mut TcpStream, req: &Request, path: &str, who: &auth::Who) -> Result<(), String> {
+    use auth::Who;
+    // a browser must come from this server's own page (keys are worth stealing)
+    if !req.origin.is_empty() && !req.origin.ends_with(&format!("//{}", req.host)) {
+        return respond_private(conn, 403, &error_body("API & access answers this server's own page only"));
+    }
+    let body = || std::str::from_utf8(&req.body).ok().and_then(|t| Json::parse(t).ok()).unwrap_or(Json::Null);
+    match (req.method.as_str(), path) {
+        ("GET", "/api/access") => respond_private(conn, 200, &auth::status(who)),
+        ("POST", "/api/access/logout") => {
+            if let Who::Session(id) = who {
+                auth::logout(id);
+            }
+            let body = obj(vec![("signed_out", Json::Bool(true))]).to_string();
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n{}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len(), session_cookie(""));
+            conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body.as_bytes())).map_err(|e| e.to_string())
+        }
+        // making and revoking keys, and opening the server to the network: not for an app with a key
+        _ if matches!(who, Who::Key(_)) => respond_private(conn, 403, &error_body("keys are managed from the chat page, not with a key")),
+        ("POST", "/api/access/keys") => match auth::create_key(body().get("name").and_then(Json::as_str).unwrap_or("")) {
+            Ok((key, id)) => respond_private(conn, 200, &obj(vec![("id", str(&id)), ("key", str(&key))])),
+            Err(e) => respond_private(conn, 500, &error_body(&e)),
+        },
+        ("DELETE", p) if p.starts_with("/api/access/keys/") => {
+            let ok = auth::revoke_key(&p["/api/access/keys/".len()..]);
+            respond_private(conn, if ok { 200 } else { 404 }, &obj(vec![("revoked", Json::Bool(ok))]))
+        }
+        ("DELETE", p) if p.starts_with("/api/access/sessions/") => {
+            let ok = auth::logout(&p["/api/access/sessions/".len()..]);
+            respond_private(conn, if ok { 200 } else { 404 }, &obj(vec![("signed_out", Json::Bool(ok))]))
+        }
+        ("POST", "/api/access/network") => {
+            let on = body().get("on").and_then(Json::as_bool).unwrap_or(false);
+            let made = auth::set_network(on);
+            // the key made for it signs this browser in, so it is not locked out of its own settings
+            let cookie = made.as_deref().filter(|_| matches!(who, Who::Open)).and_then(|k| {
+                let ip = conn.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+                auth::login(k, &req.agent, &ip)
+            });
+            let body = obj(vec![("network", Json::Bool(on)), ("restart", Json::Bool(true)), ("key", made.as_deref().map(str).unwrap_or(Json::Null))]).to_string();
+            let set = cookie.map(|c| format!("{}\r\n", session_cookie(&c))).unwrap_or_default();
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n{set}Cache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
+            conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body.as_bytes())).map_err(|e| e.to_string())
+        }
+        _ => respond_private(conn, 404, &error_body("not found")),
+    }
 }
 
 /// A random hex token (the standard library's hasher keys come from the operating system's randomness).
@@ -1159,18 +1280,24 @@ fn new_token() -> String {
 
 /// A request the agent tools may answer: from this computer, addressed to localhost (so a website that
 /// points its own name at 127.0.0.1 cannot reach them), from the chat page or no page, carrying the token.
-fn tools_allowed(req: &Request, conn: &TcpStream, token: &str) -> Result<(), &'static str> {
-    if !conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
-        return Err("the agent tools only answer requests from this computer");
-    }
-    let host = req.host.rsplit_once(':').map_or(req.host.as_str(), |(h, _)| h);
-    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
-        return Err("the agent tools only answer requests addressed to localhost or 127.0.0.1");
+fn tools_allowed(req: &Request, conn: &TcpStream, token: &str, who: Option<&auth::Who>) -> Result<(), &'static str> {
+    use auth::Who;
+    // with access keys on, a key or a signed-in browser may use them from anywhere; without, this computer only
+    let keyed = matches!(who, Some(Who::Key(_) | Who::Session(_)));
+    if !keyed {
+        if !conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
+            return Err("the agent tools only answer requests from this computer (or ones with an access key)");
+        }
+        let host = req.host.rsplit_once(':').map_or(req.host.as_str(), |(h, _)| h);
+        if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+            return Err("the agent tools only answer requests addressed to localhost or 127.0.0.1");
+        }
     }
     if !req.origin.is_empty() && !req.origin.ends_with(&format!("//{}", req.host)) {
         return Err("the agent tools do not answer other websites");
     }
-    if req.token != token {
+    // an app with a key has no page to read the token from; a browser has (a guard against forged requests)
+    if req.token != token && !matches!(who, Some(Who::Key(_))) {
         return Err("missing or wrong tool token: reload the chat page");
     }
     Ok(())
@@ -1196,9 +1323,11 @@ pub(crate) fn preview_url(page: &Path) -> Option<String> {
 
 /// A file from a preview folder (see PREVIEWS): only to this computer, addressed to localhost (a website
 /// pointing its own name at 127.0.0.1 cannot read it), and only from inside that folder.
-fn respond_preview(conn: &mut TcpStream, req: &Request, rest: &str) -> Result<(), String> {
+fn respond_preview(conn: &mut TcpStream, req: &Request, rest: &str, who: Option<&auth::Who>) -> Result<(), String> {
     let host = req.host.rsplit_once(':').map_or(req.host.as_str(), |(h, _)| h);
-    if !conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) || !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+    // with access keys on, a signed-in browser may see them from anywhere
+    let keyed = matches!(who, Some(auth::Who::Key(_) | auth::Who::Session(_)));
+    if !keyed && (!conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) || !matches!(host, "127.0.0.1" | "localhost" | "[::1]")) {
         return respond(conn, 403, &error_body("previews are for this computer only"));
     }
     let rest = rest.split(['?', '#']).next().unwrap_or("");
@@ -1320,6 +1449,66 @@ fn sse(conn: &mut TcpStream, data: &str) -> std::io::Result<()> {
 
 fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Result<(), String> {
     let req = read_request(&mut conn)?;
+    // access keys (auth.rs): who this is, or None when a key is needed and none came
+    let who = auth::check(&auth::Creds { bearer: req.bearer.clone(), cookie: req.cookie.clone(), token: req.token.clone() }, &shared.token);
+    {
+        let p = req.path.trim_end_matches('/');
+        let is_page = req.method == "GET" && matches!(p, "" | "/index.html");
+        // the sign-in link: the key becomes a cookie, and leaves the address bar
+        if is_page && let Some(key) = req.param("key") {
+            let ip = conn.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            return match auth::login(&key, &req.agent, &ip) {
+                Some(cookie) => redirect_with_cookie(&mut conn, "/", &cookie),
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    redirect_with_cookie(&mut conn, "/?signin=wrong", "")
+                }
+            };
+        }
+        if req.method == "POST" && p == "/api/access/login" {
+            let ip = conn.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            let key = std::str::from_utf8(&req.body).ok().and_then(|t| Json::parse(t).ok()).and_then(|b| b.get("key").and_then(Json::as_str).map(String::from)).unwrap_or_default();
+            return match auth::login(&key, &req.agent, &ip) {
+                Some(cookie) => {
+                    let body = obj(vec![("signed_in", Json::Bool(true))]).to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                        session_cookie(&cookie)
+                    );
+                    conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body.as_bytes())).map_err(|e| e.to_string())
+                }
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(400)); // slows guessing
+                    respond_private(&mut conn, 401, &error_body("that key does not work here"))
+                }
+            };
+        }
+        if who.is_none() && req.method == "GET" && p == "/classic" {
+            return redirect_with_cookie(&mut conn, "/", ""); // signing in happens on the new page
+        }
+        let public = req.method == "OPTIONS" || is_page || (req.method == "GET" && (p == "/health" || VENDOR.iter().any(|v| v.0 == p)));
+        if who.is_none() && !public {
+            let body = obj(vec![("error", obj(vec![("message", str("this ghost-infer needs an access key (Authorization: Bearer <key>)")), ("type", str("authentication_error"))]))]).to_string();
+            let head = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nWWW-Authenticate: Bearer\r\n{CORS}Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            return conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body.as_bytes())).map_err(|e| e.to_string());
+        }
+        if is_page {
+            // the page carries this run's tool token only for someone who may use it
+            return respond_page(&mut conn, if who.is_some() { &shared.token } else { "" }, who.is_some());
+        }
+        // the older chat page (voice calls, the 3D ghost) until those move to the new one
+        if req.method == "GET" && p == "/classic" {
+            let page = include_str!("chat-classic.html").replace("__GHOST_TOKEN__", &shared.token);
+            return respond_file(&mut conn, page.as_bytes(), "text/html; charset=utf-8", "no-store");
+        }
+        if p.starts_with("/api/access") {
+            return access_request(&mut conn, &req, p, who.as_ref().unwrap_or(&auth::Who::Open));
+        }
+    }
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let (current, for_call, together, loading) = {
         let s = shared.status.lock().unwrap();
@@ -1329,7 +1518,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     // the agent tools and their settings: private to the chat page on this computer
     let path = req.path.trim_end_matches('/');
     if req.method == "GET" && req.path.starts_with("/preview/") {
-        return respond_preview(&mut conn, &req, &req.path["/preview/".len()..]);
+        return respond_preview(&mut conn, &req, &req.path["/preview/".len()..], who.as_ref());
     }
     if req.path.starts_with("/plugin/") {
         return respond_plugin(&mut conn, &req, &req.path["/plugin/".len()..]);
@@ -1342,7 +1531,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         return transcription_request(&mut conn, &req, shared);
     }
     if ["/api/tools", "/api/harness", "/api/nightly", "/api/chats", "/api/agent", "/api/memory", "/api/maya", "/api/quit", "/api/skills", "/api/mcp", "/api/plugins", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads", "/api/models/folders"].iter().any(|p| path.starts_with(p)) {
-        if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
+        if let Err(e) = tools_allowed(&req, &conn, &shared.token, who.as_ref()) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
         let body = || std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse);
@@ -1665,7 +1854,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         // model alone. Answers once the switch is done (it can take a minute)
         // the nightly training's turn on the GPU: every model dropped; POST /api/models/load brings one back
         ("POST", "/api/models/unload") => {
-            if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
+            if let Err(e) = tools_allowed(&req, &conn, &shared.token, who.as_ref()) {
                 return respond_private(&mut conn, 403, &error_body(e));
             }
             if let Some(l) = &loading {
@@ -1718,7 +1907,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             return respond(&mut conn, 503, &error_body(&msg));
         }
         if let ("GET", "" | "/index.html") = (req.method.as_str(), req.path.trim_end_matches('/')) {
-            return respond_page(&mut conn, &shared.token);
+            return respond_page(&mut conn, &shared.token, true);
         }
         if let Some((_, body, content_type)) = VENDOR.iter().find(|v| v.0 == req.path) {
             return respond_file(&mut conn, body, content_type, "public, max-age=31536000, immutable");
@@ -1731,7 +1920,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
             return conn.write_all(head.as_bytes()).map_err(|e| e.to_string());
         }
-        ("GET", "" | "/index.html") => return respond_page(&mut conn, &shared.token),
+        ("GET", "" | "/index.html") => return respond_page(&mut conn, &shared.token, true),
         ("GET", p) if VENDOR.iter().any(|v| v.0 == p) => {
             let (_, body, content_type) = VENDOR.iter().find(|v| v.0 == p).unwrap();
             return respond_file(&mut conn, body, content_type, "public, max-age=31536000, immutable");
