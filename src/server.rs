@@ -1082,8 +1082,7 @@ fn respond(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
 /// POST /v1/audio/speech, as OpenAI's: {"input": text, "voice": a speaker id (a number, or "maya": 4, the
 /// speaker the Maya fine-tune learned), "response_format": "wav" (the default, sent when done) or "pcm" (16-bit
 /// mono samples at the X-Sample-Rate header's rate, sent as they are made)}, and also "conversation" (an id:
-/// the turns spoken under it are this one's context, which keeps the voice), "temperature", "top_k", "seed", and
-/// "description" (maya1: another voice than the folder's, described in words).
+/// the turns spoken under it are this one's context, which keeps the voice), "temperature", "top_k", "seed".
 fn speech_request(conn: &mut TcpStream, req: &Request, shared: &Shared) -> Result<(), String> {
     if req.method == "OPTIONS" {
         let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
@@ -1129,8 +1128,7 @@ fn speech_request(conn: &mut TcpStream, req: &Request, shared: &Shared) -> Resul
     let max_frames = (text.chars().count() * 2 + 50).min(750);
     let (tx, events) = mpsc::channel();
     let conversation = body.get("conversation").and_then(Json::as_str).map(String::from);
-    let description = body.get("description").and_then(Json::as_str).map(str::trim).filter(|d| !d.is_empty()).map(String::from);
-    sp.send(speech::SpeechJob { text, speaker, sampling, max_frames, conversation, description, events: tx })?;
+    sp.send(speech::SpeechJob { text, speaker, sampling, max_frames, conversation, events: tx })?;
     let s16 = |samples: &[f32]| -> Vec<u8> { samples.iter().flat_map(|&v| ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect() };
     if pcm {
         // each 80 ms of audio goes out on its own: small writes must not wait for the last one's ACK
