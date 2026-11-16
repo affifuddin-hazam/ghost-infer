@@ -553,6 +553,30 @@ struct Engine<'a> {
     pace: [lookup::Pace; 2],
     /// GPU: prompts' openings (see Engine::opening) and the state after each, in system memory, latest used last
     openings: Vec<(Vec<u32>, cuda::SavedState)>,
+    /// GPU: whole conversations another took the caches from, in system memory (see Engine::adopt)
+    parked: Vec<Parked>,
+    /// counts parks, so `Parked::used` orders them by age
+    clock: u64,
+}
+
+/// A conversation the GPU is not holding: its tokens and what it left in the caches, kept in system memory so
+/// that a request continuing it takes the caches back instead of reading its history again (an agent's
+/// subagent cutting in between two of its turns, a client switching between chats).
+struct Parked {
+    tokens: Vec<u32>,
+    state: cuda::SavedState,
+    used: u64,
+}
+
+/// Conversations parked at most, and shorter ones not parked (reading them again costs about what a copy does).
+const PARKED_MAX: usize = 5;
+const PARK_MIN: usize = 512;
+
+/// System memory parked conversations may hold: GHOST_INFER_PARK_MB, 2048 by default (a 17K-token conversation
+/// of a 35B-A3B is about 300 MB). It is page-locked, so it is taken from what the experts' file cache could use.
+fn park_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| std::env::var("GHOST_INFER_PARK_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048) << 20)
 }
 
 /// Openings shorter than this are read again rather than kept (copying back is not worth it).
@@ -651,7 +675,7 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
             }
         }
     }
-    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new(), lookup: Default::default(), pace: Default::default(), openings: Vec::new() })
+    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new(), lookup: Default::default(), pace: Default::default(), openings: Vec::new(), parked: Vec::new(), clock: 0 })
 }
 
 impl Engine<'_> {
@@ -778,6 +802,83 @@ impl Engine<'_> {
         self.backend.snapshot();
         self.hist.extend_from_slice(ids);
         Ok(())
+    }
+
+    /// Gives the caches to the conversation `ids` continues, and says how much of `ids` they hold (before any
+    /// truncate). A request carries its whole prompt, so it is compared token by token with the live history
+    /// and with each parked conversation: the one it continues matches for thousands of tokens, the others for
+    /// what their prompts happen to share. The longest match wins; when a parked one beats the live one, the
+    /// live one is parked and the other comes back. A request that continues neither starts a conversation of
+    /// its own: the live one is parked first, for when its client comes back. (From PR #2.)
+    fn adopt(&mut self, ids: &[u32]) -> usize {
+        let held = |tokens: &[u32]| tokens.iter().zip(ids).take_while(|(a, b)| a == b).count();
+        let live = held(&self.hist);
+        if !matches!(self.backend, Backend::Gpu(..)) {
+            return live;
+        }
+        let back = self.parked.iter().enumerate().map(|(i, p)| (i, held(&p.tokens))).filter(|&(_, n)| n > live && n >= PARK_MIN).max_by_key(|&(_, n)| n);
+        if let Some((i, n)) = back {
+            let p = self.parked.remove(i);
+            self.park_now();
+            return self.put_back(p).unwrap_or(0).min(n);
+        }
+        // a request that follows neither is another conversation: keep this one for when it comes back
+        if live + PARK_MIN <= self.hist.len() {
+            self.park_now();
+        }
+        live
+    }
+
+    /// Copies the conversation the caches hold to system memory (they stay as they are, for whatever comes next).
+    fn park_now(&mut self) {
+        let Backend::Gpu(_, s) = &self.backend else { return };
+        if self.hist.len() < PARK_MIN || s.pos != self.hist.len() {
+            return;
+        }
+        // a conversation parked already and not gone on since: its copy is still good
+        if self.parked.iter().any(|p| p.tokens == self.hist) {
+            return;
+        }
+        match s.park() {
+            Ok(state) => {
+                self.clock += 1;
+                let (n, mb) = (self.hist.len(), state.bytes() >> 20);
+                self.parked.push(Parked { tokens: self.hist.clone(), state, used: self.clock });
+                self.sweep_parked();
+                eprintln!("[parked {n} tokens ({mb} MB), {} in system memory]", self.parked.len());
+            }
+            Err(e) => eprintln!("[could not park this conversation: {e}]"),
+        }
+    }
+
+    /// Puts a parked conversation back into the caches; returns the positions they now hold of it, or None
+    /// when it could not go back (the prompt is then read again, as it would have been without parking).
+    fn put_back(&mut self, p: Parked) -> Option<usize> {
+        let Backend::Gpu(m, s) = &mut self.backend else { return None };
+        let pos = p.state.pos();
+        if let Err(e) = m.reserve(s, pos).and_then(|()| s.unpark(p.state)) {
+            eprintln!("[could not put back a parked conversation: {e}; its prompt is read again]");
+            let _ = s.reset();
+            self.hist.clear();
+            return None;
+        }
+        eprintln!("[put back {} tokens from system memory]", p.tokens.len());
+        self.hist = p.tokens;
+        if let Some(d) = self.draft.as_mut() {
+            d.sess.pos = 0; // the draft model reads it again
+        }
+        Some(pos)
+    }
+
+    /// Drops parked conversations, least recently used first, until there are PARKED_MAX at most and they fit
+    /// park_budget(). One still in play is never the oldest: its client sends it every turn.
+    fn sweep_parked(&mut self) {
+        let held = |v: &Vec<Parked>| v.iter().map(|p| p.state.bytes()).sum::<usize>();
+        while self.parked.len() > PARKED_MAX || (held(&self.parked) > park_budget() && !self.parked.is_empty()) {
+            let (i, _) = self.parked.iter().enumerate().min_by_key(|(_, p)| p.used).expect("not empty");
+            let p = self.parked.remove(i);
+            eprintln!("[dropped a parked conversation of {} tokens]", p.tokens.len());
+        }
     }
 
     /// The cache for a prompt `ids` of which it holds the first `keep` tokens: when it lacks the prompt's

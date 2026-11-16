@@ -5195,6 +5195,13 @@ impl HostBuf {
         let a = api()?;
         a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(dst, self.ptr, self.bytes) }, "copy to GPU")
     }
+
+    /// A copy of it in a buffer of its own.
+    fn dup(&self) -> Result<HostBuf, String> {
+        let b = HostBuf::alloc(self.bytes)?;
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr as *const u8, b.ptr as *mut u8, self.bytes) };
+        Ok(b)
+    }
 }
 
 /// Page-locked system memory mapped into the GPU's address space: kernels read and write it in place over PCIe
@@ -5247,6 +5254,22 @@ impl Drop for MappedBuf {
 pub struct SavedState {
     pos: usize,
     parts: Vec<HostBuf>,
+    /// A parked conversation's DeltaNet notes (GpuSession::park): a request that continues it stops a few
+    /// tokens short of where it got (the last reply's tail is not in the next prompt), and a recurrent model
+    /// can only go back to a note at or before that point. Without them it would read from the start.
+    snaps: Vec<(usize, HostBuf)>,
+}
+
+impl SavedState {
+    /// The positions it holds.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Bytes of system memory it holds.
+    pub fn bytes(&self) -> usize {
+        self.parts.iter().chain(self.snaps.iter().map(|(_, b)| b)).map(|b| b.bytes).sum()
+    }
 }
 
 impl Drop for HostBuf {
@@ -9870,6 +9893,12 @@ impl GpuModel {
         self.cache.borrow().as_ref().map(ExpertCache::describe)
     }
 
+    /// Grows the session's caches to hold `need` positions, so a parked conversation can come back
+    /// (GpuSession::unpark): the memory comes from the expert cache, as for a long prompt.
+    pub fn reserve(&self, s: &mut GpuSession, need: usize) -> Result<(), String> {
+        self.fit_session(s, need.min(s.ctx), false)
+    }
+
     /// A session that grows gets room for `need` positions, in CTX_STEP steps: the memory it takes comes
     /// from the expert cache's last blocks, the memory it gives back goes to the cache. `shrink`: also give
     /// memory back, when the conversation needs two steps less than the session holds (a new one after a
@@ -10126,7 +10155,26 @@ impl GpuSession {
             h.copy_from(d.ptr)?;
             parts.push(h);
         }
-        Ok(SavedState { pos: self.pos, parts })
+        Ok(SavedState { pos: self.pos, parts, snaps: Vec::new() })
+    }
+
+    /// `keep` for a whole conversation that another is about to take the caches from (Engine::adopt): with
+    /// copies of its DeltaNet notes, which `unpark` puts back with it. The notes stay here as well, for the
+    /// request that takes over next, which may share this conversation's start.
+    pub fn park(&self) -> Result<SavedState, String> {
+        let mut s = self.keep()?;
+        for (at, b) in self.snaps.iter().filter(|(at, _)| *at <= self.pos) {
+            s.snaps.push((*at, b.dup()?));
+        }
+        Ok(s)
+    }
+
+    /// Back to a parked conversation, its notes too. The caches must hold room for `s.pos()` positions
+    /// (GpuModel::reserve).
+    pub fn unpark(&mut self, s: SavedState) -> Result<(), String> {
+        self.load(&s)?;
+        self.snaps = s.snaps;
+        Ok(())
     }
 
     /// Back to a state `keep` copied (of this session); its snapshots go, as they were of other tokens.
