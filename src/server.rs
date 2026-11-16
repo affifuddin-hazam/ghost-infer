@@ -1082,7 +1082,8 @@ fn respond(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
 /// POST /v1/audio/speech, as OpenAI's: {"input": text, "voice": a speaker id (a number, or "maya": 4, the
 /// speaker the Maya fine-tune learned), "response_format": "wav" (the default, sent when done) or "pcm" (16-bit
 /// mono samples at the X-Sample-Rate header's rate, sent as they are made)}, and also "conversation" (an id:
-/// the turns spoken under it are this one's context, which keeps the voice), "temperature", "top_k", "seed".
+/// the turns spoken under it are this one's context, which keeps the voice), "temperature", "top_k", "seed", and
+/// "description" (maya1: another voice than the folder's, described in words).
 fn speech_request(conn: &mut TcpStream, req: &Request, shared: &Shared) -> Result<(), String> {
     if req.method == "OPTIONS" {
         let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
@@ -1128,7 +1129,8 @@ fn speech_request(conn: &mut TcpStream, req: &Request, shared: &Shared) -> Resul
     let max_frames = (text.chars().count() * 2 + 50).min(750);
     let (tx, events) = mpsc::channel();
     let conversation = body.get("conversation").and_then(Json::as_str).map(String::from);
-    sp.send(speech::SpeechJob { text, speaker, sampling, max_frames, conversation, events: tx })?;
+    let description = body.get("description").and_then(Json::as_str).map(str::trim).filter(|d| !d.is_empty()).map(String::from);
+    sp.send(speech::SpeechJob { text, speaker, sampling, max_frames, conversation, description, events: tx })?;
     let s16 = |samples: &[f32]| -> Vec<u8> { samples.iter().flat_map(|&v| ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect() };
     if pcm {
         // each 80 ms of audio goes out on its own: small writes must not wait for the last one's ACK
@@ -1365,9 +1367,11 @@ fn respond_preview(conn: &mut TcpStream, req: &Request, rest: &str, who: Option<
 /// A plugin's panel page and what it loads (/plugin/<name>/<file>), and its functions called by that page
 /// (POST /plugin/<name>/call/<function>, the arguments as the body's JSON): as previews are, for this computer
 /// only, and not for other websites' pages.
-fn respond_plugin(conn: &mut TcpStream, req: &Request, rest: &str) -> Result<(), String> {
+fn respond_plugin(conn: &mut TcpStream, req: &Request, rest: &str, who: Option<&auth::Who>) -> Result<(), String> {
     let host = req.host.rsplit_once(':').map_or(req.host.as_str(), |(h, _)| h);
-    if !conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) || !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+    // with access keys on, a signed-in browser may open them from anywhere, as the agent tools
+    let keyed = matches!(who, Some(auth::Who::Key(_) | auth::Who::Session(_)));
+    if !keyed && (!conn.peer_addr().is_ok_and(|a| a.ip().is_loopback()) || !matches!(host, "127.0.0.1" | "localhost" | "[::1]")) {
         return respond(conn, 403, &error_body("plugin pages are for this computer only"));
     }
     if !req.origin.is_empty() && !req.origin.ends_with(&format!("//{}", req.host)) {
@@ -1546,7 +1550,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         return respond_preview(&mut conn, &req, &req.path["/preview/".len()..], who.as_ref());
     }
     if req.path.starts_with("/plugin/") {
-        return respond_plugin(&mut conn, &req, &req.path["/plugin/".len()..]);
+        return respond_plugin(&mut conn, &req, &req.path["/plugin/".len()..], who.as_ref());
     }
     // speech has a model of its own: it answers whether or not a language model runs
     if path == "/v1/audio/speech" {
@@ -1563,7 +1567,16 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         return match (req.method.as_str(), path) {
             ("GET", "/api/harness") => respond_private(&mut conn, 200, &crate::tools::status(&shared.harness.lock().unwrap())),
             // the nightly LoRA run: its settings and last result, or a run started now
-            ("GET", "/api/nightly") => respond_private(&mut conn, 200, &nightly::status()),
+            // (with "ready": set up on this computer, nightly.json naming a Python and a training script that is there)
+            ("GET", "/api/nightly") => {
+                let mut st = nightly::status();
+                let field = |k: &str| st.get("settings").and_then(|s| s.get(k)).and_then(Json::as_str).filter(|v| !v.is_empty()).map(String::from);
+                let ready = field("python").is_some() && field("script").is_some_and(|p| Path::new(&p).is_file());
+                if let Json::Obj(fields) = &mut st {
+                    fields.push(("ready".into(), Json::Bool(ready)));
+                }
+                respond_private(&mut conn, 200, &st)
+            }
             ("POST", "/api/nightly/run") => match nightly::launch(shared) {
                 Ok(()) => respond_private(&mut conn, 202, &nightly::status()),
                 Err(e) => respond_private(&mut conn, 409, &error_body(&e)),
@@ -1667,7 +1680,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                     Ok(b) => b,
                     Err(e) => return respond_private(&mut conn, 400, &error_body(&e)),
                 };
-                let maya = b.get("persona").and_then(Json::as_str) == Some("maya");
+                let maya = matches!(b.get("persona").and_then(Json::as_str), Some("maya" | "caller"));
                 let Some(l) = (if maya { for_call.clone() } else { current.clone() }).filter(|_| loading.is_none()) else {
                     return respond_private(&mut conn, 503, &error_body("no model is running yet; try again in a moment"));
                 };
@@ -1784,6 +1797,29 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             ("POST", "/api/mcp/reload") => {
                 std::thread::spawn(mcp::start_all);
                 respond_private(&mut conn, 200, &obj(vec![("reloading", Json::Bool(true))]))
+            }
+            // mcp.json itself, for a client that cannot open the file (the chat page, on this computer or another):
+            // GET {"path", "text"}; POST {"text"}: saved when it is a JSON object, then the servers start again
+            ("GET", "/api/mcp/config") => match mcp::ensure_config() {
+                Ok(path) => {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    respond_private(&mut conn, 200, &obj(vec![("path", str(&path)), ("text", str(text.trim_start_matches('\u{feff}')))]))
+                }
+                Err(e) => respond_private(&mut conn, 500, &error_body(&e)),
+            },
+            ("POST", "/api/mcp/config") => {
+                let text = body().ok().and_then(|b| b.get("text").and_then(Json::as_str).map(String::from)).unwrap_or_default();
+                match Json::parse(&text) {
+                    Ok(Json::Obj(_)) => match mcp::config_file().and_then(|p| std::fs::write(&p, &text).map_err(|e| e.to_string())) {
+                        Ok(()) => {
+                            std::thread::spawn(mcp::start_all);
+                            respond_private(&mut conn, 200, &obj(vec![("saved", Json::Bool(true))]))
+                        }
+                        Err(e) => respond_private(&mut conn, 500, &error_body(&e)),
+                    },
+                    Ok(_) => respond_private(&mut conn, 400, &error_body("mcp.json must be a JSON object, like {\"mcpServers\": {...}}")),
+                    Err(e) => respond_private(&mut conn, 400, &error_body(&format!("not valid JSON: {e}"))),
+                }
             }
             ("POST", "/api/mcp/import-claude") => match mcp::import_claude() {
                 Ok(added) => {

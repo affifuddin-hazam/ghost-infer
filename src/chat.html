@@ -253,6 +253,44 @@
   .signin .hint code { color: var(--muted); }
   .signin .bad { color: var(--bad); font-size: 13px; margin-top: 10px; }
 
+  /* header switch: Code or Voice call */
+  .modeseg button { display: inline-flex; align-items: center; gap: 6px; }
+  /* rail lists */
+  .lk { color: var(--accent); font-size: 12px; padding: 2px 4px; border-radius: 6px; }
+  .lk:hover { background: var(--hover); }
+  .lks { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .mini { width: 100%; background: var(--code); border: 1px solid var(--line2); border-radius: 8px; padding: 5px 9px; font: 12.5px var(--sans); outline: 0; margin-top: 6px; color: var(--text); }
+  .mini:focus { border-color: color-mix(in srgb, var(--accent) 45%, var(--line2)); }
+  .kv .xs { opacity: .5; } .kv:hover .xs { opacity: 1; }
+  .task-done .k { color: var(--faint); text-decoration: line-through; }
+  textarea.code { width: 100%; min-height: 300px; resize: vertical; background: var(--code); border: 1px solid var(--line2); border-radius: 10px; padding: 10px 12px; font: 12.5px/1.55 var(--mono); color: var(--text); outline: 0; }
+  .dialog.wide { width: min(760px, 100%); }
+  .dialog.panel { width: min(900px, 100%); height: min(720px, calc(100dvh - 32px)); display: flex; flex-direction: column; padding: 14px; }
+  .dialog.panel iframe { flex: 1; border: 1px solid var(--line2); border-radius: 10px; background: #fff; width: 100%; }
+  /* the voice call */
+  .call { flex: 1; display: flex; flex-direction: column; align-items: center; min-height: 0; padding: 4vh 16px max(16px, env(safe-area-inset-bottom)); }
+  .call-stage { position: relative; text-align: center; padding-top: 4vh; }
+  #callGhost { width: 120px; height: 110px; image-rendering: pixelated; position: relative; z-index: 1; }
+  .call-ring { position: absolute; left: 50%; top: calc(4vh + 55px); width: 150px; height: 150px; margin: -75px 0 0 -75px; border-radius: 50%; background: radial-gradient(circle, var(--accent-soft) 0%, transparent 70%); transform: scale(calc(1 + var(--lvl, 0) * .9)); transition: transform .08s linear; }
+  .call h2 { font-size: 22px; font-weight: 500; margin: 14px 0 2px; }
+  .call-state { color: var(--muted); font-size: 13.5px; min-height: 20px; }
+  .call-mood { color: var(--faint); font-size: 12.5px; min-height: 18px; margin-top: 2px; }
+  .call-lines { flex: 1; overflow-y: auto; width: min(620px, 100%); margin: 22px 0 12px; display: flex; flex-direction: column; gap: 10px; mask-image: linear-gradient(to bottom, transparent 0, #000 40px); }
+  .call-lines .ln { font-size: 15px; line-height: 1.55; }
+  .call-lines .ln.you { color: var(--muted); text-align: right; }
+  .call-lines .ln.you::before { content: "You  "; color: var(--faint); font-size: 12px; }
+  .call-lines .ln.err { color: var(--bad); font-size: 13px; text-align: center; }
+  .call-note { width: min(560px, 100%); font-size: 13px; color: var(--muted); background: var(--raise); border: 1px solid var(--line2); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
+  .call-bar { width: min(560px, 100%); display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .call-type { width: 100%; }
+  .call-btns { display: flex; gap: 14px; align-items: center; }
+  .callbtn { width: 54px; height: 54px; border-radius: 50%; display: grid; place-items: center; background: var(--raise2); color: var(--text); }
+  .callbtn .icon { width: 22px; height: 22px; }
+  .callbtn.on { background: var(--text); color: var(--bg); }
+  .callbtn.end { background: #d9453a; color: #fff; }
+  .callbtn.start { width: auto; padding: 0 22px; border-radius: 999px; gap: 8px; display: inline-flex; align-items: center; background: var(--accent); color: var(--ink); font-weight: 500; }
+  body.in-call .scroll, body.in-call .dock { display: none; }
+
   /* narrower: the rail floats, then the sidebar becomes a drawer */
   @media (max-width: 1180px) {
     #app { grid-template-columns: 250px 1fr; }
@@ -325,6 +363,17 @@
     <symbol id="i-web" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
     <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 6 1V5a3 3 0 0 0-3-1zM15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-6 1"/></symbol>
     <symbol id="i-cube" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></symbol>
+    <symbol id="i-micoff" viewBox="0 0 24 24"><path d="M15 9.3V6a3 3 0 0 0-5.7-1.3M9 9v2a3 3 0 0 0 4.6 2.5M5 11a7 7 0 0 0 11.3 5.5M19 11a7 7 0 0 1-.6 2.8M12 18v3M3 3l18 18"/></symbol>
+    <symbol id="i-phone" viewBox="0 0 24 24"><path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2"/></symbol>
+    <symbol id="i-hangup" viewBox="0 0 24 24"><path d="M3 15.5c5-4.7 13-4.7 18 0l-2.4 2.4-3.3-1.4v-2.6a10 10 0 0 0-6.6 0v2.6l-3.3 1.4z"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></symbol>
+    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20s-7-4.4-9-9a5 5 0 0 1 9-3 5 5 0 0 1 9 3c-2 4.6-9 9-9 9z"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5v14l11-7z"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0zM12 17v5"/></symbol>
+    <symbol id="i-skill" viewBox="0 0 24 24"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.4 6.8 19.1l1-5.8L3.5 9.2l5.9-.9z"/></symbol>
     <symbol id="i-signout" viewBox="0 0 24 24"><path d="M15 4h4a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-4M10 17l-5-5 5-5M5 12h11"/></symbol>
   </defs>
 </svg>
@@ -366,9 +415,29 @@
       <button class="ibtn" id="menuBtn" aria-label="Chats"><svg class="icon"><use href="#i-menu"/></svg></button>
       <div class="title" id="title">New chat</div>
       <div class="sp"></div>
+      <span class="seg modeseg" id="viewSeg" hidden><button data-v="code" aria-pressed="true"><svg class="icon" style="width:14px;height:14px"><use href="#i-code"/></svg>Code</button><button data-v="call" aria-pressed="false"><svg class="icon" style="width:14px;height:14px"><use href="#i-phone"/></svg>Voice call</button></span>
       <button class="ibtn" id="railBtn" aria-label="Details" aria-pressed="false"><svg class="icon"><use href="#i-panel"/></svg></button>
     </header>
     <div class="scroll" id="scroll"><div class="col log" id="log" aria-live="polite"></div></div>
+    <section class="call" id="callView" hidden aria-label="Voice call">
+      <div class="call-stage">
+        <canvas id="callGhost" width="24" height="22" aria-hidden="true"></canvas>
+        <div class="call-ring" id="callRing" aria-hidden="true"></div>
+        <h2 id="callWho">Maya</h2>
+        <div class="call-state" id="callState">Ready when you are</div>
+        <div class="call-mood" id="callMood"></div>
+      </div>
+      <div class="call-lines" id="callLines" aria-live="polite"></div>
+      <div class="call-note" id="callNote" hidden></div>
+      <div class="call-bar">
+        <form class="field call-type" id="callType" hidden><input placeholder="Type to Maya instead" aria-label="Type a message"><button class="btn sm">Send</button></form>
+        <div class="call-btns">
+          <button class="callbtn" id="callMute" aria-label="Mute" hidden><svg class="icon"><use href="#i-mic"/></svg></button>
+          <button class="callbtn start" id="callStart"><svg class="icon"><use href="#i-phone"/></svg><span>Start call</span></button>
+          <button class="callbtn end" id="callEnd" hidden aria-label="End call"><svg class="icon"><use href="#i-hangup"/></svg></button>
+        </div>
+      </div>
+    </section>
     <div class="dock">
       <canvas id="ghost" width="24" height="22" aria-hidden="true"></canvas>
       <form class="composer" id="form">
@@ -392,7 +461,12 @@
     <div class="card"><h4>Environment<span class="sp"></span><button class="ibtn" id="railClose" aria-label="Close details" style="width:24px;height:24px;margin:-4px -6px -4px 0"><svg class="icon" style="width:14px;height:14px"><use href="#i-x"/></svg></button></h4><div id="env"></div></div>
     <div class="card"><h4>Context</h4><div id="ctx"></div></div>
     <div class="card"><h4>Changes<span class="sp"></span><button class="btn sm" id="undoAll" hidden>Undo all</button></h4><div id="changes"></div></div>
+    <div class="card" id="cardTasks" hidden><h4>Tasks<span class="sp"></span><span class="faint" id="tasksNote" style="font-weight:400;font-size:12px"></span></h4><div id="tasks"></div></div>
     <div class="card"><h4>Background tasks</h4><div id="bg"></div></div>
+    <div class="card" id="cardSched" hidden><h4>Scheduled<span class="sp"></span><span class="faint" id="schedNote" style="font-weight:400;font-size:12px"></span></h4><div id="sched"></div></div>
+    <div class="card"><h4>Skills<span class="sp"></span><span class="faint" id="skillsNote" style="font-weight:400;font-size:12px"></span></h4><div id="skills"></div></div>
+    <div class="card"><h4>MCP servers<span class="sp"></span><span class="faint" id="mcpNote" style="font-weight:400;font-size:12px"></span></h4><div id="mcp"></div></div>
+    <div class="card" id="cardPlugins" hidden><h4>Plugins<span class="sp"></span><span class="faint" id="pluginsNote" style="font-weight:400;font-size:12px"></span></h4><div id="plugins"></div></div>
   </aside>
 </div>
 
@@ -405,6 +479,9 @@
       <button class="row" data-page="appearance"><svg class="icon"><use href="#i-color"/></svg>Appearance</button>
       <button class="row" data-page="models"><svg class="icon"><use href="#i-cube"/></svg>Models</button>
       <button class="row" data-page="access"><svg class="icon"><use href="#i-key"/></svg>API &amp; access</button>
+      <button class="row" data-page="voice" data-needs="voice"><svg class="icon"><use href="#i-mic"/></svg>Voice</button>
+      <button class="row" data-page="maya" data-needs="voice"><svg class="icon"><use href="#i-heart"/></svg>Maya</button>
+      <button class="row" data-page="sleep" data-needs="sleep"><svg class="icon"><use href="#i-moon"/></svg>Sleep training</button>
       <button class="row" data-page="about"><svg class="icon"><use href="#i-info"/></svg>About</button>
     </nav>
     <div class="spage" id="spage"></div>
@@ -442,7 +519,8 @@ function ago(ms) {
   if (!ms) return "never";
   const s = (Date.now() - ms) / 1000;
   if (s < 60) return "just now"; if (s < 3600) return Math.floor(s / 60) + " min ago"; if (s < 86400) return Math.floor(s / 3600) + " h ago";
-  return Math.floor(s / 86400) + " days ago";
+  const d = Math.floor(s / 86400);
+  return d === 1 ? "yesterday" : d + " days ago";
 }
 const day = (ms) => new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 const baseName = (p) => String(p).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || String(p);
@@ -795,9 +873,9 @@ function drawRail() {
   const running = procs.filter((p) => p.running), done = procs.filter((p) => !p.running);
   let b = running.map((p) => `<div class="kv"><span class="dot live"></span><span class="k" title="${esc(p.command)}">${esc(p.title || p.command)}</span><button class="btn sm" data-out="${p.id}">${S.procOut && S.procOut.id === p.id ? "Hide" : "Output"}</button></div>`).join("");
   if (done.length) b += `<div class="kv">${icon("list")}<span class="k">${done.length} finished</span><button class="btn sm" data-out="${done[done.length - 1].id}">${S.procOut && S.procOut.id === done[done.length - 1].id ? "Hide" : "Last output"}</button></div>`;
-  for (const j of bg.jobs || []) b += `<div class="kv">${icon("bolt")}<span class="k">${esc(j.name || j.prompt || "Scheduled task")}</span></div>`;
   if (S.procOut) b += `<div class="proc-out">${esc(S.procOut.text || "(nothing printed yet)")}</div>`;
   $("bg").innerHTML = b || `<div class="kv faint">Nothing running</div>`;
+  if (typeof drawExtras === "function" && S.skills) drawExtras();
 }
 $("bg").addEventListener("click", async (e) => {
   const t = e.target.closest("[data-out]"); if (!t) return;
@@ -852,7 +930,8 @@ async function openChat(id) {
   try {
     const c = await api("/api/chats/" + encodeURIComponent(id));
     S.chat = { id: c.id, title: c.title, cwd: c.cwd || null, turns: turnsFrom(c.messages), parts: c.parts, tokens: c.tokens, ctxLen: S.models && S.models.context_length };
-    S.procOut = null; opened.clear();
+    S.procOut = null; opened.clear(); S.tasks = c.tasks || [];
+    if (S.view === "call") setView("code");
     $("title").textContent = c.title || "Chat"; document.title = (c.title || "Chat") + " · ghost-infer";
     if (c.unread) api("/api/chats/read", { body: { id } }).then(loadChats).catch(() => {});
     stick = true; draw(); drawChats(); drawChips(); closeDrawer();
@@ -861,7 +940,9 @@ async function openChat(id) {
 }
 function newChat() {
   if (S.busy) { toast("Stop the reply first"); return; }
-  S.chat = null; S.procOut = null; opened.clear(); $("title").textContent = "New chat"; document.title = "ghost-infer";
+  if (CALL.on) { toast("End the call first"); return; }
+  if (S.view === "call") setView("code");
+  S.chat = null; S.procOut = null; S.tasks = []; opened.clear(); $("title").textContent = "New chat"; document.title = "ghost-infer";
   history.replaceState(null, "", location.pathname); draw(); drawChats(); drawChips(); closeDrawer(); input.focus();
 }
 $("newChat").onclick = newChat;
@@ -1045,6 +1126,8 @@ function onEvent(j, turn) {
       turn.parts.push({ t: "note", text: { compacting: "The chat outgrew the context: summarising it", compact: "Summarised the earlier chat to make room", check: "Checking its work" }[j.kind] || "Keeping going" + (j.text ? ": " + j.text.slice(0, 140) : "") });
       break;
     case "error": turn.parts.push({ t: "error", text: j.message }); break;
+    case "tasks": S.tasks = j.tasks || []; if (S.rail) drawExtras(); break;
+    case "goal": if (j.goal) turn.parts.push({ t: "note", text: `Goal ${j.goal.state || "set"}: ${j.goal.text || ""}${j.goal.reason ? " (" + j.goal.reason + ")" : ""}` }); break;
     case "preview": turn.parts.push({ t: "note", text: "Wrote a web page: " + j.url }); break;
   }
 }
@@ -1240,6 +1323,7 @@ async function refreshModels() {
     const changed = !S.models || m.current !== S.models.current || m.loading !== S.models.loading || m.thinking !== S.models.thinking;
     S.models = m;
     if (S.chat && m.context_length && !S.chat.ctxLen) S.chat.ctxLen = m.context_length;
+    if (changed || m.voice !== S._voice) { S._voice = m.voice; navCaps(); }
     if (changed) { drawChips(); if (!S.chat || !S.chat.turns.length) drawWelcome(); drawRail(); if (!$("settings").hidden && page === "models") drawSettings(); }
   } catch {}
 }
@@ -1258,7 +1342,10 @@ async function boot() {
   $("lockPill").innerHTML = ACCESS === "key" ? `<span class="pill ok" title="Requests need a key">${icon("lock", 'style="width:10px;height:10px"')}key</span>` : "";
   $("underLeft").textContent = LOCAL ? "Runs on this computer · chats are kept by the server" : `Runs on ${location.hostname} · chats are kept there`;
   try { S.harness = await api("/api/harness"); } catch {}
-  await Promise.all([refreshModels(), loadChats(), refreshSystem(), refreshBackground()]);
+  await Promise.all([refreshModels(), loadChats(), refreshSystem(), refreshBackground(), refreshExtras(),
+    api("/api/nightly").then((n) => (S.nightly = n)).catch(() => {}), api("/api/nightly/learned").then((l) => (S.learned = l)).catch(() => {})]);
+  navCaps();
+  setInterval(() => { if (!document.hidden && S.rail) refreshExtras(); }, 8000);
   drawChips();
   const id = location.hash.slice(1);
   if (id && S.chats.some((c) => c.id === id)) openChat(id); else draw();
@@ -1267,6 +1354,489 @@ async function boot() {
   setInterval(() => { if (!document.hidden && S.rail) refreshSystem(); }, 10000);
   input.focus(); typed();
 }
+
+// ================================================================ phase 2: the rail's other cards
+Object.assign(S, { skills: [], skillChoices: null, mcp: { servers: [] }, plugins: [], tasks: [], nightly: null, learned: null, maya: null });
+async function refreshExtras() {
+  const [sk, mc, pl] = await Promise.all([api("/api/skills").catch(() => null), api("/api/mcp").catch(() => null), api("/api/plugins").catch(() => null)]);
+  if (sk) S.skills = sk.skills || [];
+  if (mc) S.mcp = mc;
+  if (pl) S.plugins = pl.plugins || [];
+  if (S.rail && !S.busy) drawExtras();
+}
+function drawExtras() {
+  // the model's task list for this chat
+  const tasks = S.tasks || [];
+  $("cardTasks").hidden = !tasks.length;
+  if (tasks.length) {
+    const done = tasks.filter((t) => t.status === "completed").length;
+    $("tasksNote").textContent = `${done}/${tasks.length}`;
+    $("tasks").innerHTML = tasks.map((t) => `<div class="kv ${t.status === "completed" ? "task-done" : ""}">${t.status === "in_progress" ? '<span class="spin"></span>' : icon(t.status === "completed" ? "check" : "list", t.status === "completed" ? 'style="color:var(--ok)"' : "")}<span class="k" title="${esc(t.text)}">${esc(t.text)}</span></div>`).join("");
+  }
+  // scheduled: the tasks the model set and the /loop ones
+  const bg = S.background || {}, jobs = bg.jobs || [];
+  $("cardSched").hidden = !jobs.length && !bg.running;
+  $("schedNote").textContent = bg.running ? "running" : jobs.length ? String(jobs.length) : "";
+  $("sched").innerHTML = (bg.running ? `<div class="kv"><span class="spin"></span><span class="k">Running one now</span></div>` : "")
+    + jobs.map((j) => `<div class="kv">${icon("clock")}<span class="k" title="${esc(j.prompt || "")}">${esc(j.name || j.prompt || "Task")} <span class="faint">· ${esc(j.when || "")}${j.next ? ", next " + esc(String(j.next)) : ""}</span></span><button class="lk" data-run="${esc(j.id)}">Run</button><button class="ibtn xs" style="width:22px;height:22px" data-cancel="${esc(j.id)}" aria-label="Cancel">${icon("x", 'style="width:12px;height:12px"')}</button></div>`).join("");
+  // skills
+  $("skillsNote").textContent = S.skills.length ? String(S.skills.length) : "";
+  let sk = S.skills.map((s) => `<div class="kv">${icon("skill")}<span class="k" title="${esc(s.description)}">${esc(s.name)} <span class="faint">· ${esc(s.description)}</span></span><button class="ibtn xs" style="width:22px;height:22px" data-unskill="${esc(s.name)}" aria-label="Remove ${esc(s.name)}">${icon("x", 'style="width:12px;height:12px"')}</button></div>`).join("");
+  if (!S.skills.length) sk = `<div class="kv faint">None installed</div>`;
+  if (S.skillChoices) {
+    sk += `<div class="kv faint" style="margin-top:6px">It has ${S.skillChoices.choose.length} skills. Install which?</div>`
+      + S.skillChoices.choose.map((c) => `<div class="kv">${icon("skill")}<span class="k" title="${esc(c.description)}">${esc(c.name)} <span class="faint">· ${esc(c.description)}</span></span><button class="lk" data-pick="${esc(c.path)}">Install</button></div>`).join("")
+      + `<div class="lks"><button class="lk" data-pick="__all">Install all</button><button class="lk" data-pick="__cancel">Cancel</button></div>`;
+  }
+  sk += `<form id="skillForm"><input class="mini" placeholder="Install: GitHub link, .zip or folder" title="A GitHub link, a .zip link, or a folder on the server" spellcheck="false" aria-label="Skill link"></form>`;
+  $("skills").innerHTML = sk;
+  // MCP servers
+  const servers = S.mcp.servers || [];
+  const ready = servers.filter((m) => m.status === "ready").length, broken = servers.filter((m) => m.status !== "ready" && m.status !== "starting").length;
+  $("mcpNote").textContent = broken ? `${broken} not working` : ready ? `${ready} ready` : "";
+  $("mcp").innerHTML = (servers.length ? servers.map((m) => {
+    const [c, note] = m.status === "ready" ? ["ok", `${(m.tools || []).length} tools`] : m.status === "starting" ? ["warn", "starting"] : ["bad", m.status];
+    return `<div class="kv"><span class="lamp" style="background:var(--${c})"></span><span class="k">${esc(m.name)}</span><span class="v" title="${esc(note)}" style="max-width:120px;overflow:hidden;text-overflow:ellipsis">${esc(note)}</span></div>`;
+  }).join("") : `<div class="kv faint">None set up</div>`)
+    + `<div class="lks"><button class="lk" id="mcpEdit">Edit servers</button><button class="lk" id="mcpReload">Reload</button>${S.system && /Windows/.test(S.system.os || "") ? `<button class="lk" id="mcpImport">From Claude</button>` : ""}</div>`;
+  // plugins
+  $("cardPlugins").hidden = !S.plugins.length;
+  $("pluginsNote").textContent = S.plugins.length ? String(S.plugins.filter((p) => p.enabled).length) + " on" : "";
+  $("plugins").innerHTML = S.plugins.map((p) => {
+    const c = !p.enabled ? "faint" : p.status === "ready" ? "ok" : p.status === "starting" ? "warn" : "bad";
+    return `<div class="kv"><span class="lamp" style="background:var(--${c})"></span><span class="k" title="${esc(p.description)}">${esc(p.name)} <span class="faint">· ${esc(p.enabled ? p.description : "off")}</span></span>${p.panel && p.enabled ? `<button class="lk" data-panel="${esc(p.panel.url)}" data-title="${esc(p.panel.title)}">Open</button>` : ""}</div>`;
+  }).join("");
+}
+$("rail").addEventListener("click", async (e) => {
+  const t = e.target.closest("button"); if (!t) return;
+  try {
+    if (t.dataset.run) { S.background = await api("/api/schedules/run", { body: { id: t.dataset.run } }); toast("It runs as soon as the model is free"); drawExtras(); }
+    else if (t.dataset.cancel) { S.background = await api("/api/schedules/cancel", { body: { id: t.dataset.cancel } }); drawExtras(); }
+    else if (t.dataset.unskill) { if (!confirm(`Remove the skill "${t.dataset.unskill}"?`)) return; S.skills = (await api("/api/skills/remove", { body: { name: t.dataset.unskill } })).skills; drawExtras(); }
+    else if (t.dataset.pick) {
+      const c = S.skillChoices; if (!c) return;
+      if (t.dataset.pick === "__cancel") { S.skillChoices = null; drawExtras(); return; }
+      await installSkill(c.source, t.dataset.pick === "__all" ? c.choose.map((x) => x.path) : [t.dataset.pick]);
+    }
+    else if (t.id === "mcpReload") { await api("/api/mcp/reload", { body: {} }); toast("Starting the MCP servers again"); setTimeout(refreshExtras, 2500); }
+    else if (t.id === "mcpImport") { const r = await api("/api/mcp/import-claude", { body: {} }); toast(r.added && r.added.length ? "Added " + r.added.join(", ") : "Nothing new in Claude's settings"); setTimeout(refreshExtras, 2500); }
+    else if (t.id === "mcpEdit") editMcp();
+    else if (t.dataset.panel) openPanel(t.dataset.panel, t.dataset.title);
+  } catch (err) { toast(err.message); }
+});
+$("rail").addEventListener("submit", (e) => {
+  if (e.target.id !== "skillForm") return;
+  e.preventDefault();
+  const v = e.target.querySelector("input").value.trim(); if (v) installSkill(v, []);
+});
+async function installSkill(path, pick) {
+  toast("Installing…", 8000);
+  try {
+    const r = await api("/api/skills/install", { body: { path, skills: pick } });
+    S.skills = r.skills || S.skills;
+    if (r.choose) { S.skillChoices = r; toast("Pick the skills to install"); }
+    else { S.skillChoices = null; toast("Installed " + (r.installed || "")); }
+  } catch (err) { toast(err.message, 5000); }
+  drawExtras();
+}
+async function editMcp() {
+  let cfg; try { cfg = await api("/api/mcp/config"); } catch (e) { toast(e.message); return; }
+  dialog(`<h3>MCP servers</h3><p>The servers the agent can use, as in Claude Desktop's settings. Saved to <code>${esc(cfg.path)}</code> on ${where()}; they start again when you save.</p>
+    <textarea class="code" id="mcpText" spellcheck="false" aria-label="mcp.json">${esc(cfg.text || '{\n  "mcpServers": {}\n}')}</textarea>
+    <div class="err" id="mcpErr" hidden style="margin-top:10px"></div>
+    <div class="acts" style="justify-content:flex-end;margin-top:12px"><button class="btn" id="mcpCancel">Cancel</button><button class="btn pri" id="mcpSave">Save and restart them</button></div>`);
+  $("dialog").firstElementChild.classList.add("wide");
+  $("mcpCancel").onclick = closeDialog;
+  $("mcpSave").onclick = async () => {
+    const text = $("mcpText").value;
+    try { JSON.parse(text); } catch (e) { $("mcpErr").textContent = "Not valid JSON: " + e.message; $("mcpErr").hidden = false; return; }
+    try { await api("/api/mcp/config", { body: { text } }); closeDialog(); toast("Saved; starting them"); setTimeout(refreshExtras, 3000); }
+    catch (e) { $("mcpErr").textContent = e.message; $("mcpErr").hidden = false; }
+  };
+}
+function openPanel(url, title) {
+  dialog(`<div style="display:flex;align-items:center;margin-bottom:10px"><h3 style="margin:0;flex:1">${esc(title)}</h3><button class="ibtn" id="panelClose" aria-label="Close">${icon("x")}</button></div><iframe src="${esc(url)}" title="${esc(title)}"></iframe>`);
+  $("dialog").firstElementChild.classList.add("panel");
+  $("panelClose").onclick = closeDialog;
+}
+
+// ================================================================ phase 2: settings pages (voice, Maya, sleep training)
+const hasVoice = () => !!(S.models && S.models.speech && S.models.listen);
+const hasSleep = () => !!(S.nightly && (S.nightly.ready || (S.learned && (S.learned.nights || []).length)));
+function navCaps() {
+  document.querySelectorAll("#snav [data-needs]").forEach((b) => { b.hidden = b.dataset.needs === "voice" ? !hasVoice() : !hasSleep(); });
+  $("viewSeg").hidden = !hasVoice();
+}
+const drawSettingsBase = drawSettings;
+drawSettings = async function () {
+  try { [S.nightly, S.learned] = await Promise.all([api("/api/nightly").catch(() => null), api("/api/nightly/learned").catch(() => null)]); } catch {}
+  navCaps();
+  if (!["voice", "maya", "sleep"].includes(page)) return drawSettingsBase();
+  document.querySelectorAll("#snav [data-page]").forEach((b) => b.classList.toggle("on", b.dataset.page === page));
+  const P = $("spage");
+  const head = (t, sub) => `<button class="ibtn close" id="closeSettings" aria-label="Close settings">${icon("x")}</button><h2>${t}</h2><p class="sub">${sub}</p>`;
+  if (page === "voice") {
+    const m = S.models || {};
+    P.innerHTML = head("Voice", "Voice calls with Maya.") + `<div class="gtitle">Models</div><div class="gcard">`
+      + srow("Voice", "What Maya speaks with", `<span class="muted">${esc(m.speech || "Not set up")}</span>`)
+      + srow("Listening", "What turns your speech into text", `<span class="muted">${esc(m.listen || "Not set up")}</span>`)
+      + srow("Call model", "Calls talk to the model running now. Switch models from the message box.", `<span class="muted">${esc(m.current || "None loaded")}</span>`) + `</div>`
+      + `<div class="gtitle">During a call</div><div class="gcard">`
+      + srow("Show response timings", "How long each reply took to start: for checking speed", sw(store.get("callTimings", false), "swTimings", "Show response timings"))
+      + srow("Talk over her", "Speaking while she talks stops her. Turn off on loudspeakers if she keeps stopping herself", sw(store.get("bargeIn", true), "swBarge", "Talk over her")) + `</div>`
+      + `<p class="faint" style="font-size:12.5px;margin-top:14px">The voice models are chosen when the server starts (its --tts and --stt options).${window.isSecureContext ? "" : " This page isn't on HTTPS or this computer, so the browser won't give it the microphone: open it through an SSH tunnel (localhost) to call."}</p>`;
+    $("swTimings").onclick = () => { store.set("callTimings", !store.get("callTimings", false)); drawSettings(); };
+    $("swBarge").onclick = () => { store.set("bargeIn", !store.get("bargeIn", true)); drawSettings(); };
+  } else if (page === "maya") {
+    let m = {}; try { m = S.maya = await api("/api/maya"); } catch (e) { P.innerHTML = head("Maya", "") + `<div class="err">${esc(e.message)}</div>`; return; }
+    const list = (k) => (m[k] || []).filter((x) => typeof x === "string");
+    const line = (t, kind, i) => srow(esc(t), "", `<button class="ibtn" data-forget="${kind}:${i}" aria-label="Forget">${icon("x", 'style="width:13px;height:13px"')}</button>`);
+    const none = (t) => srow(`<span class="faint">${t}</span>`, "", "");
+    const count = m.count || 0, minutes = Math.round((m.seconds || 0) / 60), stage = (m.stage || "stranger");
+    const calls = (m.calls || []).map((c, i) => [c, i]).reverse();
+    P.innerHTML = head("Maya", "What she remembers of you, from your calls. Remove anything you don't want her to know.")
+      + `<div class="gtitle">You</div><div class="gcard">`
+      + srow("Your name", "What she calls you", `<form class="field" id="mayaName" style="width:240px"><input value="${esc(m.name || "")}" placeholder="Your name" aria-label="Your name"><button class="btn sm">Save</button></form>`)
+      + srow("How close you are", count ? `${count} call${count === 1 ? "" : "s"}, about ${minutes} min in all.` : "You haven't talked yet.", `<span class="muted">${esc(stage[0].toUpperCase() + stage.slice(1))}</span>`) + `</div>`
+      + `<div class="gtitle">What she knows about you</div><div class="gcard">${list("facts").map((f, i) => line(f, "facts", i)).join("") || none("Nothing yet.")}</div>`
+      + `<div class="gtitle">Moments you share</div><div class="gcard">${list("moments").map((f, i) => line(f, "moments", i)).join("") || none("None yet.")}</div>`
+      + `<div class="gtitle">Calls she remembers</div><div class="gcard">${calls.map(([c, i]) => line(c.summary || "", "calls", i)).join("") || none("None yet.")}</div>`
+      + `<div class="gtitle">How she sees you</div><div class="gcard">${m.impression ? srow(esc(m.impression), "", `<button class="ibtn" data-forget="impression" aria-label="Clear">${icon("x", 'style="width:13px;height:13px"')}</button>`) : none("Nothing yet.")}</div>`
+      + `<div class="gtitle">Start over</div><div class="gcard">${srow("Forget everything", "She meets you again as a stranger. The old memory is kept beside it as a backup.", `<button class="btn sm danger" id="mayaReset">Start over</button>`)}</div>`;
+    P.querySelector("#mayaName").onsubmit = async (e) => { e.preventDefault(); try { await api("/api/maya/edit", { body: { name: e.target.querySelector("input").value.trim() } }); toast("Saved"); } catch (err) { toast(err.message); } };
+    P.querySelectorAll("[data-forget]").forEach((b) => b.onclick = async () => {
+      const [kind, i] = b.dataset.forget.split(":");
+      try { await api("/api/maya/edit", { body: kind === "impression" ? { impression: "" } : { forget: kind, index: +i } }); drawSettings(); } catch (err) { toast(err.message); }
+    });
+    $("mayaReset").onclick = async () => { if (!confirm("Start over? She forgets you; the old memory is kept as a backup.")) return; try { await api("/api/maya/reset", { body: {} }); drawSettings(); } catch (err) { toast(err.message); } };
+  } else if (page === "sleep") {
+    const n = S.nightly || {}, l = S.learned || {}, set = n.settings || {};
+    const nights = l.nights || [], facts = l.facts || [];
+    const hour = set.hour ?? 3, on = set.enabled !== false;
+    const stampTime = (s) => s && s.length >= 13 ? `${s.slice(9, 11)}:${s.slice(11, 13)}` : "";
+    const nightName = (r) => `${ago(r.started)}, ${stampTime(r.stamp || "")}`;
+    const last = n.running ? "Training now" : nights[0] ? `${nightName(nights[0])}: ${nights[0].installed ? "installed" : "kept the one before"}` : "Not yet";
+    const nightRow = (r) => {
+      const parts = [];
+      if (r.facts != null) parts.push(`${r.facts} facts`);
+      if (r.fact_loss && r.fact_loss.length > 1) parts.push(`learned ${(+r.fact_loss[0]).toFixed(2)} → ${(+r.fact_loss[1]).toFixed(2)}`);
+      if (r.general_loss && r.general_loss.length > 1) parts.push(`general ${(+r.general_loss[0]).toFixed(2)} → ${(+r.general_loss[1]).toFixed(2)}`);
+      if (r.tools) parts.push(`tools ${r.tools.passed || 0}/${r.tools.of || 0}`);
+      if (r.minutes != null) parts.push(`${Math.round(r.minutes)} min`);
+      if (r.reason) parts.push(r.reason);
+      const read = (r.learned || []).slice(0, 6).map((f) => `<div class="faint" style="font-size:12.5px">+ ${esc(f.fact || "")}</div>`).join("");
+      return `<div class="srow"><div class="w"><b>${esc(nightName(r))} <span class="tag ${r.installed ? "ok" : ""}">${r.installed ? "Installed" : "Kept the one before"}</span></b><span>${esc(parts.join(" · "))}</span>${read}</div></div>`;
+    };
+    const kinds = [["semantic", "About you and your things"], ["preference", "What you prefer"], ["episodic", "What happened"]];
+    const factRow = (f) => srow(esc(f.fact || ""), `${f.chat_title ? `from “${esc(f.chat_title)}”` : "from a chat since deleted"} · ${ago(f.at)}`, `<button class="ibtn" data-fact="${esc(f.name)}" aria-label="Forget">${icon("x", 'style="width:13px;height:13px"')}</button>`);
+    let known = kinds.map(([k, t]) => { const rows = facts.filter((f) => f.type === k); return rows.length ? `<div class="gtitle">${t}</div><div class="gcard">${rows.map(factRow).join("")}</div>` : ""; }).join("");
+    const other = facts.filter((f) => !kinds.some(([k]) => k === f.type));
+    if (other.length) known += `<div class="gtitle">Other</div><div class="gcard">${other.map(factRow).join("")}</div>`;
+    if (!facts.length) known = `<div class="gtitle">What it knows</div><div class="gcard">${srow('<span class="faint">Nothing yet.</span>', "", "")}</div>`;
+    P.innerHTML = head("Sleep training", "What the model has learned from your chats, night by night.")
+      + `<div class="gcard">` + (n.ready
+        ? srow("Learn at night", "Reads your chats for things worth keeping and trains them into a small adapter beside the model's own weights. It is checked before it is used: the facts learned, general answers unchanged, tools still called.", sw(on, "swSleep", "Learn at night"))
+          + srow("When", "In that hour or the three after it, once ghost has been idle for half an hour. The models are unloaded while it trains, about half an hour.", `<span class="seg" id="hourSeg">${[1, 2, 3, 4, 5].map((h) => `<button data-v="${h}" aria-pressed="${h === hour}">${h}:00</button>`).join("")}</span>`)
+          + srow("Last run", "", `<span class="muted">${esc(last)}</span>${n.running ? "" : ` <button class="btn sm" id="sleepNow" style="margin-left:8px">Run now</button>`}`)
+        : srow("Not set up on this server", "It trains with Python and PyTorch from a copy of ghost-infer's source (scripts/nightly). Earlier nights stay listed below.", `<span class="muted">Off</span>`)) + `</div>`
+      + `<div class="gtitle">Nights</div><div class="gcard">${nights.slice(0, 10).map(nightRow).join("") || srow('<span class="faint">No nights yet.</span>', "", "")}</div>`
+      + known + `<p class="faint" style="font-size:12.5px;margin-top:14px">A fact you remove here is left out of the next night's training, and not learned again from the same chat.</p>`;
+    const sw1 = $("swSleep"); if (sw1) sw1.onclick = async () => { try { await api("/api/nightly/settings", { body: { enabled: !on } }); drawSettings(); } catch (e) { toast(e.message); } };
+    const hs = $("hourSeg"); if (hs) hs.onclick = async (e) => { const b = e.target.closest("[data-v]"); if (!b) return; try { await api("/api/nightly/settings", { body: { hour: +b.dataset.v } }); drawSettings(); } catch (err) { toast(err.message); } };
+    const sn = $("sleepNow"); if (sn) sn.onclick = async () => { if (!confirm("Train now? The models are unloaded while it runs, about half an hour.")) return; try { await api("/api/nightly/run", { body: {} }); toast("Training started"); drawSettings(); } catch (e) { toast(e.message); } };
+    P.querySelectorAll("[data-fact]").forEach((b) => b.onclick = async () => { try { S.learned = await api("/api/nightly/forget", { body: { name: b.dataset.fact } }); drawSettings(); } catch (e) { toast(e.message); } });
+  }
+  const cs = $("closeSettings"); if (cs) cs.onclick = closeSettings;
+};
+
+// ================================================================ phase 2: the voice call
+// As the app's (app/src/call.rs, voice.rs): the microphone cut into utterances by loudness, each turned into text
+// (/v1/audio/transcriptions), sent to Maya (/api/agent, persona "maya", no tools), her reply spoken a sentence
+// at a time as it is written (/v1/audio/speech, 24 kHz PCM), in the chat's voice context. The browser's echo
+// canceller lets the user talk over her; afterwards she thinks the call over (/api/maya/reflect).
+const CALL = { on: false, chat: null, topic: 0, started: 0, muted: false, ctx: null, mic: null, node: null, speaking: 0, playEnd: 0, sources: [], turn: 0, busy: null, cut: null, quietSince: 0, nudges: 0, said: [], lines: [] };
+const OPENING = "(The call has just connected. Say hello your way.)", QUIET = "(They have gone quiet. Your turn: say something of your own.)";
+const callGhost = pixelGhost($("callGhost"));
+function setView(v) {
+  if (v === "call" && S.busy) { toast("Wait for the reply to finish, or stop it"); v = "code"; }
+  if (v === "code" && CALL.on) { toast("End the call first"); v = "call"; }
+  S.view = v;
+  document.body.classList.toggle("in-call", v === "call");
+  $("callView").hidden = v !== "call";
+  document.querySelectorAll("#viewSeg [data-v]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === v)));
+  if (v === "call") {
+    $("title").textContent = "Voice call";
+    if (!window.isSecureContext) { $("callNote").hidden = false; $("callNote").innerHTML = `Browsers give the microphone only to pages on HTTPS or on this computer. Open it through an SSH tunnel (<code>ssh -L ${esc(location.port || "80")}:localhost:${esc(location.port || "80")} you@${esc(location.hostname)}</code>, then <code>http://localhost:${esc(location.port || "80")}</code>), or put it behind HTTPS.`; }
+  } else $("title").textContent = S.chat && S.chat.title ? S.chat.title : "New chat";
+}
+$("viewSeg").addEventListener("click", (e) => { const b = e.target.closest("[data-v]"); if (b) setView(b.dataset.v); });
+function callState(t) { $("callState").textContent = t; }
+function callLine(kind, text, replace) {
+  if (replace && CALL.lines.length && CALL.lines[CALL.lines.length - 1].kind === kind) CALL.lines[CALL.lines.length - 1].text = text;
+  else CALL.lines.push({ kind, text });
+  CALL.lines = CALL.lines.slice(-40);
+  const box = $("callLines");
+  box.innerHTML = CALL.lines.map((l) => `<div class="ln ${l.kind}">${esc(l.text)}</div>`).join("");
+  box.scrollTop = box.scrollHeight;
+}
+// the reply's words to show and speak: no thinking, no opening {mood · way}, no voice directions on screen
+const afterThinking = (raw) => { const a = raw.indexOf("<think>"), b = raw.indexOf("</think>"); return (a >= 0 ? (b >= 0 ? raw.slice(b + 8) : "") : raw).trimStart(); };
+function answerOf(raw) {
+  let a = afterThinking(raw);
+  if (a.startsWith("{")) { const e = a.indexOf("}"); if (e < 0) return ""; a = a.slice(e + 1).trimStart(); }
+  while (a.startsWith("[")) { const e = a.indexOf("]"); if (e < 0) return ""; if (!/pause/i.test(a.slice(1, e))) break; a = a.slice(e + 1).trimStart(); }
+  return a;
+}
+const withoutTags = (s) => s.replace(/\[[^\]]*\](?!\()/g, "").replace(/\s+/g, " ").trim();
+function moodOf(raw) { const a = afterThinking(raw); if (!a.startsWith("{")) return null; const e = a.indexOf("}"); return e < 0 ? null : a.slice(1, e).trim(); }
+function speakable(t) {
+  return t.replace(/```[\s\S]*?(```|$)/g, " ").replace(/`[^`]*`/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/https?:\/\/\S+/g, "a link")
+    .replace(/[^\p{L}\p{N}\s.,!?;:'"\-()%$&/@+=’‘“”—–…\[\]]/gu, "").replace(/\s+/g, " ").trim();
+}
+// the next whole sentences after `said` (all the rest when `last`)
+function nextSentences(reply, st, last) {
+  const rest = reply.slice(st.said);
+  let end = 0;
+  if (last) end = rest.length;
+  else {
+    const min = st.said === 0 ? 12 : 40;
+    const re = /[.!?…:;](?=\s)|\n/g; let m;
+    while ((m = re.exec(rest))) if (m.index + 1 >= min) end = m.index + 1;
+  }
+  if (!end) return null;
+  st.said += end;
+  const words = speakable(rest.slice(0, end));
+  return /[\p{L}\p{N}]/u.test(words) ? words : null;
+}
+
+// ---- the speaker: 24 kHz PCM pieces scheduled one after another
+function playPcm(bytes, turn) {
+  if (turn !== CALL.turn || !CALL.ctx) return;
+  const n = bytes.length >> 1; if (!n) return;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
+  const buf = CALL.ctx.createBuffer(1, n, 24000), ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) ch[i] = dv.getInt16(i * 2, true) / 32768;
+  const src = CALL.ctx.createBufferSource(); src.buffer = buf; src.connect(CALL.ctx.destination);
+  const at = Math.max(CALL.ctx.currentTime + 0.03, CALL.playEnd);
+  src.start(at); CALL.playEnd = at + buf.duration; CALL.sources.push(src);
+  src.onended = () => { CALL.sources = CALL.sources.filter((s) => s !== src); };
+}
+const queued = () => CALL.ctx ? Math.max(0, CALL.playEnd - CALL.ctx.currentTime) : 0;
+function stopVoice() { CALL.turn++; for (const s of CALL.sources) try { s.stop(); } catch {} CALL.sources = []; CALL.playEnd = 0; }
+// sentences are voiced in order, one request at a time, while the model writes the next
+let sayChain = Promise.resolve();
+function say(text, turn) {
+  CALL.speaking++;
+  sayChain = sayChain.then(async () => {
+    if (turn !== CALL.turn || !CALL.on) return;
+    try {
+      const r = await fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json", "X-Ghost-Token": TOKEN }, credentials: "same-origin",
+        body: JSON.stringify({ input: text, voice: "maya", response_format: "pcm", conversation: CALL.chat || "" }) });
+      if (!r.ok) throw new Error(`the voice failed (HTTP ${r.status})`);
+      const reader = r.body.getReader(); let odd = null;
+      if (!CALL.firstAudio) CALL.firstAudio = performance.now();
+      for (;;) {
+        const { value, done } = await reader.read(); if (done) break;
+        if (turn !== CALL.turn) { reader.cancel().catch(() => {}); break; }
+        let b = value; if (odd) { const j = new Uint8Array(b.length + 1); j[0] = odd; j.set(b, 1); b = j; odd = null; }
+        if (b.length % 2) { odd = b[b.length - 1]; b = b.subarray(0, b.length - 1); }
+        playPcm(b, turn);
+      }
+    } catch (e) { callLine("err", e.message); }
+  }).finally(() => CALL.speaking--);
+}
+
+// ---- the microphone: 16 kHz mono, cut into utterances (as voice.rs: 30 ms frames, a noise floor, 500 ms of quiet ends it)
+const MIC = { floor: 0, before: [], speech: null, loudRun: 0, buf: [], rate: 48000, pos: 0 };
+function micFrame(frame) {
+  let s = 0; for (const v of frame) s += v * v;
+  const rms = Math.sqrt(s / frame.length);
+  document.documentElement.style.setProperty("--lvl", Math.min(1, rms * 12).toFixed(3));
+  if (!MIC.floor) MIC.floor = Math.max(rms, 1e-4);
+  const overVoice = queued() > 0 || CALL.speaking > 0;
+  const deaf = CALL.muted || (overVoice && !store.get("bargeIn", true));
+  if (deaf) { MIC.speech = null; MIC.loudRun = 0; MIC.before = []; return; }
+  const loud = rms > Math.max(MIC.floor * 3.2, 0.012), quiet = rms < Math.max(MIC.floor * 2, 0.008);
+  if (!MIC.speech) {
+    if (!overVoice) MIC.floor = rms < MIC.floor ? Math.max(rms, 1e-4) : MIC.floor * 0.995 + rms * 0.005;
+    MIC.loudRun = loud ? MIC.loudRun + 1 : 0;
+    MIC.before.push(frame); if (MIC.before.length > 10) MIC.before.shift();
+    if (MIC.loudRun >= (overVoice ? 10 : 3)) { MIC.speech = { audio: MIC.before.slice(), quiet: 0, loud: 3 }; MIC.before = []; onHeard({ started: true }); }
+    return;
+  }
+  const sp = MIC.speech; sp.audio.push(frame);
+  sp.quiet = quiet ? sp.quiet + 1 : 0; if (loud) sp.loud++;
+  if (sp.quiet >= 17 || sp.audio.length >= 667) { // 500 ms of quiet, or 20 s
+    MIC.speech = null; MIC.loudRun = 0;
+    if (sp.loud >= 8) onHeard({ audio: sp.audio.slice(0, Math.max(1, sp.audio.length - Math.max(0, sp.quiet - 8))) });
+  }
+}
+function micInput(samples, rate) {
+  // linear resample to 16 kHz, then 480-sample frames
+  const step = rate / 16000;
+  for (; MIC.pos < samples.length; MIC.pos += step) {
+    const i = Math.floor(MIC.pos), f = MIC.pos - i;
+    MIC.buf.push(samples[i] * (1 - f) + (samples[i + 1] ?? samples[i]) * f);
+    if (MIC.buf.length === 480) { micFrame(Float32Array.from(MIC.buf)); MIC.buf = []; }
+  }
+  MIC.pos -= samples.length;
+}
+function wav16(frames) {
+  const n = frames.reduce((a, f) => a + f.length, 0), out = new DataView(new ArrayBuffer(44 + n * 2));
+  const w = (o, s) => [...s].forEach((c, i) => out.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); out.setUint32(4, 36 + n * 2, true); w(8, "WAVEfmt "); out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+  out.setUint32(24, 16000, true); out.setUint32(28, 32000, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true); w(36, "data"); out.setUint32(40, n * 2, true);
+  let o = 44; for (const f of frames) for (const v of f) { out.setInt16(o, Math.max(-1, Math.min(1, v)) * 32767, true); o += 2; }
+  return out.buffer;
+}
+
+// ---- turns
+const heard = [];
+function onHeard(h) {
+  if (h.started) {
+    // a voice over hers cuts her off (the browser's echo canceller keeps her own voice out of the microphone)
+    if (queued() > 0 || CALL.speaking > 0 || CALL.busy) cutOff();
+    callState("Hearing you"); callGhost.set("listening"); return;
+  }
+  heard.push(h.audio); pump();
+}
+function cutOff() {
+  if (CALL.busy) CALL.busy.abort();
+  const said = CALL.said.join(" ");
+  CALL.cut = said ? withoutTags(said) : CALL.cut;
+  stopVoice(); CALL.speaking = 0; sayChain = Promise.resolve();
+}
+let pumping = false;
+async function pump() {
+  if (pumping || !CALL.on) return;
+  pumping = true;
+  try {
+    while (heard.length && CALL.on) {
+      // what was said while the last piece was being heard goes with it: one turn, not one per pause
+      let audio = heard.splice(0).flat();
+      callState("Thinking"); callGhost.set("thinking");
+      let text = "";
+      for (let again = 0; again < 4; again++) {
+        try {
+          const res = await fetch("/v1/audio/transcriptions", { method: "POST", headers: { "Content-Type": "audio/wav", "X-Ghost-Token": TOKEN }, credentials: "same-origin", body: wav16(audio) });
+          const j = await res.json();
+          if (!res.ok) throw new Error((j.error && j.error.message) || `HTTP ${res.status}`);
+          text = (j.no_speech || 0) > 0.6 ? "" : (j.text || "").trim();
+          // speech-to-text sometimes repeats itself on a short clip ("and, and, and"): once is what was said
+          text = text.replace(/\b([^.!?,]{2,80}?)([.,!?]?)(?:\s*\1[.,!?]?){2,}/gi, "$1$2").trim();
+        } catch (e) { callLine("err", "Couldn't hear that: " + e.message); break; }
+        // they went on talking while it was transcribed (a pause mid-sentence): wait for the rest, then it all again
+        for (let w = 0; w < 100 && MIC.speech && CALL.on; w++) await new Promise((r) => setTimeout(r, 100));
+        if (!heard.length) break;
+        audio = audio.concat(heard.splice(0).flat());
+      }
+      if (!text) { callState("Listening"); callGhost.set("idle"); continue; }
+      CALL.nudges = 0;
+      callLine("you", text);
+      await turn(text, false);
+    }
+  } finally { pumping = false; }
+}
+async function turn(text, auto) {
+  const t = CALL.turn, body = { message: text, persona: "maya", topic: CALL.topic, tools: [], thinking: false, mode: S.mode };
+  if (CALL.chat) body.chat = CALL.chat;
+  if (auto) body.auto = true;
+  if (CALL.cut) { body.cut = CALL.cut; CALL.cut = null; }
+  const ctrl = new AbortController(); CALL.busy = ctrl; CALL.said = []; CALL.firstAudio = 0;
+  const st = { said: 0 }, t0 = performance.now(); let raw = "", firstText = 0;
+  callState("Thinking"); callGhost.set("thinking");
+  try {
+    const r = await api("/api/agent", { body, raw: true, signal: ctrl.signal });
+    if (!r.ok) { const j = await r.json().catch(() => null); throw new Error((j && j.error && j.error.message) || `HTTP ${r.status}`); }
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true }); let at;
+      while ((at = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, at); buf = buf.slice(at + 2);
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        let j; try { j = JSON.parse(line.slice(6)); } catch { continue; }
+        if (j.type === "chat") CALL.chat = j.id;
+        else if (j.type === "error") callLine("err", j.message);
+        else if (j.type === "text") {
+          raw += j.text;
+          const md = moodOf(raw); if (md) $("callMood").textContent = md.replace(/\s*[·|,;/]\s*/, " · ");
+          const reply = answerOf(raw);
+          if (reply.trim()) { if (!firstText) firstText = performance.now(); callLine("her", withoutTags(reply), true); callGhost.set("talking"); callGhost.token(); }
+          const piece = nextSentences(reply, st, false);
+          if (piece) { CALL.said.push(piece); say(piece, t); }
+        }
+      }
+    }
+    const piece = nextSentences(answerOf(raw), st, true);
+    if (piece) { CALL.said.push(piece); say(piece, t); }
+    callState("Speaking");
+    await sayChain;
+    while (CALL.on && t === CALL.turn && queued() > 0.05) await new Promise((r) => setTimeout(r, 80));
+    if (store.get("callTimings", false) && firstText) callLine("err", `first words ${((firstText - t0) / 1000).toFixed(2)} s · voice ${CALL.firstAudio ? ((CALL.firstAudio - t0) / 1000).toFixed(2) : "-"} s`);
+    if (/\[hangs? up\]/i.test(afterThinking(raw))) { endCall(); return; }
+  } catch (e) { if (!ctrl.signal.aborted) callLine("err", "No answer: " + e.message); }
+  finally { if (CALL.busy === ctrl) CALL.busy = null; }
+  CALL.quietSince = performance.now();
+  if (CALL.on) { callState(CALL.muted ? "Muted" : "Listening"); callGhost.set("idle"); }
+}
+// Maya opens the call, and speaks up when the user stays quiet (20 s, doubled each time, twice in a row at most)
+setInterval(() => {
+  if (!CALL.on || CALL.busy || pumping || heard.length || MIC.speech || CALL.muted || queued() > 0 || CALL.nudges >= 2) return;
+  if (document.activeElement && document.activeElement.closest && document.activeElement.closest("#callType") && document.activeElement.value) { CALL.quietSince = performance.now(); return; }
+  if (performance.now() - CALL.quietSince >= (20000 << CALL.nudges)) { CALL.nudges++; turn(QUIET, true); }
+}, 1000);
+
+async function startCall() {
+  if (!window.isSecureContext) { toast("The microphone needs HTTPS or this computer"); return; }
+  const m = S.models || {};
+  if (!m.current) { toast("Pick a model first"); $("modelChip").click(); return; }
+  $("callStart").disabled = true; $("callNote").hidden = true;
+  try {
+    CALL.ctx = new AudioContext(); await CALL.ctx.resume();
+    CALL.mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+  } catch (e) { $("callStart").disabled = false; callLine("err", "No microphone: " + e.message); if (CALL.ctx) CALL.ctx.close(); CALL.ctx = null; return; }
+  if (!m.voice) {
+    callState("Loading the voice…"); callGhost.set("thinking");
+    try { await api("/api/models/load", { body: { id: m.current, voice: true } }); await refreshModels(); } catch (e) { callLine("err", "The voice didn't load: " + e.message); }
+  }
+  const src = CALL.ctx.createMediaStreamSource(CALL.mic);
+  const node = CALL.ctx.createScriptProcessor(2048, 1, 1); // small and everywhere; an AudioWorklet would need its own file
+  node.onaudioprocess = (e) => { if (CALL.on) micInput(e.inputBuffer.getChannelData(0), CALL.ctx.sampleRate); };
+  src.connect(node); node.connect(CALL.ctx.destination); CALL.node = node;
+  Object.assign(CALL, { on: true, chat: null, topic: Math.floor(Date.now() / 1000), started: performance.now(), muted: false, nudges: 0, cut: null, lines: [] });
+  Object.assign(MIC, { floor: 0, before: [], speech: null, loudRun: 0, buf: [], pos: 0 });
+  $("callLines").innerHTML = ""; $("callMood").textContent = "";
+  $("callStart").hidden = true; $("callStart").disabled = false; $("callEnd").hidden = false; $("callMute").hidden = false; $("callType").hidden = false;
+  turn(OPENING, true);
+}
+async function endCall() {
+  if (!CALL.on) return;
+  CALL.on = false; cutOff(); heard.length = 0;
+  try { CALL.node && CALL.node.disconnect(); CALL.mic && CALL.mic.getTracks().forEach((t) => t.stop()); await CALL.ctx.close(); } catch {}
+  CALL.ctx = null; CALL.mic = null;
+  document.documentElement.style.setProperty("--lvl", "0");
+  $("callStart").hidden = false; $("callEnd").hidden = true; $("callMute").hidden = true; $("callType").hidden = true;
+  if (CALL.chat) {
+    callState("Maya is thinking back over the call…"); callGhost.set("thinking");
+    try { await api("/api/maya/reflect", { body: { chat: CALL.chat, seconds: (performance.now() - CALL.started) / 1000 } }); } catch {}
+    loadChats();
+  }
+  callState("Call ended"); callGhost.set("idle");
+}
+$("callStart").onclick = startCall;
+$("callEnd").onclick = endCall;
+$("callMute").onclick = () => {
+  CALL.muted = !CALL.muted;
+  $("callMute").classList.toggle("on", CALL.muted); $("callMute").innerHTML = icon(CALL.muted ? "micoff" : "mic"); $("callMute").setAttribute("aria-label", CALL.muted ? "Unmute" : "Mute");
+  callState(CALL.muted ? "Muted" : "Listening");
+};
+$("callType").onsubmit = (e) => {
+  e.preventDefault();
+  const i = e.target.querySelector("input"), t = i.value.trim(); if (!t || !CALL.on) return;
+  i.value = ""; cutOff(); CALL.nudges = 0; callLine("you", t); turn(t, false);
+};
+addEventListener("beforeunload", (e) => { if (CALL.on) { e.preventDefault(); e.returnValue = ""; } });
 
 // ================================================================ start
 if (ACCESS === "signin") {
