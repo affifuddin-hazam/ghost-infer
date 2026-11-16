@@ -144,6 +144,8 @@
 
   .dock { position: relative; padding: 0 0 max(10px, env(safe-area-inset-bottom)); }
   #ghost { position: absolute; left: calc(50% - min(360px, 50% - 20px) + 18px); top: -40px; width: 48px; height: 44px; image-rendering: pixelated; pointer-events: none; }
+  #ghost3d { position: absolute; left: calc(50% - min(360px, 50% - 20px) - 4px); top: -96px; width: 140px; height: 105px; pointer-events: none; }
+  body[data-ghost="3d"] #ghost, body:not([data-ghost="3d"]) #ghost3d, body.no-ghost #ghost, body.no-ghost #ghost3d { display: none; }
   .composer { width: min(720px, calc(100% - 24px)); margin: 0 auto; }
   .box { background: var(--raise); border: 1px solid var(--line2); border-radius: 16px; padding: 10px 10px 8px 14px; transition: border-color .15s; }
   .box:focus-within { border-color: color-mix(in srgb, var(--accent) 45%, var(--line2)); }
@@ -253,8 +255,35 @@
   .signin .hint code { color: var(--muted); }
   .signin .bad { color: var(--bad); font-size: 13px; margin-top: 10px; }
 
+  /* attachments, editing, the / list, plugin badges */
+  .files { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+  .fchip { display: inline-flex; align-items: center; gap: 6px; background: var(--raise2); border: 1px solid var(--line2); border-radius: 8px; padding: 3px 4px 3px 8px; font-size: 12.5px; max-width: 260px; }
+  .fchip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fchip .s { color: var(--faint); white-space: nowrap; }
+  .fchip button { width: 18px; height: 18px; display: grid; place-items: center; border-radius: 5px; color: var(--faint); }
+  .fchip button:hover { color: var(--text); background: var(--hover); }
+  .user .b .files { margin: 8px 0 0; justify-content: flex-end; }
+  .user .b .fchip { background: var(--raise); }
+  .editing { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--accent); margin: -2px 0 6px; }
+  .editing span { flex: 1; }
+  .user { align-items: center; gap: 4px; }
+  .user .ed { opacity: 0; flex: none; }
+  .user:hover .ed, .user .ed:focus-visible { opacity: 1; }
+  .box.drop { border-color: var(--accent); background: var(--accent-soft); }
+  .slash { position: absolute; z-index: 20; bottom: calc(100% + 6px); left: 0; right: 0; background: var(--menu); border: 1px solid var(--line2); border-radius: 12px; box-shadow: var(--shadow); padding: 5px; max-height: 280px; overflow: auto; }
+  .slash .opt { display: flex; gap: 10px; align-items: baseline; width: 100%; text-align: left; padding: 6px 10px; border-radius: 8px; font-size: 13px; }
+  .slash .opt b { font-weight: 500; white-space: nowrap; }
+  .slash .opt span { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slash .opt.on { background: var(--hover); }
+  .composer { position: relative; }
+  .badges { display: flex; gap: 6px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; background: var(--raise); border: 1px solid var(--line2); color: var(--muted); white-space: nowrap; }
+  .badge:hover { color: var(--text); }
+  @media (max-width: 780px) { .badges { display: none; } }
   /* header switch: Code or Voice call */
-  .modeseg button { display: inline-flex; align-items: center; gap: 6px; }
+  .modeseg { flex-wrap: nowrap; flex: none; }
+  .modeseg button { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  @media (max-width: 1000px) { .modeseg .lbl { display: none; } .modeseg button { padding: 5px 8px; } }
   /* rail lists */
   .lk { color: var(--accent); font-size: 12px; padding: 2px 4px; border-radius: 6px; }
   .lk:hover { background: var(--hover); }
@@ -320,6 +349,7 @@
     #thinkChip .lbl { display: none; }
     #thinkChip, #modeChip { flex-shrink: 0; }
     #ghost { left: 22px; }
+    #ghost3d { left: 0; }
   }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
@@ -415,7 +445,8 @@
       <button class="ibtn" id="menuBtn" aria-label="Chats"><svg class="icon"><use href="#i-menu"/></svg></button>
       <div class="title" id="title">New chat</div>
       <div class="sp"></div>
-      <span class="seg modeseg" id="viewSeg" hidden><button data-v="code" aria-pressed="true"><svg class="icon" style="width:14px;height:14px"><use href="#i-code"/></svg>Code</button><button data-v="call" aria-pressed="false"><svg class="icon" style="width:14px;height:14px"><use href="#i-phone"/></svg>Voice call</button></span>
+      <span class="badges" id="badges"></span>
+      <span class="seg modeseg" id="viewSeg" hidden><button data-v="code" aria-pressed="true" title="Code" aria-label="Code"><svg class="icon" style="width:14px;height:14px"><use href="#i-code"/></svg><span class="lbl">Code</span></button><button data-v="call" aria-pressed="false" title="Voice call" aria-label="Voice call"><svg class="icon" style="width:14px;height:14px"><use href="#i-phone"/></svg><span class="lbl">Voice call</span></button></span>
       <button class="ibtn" id="railBtn" aria-label="Details" aria-pressed="false"><svg class="icon"><use href="#i-panel"/></svg></button>
     </header>
     <div class="scroll" id="scroll"><div class="col log" id="log" aria-live="polite"></div></div>
@@ -440,11 +471,16 @@
     </section>
     <div class="dock">
       <canvas id="ghost" width="24" height="22" aria-hidden="true"></canvas>
+      <canvas id="ghost3d" aria-hidden="true"></canvas>
       <form class="composer" id="form">
         <div class="box">
+          <div class="editing" id="editing" hidden><svg class="icon"><use href="#i-edit"/></svg><span>Editing your message: the reply after it is replaced</span><button type="button" class="lk" id="editCancel">Cancel</button></div>
+          <div class="files" id="files" hidden></div>
           <label class="sr" for="input">Message</label>
           <textarea id="input" rows="1" placeholder="Ask anything, or describe a task" autocomplete="off"></textarea>
+          <input type="file" id="filePick" multiple hidden>
           <div class="chipsrow">
+            <button type="button" class="chip" id="attachChip" title="Attach text files" aria-label="Attach files"><svg class="icon"><use href="#i-plus"/></svg></button>
             <button type="button" class="chip" id="folderChip" title="The folder this chat works in"><svg class="icon"><use href="#i-folder"/></svg><span id="folderName">No folder</span></button>
             <button type="button" class="chip" id="modelChip" title="Model"><span id="modelName">Model</span><svg class="icon" style="width:12px"><use href="#i-down"/></svg></button>
             <button type="button" class="chip" id="thinkChip" aria-pressed="false" title="Think before answering"><svg class="icon"><use href="#i-bulb"/></svg><span class="lbl">Think</span></button>
@@ -490,6 +526,312 @@
 <div class="shade" id="dialog" hidden></div>
 <div class="toast" id="toast" hidden role="status"></div>
 
+<script type="importmap">{ "imports": { "three": "/vendor/three-0.160.0.module.min.js" } }</script>
+<script type="module">
+// the 3D ghost of the classic page (three.js, loaded only when it is chosen in Appearance): window.make3d()
+// A small 3D ghost drawn in code (three.js), sitting on the message box: every state is a set of pose targets the
+// animation eases toward, so changes always blend. set(state), token() on each streamed token, rate(tok/s).
+// Made only when the 3D style is chosen (three.js is not even loaded otherwise); null without WebGL.
+async function make3d() {
+  let THREE;
+  try { THREE = await import("three"); } catch { return null; }
+  const canvas = document.getElementById("ghost3d");
+  let renderer;
+  try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true }); } catch { return null; }
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 3));
+  const scene = new THREE.Scene();
+  // framed so the ghost stands in the canvas's left part with its hem just above the box's edge, leaving room
+  // above and to the right for raised arms, the magnifier and the z / ? / steam effects
+  const camera = new THREE.PerspectiveCamera(32, 4 / 3, 0.1, 100);
+  camera.position.set(2.0, 0.69, 10.5);
+  scene.add(new THREE.HemisphereLight(0xf2f5ff, 0x3a4566, 1.7));
+  const key = new THREE.DirectionalLight(0xffffff, 2.0);
+  key.position.set(-3, 5, 6);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x9fb2ff, 1.2);
+  rim.position.set(4, 2, -5);
+  scene.add(rim);
+
+  const root = new THREE.Group(); // floats and leans
+  const body = new THREE.Group(); // squash and stretch
+  root.add(body);
+  scene.add(root);
+
+  // body: a lathe dome with straight sides; the hem is waved per frame
+  const R = 1.25, H = 1.55;
+  const prof = [];
+  for (let i = 0; i <= 24; i++) { const a = (i / 24) * Math.PI / 2; prof.push(new THREE.Vector2(Math.sin(a) * R + 1e-4, Math.cos(a) * R)); }
+  for (let i = 1; i <= 12; i++) prof.push(new THREE.Vector2(R * (1 + 0.05 * i / 12), -H * (i / 12)));
+  prof.reverse(); // hem to top: the lathe's faces then point outward
+  const geo = new THREE.LatheGeometry(prof, 96);
+  const base = geo.attributes.position.array.slice();
+  // a soft self-glow keeps it ghostly white under the blue light; working states add to it
+  const white = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85, metalness: 0, emissive: 0xdfe5ff, emissiveIntensity: 0.12, transparent: true, opacity: 1 });
+  const inner = new THREE.MeshStandardMaterial({ color: 0x8e99b8, roughness: 0.9, side: THREE.BackSide, transparent: true, opacity: 1 });
+  body.add(new THREE.Mesh(geo, white), new THREE.Mesh(geo, inner));
+
+  // face: eyes (oval, happy arc, closed line) with brows for angry / serious / worried faces, mouth, blush
+  const dark = new THREE.MeshBasicMaterial({ color: 0x1a2030 });
+  const shine = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const face = new THREE.Group();
+  face.position.set(0, 0.28, 0);
+  body.add(face);
+  function makeEye(x) {
+    const g = new THREE.Group();
+    g.position.set(x, 0, R * 0.985);
+    const oval = new THREE.Mesh(new THREE.SphereGeometry(0.15, 32, 16), dark);
+    oval.scale.set(1, 1.42, 0.2);
+    const hi = new THREE.Mesh(new THREE.CircleGeometry(0.042, 16), shine);
+    hi.position.set(0.045, 0.07, 0.16);
+    oval.add(hi);
+    const arc = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.032, 10, 32, Math.PI), dark); // ^ shape
+    arc.visible = false;
+    const line = new THREE.Mesh(new THREE.CapsuleGeometry(0.03, 0.2, 4, 12), dark);
+    line.rotation.z = Math.PI / 2;
+    line.visible = false;
+    const brow = new THREE.Mesh(new THREE.CapsuleGeometry(0.032, 0.2, 4, 12), dark);
+    brow.rotation.z = Math.PI / 2;
+    brow.position.set(0, 0.29, 0.02);
+    brow.scale.setScalar(0.001);
+    g.add(oval, arc, line, brow);
+    return { g, oval, arc, line, brow, side: Math.sign(x) };
+  }
+  const eyes = [makeEye(-0.36), makeEye(0.36)];
+  eyes.forEach((e) => face.add(e.g));
+  const mouth = new THREE.Mesh(new THREE.SphereGeometry(0.09, 24, 12), dark);
+  mouth.position.set(0, -0.36, R * 1.0); // on the surface: the body is a little wider than R just below the dome
+  mouth.scale.set(1, 0.05, 0.4);
+  face.add(mouth);
+  const blushMat = new THREE.MeshBasicMaterial({ color: 0xff9db5, transparent: true, opacity: 0, depthWrite: false });
+  [-0.68, 0.68].forEach((x) => { const m = new THREE.Mesh(new THREE.CircleGeometry(0.13, 24), blushMat); m.position.set(x, -0.18, R * 0.9); m.rotation.y = x * 0.55; face.add(m); });
+
+  // arms: small rounded nubs that slide out of the sides when there is something to do
+  function makeArm(side) {
+    const pivot = new THREE.Group();
+    pivot.position.set(side * (R * 0.92), -0.45, 0.05);
+    const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.15, 0.42, 6, 16), white);
+    arm.position.set(side * 0.28, 0, 0);
+    arm.rotation.z = side * Math.PI / 2;
+    pivot.add(arm);
+    pivot.scale.setScalar(0.001);
+    body.add(pivot);
+    return pivot;
+  }
+  const arms = [makeArm(-1), makeArm(1)];
+
+  // a magnifying glass gripped by its handle at the tip of the right arm (the group's origin is the grip)
+  const prop = new THREE.Group();
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.055, 0.46, 14), new THREE.MeshStandardMaterial({ color: 0x5a648a, roughness: 0.6 }));
+  handle.position.set(0, 0.12, 0);
+  const lens = new THREE.Mesh(new THREE.TorusGeometry(0.24, 0.05, 12, 36), new THREE.MeshStandardMaterial({ color: 0xb9c7ff, roughness: 0.3, metalness: 0.4 }));
+  lens.position.set(0, 0.6, 0);
+  const glass = new THREE.Mesh(new THREE.CircleGeometry(0.22, 32), new THREE.MeshStandardMaterial({ color: 0xd8e2ff, transparent: true, opacity: 0.35, depthWrite: false }));
+  glass.position.copy(lens.position);
+  prop.add(handle, lens, glass);
+  prop.position.set(0.6, 0, 0.22);
+  prop.scale.setScalar(0.001);
+  arms[1].add(prop);
+
+  // the small effects (z, ?, steam)
+  function orbTexture(alpha) {
+    const c = document.createElement("canvas"); c.width = c.height = 64; const x = c.getContext("2d"); const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, `rgba(255,255,255,${alpha})`); g.addColorStop(0.6, `rgba(220,228,255,${alpha / 3})`); g.addColorStop(1, "rgba(220,228,255,0)");
+    x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
+  }
+  function glyph(text) {
+    const c = document.createElement("canvas"); c.width = c.height = 128; const x = c.getContext("2d");
+    x.font = "600 84px Bahnschrift, Segoe UI, sans-serif"; x.fillStyle = "#dfe6ff"; x.textAlign = "center"; x.textBaseline = "middle"; x.fillText(text, 64, 70);
+    return new THREE.CanvasTexture(c);
+  }
+  function drop() {
+    const c = document.createElement("canvas"); c.width = c.height = 64; const x = c.getContext("2d");
+    x.fillStyle = "#4f8dff"; x.strokeStyle = "#1d3f8f"; x.lineWidth = 4; x.beginPath(); x.moveTo(32, 6); x.bezierCurveTo(34, 24, 50, 34, 50, 44); x.arc(32, 44, 18, 0, Math.PI); x.bezierCurveTo(14, 34, 30, 24, 32, 6); x.fill(); x.stroke();
+    return new THREE.CanvasTexture(c);
+  }
+  const fx = { z: glyph("z"), q: glyph("?"), ex: glyph("!"), puff: orbTexture(0.9), tear: drop() };
+  const floaters = [];
+  function emit(kind) {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: fx[kind], transparent: true, depthWrite: false }));
+    s.scale.setScalar(kind === "z" ? 0.6 : kind === "puff" ? 0.4 + Math.random() * 0.2 : kind === "tear" ? 0.28 : 0.85);
+    const side = Math.random() < 0.5 ? -1 : 1;
+    s.userData = { age: 0, vx: 0.15, vy: 0.45 }; // drift up and to the right
+    if (kind === "puff") s.position.set(root.position.x + side * (0.35 + Math.random() * 0.25), root.position.y + 0.95, 0.3);
+    else if (kind === "tear") { // from under one eye, falling
+      s.position.set(root.position.x + side * 0.36 + face.position.x, root.position.y + 0.08, 1.35);
+      s.userData = { age: 0, vx: 0, vy: -0.6 };
+    } else s.position.set(root.position.x + 0.9 + Math.random() * 0.2, root.position.y + 1.2, 0.5);
+    scene.add(s); floaters.push(s);
+  }
+
+  // brow: [shown 0..1, angle (+ = inner ends down, angry; - = inner ends up, worried), height]; front: an arm
+  // brought round to the front (chin hand, crossed arms); bob: how much it floats; heat: white glow .. red;
+  // mouthO: the mouth held open in an "o" (surprise), apart from talking
+  const rest = { eye: "oval", eyeOpen: 1, lookX: 0, lookY: 0, lean: 0, tilt: 0, glow: 0, blush: 0, height: 0, arms: [0, 0], armLift: [0, 0], front: [0, 0],
+                 prop: 0, hem: 1, opacity: 1, brow: [0, 0, 0], bob: 1, heat: 0, mouthO: 0 };
+  const pose = (p) => ({ ...rest, ...p });
+  const poses = {
+    idle:      pose({}),
+    listening: pose({ eyeOpen: 1.12, lookY: -0.6, lean: 0.16, glow: 0.05, height: -0.05 }),
+    thinking:  pose({ eyeOpen: 0.55, lookX: 0.55, lookY: 0.65, lean: -0.04, tilt: 0.12, glow: 0.35, height: 0.08, arms: [0, 1], armLift: [0, 1.1], front: [0, 1], hem: 0.6 }),
+    talking:   pose({ lean: 0.04, glow: 0.1, height: 0.05, hem: 1.4 }),
+    cheerful:  pose({ lean: 0.04, glow: 0.12, blush: 0.4, height: 0.12, hem: 1.4 }), // talking, happily
+    tool:      pose({ eyeOpen: 0.8, lookX: 0.75, lookY: 0.35, lean: 0.04, tilt: -0.06, glow: 0.25, height: 0.02, arms: [0.7, 1], armLift: [0.3, 0.75], front: [0, 0.35], prop: 1, hem: 1.2 }),
+    happy:     pose({ eye: "arc", glow: 0.15, blush: 0.75, height: 0.3, arms: [1, 1], armLift: [1.0, 1.0], hem: 1.3 }),
+    sorry:     pose({ eyeOpen: 0.6, lookY: -0.55, lean: 0.05, tilt: -0.08, height: -0.35, hem: 0.4, opacity: 0.85, brow: [1, -0.4, 0.02] }),
+    surprised: pose({ eyeOpen: 1.45, lookY: 0.1, lean: -0.08, glow: 0.2, height: 0.25, arms: [1, 1], armLift: [0.9, 0.9], hem: 1.8, mouthO: 0.6 }),
+    shocked:   pose({ eyeOpen: 1.75, lookY: 0.05, lean: -0.18, glow: 0.25, height: 0.38, arms: [1, 1], armLift: [1.1, 1.1], hem: 2.2, brow: [1, -0.1, 0.12], bob: 0.5, mouthO: 1 }), // jolts, see frame()
+    excited:   pose({ eye: "arc", glow: 0.3, blush: 0.8, height: 0.35, arms: [1, 1], armLift: [0.95, 0.95], hem: 1.9, bob: 1.3 }), // bounces fast, arms waving
+    curious:   pose({ eyeOpen: 1.25, lookX: 0.15, lookY: 0.15, lean: 0.14, tilt: 0.28, glow: 0.15, height: 0.05, arms: [0.7, 1], armLift: [0.3, 0.75], front: [0, 0.35], prop: 1, hem: 1.1, brow: [0.7, -0.12, 0.07] }),
+    shy:       pose({ eye: "arc", eyeOpen: 0.9, lookX: -0.6, lookY: -0.45, lean: 0.08, tilt: -0.14, blush: 1, height: -0.12, arms: [1, 1], armLift: [0.1, 0.1], front: [1, 1], hem: 0.6, bob: 0.6 }),
+    proud:     pose({ eyeOpen: 0.5, lookX: 0.25, lookY: 0.45, lean: -0.14, tilt: -0.04, glow: 0.2, blush: 0.2, height: 0.22, arms: [1, 1], armLift: [-0.15, -0.15], front: [0.45, 0.45], hem: 1, brow: [0.8, 0.1, 0.06] }),
+    sad:       pose({ eyeOpen: 0.5, lookY: -0.75, lean: 0.06, tilt: 0.1, height: -0.42, hem: 0.25, opacity: 0.75, brow: [1, -0.6, 0], bob: 0.35 }), // a tear now and then
+    angry:     pose({ eyeOpen: 0.62, lookY: -0.05, lean: 0.14, glow: 0.3, height: -0.08, arms: [1, 1], armLift: [-0.35, -0.35], hem: 0.55, brow: [1, 0.5, -0.07], bob: 0.35, heat: 1 }),
+    serious:   pose({ eyeOpen: 0.78, lean: 0.03, height: -0.02, arms: [1, 1], armLift: [0.28, 0.28], front: [1, 1], hem: 0.5, brow: [1, 0.06, -0.05], bob: 0.2 }),
+    confused:  pose({ eye: "squint", eyeOpen: 0.75, lookX: -0.3, lookY: 0.2, tilt: 0.22, arms: [0, 1], armLift: [0, 1.5], hem: 0.8, brow: [0.8, -0.25, 0.03] }),
+    sleepy:    pose({ eye: "line", lookY: -0.2, lean: 0.02, tilt: 0.05, height: -0.45, hem: 0.3, opacity: 0.8, bob: 0.6 }), // sinks into the box
+    wave:      pose({ eye: "arc", tilt: 0.06, glow: 0.1, blush: 0.4, height: 0.15, arms: [0, 1], armLift: [0, 0.95], hem: 1.2 }), // up and out, so the arm clears the body's outline
+  };
+  let state = "idle", target = poses.idle, setAt = 0;
+  const cur = { ...rest, arms: [0, 0], armLift: [0, 0], front: [0, 0], brow: [0, 0, 0], talk: 0 };
+  const coolGlow = new THREE.Color(0xdfe5ff), hotGlow = new THREE.Color(0xff6a5c);
+  let rate = 0, lastTokenAt = -1, syllable = 0, openness = 0.7, mouthTarget = 0;
+  let blinkAt = 2, blinkT = -1, glanceAt = 4, glance = [0, 0], fxTimer = 0;
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const motion = reduced ? 0.3 : 1;
+
+  // it looks toward the pointer: up at the conversation while you read, down at the box while you type
+  const pointer = new THREE.Vector2();
+  const clamp = (v) => Math.max(-1, Math.min(1, v));
+  addEventListener("pointermove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    pointer.set(clamp((e.clientX - (r.left + r.width / 4)) / 400), clamp(-(e.clientY - (r.top + r.height * 0.55)) / 300));
+  });
+
+  const ease = (a, b, k) => a + (b - a) * k;
+  const clock = new THREE.Clock();
+  function frame() {
+    if (document.body.dataset.ghost !== "3d") { clock.getDelta(); requestAnimationFrame(frame); return; } // the pixel ghost is shown
+    const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime, k = 1 - Math.pow(0.0015, dt);
+    for (const key of ["eyeOpen", "lookX", "lookY", "lean", "tilt", "glow", "blush", "height", "prop", "hem", "opacity", "bob", "heat", "mouthO"]) cur[key] = ease(cur[key], target[key], k);
+    for (const key of ["arms", "armLift", "front", "brow"]) cur[key].forEach((v, i) => (cur[key][i] = ease(v, target[key][i], k)));
+    const speaking = t - lastTokenAt < 0.35 && !["thinking", "tool", "sleepy"].includes(state);
+
+    // float: livelier while speaking (only a little faster with speed)
+    const energy = (speaking ? 1 + Math.min(rate, 60) / 200 : state === "sleepy" ? 0.4 : 1) * motion;
+    // a small tremble when angry; a jolt that dies away when shocked
+    const jolt = state === "shocked" ? Math.max(0, 1 - (t - setAt) / 0.6) * 0.05 : 0;
+    root.position.x = (state === "angry" ? Math.sin(t * 38) * 0.012 : Math.sin(t * 50) * jolt) * motion;
+    root.position.y = cur.height + Math.sin(t * 1.6 * energy) * 0.12 * cur.bob * motion + (state === "happy" ? Math.abs(Math.sin(t * 6)) * 0.12 * motion : 0) +
+      (state === "excited" ? Math.abs(Math.sin(t * 9)) * 0.16 * motion : 0);
+    root.rotation.x = cur.lean + pointer.y * -0.06;
+    root.rotation.y = pointer.x * 0.25 + Math.sin(t * 0.7) * 0.04 * motion;
+    root.rotation.z = cur.tilt + Math.sin(t * 1.1) * 0.025 * motion;
+    const breathe = 1 + Math.sin(t * 1.6 * energy + 1) * 0.015;
+    body.scale.set(1 / Math.sqrt(breathe), breathe, 1 / Math.sqrt(breathe));
+
+    // the hem ripples
+    const pos = geo.attributes.position;
+    const amp = 0.11 * cur.hem, speed = 2.2 * (speaking ? 1 + Math.min(rate, 60) / 120 : 1) * Math.min(cur.hem, 1.3) * motion;
+    for (let i = 0; i < pos.count; i++) {
+      const y0 = base[3 * i + 1];
+      if (y0 > -H * 0.45) continue;
+      const x0 = base[3 * i], z0 = base[3 * i + 2], a = Math.atan2(z0, x0);
+      const w = (-y0 - H * 0.45) / (H * 0.55);
+      pos.array[3 * i + 1] = y0 + Math.sin(a * 6 + t * speed) * amp * w * w;
+      const r = 1 + Math.sin(a * 6 + t * speed + 1.4) * 0.025 * w;
+      pos.array[3 * i] = x0 * r; pos.array[3 * i + 2] = z0 * r;
+    }
+    pos.needsUpdate = true;
+
+    white.emissiveIntensity = 0.12 + cur.glow * (0.75 + 0.25 * Math.sin(t * 3));
+    white.emissive.copy(coolGlow).lerp(hotGlow, cur.heat);
+    white.opacity = inner.opacity = cur.opacity;
+    blushMat.opacity = cur.blush * 0.7;
+
+    // eyes: state + pointer + idle glances; blinks
+    if (t > glanceAt) { glance = [(Math.random() - 0.5) * 0.8, (Math.random() - 0.5) * 0.4]; glanceAt = t + 2.5 + Math.random() * 4; setTimeout(() => (glance = [0, 0]), 700); }
+    const idle = state === "idle";
+    const lx = cur.lookX + pointer.x * 0.35 + (idle ? glance[0] : 0), ly = cur.lookY + pointer.y * 0.25 + (idle ? glance[1] : 0);
+    face.position.x = ease(face.position.x, lx * 0.14, k);
+    face.position.y = ease(face.position.y, 0.28 + ly * 0.1, k);
+    if (t > blinkAt && blinkT < 0) blinkT = 0;
+    let lid = 1;
+    if (blinkT >= 0) { blinkT += dt; lid = Math.abs(Math.cos(Math.min(blinkT / 0.16, 1) * Math.PI)); if (blinkT > 0.16) { blinkT = -1; blinkAt = t + 2.5 + Math.random() * 4; } }
+    eyes.forEach((e, i) => {
+      const shape = target.eye;
+      e.oval.visible = shape === "oval" || shape === "squint";
+      e.arc.visible = shape === "arc";
+      e.line.visible = shape === "line";
+      const open = cur.eyeOpen * lid * (shape === "squint" && i === 0 ? 0.35 : 1);
+      e.oval.scale.set(0.9 + 0.1 * cur.eyeOpen, 1.42 * Math.max(open, 0.06), 0.2);
+      const [shown, angle, by] = cur.brow;
+      e.brow.scale.setScalar(Math.max(shown, 0.001));
+      e.brow.rotation.z = Math.PI / 2 + e.side * angle;
+      e.brow.position.y = 0.27 + by - (1 - cur.eyeOpen) * 0.08;
+    });
+
+    // mouth: a speaking rhythm of its own (about 4.5 syllables a second) while tokens keep arriving
+    if (speaking) {
+      syllable += dt * 4.5 * (0.92 + Math.min(rate, 60) / 400);
+      if (syllable >= 1) { syllable -= 1; openness = 0.45 + Math.random() * 0.55; }
+      mouthTarget = openness * Math.pow(Math.sin(syllable * Math.PI), 0.8);
+    } else mouthTarget = 0;
+    cur.talk = ease(cur.talk, mouthTarget, 1 - Math.pow(0.0001, dt));
+    // the mouth talks, or stays open in an "o" (surprised, shocked), whichever is wider
+    const open = Math.max(cur.talk, cur.mouthO);
+    mouth.scale.set(cur.mouthO > cur.talk ? 0.75 + 0.1 * cur.mouthO : 1 + cur.talk * 0.2, 0.05 + open * 0.75, 0.4);
+    mouth.visible = open > 0.03;
+
+    // arms: out (scale), raised (rotation), or round to the front
+    arms.forEach((a, i) => {
+      const side = i ? 1 : -1;
+      a.scale.setScalar(Math.max(cur.arms[i], 0.001));
+      let raise = cur.armLift[i];
+      if (state === "wave" && i === 1) raise += Math.sin(t * 9) * 0.35 * motion;
+      if (state === "excited") raise += Math.sin(t * 12 + i * Math.PI) * 0.3 * motion;
+      if (speaking) raise += Math.max(0, Math.sin(t * 1.3 + i * 2)) * 0.18 * Math.min(1, cur.talk * 2);
+      a.rotation.z = side * raise;
+      const f = cur.front[i], cross = state === "serious" ? f : 0;
+      a.rotation.y = side * -(1.25 + 1.1 * cross) * f;
+      a.position.x = side * R * (0.92 - 0.37 * f - 0.25 * cross);
+      a.position.z = 0.05 + (R * 0.95 + (i ? 0.09 : 0)) * f;
+      a.position.y = -0.45 - 0.1 * f - (i ? 0.02 : 0.08) * cross;
+    });
+    prop.scale.setScalar(Math.max(cur.prop, 0.001));
+    prop.rotation.z = -arms[1].rotation.z - 0.25 + Math.sin(t * 2) * 0.06 * motion;
+    prop.rotation.y = -arms[1].rotation.y - 0.3;
+
+    if (state === "sleepy" && (fxTimer -= dt) < 0) { emit("z"); fxTimer = 1.6; }
+    if (state === "angry" && (fxTimer -= dt) < 0) { emit("puff"); fxTimer = 0.35; }
+    if (state === "sad" && (fxTimer -= dt) < 0) { emit("tear"); fxTimer = 2.4; }
+    for (let i = floaters.length - 1; i >= 0; i--) {
+      const f = floaters[i]; f.userData.age += dt; f.position.y += dt * f.userData.vy; f.position.x += dt * f.userData.vx; f.material.opacity = Math.max(0, 1 - f.userData.age / 2.4);
+      if (f.userData.age > 2.4) { scene.remove(f); f.material.dispose(); floaters.splice(i, 1); }
+    }
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  new ResizeObserver(() => {
+    if (!canvas.clientWidth) return; // hidden
+    renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+    camera.aspect = canvas.clientWidth / canvas.clientHeight;
+    camera.updateProjectionMatrix();
+  }).observe(canvas);
+  frame();
+  return {
+    get state() { return state; },
+    set(s) {
+      if (!poses[s] || s === state) return;
+      state = s; target = poses[s]; setAt = clock.elapsedTime; fxTimer = 0.8;
+      if (s === "confused") emit("q");
+      if (s === "shocked") emit("ex");
+    },
+    token() { lastTokenAt = clock.elapsedTime; },
+    rate(r) { rate = r; },
+  };
+}
+window.make3d = make3d;
+</script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -589,14 +931,27 @@ function pixelGhost(canvas) {
   return { set(s) { state = s; }, token() { lastTok = performance.now(); } };
 }
 document.querySelectorAll(".ghost-mini, .ghost-big").forEach(pixelGhost);
-const ghost = pixelGhost($("ghost"));
+// the ghost over the message box: pixel art, or the classic page's 3D one (three.js loads only when it's picked)
+const pixel = pixelGhost($("ghost"));
+let ghost3d = null, ghostState = "idle";
+const ghost = { set(s) { ghostState = s; pixel.set(s); ghost3d && ghost3d.set(s); }, token() { pixel.token(); ghost3d && ghost3d.token(); } };
+async function setGhostStyle() {
+  const style = store.get("ghostStyle", "pixel");
+  document.body.dataset.ghost = style;
+  if (style !== "3d" || ghost3d) return;
+  for (let i = 0; i < 50 && !window.make3d; i++) await new Promise((r) => setTimeout(r, 100)); // the module runs after this script
+  ghost3d = window.make3d ? await window.make3d() : null;
+  if (ghost3d) ghost3d.set(ghostState);
+  else { store.set("ghostStyle", "pixel"); document.body.dataset.ghost = "pixel"; toast("This browser has no WebGL: the pixel ghost stays"); }
+}
 
 // ================================================================ theme
 function applyTheme() {
   const t = store.get("theme", "system");
   const dark = t === "dark" || (t === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.dataset.theme = dark ? "dark" : "light";
-  $("ghost").hidden = !store.get("ghostOn", true);
+  document.body.classList.toggle("no-ghost", !store.get("ghostOn", true));
+  setGhostStyle();
 }
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
 applyTheme();
@@ -609,6 +964,7 @@ const S = {
   chats: [], chat: null, // {id, title, cwd, turns, parts, tokens, ctxLen}
   busy: null, status: null, procOut: null,
   mode: store.get("mode", "manual"), thinking: store.get("thinking", false), workdir: store.get("workdir", null),
+  files: [], editing: null,
   rail: innerWidth > 1180 && store.get("rail", true), // a narrow window starts with it closed: it would cover the chat
 };
 
@@ -781,7 +1137,12 @@ function askCard(p) {
 }
 function turnHTML(turn, ti, live) {
   let h = "";
-  if (turn.user !== null) h += `<div class="user"><div class="b">${esc(turn.user)}</div></div>`;
+  if (turn.user !== null) {
+    const { words, files } = unjoin(turn.user);
+    const canEdit = !live && !S.busy && S.chat && S.chat.id;
+    h += `<div class="user">${canEdit ? `<button class="ibtn ed" data-edit="${ti}" aria-label="Edit this message" title="Edit">${icon("edit")}</button>` : ""}<div class="b">${esc(words)}`
+      + (files.length ? `<div class="files">${files.map((f) => `<span class="fchip">${icon("file")}<span class="n">${esc(f.name)}</span><span class="s">${lines(f.text)}</span></span>`).join("")}</div>` : "") + `</div></div>`;
+  }
   h += `<div class="turn">`;
   let tools = [];
   const flushTools = () => { if (tools.length) { h += `<div class="tools">${tools.join("")}</div>`; tools = []; } };
@@ -909,7 +1270,7 @@ function drawChats() {
     const k = groups.findIndex(([, t]) => c.updated >= t);
     if (k !== g) { g = k; h += `<div class="group">${groups[k][0]}</div>`; }
     const on = S.chat && S.chat.id === c.id, live = S.busy && on;
-    h += `<div class="row ${on ? "on" : ""}" role="button" tabindex="0" data-chat="${esc(c.id)}" ${on ? 'aria-current="true"' : ""}><span class="ell">${esc(c.title || "Untitled")}</span>`
+    h += `<div class="row ${on ? "on" : ""}" role="button" tabindex="0" data-chat="${esc(c.id)}" ${on ? 'aria-current="true"' : ""}><span class="ell">${esc(cleanTitle(c.title))}</span>`
       + `${live || c.unread ? `<span class="dot ${live ? "live" : ""}" title="${live ? "Replying" : "New since you looked"}"></span>` : ""}`
       + `<button class="x" data-del="${esc(c.id)}" aria-label="Delete chat" title="Delete">${icon("trash", 'style="width:14px;height:14px"')}</button></div>`;
   }
@@ -930,6 +1291,8 @@ $("chats").addEventListener("click", async (e) => {
 });
 $("chats").addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.dataset.chat) openChat(e.target.dataset.chat); });
 $("search").addEventListener("input", drawChats);
+// a title made from a first message that held a file: its words, or the file's name
+const cleanTitle = (t) => { if (!t) return "Untitled"; const m = t.match(/<file name="([^"]*)"/); if (!m) return t; return t.slice(0, m.index).trim() || m[1]; };
 async function loadChats() { try { S.chats = (await api("/api/chats")).chats || []; drawChats(); } catch {} }
 async function openChat(id) {
   if (S.busy) { if (S.chat && S.chat.id === id) return; toast("Wait for the reply to finish, or stop it"); return; }
@@ -938,7 +1301,7 @@ async function openChat(id) {
     S.chat = { id: c.id, title: c.title, cwd: c.cwd || null, turns: turnsFrom(c.messages), parts: c.parts, tokens: c.tokens, ctxLen: S.models && S.models.context_length };
     S.procOut = null; opened.clear(); S.tasks = c.tasks || [];
     if (S.view === "call") setView("code");
-    $("title").textContent = c.title || "Chat"; document.title = (c.title || "Chat") + " · ghost-infer";
+    $("title").textContent = cleanTitle(c.title); document.title = cleanTitle(c.title) + " · ghost-infer";
     if (c.unread) api("/api/chats/read", { body: { id } }).then(loadChats).catch(() => {});
     stick = true; draw(); drawChats(); drawChips(); closeDrawer();
     history.replaceState(null, "", "#" + id);
@@ -957,7 +1320,7 @@ $("newChat").onclick = newChat;
 const input = $("input");
 function typed() {
   input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.4) + "px";
-  $("send").disabled = !S.busy && !input.value.trim();
+  $("send").disabled = !S.busy && !input.value.trim() && !S.files.length;
   if (!S.busy) ghost.set(input.value ? "listening" : "idle");
 }
 input.addEventListener("input", typed);
@@ -1045,7 +1408,7 @@ function setBusy(ctrl) {
 }
 function stop() { if (S.busy) S.busy.abort(); }
 async function send(again) {
-  const text = again ? null : input.value.trim();
+  const text = again ? null : join(input.value, S.files);
   if (!again && !text) return;
   const m = S.models;
   if (!m || !m.current) { if (m && m.loading) toast("The model is still loading"); else $("modelChip").click(); return; }
@@ -1053,7 +1416,12 @@ async function send(again) {
   if (S.chat && S.chat.id) body.chat = S.chat.id;
   else { const cwd = chatCwd(); if (cwd) body.cwd = cwd; S.chat = { id: null, title: null, cwd, turns: [], parts: null, tokens: 0, ctxLen: m.context_length }; }
   if (text !== null) {
-    body.message = text; input.value = ""; typed();
+    // an edit: the message it replaces (by its place among the user's messages) and everything after it go
+    if (S.editing !== null && S.chat.id) {
+      const nth = S.chat.turns.slice(0, S.editing).filter((t) => t.user !== null).length;
+      body.edit = nth; S.chat.turns = S.chat.turns.slice(0, S.editing);
+    }
+    body.message = text; input.value = ""; S.files = []; drawFiles(); stopEditing(); typed();
     S.chat.turns.push({ user: text, parts: [], checkpoints: [] });
   } else Object.assign(currentTurn(), { parts: [], checkpoints: [], stats: null }); // the server answers the last message again
   stick = true; S.status = "Reading"; ghost.set("thinking");
@@ -1209,10 +1577,12 @@ async function drawSettings() {
     P.innerHTML = head("Appearance", "How this page looks and behaves, in this browser.") + `<div class="gcard">`
       + srow("Theme", "", `<span class="seg" id="themeSeg">${[["system", "System"], ["dark", "Dark"], ["light", "Light"]].map(([v, n]) => `<button data-v="${v}" aria-pressed="${v === t}">${n}</button>`).join("")}</span>`)
       + srow("The ghost", "The little ghost above the message box", sw(store.get("ghostOn", true), "swGhost", "Show the ghost"))
+      + srow("Ghost style", "Pixel art, or the 3D ghost (it needs WebGL)", `<span class="seg" id="styleSeg">${[["pixel", "Pixel"], ["3d", "3D"]].map(([v, n]) => `<button data-v="${v}" aria-pressed="${v === store.get("ghostStyle", "pixel")}">${n}</button>`).join("")}</span>`)
       + srow("Notifications", notif === "denied" ? "Blocked in this browser's site settings" : notif === "none" ? "This browser has none (on plain http from another device, most browsers turn them off)" : "When it needs your OK or finishes while this tab is in the background",
         notif === "granted" ? `<span class="tag ok">On</span>` : notif === "default" ? `<button class="btn sm" id="notif">Turn on</button>` : "") + `</div>`;
     P.querySelector("#themeSeg").onclick = (e) => { const b = e.target.closest("[data-v]"); if (b) { store.set("theme", b.dataset.v); applyTheme(); drawSettings(); } };
     $("swGhost").onclick = () => { store.set("ghostOn", !store.get("ghostOn", true)); applyTheme(); drawSettings(); };
+    P.querySelector("#styleSeg").onclick = (e) => { const b = e.target.closest("[data-v]"); if (b) { store.set("ghostStyle", b.dataset.v); setGhostStyle(); drawSettings(); } };
     const nb = $("notif"); if (nb) nb.onclick = async () => { await Notification.requestPermission(); drawSettings(); };
   } else if (page === "models") {
     await refreshModels();
@@ -1371,6 +1741,7 @@ async function boot() {
     api("/api/nightly").then((n) => (S.nightly = n)).catch(() => {}), api("/api/nightly/learned").then((l) => (S.learned = l)).catch(() => {})]);
   navCaps();
   setInterval(() => { if (!document.hidden && S.rail) refreshExtras(); }, 8000);
+  refreshBadges(); setInterval(() => { if (!document.hidden) refreshBadges(); }, 60000);
   drawChips();
   const id = location.hash.slice(1);
   if (id && S.chats.some((c) => c.id === id)) openChat(id); else draw();
@@ -1508,12 +1879,13 @@ drawSettings = async function () {
     P.innerHTML = head("Voice", "Voice calls with Maya.") + `<div class="gtitle">Models</div><div class="gcard">`
       + srow("Voice", "What Maya speaks with", `<span class="muted">${esc(m.speech || "Not set up")}</span>`)
       + srow("Listening", "What turns your speech into text", `<span class="muted">${esc(m.listen || "Not set up")}</span>`)
-      + srow("Call model", "Calls talk to the model running now. Switch models from the message box.", `<span class="muted">${esc(m.current || "None loaded")}</span>`) + `</div>`
+      + srow("Call model", "Kept loaded beside the Code model when your graphics card has room for both and the voice; otherwise a call swaps them, and Code gets its model back after", `<select id="callModelSel" class="mini" style="width:240px;margin:0" aria-label="Call model"><option value="">Same as Code</option>${(m.models || []).map((x) => `<option value="${esc(x.id)}" ${x.id === callModel() ? "selected" : ""}>${esc(x.id)}</option>`).join("")}</select>`) + `</div>`
       + `<div class="gtitle">During a call</div><div class="gcard">`
       + srow("Show response timings", "How long each reply took to start: for checking speed", sw(store.get("callTimings", false), "swTimings", "Show response timings"))
       + srow("Talk over her", "Speaking while she talks stops her. Turn off on loudspeakers if she keeps stopping herself", sw(store.get("bargeIn", true), "swBarge", "Talk over her")) + `</div>`
       + `<p class="faint" style="font-size:12.5px;margin-top:14px">The voice models are chosen when the server starts (its --tts and --stt options).${window.isSecureContext ? "" : " This page isn't on HTTPS or this computer, so the browser won't give it the microphone: open it through an SSH tunnel (localhost) to call."}</p>`;
     $("swTimings").onclick = () => { store.set("callTimings", !store.get("callTimings", false)); drawSettings(); };
+    $("callModelSel").onchange = (e) => { store.set("callModel", e.target.value || null); toast(e.target.value ? "Calls use " + e.target.value : "Calls use the Code model"); };
     $("swBarge").onclick = () => { store.set("bargeIn", !store.get("bargeIn", true)); drawSettings(); };
   } else if (page === "maya") {
     let m = {}; try { m = S.maya = await api("/api/maya"); } catch (e) { P.innerHTML = head("Maya", "") + `<div class="err">${esc(e.message)}</div>`; return; }
@@ -1595,7 +1967,7 @@ function setView(v) {
   if (v === "call") {
     $("title").textContent = "Voice call";
     if (!window.isSecureContext) { $("callNote").hidden = false; $("callNote").innerHTML = `Browsers give the microphone only to pages on HTTPS or on this computer. Open it through an SSH tunnel (<code>ssh -L ${esc(location.port || "80")}:localhost:${esc(location.port || "80")} you@${esc(location.hostname)}</code>, then <code>http://localhost:${esc(location.port || "80")}</code>), or put it behind HTTPS.`; }
-  } else $("title").textContent = S.chat && S.chat.title ? S.chat.title : "New chat";
+  } else { $("title").textContent = S.chat && S.chat.title ? S.chat.title : "New chat"; backToCode(); }
 }
 $("viewSeg").addEventListener("click", (e) => { const b = e.target.closest("[data-v]"); if (b) setView(b.dataset.v); });
 function callState(t) { $("callState").textContent = t; }
@@ -1840,10 +2212,8 @@ async function startCall() {
     callLine("err", e.name === "NotAllowedError" ? "The browser didn't allow the microphone. Allow it for this site (the address bar's icon), then start the call again." : e.name === "NotFoundError" ? "No microphone found." : "The microphone didn't start: " + e.message);
     if (CALL.ctx) CALL.ctx.close(); CALL.ctx = null; return;
   }
-  if (!m.voice) {
-    callState("Loading the voice…"); callGhost.set("thinking");
-    try { await api("/api/models/load", { body: { id: m.current, voice: true } }); await refreshModels(); } catch (e) { callLine("err", "The voice didn't load: " + e.message); }
-  }
+  callGhost.set("thinking");
+  try { await loadForCall(); } catch (e) { callLine("err", "The voice didn't load: " + e.message); }
   const src = CALL.ctx.createMediaStreamSource(CALL.mic);
   const node = CALL.ctx.createScriptProcessor(2048, 1, 1); // small and everywhere; an AudioWorklet would need its own file
   node.onaudioprocess = (e) => { if (CALL.on) micInput(e.inputBuffer.getChannelData(0), CALL.ctx.sampleRate); };
@@ -1881,6 +2251,140 @@ $("callType").onsubmit = (e) => {
   i.value = ""; cutOff(); CALL.nudges = 0; callLine("you", t); turn(t, false);
 };
 addEventListener("beforeunload", (e) => { if (CALL.on) { e.preventDefault(); e.returnValue = ""; } });
+
+// ================================================================ attachments (as app/src/attach.rs): text files go inside the message
+// after the words, as <file name="...">...</file>; the bubble shows them as chips again
+const MAX_FILE = 200 * 1024;
+const lines = (t) => { const n = t.replace(/\n$/, "").split("\n").length; return `${n} line${n === 1 ? "" : "s"}`; };
+function join(words, files) {
+  let out = words.trim();
+  for (const f of files) { if (out) out += "\n\n"; out += `<file name="${f.name.replace(/"/g, "'")}">\n${f.text.replace(/\n+$/, "")}\n</file>`; }
+  return out;
+}
+function unjoin(raw) {
+  const OPEN = '<file name="', starts = [];
+  for (let i = raw.indexOf(OPEN); i >= 0; i = raw.indexOf(OPEN, i + 1)) if (i === 0 || raw[i - 1] === "\n") starts.push(i);
+  if (!starts.length) return { words: raw, files: [] };
+  const files = [];
+  for (let k = 0; k < starts.length; k++) {
+    const block = raw.slice(starts[k] + OPEN.length, starts[k + 1] ?? raw.length), cut = block.indexOf('">\n');
+    if (cut < 0) return { words: raw, files: [] };
+    let body = block.slice(cut + 3).trimEnd(); if (body.endsWith("</file>")) body = body.slice(0, -7);
+    files.push({ name: block.slice(0, cut), text: body.replace(/\n+$/, "") + "\n" });
+  }
+  return { words: raw.slice(0, starts[0]).trimEnd(), files };
+}
+function drawFiles() {
+  const box = $("files");
+  box.hidden = !S.files.length;
+  box.innerHTML = S.files.map((f, i) => `<span class="fchip">${icon("file")}<span class="n" title="${esc(f.name)}">${esc(f.name)}</span><span class="s">${lines(f.text)}</span><button type="button" data-unfile="${i}" aria-label="Remove ${esc(f.name)}">${icon("x", 'style="width:11px;height:11px"')}</button></span>`).join("");
+  typed();
+}
+$("files").addEventListener("click", (e) => { const b = e.target.closest("[data-unfile]"); if (b) { S.files.splice(+b.dataset.unfile, 1); drawFiles(); input.focus(); } });
+async function attach(list) {
+  for (const f of list) {
+    if (f.size > MAX_FILE) { toast(`${f.name} is too big to attach (${Math.round(f.size / 1024)} KB; up to ${MAX_FILE / 1024} KB)`); continue; }
+    const text = await f.text();
+    if (text.includes("\0") || text.includes("�")) { toast(`${f.name} is not a text file`); continue; }
+    S.files.push({ name: f.name, text: text.replace(/^﻿/, "").replace(/\r\n/g, "\n") });
+  }
+  drawFiles(); input.focus();
+}
+$("attachChip").onclick = () => $("filePick").click();
+$("filePick").onchange = (e) => { attach([...e.target.files]); e.target.value = ""; };
+const boxEl = document.querySelector("#form .box");
+boxEl.addEventListener("dragover", (e) => { if ([...e.dataTransfer.types].includes("Files")) { e.preventDefault(); boxEl.classList.add("drop"); } });
+boxEl.addEventListener("dragleave", () => boxEl.classList.remove("drop"));
+boxEl.addEventListener("drop", (e) => { e.preventDefault(); boxEl.classList.remove("drop"); attach([...e.dataTransfer.files]); });
+input.addEventListener("paste", (e) => { const fs = [...(e.clipboardData && e.clipboardData.files || [])]; if (fs.length) { e.preventDefault(); attach(fs); } });
+
+// ================================================================ editing a sent message (as the app's: the reply after it is replaced)
+function stopEditing() { S.editing = null; $("editing").hidden = true; draw(); }
+$("editCancel").onclick = () => { input.value = ""; S.files = []; drawFiles(); stopEditing(); };
+log.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-edit]"); if (!b || S.busy) return;
+  const ti = +b.dataset.edit, { words, files } = unjoin(S.chat.turns[ti].user);
+  S.editing = ti; input.value = words; S.files = files; drawFiles();
+  $("editing").hidden = false; input.focus(); input.setSelectionRange(input.value.length, input.value.length); typed();
+});
+
+// ================================================================ the / list: skills anywhere, /goal and /loop at the start
+const COMMANDS = [["goal", "Keep working until what you describe is done, checked after each try"], ["loop", "Repeat a prompt in this chat every few minutes: /loop 10m check the build"]];
+let slashPick = 0, slashShut = null;
+function slashTyped() {
+  const at = input.selectionStart; if (at !== input.selectionEnd) return null;
+  const before = input.value.slice(0, at), m = before.match(/(^|\s)\/([^\s/]*)$/);
+  if (!m || /^\S/.test(input.value.slice(at))) return null;
+  return { q: m[2].toLowerCase(), from: at - m[2].length - 1, first: before.length - m[2].length - 1 === 0 };
+}
+function slashList() {
+  const t = slashTyped(); if (!t || slashShut === input.value) return [];
+  const all = [...(t.first ? COMMANDS.map(([name, about]) => ({ name, about })) : []), ...S.skills.map((s) => ({ name: s.name, about: s.description }))];
+  const hits = all.filter((e) => e.name.toLowerCase().includes(t.q));
+  const list = [...hits.filter((e) => e.name.toLowerCase().startsWith(t.q)), ...hits.filter((e) => !e.name.toLowerCase().startsWith(t.q))];
+  return list.length === 1 && list[0].name.toLowerCase() === t.q ? [] : list;
+}
+function drawSlash() {
+  let el = document.querySelector(".slash");
+  const list = slashList();
+  if (!list.length) { if (el) el.remove(); return; }
+  if (!el) { el = document.createElement("div"); el.className = "slash"; el.setAttribute("role", "listbox"); $("form").append(el); }
+  slashPick = Math.min(slashPick, list.length - 1);
+  el.innerHTML = list.map((e, i) => `<button type="button" class="opt ${i === slashPick ? "on" : ""}" role="option" aria-selected="${i === slashPick}" data-slash="${esc(e.name)}"><b>/${esc(e.name)}</b><span>${esc(e.about || "")}</span></button>`).join("");
+}
+function slashInsert(name) {
+  const t = slashTyped(); if (!t) return;
+  const at = input.selectionStart;
+  input.value = input.value.slice(0, t.from) + "/" + name + " " + input.value.slice(at);
+  const c = t.from + name.length + 2; input.setSelectionRange(c, c); input.focus(); slashPick = 0; drawSlash(); typed();
+}
+input.addEventListener("input", () => {
+  if (slashShut !== input.value) slashShut = null;
+  slashPick = 0;
+  // a / just typed: the skills read again, so one installed elsewhere is in the list
+  const t = slashTyped(); if (t && !t.q) refreshExtras().then(drawSlash);
+  drawSlash();
+});
+input.addEventListener("click", drawSlash);
+input.addEventListener("keydown", (e) => {
+  const list = slashList(); if (!list.length) return;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); e.stopImmediatePropagation(); slashPick = (slashPick + (e.key === "ArrowDown" ? 1 : -1) + list.length) % list.length; drawSlash(); }
+  else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopImmediatePropagation(); slashInsert(list[slashPick].name); }
+  else if (e.key === "Escape") { e.stopImmediatePropagation(); slashShut = input.value; drawSlash(); }
+}, true);
+$("form").addEventListener("click", (e) => { const b = e.target.closest("[data-slash]"); if (b) slashInsert(b.dataset.slash); });
+input.addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== input && !document.querySelector(".slash:hover")) { const el = document.querySelector(".slash"); if (el) el.remove(); } }, 150));
+
+// ================================================================ plugin badges: a dot and a few words over the top right, each opening its panel
+async function refreshBadges() {
+  let b = []; try { b = (await api("/api/plugins/badges")).badges || []; } catch {}
+  const C = { green: "ok", red: "bad", yellow: "warn", orange: "warn", gray: "faint", grey: "faint" };
+  $("badges").innerHTML = b.map((x) => `<button class="badge" ${x.url ? `data-panel="${esc(x.url)}" data-title="${esc(x.title)}"` : ""} title="${esc(x.title)}"><span class="lamp" style="background:var(--${C[x.color] || "faint"})"></span>${esc(x.text || x.title)}</button>`).join("");
+}
+$("badges").addEventListener("click", (e) => { const b = e.target.closest("[data-panel]"); if (b) openPanel(b.dataset.panel, b.dataset.title); });
+
+// ================================================================ the call model: one of its own for calls, kept loaded beside the Code
+// model when the graphics card has room for both and the voice (the server decides: /api/models/load "call")
+const callModel = () => store.get("callModel", null);
+async function loadForCall() {
+  const m = S.models, target = callModel() && (m.models || []).some((x) => x.id === callModel()) ? callModel() : null;
+  CALL.code = m.current;
+  if (target && target !== m.current) {
+    callState(`Switching to ${target} for the call…`);
+    await api("/api/models/load", { body: { id: m.current, call: target, for_call: true } });
+  } else if (!m.voice) {
+    callState("Loading the voice…");
+    await api("/api/models/load", { body: { id: m.current, voice: true } });
+  }
+  await refreshModels();
+}
+// back in Code: the Code model again, when the call took its place
+async function backToCode() {
+  const m = S.models; if (!CALL.code || !m || m.current === CALL.code || m.together) return;
+  toast(`Loading ${CALL.code} again…`);
+  try { await api("/api/models/load", { body: { id: CALL.code } }); } catch (e) { toast(e.message); }
+  refreshModels();
+}
 
 // ================================================================ start
 if (ACCESS === "signin") {
