@@ -752,6 +752,10 @@ function partHTML(p, key, live) {
     return h;
   }
   if (p.t === "note") return `<div class="note">${icon("info")}${esc(p.text)}</div>`;
+  if (p.t === "preview") { // a web page the model wrote, served at /preview/... (the server's address may be 127.0.0.1: the path is what counts)
+    let path = p.url; try { const u = new URL(p.url); path = u.pathname + u.search; } catch {}
+    return `<div class="note">${icon("globe")}Wrote a web page <a class="btn sm" href="${esc(path)}" target="_blank" rel="noopener">Open it</a></div>`;
+  }
   if (p.t === "error") return `<div class="err">${esc(p.text)}</div>`;
   return "";
 }
@@ -871,13 +875,15 @@ function drawRail() {
   // background
   const bg = S.background || {}, procs = bg.processes || [];
   const running = procs.filter((p) => p.running), done = procs.filter((p) => !p.running);
-  let b = running.map((p) => `<div class="kv"><span class="dot live"></span><span class="k" title="${esc(p.command)}">${esc(p.title || p.command)}</span><button class="btn sm" data-out="${p.id}">${S.procOut && S.procOut.id === p.id ? "Hide" : "Output"}</button></div>`).join("");
+  let b = running.map((p) => `<div class="kv"><span class="dot live"></span><span class="k" title="${esc(p.command)}">${esc(p.title || p.command)}</span><button class="btn sm" data-out="${p.id}">${S.procOut && S.procOut.id === p.id ? "Hide" : "Output"}</button><button class="ibtn" style="width:24px;height:24px" data-stop="${p.id}" aria-label="Stop it" title="Stop it">${icon("stop", 'style="width:12px;height:12px"')}</button></div>`).join("");
   if (done.length) b += `<div class="kv">${icon("list")}<span class="k">${done.length} finished</span><button class="btn sm" data-out="${done[done.length - 1].id}">${S.procOut && S.procOut.id === done[done.length - 1].id ? "Hide" : "Last output"}</button></div>`;
   if (S.procOut) b += `<div class="proc-out">${esc(S.procOut.text || "(nothing printed yet)")}</div>`;
   $("bg").innerHTML = b || `<div class="kv faint">Nothing running</div>`;
   if (typeof drawExtras === "function" && S.skills) drawExtras();
 }
 $("bg").addEventListener("click", async (e) => {
+  const s = e.target.closest("[data-stop]");
+  if (s) { try { await api("/api/tools/run", { body: { name: "stop_process", arguments: { id: +s.dataset.stop } } }); toast("Stopped"); refreshBackground(); } catch (err) { toast(err.message); } return; }
   const t = e.target.closest("[data-out]"); if (!t) return;
   const id = +t.dataset.out;
   if (S.procOut && S.procOut.id === id) { S.procOut = null; drawRail(); return; }
@@ -1043,7 +1049,7 @@ async function send(again) {
   if (!again && !text) return;
   const m = S.models;
   if (!m || !m.current) { if (m && m.loading) toast("The model is still loading"); else $("modelChip").click(); return; }
-  const body = { thinking: S.thinking, mode: S.mode, max_tokens: 16384 };
+  const body = { thinking: S.thinking, mode: S.mode, max_tokens: 16384, preview: true };
   if (S.chat && S.chat.id) body.chat = S.chat.id;
   else { const cwd = chatCwd(); if (cwd) body.cwd = cwd; S.chat = { id: null, title: null, cwd, turns: [], parts: null, tokens: 0, ctxLen: m.context_length }; }
   if (text !== null) {
@@ -1091,6 +1097,14 @@ async function send(again) {
   if (document.hidden) notify("ghost-infer finished", S.chat.title || "Your reply is ready");
 }
 function retry() { if (!S.busy && S.chat && S.chat.id) send(true); }
+// while a long prompt is read, how far it has got (the prompt's tokens read so far)
+setInterval(async () => {
+  if (!S.busy || !S.status || !/^Reading/.test(S.status) || document.hidden) return;
+  try {
+    const p = await api("/api/progress");
+    if (S.busy && /^Reading/.test(S.status || "") && p.total > 256) { S.status = `Reading ${Math.min(100, Math.round(p.done / p.total * 100))}%${p.disk ? " (from disk)" : ""}`; drawSoon(); }
+  } catch {}
+}, 600);
 function notify(title, body) { if ("Notification" in window && Notification.permission === "granted") try { new Notification(title, { body }); } catch {} }
 function onEvent(j, turn) {
   const last = turn.parts[turn.parts.length - 1];
@@ -1128,7 +1142,7 @@ function onEvent(j, turn) {
     case "error": turn.parts.push({ t: "error", text: j.message }); break;
     case "tasks": S.tasks = j.tasks || []; if (S.rail) drawExtras(); break;
     case "goal": if (j.goal) turn.parts.push({ t: "note", text: `Goal ${j.goal.state || "set"}: ${j.goal.text || ""}${j.goal.reason ? " (" + j.goal.reason + ")" : ""}` }); break;
-    case "preview": turn.parts.push({ t: "note", text: "Wrote a web page: " + j.url }); break;
+    case "preview": turn.parts.push({ t: "preview", url: j.url }); break;
   }
 }
 
@@ -1153,7 +1167,8 @@ async function drawSettings() {
   const P = $("spage");
   const head = (t, sub) => `<button class="ibtn close" id="closeSettings" aria-label="Close settings">${icon("x")}</button><h2>${t}</h2><p class="sub">${sub}</p>`;
   if (page === "general") {
-    let mem = { facts: [] }; try { mem = await api("/api/memory"); } catch {}
+    let mem = { facts: [] }, instr = []; try { mem = await api("/api/memory"); } catch {}
+    try { instr = (await api("/api/instructions")).files || []; } catch {}
     const f = S.harness.folders || [];
     P.innerHTML = head("General", `How the agent works on ${where()}.`)
       + `<div class="gtitle">New chats</div><div class="gcard">`
@@ -1168,13 +1183,23 @@ async function drawSettings() {
       + `</div>`
       + `<div class="gtitle">Memory</div><div class="gcard">`
       + ((mem.facts || []).length ? mem.facts.map((x, i) => srow(esc(x), "", `<button class="btn sm" data-forget="${i}">Forget</button>`)).join("") : srow('<span class="faint">Nothing remembered yet</span>', "What the agent saves with its remember tool shows here, for every chat", ""))
+      + `<div class="srow"><form class="field" id="addMem" style="flex:1"><input placeholder="Add something for it to remember in every chat" aria-label="A fact to remember"><button class="btn sm pri">Add</button></form></div>`
       + `</div><div class="gtitle">Server</div><div class="gcard">`
-      + srow("Warm up after a model loads", "A few short replies so the first real one is fast", sw(S.harness.warm_up !== false, "swWarm", "Warm up")) + `</div>`;
+      + srow("Warm up after a model loads", "A few short replies so the first real one is fast", sw(S.harness.warm_up !== false, "swWarm", "Warm up"))
+      + srow("Keep RAM free", S.harness.ram_floor_fixed ? "Set when the server started (--ram-floor)" : "For a mixture-of-experts model bigger than the graphics card: experts used least are let go to keep this much free. 0 is the fastest", `<span class="seg" id="floorSeg">${[0, 1, 2, 4, 6].map((g) => `<button data-v="${g}" aria-pressed="${(S.harness.ram_floor_gb ?? 2) === g}" ${S.harness.ram_floor_fixed ? "disabled" : ""}>${g} GB</button>`).join("")}</span>`)
+      + srow("Experts on the graphics card only", "A mixture-of-experts model keeps no experts in RAM: less memory, slower when they don't fit. From the next model load", sw(!!S.harness.moe_gpu_only, "swMoe", "Experts on the graphics card only")) + `</div>`
+      + `<div class="gtitle">Instructions (GHOST.md)</div><div class="gcard">`
+      + (instr.length ? instr.map((f) => srow(esc(f.scope === "global" ? "For every chat" : baseName(f.path.replace(/[\\/]GHOST\.md$/i, ""))), esc(f.path), `<span class="tag ${f.exists ? "ok" : ""}">${f.exists ? "in use" : "none yet"}</span>`)).join("") : srow('<span class="faint">None</span>', "", ""))
+      + `</div><p class="faint" style="font-size:12.5px;margin:8px 2px 0">Write a GHOST.md file there to give the agent standing instructions: the global one for every chat, one in a folder for chats working in it.</p>`;
     P.querySelector("#modeSeg").onclick = (e) => { const b = e.target.closest("[data-v]"); if (b) { S.mode = b.dataset.v; store.set("mode", S.mode); drawChips(); drawSettings(); } };
     $("swThink").onclick = () => { S.thinking = !S.thinking; store.set("thinking", S.thinking); drawChips(); drawSettings(); };
     $("swWarm").onclick = async () => { try { S.harness = await api("/api/harness", { body: { folders: f, warm_up: S.harness.warm_up === false } }); drawSettings(); } catch (e) { toast(e.message); } };
     P.querySelectorAll("[data-rmf]").forEach((b) => b.onclick = async () => { try { await setFolders(f.filter((_, i) => i !== +b.dataset.rmf)); drawSettings(); drawChips(); } catch (e) { toast(e.message); } });
     P.querySelector("#addF").onsubmit = async (e) => { e.preventDefault(); const v = e.target.querySelector("input").value.trim(); if (!v) return; try { await setFolders([...f, v]); drawSettings(); drawChips(); } catch (err) { toast(err.message); } };
+    P.querySelector("#addMem").onsubmit = async (e) => { e.preventDefault(); const v = e.target.querySelector("input").value.trim(); if (!v) return; try { await api("/api/memory/add", { body: { fact: v } }); drawSettings(); } catch (err) { toast(err.message); } };
+    const fs = P.querySelector("#floorSeg");
+    if (fs) fs.onclick = async (e) => { const b = e.target.closest("[data-v]"); if (!b || b.disabled) return; try { S.harness = await api("/api/harness", { body: { folders: f, ram_floor_gb: +b.dataset.v } }); drawSettings(); } catch (err) { toast(err.message); } };
+    $("swMoe").onclick = async () => { try { S.harness = await api("/api/harness", { body: { folders: f, moe_gpu_only: !S.harness.moe_gpu_only } }); drawSettings(); } catch (err) { toast(err.message); } };
     P.querySelectorAll("[data-unalways]").forEach((b) => b.onclick = async () => {
       try { S.harness = await api("/api/harness", { body: { folders: f, always: (S.harness.always || []).filter((g) => g !== b.dataset.unalways) } }); drawSettings(); } catch (e) { toast(e.message); }
     });
@@ -1369,9 +1394,9 @@ function drawExtras() {
   const tasks = S.tasks || [];
   $("cardTasks").hidden = !tasks.length;
   if (tasks.length) {
-    const done = tasks.filter((t) => t.status === "completed").length;
+    const done = tasks.filter((t) => t.status === "done").length;
     $("tasksNote").textContent = `${done}/${tasks.length}`;
-    $("tasks").innerHTML = tasks.map((t) => `<div class="kv ${t.status === "completed" ? "task-done" : ""}">${t.status === "in_progress" ? '<span class="spin"></span>' : icon(t.status === "completed" ? "check" : "list", t.status === "completed" ? 'style="color:var(--ok)"' : "")}<span class="k" title="${esc(t.text)}">${esc(t.text)}</span></div>`).join("");
+    $("tasks").innerHTML = tasks.map((t) => `<div class="kv ${t.status === "done" ? "task-done" : ""}">${t.status === "in_progress" ? '<span class="spin"></span>' : icon(t.status === "done" ? "check" : "list", t.status === "done" ? 'style="color:var(--ok)"' : "")}<span class="k" title="${esc(t.text)}">${esc(t.text)}</span></div>`).join("");
   }
   // scheduled: the tasks the model set and the /loop ones
   const bg = S.background || {}, jobs = bg.jobs || [];
@@ -1388,8 +1413,11 @@ function drawExtras() {
       + S.skillChoices.choose.map((c) => `<div class="kv">${icon("skill")}<span class="k" title="${esc(c.description)}">${esc(c.name)} <span class="faint">· ${esc(c.description)}</span></span><button class="lk" data-pick="${esc(c.path)}">Install</button></div>`).join("")
       + `<div class="lks"><button class="lk" data-pick="__all">Install all</button><button class="lk" data-pick="__cancel">Cancel</button></div>`;
   }
-  sk += `<form id="skillForm"><input class="mini" placeholder="Install: GitHub link, .zip or folder" title="A GitHub link, a .zip link, or a folder on the server" spellcheck="false" aria-label="Skill link"></form>`;
+  // the link box survives the rail's redraws: what is typed in it, and whether it has the focus
+  const box = $("skills").querySelector("#skillForm input"), typedLink = box ? box.value : "", focused = box && document.activeElement === box;
+  sk += `<form id="skillForm"><input class="mini" placeholder="Install: GitHub link, .zip or folder" title="A GitHub link, a .zip link, or a folder on the server" spellcheck="false" aria-label="Skill link" value="${esc(typedLink)}"></form>`;
   $("skills").innerHTML = sk;
+  if (focused) { const i = $("skills").querySelector("#skillForm input"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
   // MCP servers
   const servers = S.mcp.servers || [];
   const ready = servers.filter((m) => m.status === "ready").length, broken = servers.filter((m) => m.status !== "ready" && m.status !== "starting").length;
@@ -1554,7 +1582,7 @@ drawSettings = async function () {
 // (/v1/audio/transcriptions), sent to Maya (/api/agent, persona "maya", no tools), her reply spoken a sentence
 // at a time as it is written (/v1/audio/speech, 24 kHz PCM), in the chat's voice context. The browser's echo
 // canceller lets the user talk over her; afterwards she thinks the call over (/api/maya/reflect).
-const CALL = { on: false, chat: null, topic: 0, started: 0, muted: false, ctx: null, mic: null, node: null, speaking: 0, playEnd: 0, sources: [], turn: 0, busy: null, cut: null, quietSince: 0, nudges: 0, said: [], lines: [] };
+const CALL = { on: false, chat: null, topic: 0, started: 0, muted: false, ctx: null, mic: null, node: null, speaking: 0, playEnd: 0, sources: [], turn: 0, busy: null, cut: null, quietSince: 0, nudges: 0, said: [], pieces: [], lines: [] };
 const OPENING = "(The call has just connected. Say hello your way.)", QUIET = "(They have gone quiet. Your turn: say something of your own.)";
 const callGhost = pixelGhost($("callGhost"));
 function setView(v) {
@@ -1620,6 +1648,17 @@ function playPcm(bytes, turn) {
   const at = Math.max(CALL.ctx.currentTime + 0.03, CALL.playEnd);
   src.start(at); CALL.playEnd = at + buf.duration; CALL.sources.push(src);
   src.onended = () => { CALL.sources = CALL.sources.filter((s) => s !== src); };
+  return [at, CALL.playEnd];
+}
+// the words she had said when she was cut off: the pieces played, and of the one playing its share (as call.rs)
+function heardSoFar() {
+  const now = CALL.ctx ? CALL.ctx.currentTime : 0, out = [];
+  for (const p of CALL.pieces) {
+    if (p.end <= now) { out.push(p.text); continue; }
+    if (p.start < now) { const w = p.text.split(/\s+/); out.push(w.slice(0, Math.floor((now - p.start) / (p.end - p.start) * w.length)).join(" ")); }
+    break;
+  }
+  return withoutTags(out.join(" "));
 }
 const queued = () => CALL.ctx ? Math.max(0, CALL.playEnd - CALL.ctx.currentTime) : 0;
 function stopVoice() { CALL.turn++; for (const s of CALL.sources) try { s.stop(); } catch {} CALL.sources = []; CALL.playEnd = 0; }
@@ -1633,14 +1672,15 @@ function say(text, turn) {
       const r = await fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json", "X-Ghost-Token": TOKEN }, credentials: "same-origin",
         body: JSON.stringify({ input: text, voice: "maya", response_format: "pcm", conversation: CALL.chat || "" }) });
       if (!r.ok) throw new Error(`the voice failed (HTTP ${r.status})`);
-      const reader = r.body.getReader(); let odd = null;
+      const reader = r.body.getReader(); let odd = null, piece = null;
       if (!CALL.firstAudio) CALL.firstAudio = performance.now();
       for (;;) {
         const { value, done } = await reader.read(); if (done) break;
         if (turn !== CALL.turn) { reader.cancel().catch(() => {}); break; }
         let b = value; if (odd) { const j = new Uint8Array(b.length + 1); j[0] = odd; j.set(b, 1); b = j; odd = null; }
         if (b.length % 2) { odd = b[b.length - 1]; b = b.subarray(0, b.length - 1); }
-        playPcm(b, turn);
+        const span = playPcm(b, turn);
+        if (span) { if (!piece) { piece = { text, start: span[0], end: span[1] }; CALL.pieces.push(piece); } else piece.end = span[1]; }
       }
     } catch (e) { callLine("err", e.message); }
   }).finally(() => CALL.speaking--);
@@ -1702,9 +1742,9 @@ function onHeard(h) {
 }
 function cutOff() {
   if (CALL.busy) CALL.busy.abort();
-  const said = CALL.said.join(" ");
-  CALL.cut = said ? withoutTags(said) : CALL.cut;
-  stopVoice(); CALL.speaking = 0; sayChain = Promise.resolve();
+  // only cut when she had begun to answer: the server keeps her reply as far as it was heard
+  if (CALL.pieces.length || CALL.busy) CALL.cut = heardSoFar();
+  stopVoice(); CALL.pieces = []; sayChain = Promise.resolve(); // (pieces still queued see the new turn, and count themselves out)
 }
 let pumping = false;
 async function pump() {
@@ -1742,7 +1782,7 @@ async function turn(text, auto) {
   if (CALL.chat) body.chat = CALL.chat;
   if (auto) body.auto = true;
   if (CALL.cut) { body.cut = CALL.cut; CALL.cut = null; }
-  const ctrl = new AbortController(); CALL.busy = ctrl; CALL.said = []; CALL.firstAudio = 0;
+  const ctrl = new AbortController(); CALL.busy = ctrl; CALL.said = []; CALL.pieces = []; CALL.firstAudio = 0;
   const st = { said: 0 }, t0 = performance.now(); let raw = "", firstText = 0;
   callState("Thinking"); callGhost.set("thinking");
   try {
@@ -1795,7 +1835,11 @@ async function startCall() {
   try {
     CALL.ctx = new AudioContext(); await CALL.ctx.resume();
     CALL.mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
-  } catch (e) { $("callStart").disabled = false; callLine("err", "No microphone: " + e.message); if (CALL.ctx) CALL.ctx.close(); CALL.ctx = null; return; }
+  } catch (e) {
+    $("callStart").disabled = false;
+    callLine("err", e.name === "NotAllowedError" ? "The browser didn't allow the microphone. Allow it for this site (the address bar's icon), then start the call again." : e.name === "NotFoundError" ? "No microphone found." : "The microphone didn't start: " + e.message);
+    if (CALL.ctx) CALL.ctx.close(); CALL.ctx = null; return;
+  }
   if (!m.voice) {
     callState("Loading the voice…"); callGhost.set("thinking");
     try { await api("/api/models/load", { body: { id: m.current, voice: true } }); await refreshModels(); } catch (e) { callLine("err", "The voice didn't load: " + e.message); }
