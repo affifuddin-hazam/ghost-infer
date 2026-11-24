@@ -24,7 +24,7 @@ const START: Duration = Duration::from_secs(90);
 const CALL: Duration = Duration::from_secs(300);
 
 pub fn config_file() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer")).ok_or("LOCALAPPDATA is not set")?;
+    let d = crate::paths::data_dir().ok_or(crate::paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     Ok(d.join("mcp.json"))
 }
@@ -160,8 +160,7 @@ fn servers() -> &'static Mutex<Vec<Arc<Mutex<Server>>>> {
 /// The server process, started without a window. A command Windows cannot start by itself (npx, uvx: they
 /// are .cmd files) goes through cmd.
 fn spawn(name: &str, cfg: &Json) -> Result<Conn, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    use crate::platform::NoConsole;
     let command = cfg.get("command").and_then(Json::as_str).ok_or("no command")?;
     let args: Vec<String> = cfg.get("args").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
     let env: Vec<(String, String)> = match cfg.get("env") {
@@ -179,7 +178,7 @@ fn spawn(name: &str, cfg: &Json) -> Result<Conn, String> {
             c.arg("/C").arg(command).args(&args);
             c
         };
-        c.envs(env.iter().cloned()).stdin(Stdio::piped()).stdout(Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
+        c.envs(env.iter().cloned()).stdin(Stdio::piped()).stdout(Stdio::piped()).no_console();
         if let Some(d) = cfg.get("cwd").and_then(Json::as_str) {
             c.current_dir(d);
         }
@@ -235,7 +234,7 @@ fn start(name: &str, cfg: &Json) -> Result<(Conn, Vec<Json>), String> {
         // code 0: our own error (the process ended), not the server's
         Err(Some(e)) if e.code == 0 => {
             conn.stop();
-            return Err("it stopped as it started (see its log in %LOCALAPPDATA%\\ghost-infer)".into());
+            return Err("it stopped as it started (see its log in the ghost-infer data directory)".into());
         }
         // anything else: a legacy server, which wants the initialize handshake
         Err(_) => {

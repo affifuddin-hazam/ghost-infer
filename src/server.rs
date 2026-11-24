@@ -713,9 +713,10 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
         let _ = job.events.send(Event::Error(400, format!("the prompt has {} tokens; the context holds {ctx}", ids.len())));
         return;
     }
-    // reuse the cache for the part of the prompt it already holds (at least one token is read anew,
-    // which gives the logits for the first reply token)
-    let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
+    // the caches go to the conversation this prompt continues (one parked in system memory comes back, the one
+    // they held is parked when it is another: Engine::adopt); then the part of the prompt they hold is reused
+    // (at least one token is read anew, which gives the logits for the first reply token)
+    let keep = engine.adopt(&ids).min(ids.len() - 1);
     // the prompt rewrote what the cache read (a reply written back differently, an edited message): where, as a
     // recurrent model then goes back to a snapshot before it and reads the rest again
     if keep + 64 < engine.hist.len() && keep + 1 < ids.len() {

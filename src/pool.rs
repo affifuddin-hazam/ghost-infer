@@ -91,6 +91,9 @@ impl Pool {
 /// spinning would hold whole cores against the programs the user is working in (and against this
 /// process's own expert uploads). GHOST_INFER_POOL_PRIORITY=normal keeps them at normal priority.
 fn lower_priority() {
+    if std::env::var("GHOST_INFER_POOL_PRIORITY").is_ok_and(|v| v == "normal") {
+        return;
+    }
     #[cfg(windows)]
     {
         #[link(name = "kernel32")]
@@ -99,16 +102,33 @@ fn lower_priority() {
             fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
         }
         const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
-        if std::env::var("GHOST_INFER_POOL_PRIORITY").map_or(true, |v| v != "normal") {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    }
+    #[cfg(unix)]
+    {
+        // PRIO_PROCESS with who=0 nicens the calling thread on Linux (threads are
+        // tasks with their own TID). +1 matches Windows' BELOW_NORMAL closely: a
+        // single nudge down so the workers yield to interactive processes without
+        // being preempted while they spin between layers.
+        const PRIO_PROCESS: i32 = 0;
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
         }
+        unsafe { setpriority(PRIO_PROCESS, 0, 1) };
     }
 }
 
 /// Worker i on its own physical core (logical CPU 2i: Windows numbers a core's two hyper-threads next to each
 /// other), so two workers never share one: a parallel pass is as slow as its slowest thread. Only when the
-/// pool has at most one thread per core; GHOST_INFER_POOL_PIN=0 leaves placement to Windows.
+/// pool has at most one thread per core; GHOST_INFER_POOL_PIN=0 leaves placement to the OS.
 fn pin(i: usize, n: usize) {
+    if std::env::var("GHOST_INFER_POOL_PIN").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let logical = thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    if 2 * n > logical {
+        return;
+    }
     #[cfg(windows)]
     {
         #[link(name = "kernel32")]
@@ -116,14 +136,97 @@ fn pin(i: usize, n: usize) {
             fn GetCurrentThread() -> *mut std::ffi::c_void;
             fn SetThreadAffinityMask(thread: *mut std::ffi::c_void, mask: usize) -> usize;
         }
-        let logical = thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
-        if std::env::var("GHOST_INFER_POOL_PIN").is_ok_and(|v| v == "0") || 2 * n > logical || 2 * i >= usize::BITS as usize {
+        if 2 * i >= usize::BITS as usize {
             return;
         }
         // the caller (thread 0) on core 0, both its hyper-threads allowed; workers on cores 1..n
         let mask = if i == 0 { 3usize } else { 1usize << (2 * i) };
         unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
     }
+    #[cfg(unix)]
+    {
+        // Linux picks logical CPU ids however the firmware wants, not the "siblings next
+        // to each other" that Windows assumes. Read /sys/devices/system/cpu/.../topology
+        // to get a physical-core -> sibling-list map: the caller on all siblings of core
+        // 0, each worker on the first sibling of core i.
+        let cores = physical_cores();
+        let Some(siblings) = cores.get(i) else { return };
+        let cpus: &[usize] = if i == 0 { siblings } else { &siblings[..1] };
+        unix::set_affinity(cpus);
+    }
+}
+
+#[cfg(unix)]
+mod unix {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[link(name = "pthread")]
+    unsafe extern "C" {
+        fn pthread_self() -> *mut c_void;
+        fn pthread_setaffinity_np(thread: *mut c_void, size: usize, set: *const CpuSet) -> i32;
+    }
+
+    // glibc's cpu_set_t is 128 bytes (1024 CPU bits). Oversized here is fine; the kernel
+    // reads what we pass, nothing more. Any extra bits are zeroed and simply ignored.
+    #[repr(C)]
+    pub(super) struct CpuSet {
+        pub(super) bits: [u64; 16],
+    }
+
+    /// Pin the calling thread to the given logical CPU ids.
+    pub(super) fn set_affinity(cpus: &[usize]) {
+        let mut set = CpuSet { bits: [0; 16] };
+        for &c in cpus {
+            if c < 64 * set.bits.len() {
+                set.bits[c / 64] |= 1u64 << (c % 64);
+            }
+        }
+        let _ = unsafe { pthread_setaffinity_np(pthread_self(), std::mem::size_of::<CpuSet>(), &set) };
+    }
+
+    /// First numeric id in a cpu-list file content like "0,8", "0-1,4-5" or "0".
+    fn parse_cpu_list(s: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for part in s.trim().split(',') {
+            if let Some((a, b)) = part.split_once('-') {
+                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    out.extend(a..=b);
+                }
+            } else if let Ok(a) = part.parse::<usize>() {
+                out.push(a);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// For each physical core on this machine, the list of logical CPU ids that share
+    /// it (SMT siblings), in the order the kernel reports them. Cached on first call.
+    pub(super) fn physical_cores() -> &'static [Vec<usize>] {
+        static CORES: OnceLock<Vec<Vec<usize>>> = OnceLock::new();
+        CORES.get_or_init(|| {
+            let mut seen: Vec<Vec<usize>> = Vec::new();
+            for cpu in 0..4096 {
+                let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+                let Ok(s) = std::fs::read_to_string(&path) else { break };
+                let siblings = parse_cpu_list(&s);
+                if siblings.is_empty() {
+                    continue;
+                }
+                if !seen.iter().any(|existing| existing == &siblings) {
+                    seen.push(siblings);
+                }
+            }
+            seen
+        })
+    }
+}
+
+#[cfg(unix)]
+pub fn physical_cores() -> &'static [Vec<usize>] {
+    unix::physical_cores()
 }
 
 thread_local! {

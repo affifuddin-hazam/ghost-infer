@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::json::{num, obj, str, Json};
+use crate::paths;
 
 /// Characters a tool result may hand the model; longer ones keep their start and end.
 pub const MAX_RESULT: usize = 16_000;
@@ -47,26 +48,26 @@ impl Default for Settings {
     }
 }
 
-/// Where installed skills live (%LOCALAPPDATA%\ghost-infer\skills): the file tools may read there, and
-/// commands may run there (for a skill's scripts), but nothing is written there except by installing.
+/// Where installed skills live (`<data_dir>/skills`): the file tools may read there, and commands may run
+/// there (for a skill's scripts), but nothing is written there except by installing.
 pub fn skills_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("skills"))
+    paths::data_dir().map(|d| d.join("skills"))
 }
 
 /// The plugins ghost wrote for itself (server/plugins.rs): readable by the file tools, so a broken one can be
 /// read and fixed, but written only through plugin_manager (whose saves the user approves).
 pub fn plugins_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("plugins"))
+    paths::data_dir().map(|d| d.join("plugins"))
 }
 
 /// Where tool outputs too long for the model's context are saved, a folder per chat
-/// (%LOCALAPPDATA%\ghost-infer\outputs): the file tools may read there, as in the skills folder.
+/// (`<data_dir>/outputs`): the file tools may read there, as in the skills folder.
 pub fn outputs_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("outputs"))
+    paths::data_dir().map(|d| d.join("outputs"))
 }
 
 fn settings_file() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("harness.json"))
+    paths::data_dir().map(|d| d.join("harness.json"))
 }
 
 impl Settings {
@@ -87,7 +88,7 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = settings_file().ok_or("LOCALAPPDATA is not set")?;
+        let path = settings_file().ok_or(paths::NO_DATA_DIR)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -390,10 +391,10 @@ fn search_files(s: &Settings, pattern: &str, dir: &Path, glob: Option<&str>, ign
 
 // ---- changing files, with undo
 
-/// Where file changes are journalled for undo: %LOCALAPPDATA%\ghost-infer\checkpoints, one line per change
+/// Where file changes are journalled for undo: `<data_dir>/checkpoints`, one line per change
 /// in journal.txt (checkpoint, sequence, path, whether the file existed) and the old content in <seq>.bak.
 fn journal_dir() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("checkpoints")).ok_or("LOCALAPPDATA is not set")?;
+    let d = paths::data_dir().map(|d| d.join("checkpoints")).ok_or(paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     Ok(d)
 }
@@ -596,10 +597,11 @@ fn and_chains(command: &str) -> String {
     out
 }
 
-/// `command` in Windows PowerShell, started in `cwd`, stdout and stderr captured together.
+/// `command` in Windows PowerShell (or `/bin/sh -c` on Unix), started in `cwd`,
+/// stdout and stderr captured together.
+#[cfg(windows)]
 fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    use crate::platform::NoConsole;
     Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
         .arg(format!("{PREAMBLE}\n{}", and_chains(command)))
@@ -607,9 +609,25 @@ fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
+        .no_console()
         .spawn()
         .map_err(|e| format!("cannot start PowerShell: {e}"))
+}
+
+#[cfg(not(windows))]
+fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
+    // sh understands && and || natively; the Windows and_chains() rewrite and the
+    // PowerShell PREAMBLE are both Windows-only. Silence the unused warnings.
+    let _ = (PREAMBLE, and_chains as fn(&str) -> String);
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start /bin/sh: {e}"))
 }
 
 /// Reads a child's stdout and stderr on two threads into one shared buffer, keeping its last `keep` bytes.
@@ -645,10 +663,20 @@ fn collect_counted(child: &mut std::process::Child, keep: usize) -> (std::sync::
     (buf, total)
 }
 
-/// Ends a process and everything it started (taskkill /T), by process id.
+/// Ends a process and everything it started (taskkill /T on Windows, kill on Unix),
+/// by process id.
+#[cfg(windows)]
 fn kill_tree(pid: u32) {
-    use std::os::windows::process::CommandExt;
-    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(0x0800_0000).output();
+    use crate::platform::NoConsole;
+    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).no_console().output();
+}
+
+#[cfg(not(windows))]
+fn kill_tree(pid: u32) {
+    // taskkill /T walks Windows' job object; on Unix the nearest equivalent is
+    // killing the process group, but the server does not call setsid on children
+    // yet, so fall back to signalling the direct child. Phase 5 refactors this.
+    let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
 }
 
 /// Runs a command to completion (or `secs`), then its exit code and output.
@@ -828,24 +856,24 @@ pub fn process_output(id: usize) -> Option<String> {
     Some(clip(&text_of(&out), MAX_RESULT))
 }
 
-// ---- web (through Windows' own curl.exe: no TLS library here)
+// ---- web (through the system `curl`: no TLS library linked here)
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 
 /// GET `url` (http or https), at most 5 MB in 20 s: the body and its Content-Type.
 fn http_get(url: &str) -> Result<(Vec<u8>, String), String> {
-    use std::os::windows::process::CommandExt;
+    use crate::platform::{NoConsole, CURL};
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("{url} is not an http(s) address"));
     }
     const MARK: &[u8] = b"\n__ghost_infer_content_type__:";
-    let out = Command::new("curl.exe")
+    let out = Command::new(CURL)
         .args(["-sSL", "--compressed", "--max-time", "20", "--max-filesize", "5000000", "-A", USER_AGENT, "-w"])
         .arg(format!("{}%{{content_type}}", String::from_utf8_lossy(MARK)))
         .arg(url)
-        .creation_flags(0x0800_0000)
+        .no_console()
         .output()
-        .map_err(|e| format!("cannot run curl.exe: {e}"))?;
+        .map_err(|e| format!("cannot run {CURL}: {e}"))?;
     if !out.status.success() {
         return Err(format!("could not fetch {url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -1082,11 +1110,16 @@ pub fn status(s: &Settings) -> Json {
 mod tests {
     use super::*;
 
-    /// The id start_process gave, from its answer.
+    /// The id start_process gave, from its answer. Only used by the PowerShell tests below,
+    /// which are gated to Windows; dead on Unix.
+    #[cfg(windows)]
     fn started(answer: &str) -> usize {
         answer.split_whitespace().nth(3).and_then(|n| n.trim_end_matches(';').parse().ok()).unwrap()
     }
 
+    // Uses PowerShell cmdlets; on Unix the equivalent would be rewritten against sh.
+    // Phase 5 of the Linux port scopes shell() but leaves the Windows-authored test alone.
+    #[cfg(windows)]
     #[test]
     fn check_process_waits_for_news_and_tells_how_it_ended() {
         let dir = std::env::temp_dir();
@@ -1101,6 +1134,10 @@ mod tests {
         assert!(end.contains("finished after") && end.contains("exit code 3"), "{end}");
     }
 
+    // Uses a PowerShell range pipeline (1..20000 | ForEach-Object {...}); the
+    // sh fallback on Unix would need a different fixture. Phase 5 of the Linux
+    // port scopes shell() but leaves the Windows-authored test alone.
+    #[cfg(windows)]
     #[test]
     fn new_output_shows_after_the_kept_tail_is_full() {
         let dir = std::env::temp_dir();
@@ -1168,6 +1205,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn and_chains_in_powershell() {
         assert_eq!(and_chains("cd site && dir"), "cd site; if ($?) { dir }");
         assert_eq!(and_chains("a && b && c"), "a; if ($?) { b; if ($?) { c } }");
@@ -1190,7 +1228,11 @@ mod tests {
         assert!(s.resolve("sub/new.txt").is_ok());
         assert!(s.resolve("..").is_err());
         assert!(s.resolve("sub/../../x").is_err());
+        // Each platform's "obviously absolute, obviously outside" sentinel.
+        #[cfg(windows)]
         assert!(s.resolve(r"C:\Windows\win.ini").is_err());
+        #[cfg(unix)]
+        assert!(s.resolve("/etc/hostname").is_err());
         assert!(Settings::default().resolve("a").is_err());
     }
 }

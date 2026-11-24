@@ -3,7 +3,9 @@
 </p>
 
 <h1 align="center">ghost-infer</h1>
-
+<p align="center">
+  <a href="https://trendshift.io/repositories/351446?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-351446" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/351446/daily?language=HTML" alt="affifuddin-hazam%2Fghost-infer | Trendshift" width="250" height="55"/></a>
+</p>
 <p align="center">
   <b>Fast local LLM inference for the GPU you already have.</b><br>
   One small Rust program that runs GGUF models on an NVIDIA card, serves an OpenAI-compatible API,<br>
