@@ -1127,8 +1127,18 @@ __device__ __forceinline__ void q8_dp4a(DP4A_PARAMS) {
 // rows); lane T holds the weights of row T/4 of a row tile and the activations of token T/4 of the token tile,
 // and owns the results of row T/4 for tokens 2 (T%4) and 2 (T%4) + 1. The chains of super-blocks go one at a
 // time, so a result needs only its pairs' accumulators and what the chain tree has summed so far.
+// Tensor-core instructions (mma.sync, ldmatrix) exist from sm_75 on. Older GPUs (the GTX 10 series, sm_61)
+// compile this same module: there the kernels that use them build as stubs, never launched (Kernels::load
+// leaves every tensor-core kernel out below sm_75), so ptxas accepts the module.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
+#define MMA_S8(c0, c1, a, b) asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};" : "+r"(c0), "+r"(c1) : "r"(a), "r"(b))
+#define LDSM4(r0, r1, r2, r3, addr) asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr))
+#else
+#define MMA_S8(c0, c1, a, b) __trap()
+#define LDSM4(r0, r1, r2, r3, addr) __trap()
+#endif
 __device__ __forceinline__ void mma_s8(int a, int b, int& c0, int& c1) {
-    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};" : "+r"(c0), "+r"(c1) : "r"(a), "r"(b));
+    MMA_S8(c0, c1, a, b);
 }
 #define VFY_ROWS 32
 #define VFY_SC 12 // floats per staged token's 8 block scales (padded: bank spread)
@@ -2392,12 +2402,17 @@ __device__ __forceinline__ uint2 i8x4_to_h4(unsigned w) {
     return make_uint2(lo, hi);
 }
 #endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#define MMA_F16(c, a0, a1, b) __trap()
+#define LDSM_X4(r, addr, trans) __trap()
+#else
 #define MMA_F16(c, a0, a1, b) \
     asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};" \
         : "+f"((c)[0]), "+f"((c)[1]), "+f"((c)[2]), "+f"((c)[3]) : "r"(a0), "r"(a1), "r"(b))
 #define LDSM_X4(r, addr, trans) \
     asm volatile("ldmatrix.sync.aligned.m8n8.x4" trans ".shared.b16 {%0,%1,%2,%3}, [%4];" \
                  : "=r"((r)[0]), "=r"((r)[1]), "=r"((r)[2]), "=r"((r)[3]) : "r"(addr))
+#endif
 
 // Tensor-core version of attention_prefill (sm_75+, FlashAttention-2 style): one block per (head, 64
 // query tokens), 4 warps of 16 query rows. Q, K and V go through f16 m16n8k8 mma with f32 accumulators:
@@ -3148,8 +3163,7 @@ __global__ void matmul_mma(int fmt, const unsigned char* __restrict__ wq, const 
                 for (int i = 0; i < 4; i++)
                     #pragma unroll
                     for (int j = 0; j < 4; j++)
-                        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
-                            : "+r"(c[i][j][0]), "+r"(c[i][j][1]) : "r"(a[i]), "r"(bq[j]));
+                        MMA_S8(c[i][j][0], c[i][j][1], a[i], bq[j]);
                 // Q6_K has a scale per 16 values (one k16 step): fold in each half separately.
                 // Q8_0 / Q4_K have one scale per 32: integers keep accumulating, folded in once below.
                 if (fmt == 2) {
@@ -3391,10 +3405,8 @@ __device__ void mma_kquant(const unsigned char* __restrict__ wq, const float* __
     auto frags = [&](int kb, int buf) {
         #pragma unroll
         for (int h = 0; h < 2; h++) {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(fa[buf][0][h]), "=r"(fa[buf][1][h]), "=r"(fa[buf][2][h]), "=r"(fa[buf][3][h]) : "r"(lda + (kb * 8 + h * 4) * 4));
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(fb[buf][0][h]), "=r"(fb[buf][1][h]), "=r"(fb[buf][2][h]), "=r"(fb[buf][3][h]) : "r"(ldb + (kb * 8 + h * 4) * 4));
+            LDSM4(fa[buf][0][h], fa[buf][1][h], fa[buf][2][h], fa[buf][3][h], lda + (kb * 8 + h * 4) * 4);
+            LDSM4(fb[buf][0][h], fb[buf][1][h], fb[buf][2][h], fb[buf][3][h], ldb + (kb * 8 + h * 4) * 4);
         }
     };
 
@@ -3429,8 +3441,7 @@ __device__ void mma_kquant(const unsigned char* __restrict__ wq, const float* __
                         int c0 = 0, c1 = 0;
                         #pragma unroll
                         for (int h = 0; h < 2; h++)
-                            asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
-                                : "+r"(c0), "+r"(c1) : "r"(a[i][h]), "r"(bq[j][h]));
+                            MMA_S8(c0, c1, a[i][h], bq[j][h]);
                         iacc[i][j][0] += sc * c0;
                         iacc[i][j][1] += sc * c1;
                     } else {
@@ -3439,8 +3450,7 @@ __device__ void mma_kquant(const unsigned char* __restrict__ wq, const float* __
                         for (int h = 0; h < 2; h++) {
                             int sc = (int)(signed char)(scw[i][(FMT - 1) * (kb >> 1)] >> (8 * ((2 * kb + h) & 3)));
                             int c0 = 0, c1 = 0;
-                            asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
-                                : "+r"(c0), "+r"(c1) : "r"(a[i][h]), "r"(bq[j][h]));
+                            MMA_S8(c0, c1, a[i][h], bq[j][h]);
                             iacc[i][j][0] += sc * c0;
                             iacc[i][j][1] += sc * c1;
                         }
@@ -3464,11 +3474,9 @@ __device__ void mma_kquant(const unsigned char* __restrict__ wq, const float* __
                     if (FMT == 1) {
                         int tb = wt + j * 8 + fr; // B fragment: column = token
                         int bh = fk < nf ? xbs[tb][fk] : 0, bl = fk < nf ? xbs[tb][nf + fk] : 0;
-                        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
-                            : "+r"(m0), "+r"(m1) : "r"(ma), "r"(bh));
+                        MMA_S8(m0, m1, ma, bh);
                         m0 *= 64; m1 *= 64;
-                        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
-                            : "+r"(m0), "+r"(m1) : "r"(ma), "r"(bl));
+                        MMA_S8(m0, m1, ma, bl);
                     }
                     acc[i][j][0] += D0 * (d * (float)iacc[i][j][0] - dm * (float)m0);
                     acc[i][j][1] += D1 * (d * (float)iacc[i][j][1] - dm * (float)m1);
@@ -5463,8 +5471,11 @@ impl Kernels {
     /// options, NVRTC and GPU match a previous run, else compiled with NVRTC (seconds) and cached.
     /// GHOST_INFER_NO_KERNEL_CACHE=1 always compiles.
     fn binary(a: &Api, kv4: bool) -> Result<Vec<u8>, String> {
+        // GHOST_INFER_CUDA_ARCH=61 compiles for another architecture (checks an older GPU's build; the module
+        // then will not load on this one)
+        let arch = std::env::var("GHOST_INFER_CUDA_ARCH").unwrap_or_else(|_| format!("{}{}", a.compute.0, a.compute.1));
         let mut opts = vec![
-            format!("--gpu-architecture=sm_{}{}", a.compute.0, a.compute.1),
+            format!("--gpu-architecture=sm_{arch}"),
             "-std=c++14".into(),
             format!("-DRPW={}", kq_rpw()),
             format!("-DATT_CHUNK_CAP={}", att_chunk_cap()),

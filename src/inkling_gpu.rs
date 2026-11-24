@@ -826,7 +826,9 @@ __global__ void ink_await(volatile const int* ack, const int* posp, int h, volat
     const long long t0 = clock64();
     while (*ack != want) {
         if (clock64() - t0 > 1200000000LL) { *err = want; return; }
+#if __CUDA_ARCH__ >= 700
         __nanosleep(200);
+#endif
     }
 }
 
@@ -875,7 +877,8 @@ impl InkKernels {
     fn load() -> Result<InkKernels, String> {
         let a = api()?;
         let f = &a.f;
-        let opts = [format!("--gpu-architecture=sm_{}{}", a.compute.0, a.compute.1), "-std=c++14".to_string()];
+        let arch = std::env::var("GHOST_INFER_CUDA_ARCH").unwrap_or_else(|_| format!("{}{}", a.compute.0, a.compute.1));
+        let opts = [format!("--gpu-architecture=sm_{arch}"), "-std=c++14".to_string()];
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
