@@ -19,9 +19,14 @@ target\release\ghost-infer serve models\Qwen3-8B-Q4_K_M.gguf --gpu
 Open <http://127.0.0.1:8080> to chat, or point any OpenAI client at `http://127.0.0.1:8080/v1`. The
 other GGUF files in the same folder appear in the chat page's model picker.
 
-Requirements: Windows 10/11, an NVIDIA GPU with compute capability 6.1 or newer (GTX 10-series and
+Requirements: Windows 10/11 or Linux, an NVIDIA GPU with compute capability 6.1 or newer (GTX 10-series and
 later), a current driver, and, built from source, the CUDA toolkit's NVRTC library (see
 [GPU requirements](#gpu-requirements)). Without `--gpu` it runs on the CPU (AVX2).
+
+On Linux the commands are the same (`target/release/ghost-infer serve models/Qwen3-8B-Q4_K_M.gguf --gpu`). A
+plain `cargo build` builds the engine and server only; the desktop app is Windows-only, and the browser chat
+page is the interface. Data (chats, settings, models, the kernel cache) goes in `$XDG_DATA_HOME/ghost-infer`
+(else `~/.local/share/ghost-infer`) and `$XDG_CACHE_HOME/ghost-infer` (else `~/.cache/ghost-infer`).
 
 ## The installer
 
@@ -38,10 +43,10 @@ choose to remove them.
 - NVRTC 11.1 or newer. The installer ships it; built from source, it comes from a
   [CUDA toolkit](https://developer.nvidia.com/cuda-downloads). ghost-infer takes the one named by
   `GHOST_INFER_NVRTC`, else an `nvrtc64_*.dll` beside the program, else the newest under
-  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin`. Compiled kernels are cached in
-  `%LOCALAPPDATA%\ghost-infer\kernels` (about 0.6 MB), so only the first start after an update or a GPU
-  change compiles them.
-- Windows only for now (Linux is on the roadmap).
+  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin`. On Linux it looks in `$GHOST_INFER_NVRTC`,
+  `$CUDA_PATH`, `/opt/cuda`, `/usr/local/cuda*` and the system library folders for `libnvrtc.so`. Compiled
+  kernels are cached in `%LOCALAPPDATA%\ghost-infer\kernels` (about 0.6 MB), so only the first start after an
+  update or a GPU change compiles them.
 
 `.cargo/config.toml` builds with `target-cpu=native`, so the binary is tuned for the machine that built
 it. [`scripts/build-installer.ps1`](../scripts/build-installer.ps1) builds for any CPU with AVX2 and FMA
@@ -52,9 +57,13 @@ it. [`scripts/build-installer.ps1`](../scripts/build-installer.ps1) builds for a
 | | |
 |---|---|
 | Architectures | Llama, Qwen3, Qwen3-MoE, DeepSeek-style models such as GLM-4.7-Flash, Qwen3-Next such as Qwen3-Coder-Next, and Qwen3.5 / Qwen3.6 mixtures of experts such as Qwen3.6-35B-A3B (`general.architecture` `llama`, `qwen3`, `qwen3moe`, `deepseek2`, `qwen3next`, `qwen35moe`; on the GPU, `deepseek2` with a 512-wide latent and up to 32 heads, `qwen3next` and `qwen35moe` with 128-wide DeltaNet heads; text only) |
-| Weight formats | Q8_0, Q3_K, Q4_K, Q5_K, Q6_K (so Q3_K_M, Q4_K_M, Q5_K_M, Q6_K and Q8_0 files), IQ2_XXS, IQ2_XS and IQ2_S (the 2-bit IQ2 files), F16/F32 on the CPU; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ3_S and BF16 by dequantising, for the few tensors llama.cpp stores that way |
+| Weight formats | Q8_0, Q3_K, Q4_K, Q5_K, Q6_K (so Q3_K_M, Q4_K_M, Q5_K_M, Q6_K and Q8_0 files), IQ2_XXS, IQ2_XS and IQ2_S (the 2-bit IQ2 files), F16/F32 on the CPU; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ3_S and BF16 by dequantising, for the few tensors llama.cpp stores that way; NVFP4 and IQ3_XXS for Inkling 2 Mini's experts |
 | Tokenizer | byte-level BPE (`gpt2`): GPT-2 / Qwen2 / Qwen3.5 / GLM-4 / Llama 3 splitting, SmolLM-style digits |
 | Chat template | ChatML (SmolLM2, Qwen) with Qwen3's thinking and tool-call format, Qwen3-Coder's XML tool format, and Qwen3.5 / 3.6's (Qwen3-Coder's calls with thinking); GLM-4's format with its XML tool calls; Mistral's (`[INST]`, Mistral Nemo and its merges) and Llama 3's, without tools |
 | Tested with | [SmolLM2-135M-Instruct](https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF), Qwen3 0.6B and 8B fine-tunes, [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF), [GLM-4.7-Flash (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-GLM-4.7-Flash-abliterated-i1-GGUF), [Qwen3-Coder-30B-A3B (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated-i1-GGUF), [Qwen3-Coder-Next (Huihui abliterated, IQ2_S)](https://huggingface.co/bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF), [Qwen3.6-35B-A3B (Huihui abliterated, i1-Q3_K_M)](https://huggingface.co/mradermacher/Huihui-Qwen3.6-35B-A3B-abliterated-i1-GGUF) |
 
-Not yet: other IQ formats (IQ1, IQ3_XXS, IQ4_XS), Gemma, images.
+Inkling 2 Mini (`inkling2_loop`, [unsloth's UD-Q3_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) runs as an engine
+preview from the command line: `ghost-infer inkling-gpu-gen <model.gguf> <token ids> <tokens to write>`. A
+`<model>.hot.txt` beside the model (expert counts) picks which experts stay on the GPU when not all fit.
+
+Not yet: other IQ formats (IQ1, IQ4_XS), Gemma, images.

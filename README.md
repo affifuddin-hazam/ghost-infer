@@ -127,7 +127,8 @@ target\release\ghost-infer serve models\Qwen3-8B-Q4_K_M.gguf --gpu
 ```
 
 Open <http://127.0.0.1:8080> to chat, or point any OpenAI client at `http://127.0.0.1:8080/v1`. Built from
-source, it needs the CUDA toolkit's NVRTC: see [Building](docs/building.md).
+source, it needs the CUDA toolkit's NVRTC: see [Building](docs/building.md). On Linux the same commands build the
+engine and server (`target/release/ghost-infer`); the desktop app is Windows-only.
 
 </details>
 
@@ -169,6 +170,23 @@ Experimental, and for now from source only: it trains with Python and PyTorch on
 (`scripts/nightly`, about 25 minutes a night on an 8 GB card), and the installer does not include it yet.
 
 ## What's new
+
+New in 0.5.0:
+
+- **The chat page is the app in a browser.** The server's page has the desktop app's look and almost all of it:
+  saved chats (shared with the app), the agent with its approvals, models, skills, MCP, plugins, schedules and
+  voice calls. It works on phones too.
+- **Access keys.** A server that other devices can reach (a second PC, a phone, a cloud GPU) needs a key: make
+  one under Settings, API & access, or use the sign-in link printed at the first network start. A server only
+  this computer uses needs none, as before.
+- **Switching conversations is instant.** Up to five conversations stay in system memory, so going back to one
+  no longer reads its whole history again (a 19K-token chat: 17 s before).
+- **Linux, from source.** The engine and server build and run on Linux with CUDA, with the browser as the
+  interface. Thanks to [nullbyte61](https://github.com/nullbyte61) for the port.
+- **Inkling 2 Mini, engine preview.** Thinking Machines' looped mixture of experts (UD-Q3_K_XL, 13.6 GB) on an
+  8 GB RTX 2060 SUPER: about 21 tokens/s writing (llama.cpp's best on the same PC: 16.8) and 47 reading a
+  prompt. Command line only for now (`ghost-infer inkling-gpu-gen`); chat, the app and the server come next.
+- **Fixes.** Markdown tables no longer crash the app, and GTX 10 series cards build the GPU kernels again.
 
 New in 0.4.0:
 
@@ -240,7 +258,8 @@ GLM-4.7-Flash run too, in Q3_K to Q8_0 or the 2-bit IQ2 formats: [the full list]
 
 ## Requirements
 
-Windows 10 or 11, an NVIDIA GPU from the GTX 10 series on with a current driver, and a CPU with AVX2.
+Windows 10 or 11, an NVIDIA GPU from the GTX 10 series on with a current driver, and a CPU with AVX2. Linux
+works too, built from source (engine and server, with the CUDA toolkit): see [Building](docs/building.md).
 
 ## Documentation
 
@@ -252,7 +271,8 @@ Windows 10 or 11, an NVIDIA GPU from the GTX 10 series on with a current driver,
 
 ## Roadmap
 
-- Linux support
+- Inkling 2 Mini in the chat page, the app and the server
+- The desktop app on Linux
 - More architectures (Gemma) and formats (Q4_0, the other IQ quants)
 - Constrained decoding for tool calls
 
