@@ -2,6 +2,7 @@ mod csm;
 mod cuda;
 mod gguf;
 mod hadamard;
+mod inkling;
 mod iquant;
 mod json;
 mod lookup;
@@ -219,6 +220,11 @@ fn main() -> ExitCode {
         Some("chat") if !rest.is_empty() => parse_opts(rest).and_then(|o| chat(&o)),
         Some("tts") if rest.len() >= 2 => tts(rest),
         Some("stt") if rest.len() >= 2 => stt(rest),
+        Some("inkling-check") if rest.len() == 2 => inkling::check(&PathBuf::from(&rest[0]), &rest[1]),
+        Some("inkling-moe-bench") if rest.len() >= 2 => rest[1].parse().map_err(|e| format!("layer: {e}")).and_then(|l| inkling::moe_bench(&PathBuf::from(&rest[0]), l, rest.get(2).and_then(|p| p.parse().ok()).unwrap_or(300))),
+        Some("inkling-gpu-check") if rest.len() == 2 => cuda::inkling_gpu::run(&PathBuf::from(&rest[0]), &rest[1], None),
+        Some("inkling-gpu-gen") if rest.len() == 3 => rest[2].parse().map_err(|e| format!("n: {e}")).and_then(|n| cuda::inkling_gpu::run(&PathBuf::from(&rest[0]), &rest[1], Some(n))),
+        Some("inkling-gen") if rest.len() == 3 => rest[2].parse().map_err(|e| format!("n: {e}")).and_then(|n| inkling::generate(&PathBuf::from(&rest[0]), &rest[1], n)),
         Some("csm-check") if rest.len() == 2 => csm::check(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1])),
         Some("snac-check") if rest.len() == 2 => snac::check(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1])),
         Some("yue2") if rest.len() == 3 => yue2::run(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1]), &PathBuf::from(&rest[2])),

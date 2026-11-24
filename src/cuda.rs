@@ -11,6 +11,8 @@ use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::model::Config;
 use crate::profile;
 use crate::quant::f16_to_f32;
+#[path = "inkling_gpu.rs"]
+pub mod inkling_gpu;
 
 const MAX_BATCH: usize = 1024; // prompt tokens per GPU pass: big batches keep the attention kernel busy
 
@@ -5025,6 +5027,7 @@ api! {
     cuEventCreate: fn(*mut Ptr, u32) -> CuResult;
     cuEventRecord: fn(Ptr, Ptr) -> CuResult;
     cuEventSynchronize: fn(Ptr) -> CuResult;
+    cuEventElapsedTime: fn(*mut f32, Ptr, Ptr) -> CuResult;
     cuEventDestroy_v2: fn(Ptr) -> CuResult;
     cuStreamBeginCapture_v2: fn(Ptr, i32) -> CuResult;
     cuStreamEndCapture: fn(Ptr, *mut Ptr) -> CuResult;
@@ -9968,10 +9971,29 @@ fn graphs_enabled() -> bool {
 
 impl GpuSession {
     pub fn new(cfg: &Config, ctx: usize) -> Result<GpuSession, String> {
+        Self::new_batch(cfg, ctx, false)
+    }
+
+    /// A session whose scratch holds one token (no prompt batches, no verify attention): for callers that only
+    /// use it for one-row matrix products.
+    pub fn new_one_row(cfg: &Config, ctx: usize) -> Result<GpuSession, String> {
+        Self::new_batch(cfg, ctx, true)
+    }
+
+    fn new_batch(cfg: &Config, ctx: usize, one_row: bool) -> Result<GpuSession, String> {
         let ctx = ctx.min(cfg.max_ctx);
         let grows = session_grows(cfg);
         let cap = if grows { ctx.min(CTX_STEP) } else { ctx };
-        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, logits_dev, picks, pos_dev, att_scr] = Self::sizes(cfg, cap).map(DeviceBuf::alloc);
+        let mut sizes = Self::sizes(cfg, cap);
+        if one_row {
+            // the batch-sized buffers (all multiples of max_batch) to one row, and no verify scratch
+            let mb = max_batch(cfg);
+            for i in [0, 1, 2, 4, 5, 6, 7, 8, 9, 10] {
+                sizes[i] = sizes[i].div_ceil(mb).max(64);
+            }
+            sizes[14] = 4;
+        }
+        let [xq, xd, xsum, att_part, tokens, x, xb, qkv, att, gu, h, logits_dev, picks, pos_dev, att_scr] = sizes.map(DeviceBuf::alloc);
         let [k_row, v_row, ks_row, vs_row] = Self::cache_rows(cfg);
         Ok(GpuSession {
             xq: xq?,

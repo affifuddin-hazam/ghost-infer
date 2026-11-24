@@ -773,7 +773,7 @@ pub fn exact_mode() -> bool {
     *EXACT.get_or_init(|| std::env::var_os("GHOST_INFER_EXACT").is_some())
 }
 
-fn has_avx2() -> bool {
+pub fn has_avx2() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -897,6 +897,7 @@ impl<'a> Matrix<'a> {
             GgmlType::Q6K => kernels::dequant_q6k(row, out),
             GgmlType::Q2_0 => dequant_q2_0(row, out),
             GgmlType::Ptq1_0 => dequant_ptq1_0(row, out),
+            GgmlType::Nvfp4 => crate::iquant::dequant_nvfp4(row, out),
             ty if ty.is_iquant() => crate::iquant::dequant(ty, row, out),
             ty if ty.dequant_only() => dequant_small(ty, row, out),
             _ => panic!("unsupported weight type {}", self.ty.name()),
@@ -1060,7 +1061,7 @@ fn dot1(m: &Matrix, r: usize, x: XRow, xf: &[f32], avx2: bool) -> f32 {
         ty if ty.is_kquant() => kernels::kq_row(ty, avx2, m.row(r), [x])[0],
         GgmlType::Q8_0 if avx2 => unsafe { kernels::q8_row_avx2(m.row(r), [(x.d, x.q)])[0] },
         GgmlType::Q8_0 => kernels::q8_row_scalar(m.row(r), [(x.d, x.q)])[0],
-        ty if crate::iquant::has_dot(ty) && avx2 => unsafe { crate::iquant::row_dot_avx2(ty, m.row(r), [(x.d, x.q)])[0] },
+        ty if crate::iquant::has_dot(ty) && avx2 => unsafe { crate::iquant::row_dot1_avx2(ty, m.row(r), x.d, x.q) },
         ty if crate::iquant::has_dot(ty) => crate::iquant::row_dot_scalar(ty, m.row(r), [(x.d, x.q)])[0],
         _ => {
             let mut wf = vec![0f32; m.cols];
@@ -1131,6 +1132,219 @@ pub fn experts_one(experts: &[(Matrix, Matrix, Matrix, f32)], x: &[f32], acc: &m
         });
     }
 }
+
+/// One expert of Inkling 2's: fused [gate; up] rows, down, its router weight, and the scales of its two outputs.
+pub struct SituExpert<'a> {
+    pub gate_up: Matrix<'a>,
+    pub down: Matrix<'a>,
+    pub w: f32,
+    pub gu_scale: f32,
+    pub down_scale: f32,
+}
+
+/// One token through several SITU experts on the CPU (Inkling 2):
+/// `acc += Σ w · ds · down(β tanh(g/β) σ(g) · λ tanh(u/λ))`, g and u the halves of `gs · gate_up · x`.
+/// The two passes of `experts_one` on the spinning pool.
+pub fn experts_situ(experts: &[SituExpert], x: &[f32], acc: &mut [f32], sc: &mut ExpertScratch, beta: f32, lb: f32) {
+    let avx2 = has_avx2();
+    let (dim, hidden, k) = (x.len(), experts[0].down.cols, experts.len());
+    sc.xq.quantize(x, dim);
+    sc.h.resize(k * hidden, 0.0);
+    sc.hq.shape(k, hidden);
+    let pool = crate::pool::pool();
+    const GU_CHUNK: usize = 48;
+    const DOWN_CHUNK: usize = 64;
+    {
+        let (xq, rows) = (&sc.xq, k * hidden);
+        let h = Raw(sc.h.as_mut_ptr());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        pool.run(&|_, _| loop {
+            let r0 = next.fetch_add(GU_CHUNK, std::sync::atomic::Ordering::Relaxed);
+            if r0 >= rows {
+                break;
+            }
+            for u in r0..(r0 + GU_CHUNK).min(rows) {
+                let (e, r) = (u / hidden, u % hidden);
+                let ex = &experts[e];
+                let g = dot1(&ex.gate_up, r, xq.row3(0), x, avx2) * ex.gu_scale;
+                let v = dot1(&ex.gate_up, hidden + r, xq.row3(0), x, avx2) * ex.gu_scale;
+                // SAFETY: row u of h belongs to the chunk's thread only
+                unsafe { *h.at(u) = beta * (g / beta).tanh() / (1.0 + (-g).exp()) * lb * (v / lb).tanh() };
+            }
+        });
+        for (u, (hv, q)) in sc.h.chunks_exact(QK8_0).zip(sc.hq.quants.chunks_exact_mut(QK8_0)).enumerate() {
+            let (d, s) = quantize_block(hv, q);
+            sc.hq.scales[u] = d;
+            sc.hq.sums[u] = s;
+        }
+    }
+    {
+        let (hq, hf) = (&sc.hq, &sc.h);
+        let out = Raw(acc.as_mut_ptr());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        pool.run(&|_, _| loop {
+            let r0 = next.fetch_add(DOWN_CHUNK, std::sync::atomic::Ordering::Relaxed);
+            if r0 >= dim {
+                break;
+            }
+            for r in r0..(r0 + DOWN_CHUNK).min(dim) {
+                let mut v = 0f32;
+                for (e, ex) in experts.iter().enumerate() {
+                    v += ex.w * ex.down_scale * dot1(&ex.down, r, hq.row3(e), &hf[e * hidden..(e + 1) * hidden], avx2);
+                }
+                // SAFETY: output row r belongs to the chunk's thread only
+                unsafe { *out.at(r) += v };
+            }
+        });
+    }
+}
+/// Row r of `m` dotted with up to 4 activation rows at once, the weights decoded once for all of them; each
+/// result is the one dot1 gives.
+fn dots_upto4(m: &Matrix, r: usize, xs: &[XRow], xf: &[&[f32]], avx2: bool, out: &mut [f32]) {
+    macro_rules! n {
+        ($n:literal) => {{
+            let a: [XRow; $n] = std::array::from_fn(|i| xs[i]);
+            let v: [f32; $n] = match m.ty {
+                ty if ty.is_kquant() => kernels::kq_row(ty, avx2, m.row(r), a),
+                ty if crate::iquant::has_dot(ty) && avx2 => unsafe { crate::iquant::row_dot_avx2(ty, m.row(r), a.map(|x| (x.d, x.q))) },
+                _ => std::array::from_fn(|i| dot1(m, r, xs[i], xf[i], avx2)),
+            };
+            out[..$n].copy_from_slice(&v);
+        }};
+    }
+    match xs.len() {
+        1 => out[0] = dot1(m, r, xs[0], xf[0], avx2),
+        2 => n!(2),
+        3 => n!(3),
+        _ => n!(4),
+    }
+}
+
+/// `experts_situ` for several tokens at once (a prompt batch): `picks[t]` token t's experts in pick order, `xs`
+/// the tokens' rows (dim each), `acc` their sums. Every expert some token picked is read from memory once for
+/// all the tokens that picked it (its rows stay in cache across them); each token gets experts_situ's
+/// arithmetic in its order, so the same result to the bit.
+pub fn experts_situ_batch(picks: &[Vec<SituExpert>], xs: &[f32], acc: &mut [f32], sc: &mut ExpertScratch, beta: f32, lb: f32) {
+    let avx2 = has_avx2();
+    let nt = picks.len();
+    if nt == 0 {
+        return;
+    }
+    let dim = xs.len() / nt;
+    // the distinct experts (by their weights' address), each with its (token, pick) pairs; a pair's h row
+    let mut keys: Vec<usize> = Vec::new();
+    let mut pairs_of: Vec<Vec<usize>> = Vec::new();
+    let mut pair_src: Vec<(usize, usize)> = Vec::new();
+    let mut pair_at: Vec<Vec<usize>> = Vec::with_capacity(nt);
+    for (t, list) in picks.iter().enumerate() {
+        let mut at = Vec::with_capacity(list.len());
+        for (j, ex) in list.iter().enumerate() {
+            let key = ex.gate_up.data.as_ptr() as usize;
+            let u = match keys.iter().position(|&k| k == key) {
+                Some(u) => u,
+                None => {
+                    keys.push(key);
+                    pairs_of.push(Vec::new());
+                    keys.len() - 1
+                }
+            };
+            pairs_of[u].push(pair_src.len());
+            at.push(pair_src.len());
+            pair_src.push((t, j));
+        }
+        pair_at.push(at);
+    }
+    let np = pair_src.len();
+    if np == 0 {
+        return;
+    }
+    let hidden = picks.iter().find_map(|l| l.first()).unwrap().down.cols;
+    sc.xq.quantize(xs, dim);
+    sc.h.resize(np * hidden, 0.0);
+    sc.hq.shape(np, hidden);
+    let pool = crate::pool::pool();
+    const GU_CHUNK: usize = 48;
+    const DOWN_CHUNK: usize = 64;
+    {
+        let (xq, chunks) = (&sc.xq, hidden.div_ceil(GU_CHUNK));
+        let items = keys.len() * chunks;
+        let h = Raw(sc.h.as_mut_ptr());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (pairs_of, pair_src) = (&pairs_of, &pair_src);
+        pool.run(&|_, _| loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= items {
+                break;
+            }
+            let (u, r0) = (i / chunks, (i % chunks) * GU_CHUNK);
+            let (t0, j0) = pair_src[pairs_of[u][0]];
+            let (gate_up, gu_scale) = (&picks[t0][j0].gate_up, picks[t0][j0].gu_scale);
+            let (mut gs, mut vs) = ([0f32; 4], [0f32; 4]);
+            // the activation rows of the expert's pairs, 4 to a group
+            let groups: Vec<(&[usize], Vec<XRow>, Vec<&[f32]>)> = pairs_of[u]
+                .chunks(4)
+                .map(|g| (g, g.iter().map(|&p| xq.row3(pair_src[p].0)).collect(), g.iter().map(|&p| &xs[pair_src[p].0 * dim..(pair_src[p].0 + 1) * dim]).collect()))
+                .collect();
+            for r in r0..(r0 + GU_CHUNK).min(hidden) {
+                for (group, rows, xf) in &groups {
+                    dots_upto4(gate_up, r, rows, xf, avx2, &mut gs);
+                    dots_upto4(gate_up, hidden + r, rows, xf, avx2, &mut vs);
+                    for (i, &p) in group.iter().enumerate() {
+                        let (g, v) = (gs[i] * gu_scale, vs[i] * gu_scale);
+                        // SAFETY: element (p, r) belongs to this work item only
+                        unsafe { *h.at(p * hidden + r) = beta * (g / beta).tanh() / (1.0 + (-g).exp()) * lb * (v / lb).tanh() };
+                    }
+                }
+            }
+        });
+        for (u, (hv, q)) in sc.h.chunks_exact(QK8_0).zip(sc.hq.quants.chunks_exact_mut(QK8_0)).enumerate() {
+            let (d, s) = quantize_block(hv, q);
+            sc.hq.scales[u] = d;
+            sc.hq.sums[u] = s;
+        }
+    }
+    {
+        let (hq, hf) = (&sc.hq, &sc.h);
+        let out = Raw(acc.as_mut_ptr());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (pair_at, pairs_of, pair_src) = (&pair_at, &pairs_of, &pair_src);
+        pool.run(&|_, _| loop {
+            let r0 = next.fetch_add(DOWN_CHUNK, std::sync::atomic::Ordering::Relaxed);
+            if r0 >= dim {
+                break;
+            }
+            let mut dv = vec![0f32; np];
+            let mut four = [0f32; 4];
+            // per distinct expert: its down matrix and its pairs' h rows, 4 to a group
+            let groups: Vec<(&Matrix, Vec<(&[usize], Vec<XRow>, Vec<&[f32]>)>)> = pairs_of
+                .iter()
+                .map(|list| {
+                    let (t0, j0) = pair_src[list[0]];
+                    (&picks[t0][j0].down, list.chunks(4).map(|g| (g, g.iter().map(|&p| hq.row3(p)).collect(), g.iter().map(|&p| &hf[p * hidden..(p + 1) * hidden]).collect())).collect())
+                })
+                .collect();
+            for r in r0..(r0 + DOWN_CHUNK).min(dim) {
+                for (down, gs) in &groups {
+                    for (group, rows, xf) in gs {
+                        dots_upto4(down, r, rows, xf, avx2, &mut four);
+                        for (i, &p) in group.iter().enumerate() {
+                            dv[p] = four[i];
+                        }
+                    }
+                }
+                for (t, list) in picks.iter().enumerate() {
+                    let mut v = 0f32;
+                    for (j, ex) in list.iter().enumerate() {
+                        v += ex.w * ex.down_scale * dv[pair_at[t][j]];
+                    }
+                    // SAFETY: output row r of every token belongs to this chunk's thread only
+                    unsafe { *out.at(t * dim + r) += v };
+                }
+            }
+        });
+    }
+}
+
 /// SwiGLU front half in one pass: `h[b * rows + r] = silu(gate[r] · x[b]) * (up[r] · x[b])`.
 pub fn gate_up_silu(gate: &Matrix, up: &Matrix, x: &[f32], xq: &QuantizedBatch, h: &mut [f32]) {
     let avx2 = has_avx2();
