@@ -1140,7 +1140,6 @@ fn read_f32(g: &Gguf, name: &str) -> Result<Vec<f32>, String> {
 /// codes (cols / 2 bytes a row, the file's byte order), then all its rows' UE4M3 scales (cols / 16 a row). The
 /// same bytes per expert as the file.
 fn upload_nvfp4_split(up: &mut Uploader, g: &Gguf, t: &TensorInfo, n_exp: usize, which: &[usize]) -> Result<DeviceBuf, String> {
-    use std::os::windows::fs::FileExt;
     let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
     let ebytes = t.n_bytes / n_exp;
     let buf = up.alloc(ebytes * which.len())?;
@@ -1149,14 +1148,7 @@ fn upload_nvfp4_split(up: &mut Uploader, g: &Gguf, t: &TensorInfo, n_exp: usize,
     let mut out = vec![0u8; ebytes];
     let (qrow, srow, nb) = (cols / 2, cols / 16, cols / 64);
     for (i, &e) in which.iter().enumerate() {
-        let mut done = 0;
-        while done < ebytes {
-            let n = file.seek_read(&mut raw[done..], (t.offset + e * ebytes + done) as u64).map_err(|e| format!("reading experts: {e}"))?;
-            if n == 0 {
-                return Err("reading experts: unexpected end of file".into());
-            }
-            done += n;
-        }
+        crate::inkling::read_exact_at(&file, &mut raw, (t.offset + e * ebytes) as u64)?;
         nvfp4_split_into(&raw, rows, cols, &mut out);
         let _ = (qrow, srow, nb);
         up.put(buf.ptr + (i * ebytes) as u64, &out)?;

@@ -302,6 +302,29 @@ impl State {
 }
 
 /// `m · x` for one input vector.
+/// Fills `buf` from `file` at byte `offset`, without moving a shared cursor: seek_read on Windows, read_at on
+/// Unix (pread).
+pub fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<(), String> {
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        #[cfg(windows)]
+        let n = file.seek_read(&mut buf[done..], offset + done as u64);
+        #[cfg(unix)]
+        let n = file.read_at(&mut buf[done..], offset + done as u64);
+        match n {
+            Ok(0) => return Err("reading experts: unexpected end of file".into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("reading experts: {e}")),
+        }
+    }
+    Ok(())
+}
+
 fn mv(m: &Matrix, x: &[f32]) -> Vec<f32> {
     let mut xq = QuantizedBatch::default();
     xq.quantize(x, m.cols);
@@ -420,20 +443,12 @@ impl<'a> Inkling<'a> {
     /// The bytes are read from `file` (whose mapping starts at `base`), not through the mapping: mapped pages
     /// touched here would stay in the working set beside the copy, twice the RAM.
     pub fn own_experts(&mut self, il: usize, file: &std::fs::File, base: usize) -> Result<usize, String> {
-        use std::os::windows::fs::FileExt;
         let l = &mut self.layers[il];
         let mut total = 0;
         for ms in [&mut l.gate_up, &mut l.down] {
             let (start, end) = (ms[0].data.as_ptr() as usize, ms[ms.len() - 1].data.as_ptr() as usize + ms[ms.len() - 1].data.len());
             let mut buf = vec![0u8; end - start];
-            let (mut done, at) = (0, (start - base) as u64);
-            while done < buf.len() {
-                let n = file.seek_read(&mut buf[done..], at + done as u64).map_err(|e| format!("reading experts: {e}"))?;
-                if n == 0 {
-                    return Err("reading experts: unexpected end of file".into());
-                }
-                done += n;
-            }
+            read_exact_at(file, &mut buf, (start - base) as u64)?;
             // IQ3_S re-laid as 4-bit codes (the same values, a third of the CPU's decoding work);
             // GHOST_INFER_INK_IQ3S=1 keeps it as it is
             if ms[0].ty == GgmlType::Iq3S && std::env::var_os("GHOST_INFER_INK_IQ3S").is_none() {
