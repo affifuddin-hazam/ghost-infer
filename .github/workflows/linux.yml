@@ -9,6 +9,10 @@ jobs:
   build:
     name: cargo build + test (ubuntu, CPU-only)
     runs-on: ubuntu-latest
+    env:
+      # one CPU level for every runner (the installer's): .cargo/config.toml builds for the machine's own
+      # CPU, so crates rust-cache kept from one runner could hold instructions the next one lacks (SIGILL)
+      RUSTFLAGS: -C target-cpu=x86-64-v3
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
