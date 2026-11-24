@@ -216,7 +216,7 @@ pub fn for_model(model: &Path) -> Option<(PathBuf, f32)> {
     }
     // the model's own name, dots and all (Qwen3-4B.Q4_K_M.gguf -> lora\Qwen3-4B.Q4_K_M.gguf)
     let stem = model.file_stem()?.to_string_lossy().into_owned();
-    let file = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("ghost-infer").join("lora").join(format!("{stem}.gguf"));
+    let file = crate::paths::data_dir()?.join("lora").join(format!("{stem}.gguf"));
     file.is_file().then_some((file, 1.0))
 }
 

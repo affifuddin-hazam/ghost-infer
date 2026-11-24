@@ -55,7 +55,46 @@ fn offset_ms() -> i64 {
     ((ms(&l) - ms(&u)) as f64 / 60_000.0).round() as i64 * 60_000
 }
 
-#[cfg(not(windows))]
+/// Local time minus UTC, in milliseconds (to the minute), as glibc has it now.
+#[cfg(unix)]
+fn offset_ms() -> i64 {
+    // Linux x86_64 glibc layout of `struct tm`: nine i32 fields, then natural
+    // 8-byte alignment inserts four bytes of padding, then tm_gmtoff and
+    // tm_zone. `_pad` keeps the layout explicit for other targets with the
+    // same ABI (aarch64, riscv64 under glibc).
+    #[repr(C)]
+    struct Tm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        _pad: i32,
+        tm_gmtoff: i64,
+        tm_zone: *const i8,
+    }
+    unsafe extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+    let mut now: i64 = 0;
+    let mut tm: Tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        time(&mut now);
+        if localtime_r(&now, &mut tm).is_null() {
+            return 0;
+        }
+    }
+    // tm_gmtoff is seconds east of UTC. Round to the minute for parity with
+    // the Windows path.
+    (tm.tm_gmtoff / 60) * 60 * 1000
+}
+
+#[cfg(not(any(windows, unix)))]
 fn offset_ms() -> i64 {
     0
 }

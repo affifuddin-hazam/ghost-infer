@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::json::{obj, str, Json};
 
 pub fn dir() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("plugins")).ok_or("LOCALAPPDATA is not set")?;
+    let d = crate::paths::data_dir().map(|d| d.join("plugins")).ok_or(crate::paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     Ok(d)
 }
@@ -62,14 +62,68 @@ fn enabled(m: &Json) -> bool {
     m.get("enabled").and_then(Json::as_bool) != Some(false)
 }
 
-/// The Windows launcher for Python 3 (py.exe), which finds a real Python where "python" may be the Store's stub.
+/// A Python interpreter to run plugins with. On Windows it is py.exe (the
+/// launcher, which finds a real Python 3 where plain "python" may be the
+/// Microsoft Store stub); on Unix it is `python3` from PATH, falling back to
+/// `python`. `None` means no Python at all; the plugin stays disabled.
 pub fn py_launcher() -> Option<PathBuf> {
-    let p = std::env::var_os("SystemRoot").map(|r| PathBuf::from(r).join("py.exe"))?;
-    p.is_file().then_some(p)
+    #[cfg(windows)]
+    {
+        let p = std::env::var_os("SystemRoot").map(|r| PathBuf::from(r).join("py.exe"))?;
+        p.is_file().then_some(p)
+    }
+    #[cfg(unix)]
+    {
+        for name in ["python3", "python"] {
+            if let Some(p) = find_in_path(name) {
+                return Some(p);
+            }
+        }
+        None
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        None
+    }
+}
+
+/// One short line for the model's plugin-authoring guide, telling it how to
+/// invoke Python on this computer.
+pub fn python_note() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Python on this computer runs as py -3 (python and python3 open the Microsoft Store)"
+    }
+    #[cfg(unix)]
+    {
+        "Python on this computer runs as python3"
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        "Python on this computer is the system python3"
+    }
+}
+
+/// `name` resolved against each entry in $PATH. Only non-empty PATH entries are
+/// searched; a hit must be a regular file. Platform-neutral so Windows could
+/// reuse it if the SystemRoot path ever stopped being where py.exe lives.
+#[cfg(unix)]
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// The enabled plugins as MCP server settings (mcp.rs starts them): run in the plugin's folder, and Python
-/// through py -3, unbuffered and in UTF-8.
+/// through py_launcher() (py -3 on Windows, python3 on Unix), unbuffered and in UTF-8.
 pub fn servers() -> Vec<(String, Json)> {
     let Ok(root) = dir() else { return Vec::new() };
     all().into_iter().filter(|(_, m)| enabled(m)).filter_map(|(name, m)| Some((name.clone(), server(&root.join(&name), &m)?))).collect()
@@ -91,6 +145,9 @@ fn server(dir: &Path, m: &Json) -> Option<Json> {
         Some(file) => ("python".to_string(), vec![str(&runner()?.display().to_string()), str(file)]),
         None => (m.get("command").and_then(Json::as_str)?.to_string(), m.get("args").and_then(Json::as_array).unwrap_or(&[]).to_vec()),
     };
+    // `args` is only mutated on Windows (py.exe needs a leading -3); the mut is
+    // kept so the Windows branch below compiles and the let shape stays simple.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let (mut command, mut args) = (command, args);
     let mut env: Vec<(String, Json)> = match m.get("env") {
         Some(Json::Obj(f)) => f.clone(),
@@ -99,6 +156,9 @@ fn server(dir: &Path, m: &Json) -> Option<Json> {
     if matches!(command.to_lowercase().as_str(), "python" | "python3" | "python.exe" | "py") {
         if let Some(py) = py_launcher() {
             command = py.display().to_string();
+            // -3 selects Python 3 on the Windows py.exe launcher; python3 / python
+            // on Unix do not take it and would reject it.
+            #[cfg(windows)]
             args.insert(0, str("-3"));
         }
         env.push(("PYTHONUNBUFFERED".into(), str("1")));
@@ -119,7 +179,7 @@ pub fn tool(arguments: &str) -> String {
     let s = |k: &str| a.get(k).and_then(Json::as_str).unwrap_or("").trim().to_string();
     let result = match s("action").as_str() {
         "guide" if s("name") == "server" => Ok(format!("A plugin as a full MCP server: server.py (or server.js for Node), saved as files {{\"server.py\": \"...\"}}. It talks JSON-RPC on stdin/stdout, one message a line, so it must never print anything else to stdout (logs go to stderr). Start from this template:\n```python\n{TEMPLATE}```")),
-        "guide" => Ok(GUIDE.to_string()),
+        "guide" => Ok(GUIDE.replace("__PYTHON_NOTE__", python_note())),
         "list" => Ok(list()),
         "show" => show(&s("name")),
         "save" => save(&s("name"), &s("description"), a.get("files")),
@@ -495,7 +555,7 @@ fn merged_from(d: &Path) -> String {
 }
 
 /// A syntax error in the plugin's Python files (its folder's top level), as "tools.py line 6: ...", checked
-/// with py -3 without running anything; None when they parse, or when Python cannot be found to check.
+/// with py_launcher() without running anything; None when they parse, or when Python cannot be found to check.
 fn python_error(d: &Path) -> Option<String> {
     let py = py_launcher()?;
     const CHECK: &str = "import ast,sys\nfor f in sys.argv[1:]:\n    try:\n        ast.parse(open(f,encoding='utf-8').read(),f)\n    except SyntaxError as e:\n        print(f\"{f} line {e.lineno}: {e.msg}: {(e.text or '').strip()}\")\n        sys.exit(1)\n";
@@ -503,13 +563,12 @@ fn python_error(d: &Path) -> Option<String> {
     if files.is_empty() {
         return None;
     }
+    use crate::platform::NoConsole;
     let mut cmd = std::process::Command::new(py);
-    cmd.arg("-3").arg("-c").arg(CHECK).args(&files).current_dir(d);
+    // py.exe needs -3 to pick Python 3; python3 / python on Unix do not take it.
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // no console window
-    }
+    cmd.arg("-3");
+    cmd.arg("-c").arg(CHECK).args(&files).current_dir(d).no_console();
     let out = cmd.output().ok()?;
     if out.status.success() {
         return None;
@@ -625,7 +684,7 @@ Rules:
 - Then test it: load the tool with tool_search ("select:mcp__<name>__<function>") and call it. Say it is done only once a call works. Each call asks the user first.
 - Other actions: list, show (a plugin's files and log), enable, disable, remove, install (a plugin folder on this computer). For a plugin tools.py cannot be (Node, or a server of its own), call guide with name "server" for the full template.
 
-- Python on this computer runs as py -3 (python and python3 open the Microsoft Store). Saving checks your .py files for syntax errors and says the line; indent each block 4 spaces.
+- __PYTHON_NOTE__. Saving checks your .py files for syntax errors and says the line; indent each block 4 spaces.
 
 A plugin can also show itself in the app (a dashboard, a status, a little app of its own). Add a file named exactly plugin.json (not panel.json) to the same save:
 {"tools": "tools.py", "panel": {"title": "Site status", "icon": "status", "page": "panel.html"}, "badge": {"function": "status", "every": 60}}
@@ -844,6 +903,36 @@ main()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn py_launcher_picks_a_unix_python() {
+        // Any CI runner this is built on has python3 in PATH; local smoke test too.
+        let p = py_launcher().expect("python3 or python should be in PATH");
+        assert!(p.is_file(), "{p:?} is not a file");
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(name == "python3" || name == "python", "unexpected interpreter {name}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_note_mentions_python3_on_unix() {
+        assert_eq!(python_note(), "Python on this computer runs as python3");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn python_note_mentions_py_on_windows() {
+        assert!(python_note().starts_with("Python on this computer runs as py -3"));
+    }
+
+    #[test]
+    fn guide_has_a_python_note_placeholder_that_gets_replaced() {
+        assert!(GUIDE.contains("__PYTHON_NOTE__"), "GUIDE must carry the placeholder");
+        let out = GUIDE.replace("__PYTHON_NOTE__", python_note());
+        assert!(!out.contains("__PYTHON_NOTE__"), "placeholder must be replaced");
+        assert!(out.contains("Python on this computer runs as"));
+    }
 
     #[test]
     fn names_and_paths() {

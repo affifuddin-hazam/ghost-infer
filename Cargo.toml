@@ -9,6 +9,9 @@ repository = "https://github.com/affifuddin-hazam/ghost-infer"
 [workspace]
 # the engine and server stay at the root; the native desktop app is its own crate (it brings the GUI crates)
 members = [".", "app"]
+# a plain `cargo build --release` builds only the engine (the app pulls Windows-only GUI crates);
+# `cargo build -p ghost-app` opts in to the desktop app on Windows
+default-members = ["."]
 
 [dependencies]
 memmap2 = "0.9"

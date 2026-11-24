@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::model::Config;
+use crate::paths;
 use crate::profile;
 use crate::quant::f16_to_f32;
 
@@ -4951,7 +4952,108 @@ mod os {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+mod os {
+    use std::ffi::{c_void, CString};
+
+    // ABI constants from glibc <dlfcn.h>, <sys/mman.h>, <sys/resource.h> (Linux x86_64).
+    // Stable across every current Linux libc; matched against musl and Android too.
+    const RTLD_NOW: i32 = 2;
+    const RTLD_GLOBAL: i32 = 0x100;
+    const MADV_WILLNEED: i32 = 3;
+    const MADV_DONTNEED: i32 = 4;
+    const RUSAGE_SELF: i32 = 0;
+
+    // glibc's `struct rusage` on Linux x86_64 is two `timeval` (16 bytes each) then
+    // fourteen longs (ru_maxrss, ru_ixrss, ru_idrss, ru_isrss, ru_minflt, ru_majflt,
+    // ru_nswap, ru_inblock, ru_oublock, ru_msgsnd, ru_msgrcv, ru_nsignals, ru_nvcsw,
+    // ru_nivcsw). Only minflt (index 4) and majflt (index 5) are read.
+    #[repr(C)]
+    struct Rusage {
+        ru_utime: [i64; 2],
+        ru_stime: [i64; 2],
+        ru_fields: [i64; 14],
+    }
+
+    // libdl is folded into libc on glibc 2.34+; linking against the standalone
+    // libdl keeps the binary working on older systems too.
+    #[link(name = "dl")]
+    unsafe extern "C" {
+        fn dlopen(path: *const i8, flags: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, name: *const i8) -> *mut c_void;
+    }
+
+    unsafe extern "C" {
+        fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+
+    /// Asks the kernel to read these (address, length) ranges of mapped memory in
+    /// now (`MADV_WILLNEED`). Only a hint: failure changes nothing.
+    pub fn prefetch(ranges: &[(usize, usize)]) {
+        for &(addr, len) in ranges {
+            unsafe { madvise(addr as *mut c_void, len, MADV_WILLNEED) };
+        }
+    }
+
+    /// Hints the kernel that these ranges will not be used soon
+    /// (`MADV_DONTNEED`). Matches the Windows intent of `VirtualUnlock`: keep the
+    /// file-backed pages in the page cache while dropping them from this process's
+    /// working set.
+    pub fn release(ranges: &[(usize, usize)]) {
+        for &(addr, len) in ranges {
+            unsafe { madvise(addr as *mut c_void, len, MADV_DONTNEED) };
+        }
+    }
+
+    /// This process's page faults so far and its resident set in bytes. Reads
+    /// `getrusage` for the fault counts and `/proc/self/statm` for VmRSS (which,
+    /// unlike `ru_maxrss`, is the current value, not the peak).
+    pub fn page_faults() -> (u64, u64) {
+        let mut r = Rusage { ru_utime: [0; 2], ru_stime: [0; 2], ru_fields: [0; 14] };
+        let faults = if unsafe { getrusage(RUSAGE_SELF, &mut r) } == 0 {
+            (r.ru_fields[4].max(0) as u64) + (r.ru_fields[5].max(0) as u64)
+        } else {
+            0
+        };
+        let rss = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| {
+            let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+            Some(pages * 4096) // getpagesize is 4 KiB on x86_64 and aarch64
+        }).unwrap_or(0);
+        (faults, rss)
+    }
+
+    /// Physical memory available to programs now, in bytes. Unknown: `u64::MAX`,
+    /// so the RAM floor does nothing.
+    pub fn available_ram() -> u64 {
+        crate::sysinfo::available_ram().unwrap_or(u64::MAX)
+    }
+
+    /// `dlopen(path, RTLD_NOW)`.
+    pub fn open(path: &str) -> Option<*mut c_void> {
+        let c = CString::new(path).ok()?;
+        let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
+        (!h.is_null()).then_some(h)
+    }
+
+    /// `dlopen(path, RTLD_NOW | RTLD_GLOBAL)`: puts the library's symbols in the global
+    /// namespace so a sibling loaded later (NVRTC) that does `dlsym(RTLD_DEFAULT, ...)` for
+    /// its device-side builtins can resolve them.
+    pub fn open_global(path: &str) -> Option<*mut c_void> {
+        let c = CString::new(path).ok()?;
+        let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+        (!h.is_null()).then_some(h)
+    }
+
+    /// `dlsym(lib, name)`.
+    pub fn symbol(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
+        let c = CString::new(name).ok()?;
+        let p = unsafe { dlsym(lib, c.as_ptr()) };
+        (!p.is_null()).then_some(p)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod os {
     use std::ffi::c_void;
     pub fn open(_: &str) -> Option<*mut c_void> {
@@ -4963,7 +5065,7 @@ mod os {
     pub fn prefetch(_: &[(usize, usize)]) {}
     pub fn release(_: &[(usize, usize)]) {}
     pub fn available_ram() -> u64 {
-        u64::MAX // the RAM floor is Windows-only for now
+        u64::MAX
     }
     pub fn page_faults() -> (u64, u64) {
         (0, 0)
@@ -5066,8 +5168,17 @@ impl Api {
     }
 }
 
+/// The name of the NVIDIA driver library to pass to `os::open`.
+#[cfg(windows)]
+const CUDA_DRIVER: &str = "nvcuda.dll";
+#[cfg(unix)]
+const CUDA_DRIVER: &str = "libcuda.so.1";
+#[cfg(not(any(windows, unix)))]
+const CUDA_DRIVER: &str = "nvcuda";
+
 /// GHOST_INFER_NVRTC, else the NVRTC beside the program (the installer ships one), else the newest under the
 /// CUDA toolkit folder.
+#[cfg(windows)]
 fn find_nvrtc() -> Option<String> {
     if let Ok(p) = std::env::var("GHOST_INFER_NVRTC") {
         return Some(p);
@@ -5098,10 +5209,101 @@ fn find_nvrtc() -> Option<String> {
     found.pop().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// CUDA library search roots on Linux: `$CUDA_PATH`, `/opt/cuda`, `/usr/local/cuda`,
+/// every `/usr/local/cuda-*` versioned install, and the distro multiarch dirs.
+#[cfg(unix)]
+fn cuda_lib_roots() -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("CUDA_PATH") {
+        let base = std::path::PathBuf::from(&p);
+        roots.push(base.join("lib64"));
+        roots.push(base.join("lib"));
+    }
+    for p in [
+        "/opt/cuda/lib64",                    // Arch
+        "/opt/cuda/targets/x86_64-linux/lib", // CUDA toolkit versioned layout
+        "/usr/local/cuda/lib64",              // NVIDIA .run installer default (unversioned symlink)
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/lib/x86_64-linux-gnu",          // Debian/Ubuntu multiarch
+        "/usr/lib64",                         // Fedora/RHEL
+        "/usr/lib",                           // fallback
+    ] {
+        roots.push(std::path::PathBuf::from(p));
+    }
+    // Versioned NVIDIA .run installer dirs: /usr/local/cuda-13.4/lib64, /usr/local/cuda-12.6/lib64, ...
+    if let Ok(dirs) = std::fs::read_dir("/usr/local") {
+        for e in dirs.flatten() {
+            if e.file_name().to_string_lossy().starts_with("cuda-") {
+                roots.push(e.path().join("lib64"));
+                roots.push(e.path().join("targets/x86_64-linux/lib"));
+            }
+        }
+    }
+    roots
+}
+
+/// Longest `<prefix>*` filename wins (so `libnvrtc.so.13.4.92` beats `libnvrtc.so.13` beats
+/// `libnvrtc.so`). Searched beside the program first, then under `cuda_lib_roots()`. dlopen
+/// follows symlinks either way, but picking the versioned target avoids a -dev symlink that
+/// may not exist in a runtime-only install.
+#[cfg(unix)]
+fn find_cuda_lib(prefix: &str, exclude_builtins: bool) -> Option<String> {
+    let is_match = |p: &std::path::Path| {
+        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        n.starts_with(prefix) && !(exclude_builtins && n.starts_with("libnvrtc-builtins"))
+    };
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
+    if let Some(p) = beside.and_then(|d| std::fs::read_dir(d).ok()).and_then(|d| d.flatten().map(|e| e.path()).filter(|p| is_match(p)).max()) {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    let mut found: Vec<std::path::PathBuf> = cuda_lib_roots()
+        .iter()
+        .filter_map(|r| std::fs::read_dir(r).ok())
+        .flat_map(|d| d.flatten().map(|e| e.path()))
+        .filter(|p| is_match(p))
+        .collect();
+    found.sort_by_key(|p| p.file_name().map(|n| n.len()).unwrap_or(0));
+    found.pop().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// GHOST_INFER_NVRTC, else libnvrtc.so beside the program, else the newest
+/// `libnvrtc.so*` under the Linux CUDA roots. `libnvrtc-builtins.*` is a different
+/// library NVRTC loads itself at compile time; we exclude it here and preload it
+/// with RTLD_GLOBAL in `api()`.
+#[cfg(unix)]
+fn find_nvrtc() -> Option<String> {
+    if let Ok(p) = std::env::var("GHOST_INFER_NVRTC") {
+        return Some(p);
+    }
+    find_cuda_lib("libnvrtc.so", true)
+}
+
+/// Companion to `find_nvrtc`: locates `libnvrtc-builtins.so*` so we can preload it
+/// with RTLD_GLOBAL before opening NVRTC. On Windows the loader finds
+/// `nvrtc-builtins64_*.dll` by the same-directory rule, so this is Unix-only.
+#[cfg(unix)]
+fn find_nvrtc_builtins() -> Option<String> {
+    find_cuda_lib("libnvrtc-builtins.so", false)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn find_nvrtc() -> Option<String> {
+    std::env::var("GHOST_INFER_NVRTC").ok()
+}
+
 fn api() -> Result<&'static Api, String> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| {
-        let cuda = os::open("nvcuda.dll").ok_or("no NVIDIA driver (nvcuda.dll) found")?;
+        let cuda = os::open(CUDA_DRIVER).ok_or_else(|| format!("no NVIDIA driver ({CUDA_DRIVER}) found"))?;
+        // Preload libnvrtc-builtins with RTLD_GLOBAL so NVRTC's dlsym(RTLD_DEFAULT, ...) for its
+        // device-side builtins resolves (nvrtcCompileProgram would fail with
+        // "__internal_trig_reduction..." otherwise). Windows loads nvrtc-builtins64_*.dll via the
+        // same-directory rule, so this is Unix-only. The handle is intentionally leaked (stays
+        // loaded for the process's lifetime).
+        #[cfg(unix)]
+        if let Some(p) = find_nvrtc_builtins() {
+            let _ = os::open_global(&p);
+        }
         let nvrtc_path = find_nvrtc().ok_or("no NVRTC found (install the CUDA toolkit or set GHOST_INFER_NVRTC)")?;
         let nvrtc = os::open(&nvrtc_path).ok_or_else(|| format!("cannot load {nvrtc_path}"))?;
         let f = Fns::load(cuda, nvrtc)?;
@@ -5517,7 +5719,7 @@ impl Kernels {
             format!("{:016x}", h.finish())
         };
         let use_cache = std::env::var_os("GHOST_INFER_NO_KERNEL_CACHE").is_none();
-        let dir = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("ghost-infer").join("kernels"));
+        let dir = paths::cache_dir().map(|d| d.join("kernels"));
         let file = dir.as_ref().map(|d| d.join(format!("{key}.cubin")));
         if let (true, Some(file)) = (use_cache, &file) {
             if let Ok(bin) = std::fs::read(file) {

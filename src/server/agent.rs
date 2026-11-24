@@ -925,11 +925,11 @@ fn fitted_prompt(out: &mut Out, req: &Request, chat: &mut Chat, tools: &[Json], 
     Err("this chat cannot be made to fit the model's context; start a new chat".into())
 }
 
-// ---- memory: facts the model saved, kept in %LOCALAPPDATA%\ghost-infer\memory.json for every chat
+// ---- memory: facts the model saved, kept at <data_dir>/memory.json for every chat
 
-/// %LOCALAPPDATA%\ghost-infer, made if missing.
+/// The data directory, made if missing.
 pub(super) fn data_dir() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer")).ok_or("LOCALAPPDATA is not set")?;
+    let d = crate::paths::data_dir().ok_or(crate::paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     Ok(d)
 }
@@ -1266,7 +1266,7 @@ pub fn answer(id: &str, decision: &str) -> bool {
 // ---- the chat store
 
 fn chats_dir() -> Result<PathBuf, String> {
-    let d = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("chats")).ok_or("LOCALAPPDATA is not set")?;
+    let d = crate::paths::data_dir().map(|d| d.join("chats")).ok_or(crate::paths::NO_DATA_DIR)?;
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     Ok(d)
 }
