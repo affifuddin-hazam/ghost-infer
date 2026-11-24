@@ -180,7 +180,8 @@ New in 0.5.0:
   one under Settings, API & access, or use the sign-in link printed at the first network start. A server only
   this computer uses needs none, as before.
 - **Switching conversations is instant.** Up to five conversations stay in system memory, so going back to one
-  no longer reads its whole history again (a 19K-token chat: 17 s before).
+  no longer reads its whole history again (a 19K-token chat: 17 s before). Thanks to
+  [huai_xin](https://github.com/2424830124) for the idea and design (#2).
 - **Linux, from source.** The engine and server build and run on Linux with CUDA, with the browser as the
   interface. Thanks to [nullbyte61](https://github.com/nullbyte61) for the port.
 - **Inkling 2 Mini, engine preview.** Thinking Machines' looped mixture of experts (UD-Q3_K_XL, 13.6 GB) on an
