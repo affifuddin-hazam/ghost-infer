@@ -12,6 +12,7 @@ pub const IQ2_XXS_BYTES: usize = 66; // f16 d, 32 x u16 (4 grid indices, then 4 
 pub const IQ2_XS_BYTES: usize = 74; // f16 d, 32 x u16 (9-bit grid index, 7 sign bits), 8 scale bytes (two 4-bit per 32)
 pub const IQ2_S_BYTES: usize = 82; // f16 d, 32 grid index bytes, 32 sign bytes, 8 high-bit bytes, 8 scale bytes
 pub const IQ3_S_BYTES: usize = 110; // f16 d, 64 grid index bytes, 8 high-bit bytes, 32 sign bytes, 4 scale bytes
+pub const IQ3S_NIB_BYTES: usize = 134; // f16 d, IQ3_S's 4 scale bytes, 8 x 16 bytes of 4-bit codes
 pub const IQ3_XXS_BYTES: usize = 98; // f16 d, 64 grid index bytes, 8 x u32 (4 x 7 sign bits and a 4-bit scale per 32)
 
 /// IQ3_XXS (ggml's dequantize_row_iq3_xxs): per 32 values, 8 grid indices into 4-wide entries and one u32
@@ -32,6 +33,53 @@ fn dequant_iq3_xxs(row: &[u8], out: &mut [f32]) {
                     o[j] = db * g1[j] as f32 * if signs >> j & 1 != 0 { -1.0 } else { 1.0 };
                     o[j + 4] = db * g2[j] as f32 * if signs >> (j + 4) & 1 != 0 { -1.0 } else { 1.0 };
                 }
+            }
+        }
+    }
+}
+
+/// The signed levels of Iq3SNib's 4-bit codes: bit 3 the sign, bits 0..2 the level (2c + 1).
+const NIB3S: [i8; 16] = [1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15];
+
+/// IQ3_S rows (110-byte blocks) as Iq3SNib (134-byte blocks): every value is +-(1, 3, .., 15) times its 32's
+/// scale d (1 + 2s), so a 4-bit code holds it exactly; per 32, byte j holds value j (low nibble) and value 16 + j
+/// (high), as IQ4_NL. None if a grid level is not odd (no IQ3_S file has one).
+pub fn iq3s_to_nib(src: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(src.len() / IQ3_S_BYTES * IQ3S_NIB_BYTES);
+    for blk in src.chunks_exact(IQ3_S_BYTES) {
+        let (qs, qh, signs, scales) = (&blk[2..66], &blk[66..74], &blk[74..106], &blk[106..110]);
+        out.extend_from_slice(&blk[..2]);
+        out.extend_from_slice(scales);
+        for ib in 0..8 {
+            let (q, h, sg) = (&qs[8 * ib..8 * ib + 8], qh[ib] as usize, &signs[4 * ib..4 * ib + 4]);
+            let mut code = [0u8; 32];
+            for l in 0..4 {
+                let g1 = IQ3S_GRID[q[2 * l] as usize | (h << (8 - 2 * l) & 256)].to_le_bytes();
+                let g2 = IQ3S_GRID[q[2 * l + 1] as usize | (h << (7 - 2 * l) & 256)].to_le_bytes();
+                for j in 0..8 {
+                    let level = if j < 4 { g1[j] } else { g2[j - 4] };
+                    if level % 2 == 0 || level > 15 {
+                        return None;
+                    }
+                    code[8 * l + j] = (level - 1) / 2 | ((sg[l] >> j & 1) << 3);
+                }
+            }
+            out.extend((0..16).map(|j| code[j] | code[16 + j] << 4));
+        }
+    }
+    Some(out)
+}
+
+fn dequant_iq3s_nib(row: &[u8], out: &mut [f32]) {
+    for (blk, o) in row.chunks_exact(IQ3S_NIB_BYTES).zip(out.chunks_exact_mut(256)) {
+        let d = d16(blk);
+        for (ib, o) in o.chunks_exact_mut(32).enumerate() {
+            let s = blk[2 + ib / 2];
+            let db = d * (1 + 2 * if ib % 2 == 0 { s & 0xf } else { s >> 4 }) as f32;
+            let q = &blk[6 + 16 * ib..6 + 16 * ib + 16];
+            for j in 0..16 {
+                o[j] = db * NIB3S[(q[j] & 15) as usize] as f32;
+                o[j + 16] = db * NIB3S[(q[j] >> 4) as usize] as f32;
             }
         }
     }
@@ -167,7 +215,7 @@ pub fn has_dot(ty: GgmlType) -> bool {
 }
 
 fn is_ext(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::Nvfp4 | GgmlType::Iq4Nl | GgmlType::Iq3Xxs | GgmlType::Iq3S)
+    matches!(ty, GgmlType::Nvfp4 | GgmlType::Iq4Nl | GgmlType::Iq3Xxs | GgmlType::Iq3S | GgmlType::Iq3SNib)
 }
 
 /// Scalar dot of a row of one of the `is_ext` formats with int8 activations: each 32 values dequantised
@@ -248,6 +296,21 @@ unsafe fn ext_dot_avx2<const N: usize>(ty: GgmlType, w: &[u8], xs: [(&[f32], &[i
                 // F16C for the per-32 scale (every AVX2 CPU has it): the software conversion was a tenth of the time
                 let d = _mm256_cvtph_ps(_mm_set1_epi16(u16::from_le_bytes([blk[0], blk[1]]) as i16));
                 block!(_mm256_set_m128i(hi, lo), b, d);
+            }
+        }
+        GgmlType::Iq3SNib => {
+            // IQ3_S's values and scales exactly, a table look-up per nibble instead of grid look-ups
+            let table = unsafe { _mm_loadu_si128(NIB3S.as_ptr() as *const __m128i) };
+            for (sb, blk) in w.chunks_exact(IQ3S_NIB_BYTES).enumerate() {
+                let d = d16(blk);
+                for ib in 0..8 {
+                    let s = blk[2 + ib / 2];
+                    let db = d * (1 + 2 * if ib % 2 == 0 { s & 0xf } else { s >> 4 }) as f32;
+                    let bytes = unsafe { _mm_loadu_si128(blk.as_ptr().add(6 + 16 * ib) as *const __m128i) };
+                    let lo = _mm_shuffle_epi8(table, _mm_and_si128(bytes, m4));
+                    let hi = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), m4));
+                    block!(_mm256_set_m128i(hi, lo), sb * 8 + ib, _mm256_set1_ps(db));
+                }
             }
         }
         GgmlType::Iq3Xxs => {
@@ -362,6 +425,21 @@ pub unsafe fn row_dot1_avx2(ty: GgmlType, w: &[u8], xd: &[f32], xq: &[i8]) -> f3
                 let lo = _mm_shuffle_epi8(table, _mm_and_si128(bytes, m4));
                 let hi = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), m4));
                 ext!(_mm256_set_m128i(hi, lo), b, h16x8(blk));
+            }
+        }
+        GgmlType::Iq3SNib => {
+            let table = unsafe { _mm_loadu_si128(NIB3S.as_ptr() as *const __m128i) };
+            for sb in 0..w.len() / IQ3S_NIB_BYTES {
+                let blk = unsafe { p.add(sb * IQ3S_NIB_BYTES) };
+                let d = h16(blk);
+                for ib in 0..8 {
+                    let s = unsafe { *blk.add(2 + ib / 2) };
+                    let db = d * (1 + 2 * if ib % 2 == 0 { s & 0xf } else { s >> 4 }) as f32;
+                    let bytes = unsafe { _mm_loadu_si128(blk.add(6 + 16 * ib) as *const __m128i) };
+                    let lo = _mm_shuffle_epi8(table, _mm_and_si128(bytes, m4));
+                    let hi = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), m4));
+                    ext!(_mm256_set_m128i(hi, lo), sb * 8 + ib, _mm256_set1_ps(db));
+                }
             }
         }
         GgmlType::Iq3Xxs => {
@@ -603,6 +681,7 @@ pub fn dequant(ty: GgmlType, row: &[u8], out: &mut [f32]) {
         GgmlType::Iq2S => dequant_iq2_s(row, out),
         GgmlType::Iq3S => dequant_iq3_s(row, out),
         GgmlType::Iq3Xxs => dequant_iq3_xxs(row, out),
+        GgmlType::Iq3SNib => dequant_iq3s_nib(row, out),
         _ => unreachable!("not an i-quant: {}", ty.name()),
     }
 }
@@ -704,6 +783,33 @@ mod tests {
 
     /// cargo test --release kernel_speed -- --ignored --nocapture: each format's AVX2 row kernel on one thread,
     /// in cache (64 rows of 2304), as ns per 32 values.
+    /// IQ3_S re-laid as nibbles dots (and dequantises) exactly as IQ3_S.
+    #[test]
+    fn iq3s_nib_matches() {
+        if !crate::quant::has_avx2() {
+            return;
+        }
+        let cols = 1024;
+        let w = row(GgmlType::Iq3S, cols / 256, 31);
+        let nib = iq3s_to_nib(&w).expect("odd levels");
+        let mut s = 5u64;
+        let xq: Vec<i8> = (0..cols)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 33) as u8 as i8).max(-127)
+            })
+            .collect();
+        let xd: Vec<f32> = (0..cols / 32).map(|i| 0.01 + i as f32 * 0.001).collect();
+        let (a, b) = unsafe { (row_dot1_avx2(GgmlType::Iq3S, &w, &xd, &xq), row_dot1_avx2(GgmlType::Iq3SNib, &nib, &xd, &xq)) };
+        assert_eq!(a.to_bits(), b.to_bits(), "one row: {a} vs {b}");
+        let (a4, b4) = unsafe { (row_dot_avx2(GgmlType::Iq3S, &w, [(&xd[..], &xq[..]); 3]), row_dot_avx2(GgmlType::Iq3SNib, &nib, [(&xd[..], &xq[..]); 3])) };
+        assert_eq!(a4.map(f32::to_bits), b4.map(f32::to_bits));
+        let (mut fa, mut fb) = (vec![0f32; cols], vec![0f32; cols]);
+        dequant(GgmlType::Iq3S, &w, &mut fa);
+        dequant(GgmlType::Iq3SNib, &nib, &mut fb);
+        assert_eq!(fa, fb);
+    }
+
     #[test]
     #[ignore]
     fn kernel_speed() {
@@ -712,10 +818,10 @@ mod tests {
         let mut xq = crate::quant::QuantizedBatch::default();
         xq.quantize(&x, cols);
         let (xd, xqv) = xq.row_parts(0);
-        for ty in [GgmlType::Nvfp4, GgmlType::Iq4Nl, GgmlType::Iq3Xxs, GgmlType::Iq3S, GgmlType::Iq2Xxs, GgmlType::Iq2Xs, GgmlType::Iq2S] {
+        for ty in [GgmlType::Nvfp4, GgmlType::Iq4Nl, GgmlType::Iq3Xxs, GgmlType::Iq3S, GgmlType::Iq3SNib, GgmlType::Iq2Xxs, GgmlType::Iq2Xs, GgmlType::Iq2S] {
             let (per, bytes) = ty.block().unwrap();
             let rb = cols / per * bytes;
-            let mut w = row(ty, rows * cols / per, 99);
+            let mut w = if ty == GgmlType::Iq3SNib { iq3s_to_nib(&row(GgmlType::Iq3S, rows * cols / per, 99)).unwrap() } else { row(ty, rows * cols / per, 99) };
             if ty == GgmlType::Nvfp4 {
                 for b in w.chunks_exact_mut(bytes) {
                     b[..2].copy_from_slice(&[0x30, 0x31]);

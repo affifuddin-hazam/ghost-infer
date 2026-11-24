@@ -1198,7 +1198,10 @@ pub fn experts_situ(experts: &[SituExpert], x: &[f32], acc: &mut [f32], sc: &mut
         });
     }
 }
-/// Row r of `m` dotted with up to 4 activation rows at once, the weights decoded once for all of them; each
+/// Activation rows one decoded weight row serves at a time in the prompt-batch experts.
+const GROUP: usize = 8;
+
+/// Row r of `m` dotted with up to 8 activation rows at once, the weights decoded once for all of them; each
 /// result is the one dot1 gives.
 fn dots_upto4(m: &Matrix, r: usize, xs: &[XRow], xf: &[&[f32]], avx2: bool, out: &mut [f32]) {
     macro_rules! n {
@@ -1216,7 +1219,11 @@ fn dots_upto4(m: &Matrix, r: usize, xs: &[XRow], xf: &[&[f32]], avx2: bool, out:
         1 => out[0] = dot1(m, r, xs[0], xf[0], avx2),
         2 => n!(2),
         3 => n!(3),
-        _ => n!(4),
+        4 => n!(4),
+        5 => n!(5),
+        6 => n!(6),
+        7 => n!(7),
+        _ => n!(8),
     }
 }
 
@@ -1224,8 +1231,13 @@ fn dots_upto4(m: &Matrix, r: usize, xs: &[XRow], xf: &[&[f32]], avx2: bool, out:
 /// the tokens' rows (dim each), `acc` their sums. Every expert some token picked is read from memory once for
 /// all the tokens that picked it (its rows stay in cache across them); each token gets experts_situ's
 /// arithmetic in its order, so the same result to the bit.
+/// Time in experts_situ_batch (ns): setup, gate_up, quantising h, down; and its calls and pairs.
+pub static BATCH_PROF: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 pub fn experts_situ_batch(picks: &[Vec<SituExpert>], xs: &[f32], acc: &mut [f32], sc: &mut ExpertScratch, beta: f32, lb: f32) {
     let avx2 = has_avx2();
+    let tp = std::time::Instant::now();
+    let bp = |i: usize, t: &std::time::Instant| BATCH_PROF[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     let nt = picks.len();
     if nt == 0 {
         return;
@@ -1265,6 +1277,10 @@ pub fn experts_situ_batch(picks: &[Vec<SituExpert>], xs: &[f32], acc: &mut [f32]
     let pool = crate::pool::pool();
     const GU_CHUNK: usize = 48;
     const DOWN_CHUNK: usize = 64;
+    bp(0, &tp);
+    BATCH_PROF[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    BATCH_PROF[5].fetch_add(np as u64, std::sync::atomic::Ordering::Relaxed);
+    let tp = std::time::Instant::now();
     {
         let (xq, chunks) = (&sc.xq, hidden.div_ceil(GU_CHUNK));
         let items = keys.len() * chunks;
@@ -1279,10 +1295,10 @@ pub fn experts_situ_batch(picks: &[Vec<SituExpert>], xs: &[f32], acc: &mut [f32]
             let (u, r0) = (i / chunks, (i % chunks) * GU_CHUNK);
             let (t0, j0) = pair_src[pairs_of[u][0]];
             let (gate_up, gu_scale) = (&picks[t0][j0].gate_up, picks[t0][j0].gu_scale);
-            let (mut gs, mut vs) = ([0f32; 4], [0f32; 4]);
+            let (mut gs, mut vs) = ([0f32; GROUP], [0f32; GROUP]);
             // the activation rows of the expert's pairs, 4 to a group
             let groups: Vec<(&[usize], Vec<XRow>, Vec<&[f32]>)> = pairs_of[u]
-                .chunks(4)
+                .chunks(GROUP)
                 .map(|g| (g, g.iter().map(|&p| xq.row3(pair_src[p].0)).collect(), g.iter().map(|&p| &xs[pair_src[p].0 * dim..(pair_src[p].0 + 1) * dim]).collect()))
                 .collect();
             for r in r0..(r0 + GU_CHUNK).min(hidden) {
@@ -1297,12 +1313,16 @@ pub fn experts_situ_batch(picks: &[Vec<SituExpert>], xs: &[f32], acc: &mut [f32]
                 }
             }
         });
+        bp(1, &tp);
+        let tp = std::time::Instant::now();
         for (u, (hv, q)) in sc.h.chunks_exact(QK8_0).zip(sc.hq.quants.chunks_exact_mut(QK8_0)).enumerate() {
             let (d, s) = quantize_block(hv, q);
             sc.hq.scales[u] = d;
             sc.hq.sums[u] = s;
         }
+        bp(2, &tp);
     }
+    let tp = std::time::Instant::now();
     {
         let (hq, hf) = (&sc.hq, &sc.h);
         let out = Raw(acc.as_mut_ptr());
@@ -1314,13 +1334,13 @@ pub fn experts_situ_batch(picks: &[Vec<SituExpert>], xs: &[f32], acc: &mut [f32]
                 break;
             }
             let mut dv = vec![0f32; np];
-            let mut four = [0f32; 4];
+            let mut four = [0f32; GROUP];
             // per distinct expert: its down matrix and its pairs' h rows, 4 to a group
             let groups: Vec<(&Matrix, Vec<(&[usize], Vec<XRow>, Vec<&[f32]>)>)> = pairs_of
                 .iter()
                 .map(|list| {
                     let (t0, j0) = pair_src[list[0]];
-                    (&picks[t0][j0].down, list.chunks(4).map(|g| (g, g.iter().map(|&p| hq.row3(p)).collect(), g.iter().map(|&p| &hf[p * hidden..(p + 1) * hidden]).collect())).collect())
+                    (&picks[t0][j0].down, list.chunks(GROUP).map(|g| (g, g.iter().map(|&p| hq.row3(p)).collect(), g.iter().map(|&p| &hf[p * hidden..(p + 1) * hidden]).collect())).collect())
                 })
                 .collect();
             for r in r0..(r0 + DOWN_CHUNK).min(dim) {
@@ -1342,7 +1362,7 @@ pub fn experts_situ_batch(picks: &[Vec<SituExpert>], xs: &[f32], acc: &mut [f32]
                 }
             }
         });
-    }
+    }    bp(3, &tp);
 }
 
 /// SwiGLU front half in one pass: `h[b * rows + r] = silu(gate[r] · x[b]) * (up[r] · x[b])`.

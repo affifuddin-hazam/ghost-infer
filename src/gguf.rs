@@ -124,6 +124,9 @@ pub enum GgmlType {
     Iq2S,
     Iq3S,
     Iq3Xxs,
+    /// ghost-infer's own (never in a file): IQ3_S re-laid at load as a 4-bit code a value (sign, level 1..15),
+    /// the IQ4_NL layout per 32, for a cheaper CPU dot; see iquant::iq3s_to_nib
+    Iq3SNib,
     /// NVIDIA FP4: 64-value blocks of four unsigned E4M3 scales (one per 16) and 4-bit E2M1 codes
     Nvfp4,
     /// 64-value blocks, f16 scale, 2-bit codes worth (code - 1) * d: -1, 0, +1 (and +2, unused by ternary files)
@@ -183,6 +186,7 @@ impl GgmlType {
             GgmlType::Iq2S => Some((256, crate::iquant::IQ2_S_BYTES)),
             GgmlType::Iq3S => Some((256, crate::iquant::IQ3_S_BYTES)),
             GgmlType::Iq3Xxs => Some((256, crate::iquant::IQ3_XXS_BYTES)),
+            GgmlType::Iq3SNib => Some((256, crate::iquant::IQ3S_NIB_BYTES)),
             GgmlType::Nvfp4 => Some((64, 36)),
             GgmlType::Q2_0 => Some((64, 18)),
             GgmlType::Ptq1_0 => Some((128, 28)),
@@ -210,6 +214,7 @@ impl GgmlType {
             GgmlType::Iq2S => "IQ2_S".into(),
             GgmlType::Iq3S => "IQ3_S".into(),
             GgmlType::Iq3Xxs => "IQ3_XXS".into(),
+            GgmlType::Iq3SNib => "IQ3_S (nibbles)".into(),
             GgmlType::Nvfp4 => "NVFP4".into(),
             GgmlType::Q2_0 => "Q2_0".into(),
             GgmlType::Ptq1_0 => "PTQ1_0".into(),
@@ -229,7 +234,7 @@ impl GgmlType {
 
     /// The grid-based i-quants (iquant.rs).
     pub fn is_iquant(self) -> bool {
-        matches!(self, GgmlType::Iq2Xxs | GgmlType::Iq2Xs | GgmlType::Iq2S | GgmlType::Iq3S | GgmlType::Iq3Xxs)
+        matches!(self, GgmlType::Iq2Xxs | GgmlType::Iq2Xs | GgmlType::Iq2S | GgmlType::Iq3S | GgmlType::Iq3Xxs | GgmlType::Iq3SNib)
     }
 }
 

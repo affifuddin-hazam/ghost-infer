@@ -434,6 +434,29 @@ impl<'a> Inkling<'a> {
                 }
                 done += n;
             }
+            // IQ3_S re-laid as 4-bit codes (the same values, a third of the CPU's decoding work);
+            // GHOST_INFER_INK_IQ3S=1 keeps it as it is
+            if ms[0].ty == GgmlType::Iq3S && std::env::var_os("GHOST_INFER_INK_IQ3S").is_none() {
+                let mut nib = Vec::with_capacity(buf.len() / crate::iquant::IQ3_S_BYTES * crate::iquant::IQ3S_NIB_BYTES);
+                let mut spans = Vec::with_capacity(ms.len());
+                for m in ms.iter() {
+                    let off = m.data.as_ptr() as usize - start;
+                    let at = nib.len();
+                    match crate::iquant::iq3s_to_nib(&buf[off..off + m.data.len()]) {
+                        Some(v) => nib.extend_from_slice(&v),
+                        None => return Err("an IQ3_S grid level is not odd".into()),
+                    }
+                    spans.push((at, nib.len() - at));
+                }
+                drop(buf);
+                let owned: &'static [u8] = Box::leak(nib.into_boxed_slice());
+                for (m, (at, n)) in ms.iter_mut().zip(spans) {
+                    m.data = &owned[at..at + n];
+                    m.ty = GgmlType::Iq3SNib;
+                }
+                total += owned.len();
+                continue;
+            }
             let owned: &'static [u8] = Box::leak(buf.into_boxed_slice());
             for m in ms.iter_mut() {
                 let off = m.data.as_ptr() as usize - start;
@@ -442,6 +465,11 @@ impl<'a> Inkling<'a> {
             total += end - start;
         }
         Ok(total)
+    }
+
+    /// Expert `e` of layer `il`: its [gate; up] and down matrices (their bytes as the CPU holds them).
+    pub fn expert_mats(&self, il: usize, e: usize) -> (crate::quant::Matrix<'a>, crate::quant::Matrix<'a>) {
+        (self.layers[il].gate_up[e], self.layers[il].down[e])
     }
 
     pub fn embed(&self, token: u32) -> Vec<f32> {

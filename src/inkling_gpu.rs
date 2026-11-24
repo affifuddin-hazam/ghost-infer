@@ -577,6 +577,87 @@ __global__ void ink_moe_gu_iq3(const unsigned char* W, long long ebytes, const i
     if (lane == 0) out[(size_t)blockIdx.y * rows + r] = s * gscale[e0];
 }
 
+// a prompt batch's (token, pick) pairs bucketed by expert: cnt[e], off[e] (where e's pairs start in list) and
+// list (pair t * k + j); one block
+__global__ void ink_group(const int* picks, int np, int n_exp, int* cnt, int* off, int* list) {
+    __shared__ int c[256], o[257];
+    for (int i = threadIdx.x; i < n_exp; i += blockDim.x) c[i] = 0;
+    __syncthreads();
+    for (int p = threadIdx.x; p < np; p += blockDim.x) atomicAdd(&c[picks[p]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        o[0] = 0;
+        for (int i = 0; i < n_exp; i++) o[i + 1] = o[i] + c[i];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_exp; i += blockDim.x) { cnt[i] = c[i]; off[i] = o[i]; c[i] = o[i]; }
+    __syncthreads();
+    for (int p = threadIdx.x; p < np; p += blockDim.x) list[atomicAdd(&c[picks[p]], 1)] = p;
+}
+
+// ink_moe_gu for a prompt batch grouped by expert: block (row group, expert u) takes every pair that picked u, 8
+// at a time, each weight piece read once for the 8; per pair the same arithmetic as ink_moe_gu (out: a pair's
+// [gate; up] row at pair * rows)
+__global__ void ink_moe_gu_g(const unsigned char* W, long long ebytes, const int* cnt, const int* off, const int* list, int k,
+                             const float* gscale, const signed char* xq, const float* xd, float* out, int rows, int cols, const int* slot) {
+    __shared__ __align__(16) signed char xs[8 * 2304];
+    __shared__ float ds[8 * 72];
+    const int u = blockIdx.y, n = cnt[u];
+    if (n == 0) return;
+    const int e = slot[u], start = off[u];
+    const int r = blockIdx.x * (blockDim.x >> 3) + (threadIdx.x >> 3), sub = threadIdx.x & 7;
+    const unsigned char* base = W + (e < 0 ? 0 : e) * ebytes;
+    const unsigned char *q = base + (size_t)r * (cols / 2), *sc = base + (size_t)rows * (cols / 2) + (size_t)r * (cols / 16);
+    for (int c0 = 0; c0 < n; c0 += 8) {
+        const int nt = min(8, n - c0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nt * cols / 16; i += blockDim.x) {
+            const int t = i / (cols / 16), w = i - t * (cols / 16), tok = list[start + c0 + t] / k;
+            reinterpret_cast<int4*>(xs + t * cols)[w] = reinterpret_cast<const int4*>(xq + (size_t)tok * cols)[w];
+        }
+        for (int i = threadIdx.x; i < nt * cols / 32; i += blockDim.x) {
+            const int t = i / (cols / 32), w = i - t * (cols / 32), tok = list[start + c0 + t] / k;
+            ds[t * (cols / 32) + w] = xd[(size_t)tok * (cols / 32) + w];
+        }
+        __syncthreads();
+        float s[8];
+#pragma unroll
+        for (int t = 0; t < 8; t++) s[t] = 0.f;
+        if (r < rows && e >= 0) {
+            for (int hb = sub; hb < cols / 32; hb += 8) {
+                const int4 w = reinterpret_cast<const int4*>(q)[hb];
+                const unsigned short ss = reinterpret_cast<const unsigned short*>(sc)[hb];
+                const float s0 = ue4m3(ss & 0xff), s1 = ue4m3(ss >> 8);
+                const int2 a0 = fp4_lookup(w.x), b0 = fp4_lookup(w.y), a1 = fp4_lookup(w.z), b1 = fp4_lookup(w.w);
+#pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    if (t < nt) {
+                        const int4 x0 = reinterpret_cast<const int4*>(xs + t * cols + hb * 32)[0], x1 = reinterpret_cast<const int4*>(xs + t * cols + hb * 32)[1];
+                        int acc = __dp4a(a0.x, x0.x, 0);
+                        acc = __dp4a(b0.x, x0.y, acc);
+                        acc = __dp4a(a0.y, x0.z, acc);
+                        acc = __dp4a(b0.y, x0.w, acc);
+                        float part = s0 * (float)acc;
+                        acc = __dp4a(a1.x, x1.x, 0);
+                        acc = __dp4a(b1.x, x1.y, acc);
+                        acc = __dp4a(a1.y, x1.z, acc);
+                        acc = __dp4a(b1.y, x1.w, acc);
+                        s[t] += ds[t * (cols / 32) + hb] * (part + s1 * (float)acc);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < 8; t++) {
+            float v = s[t];
+            v += __shfl_xor_sync(0xffffffff, v, 4);
+            v += __shfl_xor_sync(0xffffffff, v, 2);
+            v += __shfl_xor_sync(0xffffffff, v, 1);
+            if (r < rows && sub == 0 && t < nt) out[(size_t)list[start + c0 + t] * rows + r] = e >= 0 ? v * gscale[u] : 0.f;
+        }
+    }
+}
+
 // SITU of each pick's [gate; up] (ff each) into int8 per 32 for the downs
 __global__ void ink_situ_q8(const float* gu, signed char* hq, float* hd, int ff, int k, float beta, float lb) {
     int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), l = threadIdx.x & 31;
@@ -786,6 +867,8 @@ struct InkKernels {
     mv_q8s: Ptr,
     publish: Ptr,
     await_: Ptr,
+    group: Ptr,
+    moe_gu_g: Ptr,
 }
 
 impl InkKernels {
@@ -869,6 +952,8 @@ impl InkKernels {
                 mv_q8s: get("ink_mv_q8s")?,
                 publish: get("ink_publish")?,
                 await_: get("ink_await")?,
+                group: get("ink_group")?,
+                moe_gu_g: get("ink_moe_gu_g")?,
             })
         }
     }
@@ -883,6 +968,8 @@ struct GExperts {
     slot: DeviceBuf,
     /// only some experts on the GPU: which
     resident: Option<Vec<bool>>,
+    /// the slot table as the host holds it
+    slots: Vec<i32>,
     down: DeviceBuf,
     gu_bytes: usize,
     down_bytes: usize,
@@ -963,6 +1050,7 @@ struct Work {
     mo: DeviceBuf,
     mo2: DeviceBuf,
     mcpu: DeviceBuf, // the CPU's experts' part of a partly resident layer
+    grp: DeviceBuf,  // a batch's pairs by expert: counts, starts, the pairs (ink_group)
     msgs: DeviceBuf, // 4 rows
     cg: DeviceBuf,   // control gate input (2 * dim)
     c64: DeviceBuf,
@@ -987,6 +1075,9 @@ struct Hops {
 pub struct GpuInkling<'a> {
     /// the hand-offs' buffers (None: GHOST_INFER_INK_SYNC_HOPS=1, a graph between hand-offs and copies at each)
     hops: Option<Hops>,
+    /// per layer, how often each expert was picked lately (partly resident layers: what to keep on the GPU)
+    heat: Vec<Vec<f32>>,
+    pub swaps: usize,
     /// the hand-off now in the token, and tokens stepped so far (the hand-offs' numbers)
     hop: i32,
     steps: i32,
@@ -1023,6 +1114,8 @@ pub struct GpuInkling<'a> {
     /// CUDA graphs: one per stretch of GPU work between two CPU-expert hand-offs (the same every token), captured
     /// on the first token and replayed after; `gmode` 0 off, 1 capturing, 2 replaying; `seg` the stretch now
     graphs: Vec<Ptr>,
+    /// the graphs of a full prompt batch's stretches (swapped in while one runs: every full batch is the same work)
+    graphs_b: Vec<Ptr>,
     gmode: u8,
     kev: std::cell::RefCell<Vec<(usize, usize, usize)>>,
     /// GHOST_INFER_INK_COUNT: how often each layer picks each expert (no graphs then: the picks are read back)
@@ -1064,14 +1157,8 @@ fn upload_nvfp4_split(up: &mut Uploader, g: &Gguf, t: &TensorInfo, n_exp: usize,
             }
             done += n;
         }
-        let (q, sc) = out.split_at_mut(rows * qrow);
-        for r in 0..rows {
-            for b in 0..nb {
-                let blk = &raw[(r * nb + b) * 36..(r * nb + b + 1) * 36];
-                sc[r * srow + 4 * b..r * srow + 4 * b + 4].copy_from_slice(&blk[..4]);
-                q[r * qrow + 32 * b..r * qrow + 32 * b + 32].copy_from_slice(&blk[4..]);
-            }
-        }
+        nvfp4_split_into(&raw, rows, cols, &mut out);
+        let _ = (qrow, srow, nb);
         up.put(buf.ptr + (i * ebytes) as u64, &out)?;
     }
     Ok(buf)
@@ -1086,8 +1173,10 @@ const MV_ROWS: usize = 1;
 /// Rows a warp of ink_moe_down takes (must match DOWN_ROWS).
 const DOWN_ROWS: usize = 1;
 
-fn hot_experts(il: usize, n_exp: usize, n: usize) -> Vec<usize> {
-    let counts: Option<Vec<u64>> = std::env::var_os("GHOST_INFER_INK_HOT").and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| {
+fn hot_experts(il: usize, n_exp: usize, n: usize, model: &std::path::Path) -> Vec<usize> {
+    // the counts GHOST_INFER_INK_HOT names, else <model>.hot.txt beside the model when there is one
+    let file = std::env::var_os("GHOST_INFER_INK_HOT").map(std::path::PathBuf::from).unwrap_or_else(|| model.with_extension("hot.txt"));
+    let counts: Option<Vec<u64>> = std::fs::read_to_string(file).ok().and_then(|t| {
         t.lines().find_map(|l| {
             let (a, b) = l.split_once(':')?;
             (a.trim().parse::<usize>().ok()? == il).then(|| b.split_whitespace().filter_map(|v| v.parse().ok()).collect::<Vec<u64>>())
@@ -1156,7 +1245,9 @@ fn fuse_projections(l: &mut GLayer) -> Result<(), String> {
 }
 
 /// Prompt tokens a GPU pass takes at most.
-const PREFILL_B: usize = 32;
+const PREFILL_B: usize = 128;
+/// Rows the depth states take in the pool: the prelude's block and output, each pass's blocks and output, the tail's block
+const POOL_ROWS: usize = 12;
 
 /// The work buffers for passes of `nb` tokens (the attention scores for 8 of them at a time).
 fn alloc_work(c: &Cfg, ctx: usize, nb: usize, logits_rows: usize) -> Result<Work, String> {
@@ -1197,6 +1288,7 @@ fn alloc_work(c: &Cfg, ctx: usize, nb: usize, logits_rows: usize) -> Result<Work
         mo: f(d * nb)?,
         mo2: f(d * nb)?,
         mcpu: f(d * nb)?,
+        grp: f(2 * c.n_exp + c.k * nb)?,
         msgs: f(4 * d * nb)?,
         cg: f(2 * d)?,
         c64: f(256 * nb)?,
@@ -1204,9 +1296,22 @@ fn alloc_work(c: &Cfg, ctx: usize, nb: usize, logits_rows: usize) -> Result<Work
         cforget: f(d)?,
         scr: f(c.n_head * ctx * nb.min(8))?,
         pos: DeviceBuf::alloc(8)?, // the position, and the step count (hand-off numbers)
-        pool: f(24 * d * nb)?,
+        pool: f(POOL_ROWS * d * nb)?,
         logits: f(logits_rows)?,
     })
+}
+
+/// One NVFP4 expert matrix (rows of 36-byte blocks, as in the file) re-laid as upload_nvfp4_split lays it.
+fn nvfp4_split_into(raw: &[u8], rows: usize, cols: usize, out: &mut [u8]) {
+    let (qrow, srow, nb) = (cols / 2, cols / 16, cols / 64);
+    let (q, sc) = out.split_at_mut(rows * qrow);
+    for r in 0..rows {
+        for b in 0..nb {
+            let blk = &raw[(r * nb + b) * 36..(r * nb + b + 1) * 36];
+            sc[r * srow + 4 * b..r * srow + 4 * b + 4].copy_from_slice(&blk[..4]);
+            q[r * qrow + 32 * b..r * qrow + 32 * b + 32].copy_from_slice(&blk[4..]);
+        }
+    }
 }
 
 fn free_vram() -> Result<usize, String> {
@@ -1367,17 +1472,18 @@ impl<'a> GpuInkling<'a> {
             _fold_signs: Vec::new(),
             _weights: None,
         };
-        let mut m = GpuInkling { cpu, c, mm, s, ik, layers, loops, tok_norm, output, output_norm, output_res_q, kv, conv, w, wb, nb: 1, hops, hop: 0, steps: 0, ctx, pos: 0, gpu_expert_layers: Vec::new(), trace: None, prof: [0.0; 2], hostprof: [0.0; 4], prof_layer: vec![(0.0, 0); 24], sc: Default::default(), kprof: std::env::var_os("GHOST_INFER_INK_KPROF").map(|_| Default::default()), graphs: Vec::new(), gmode: 0, seg: 0, kev: Default::default(), segtime: std::env::var_os("GHOST_INFER_INK_SEGTIME").map(|_| Vec::new()), counts: None };
+        let mut m = GpuInkling { cpu, c, mm, s, ik, layers, loops, tok_norm, output, output_norm, output_res_q, kv, conv, w, wb, nb: 1, hops, heat: Vec::new(), swaps: 0, hop: 0, steps: 0, ctx, pos: 0, gpu_expert_layers: Vec::new(), trace: None, prof: [0.0; 2], hostprof: [0.0; 4], prof_layer: vec![(0.0, 0); 24], sc: Default::default(), kprof: std::env::var_os("GHOST_INFER_INK_KPROF").map(|_| Default::default()), graphs: Vec::new(), graphs_b: Vec::new(), gmode: 0, seg: 0, kev: Default::default(), segtime: std::env::var_os("GHOST_INFER_INK_SEGTIME").map(|_| Vec::new()), counts: None };
         if std::env::var_os("GHOST_INFER_INK_COUNT").is_some() {
             m.counts = Some(vec![vec![0; m.c.n_exp]; m.c.n_layers]);
         }
+        m.heat = vec![vec![0f32; m.c.n_exp]; m.c.n_layers];
         eprintln!("[vram free after session: {} MB]", free_vram()? >> 20);
         m.place_experts(g)?;
         Ok(m)
     }
 
     /// Experts to the GPU for the looped layers stored in NVFP4 (three runs per token each), as many as fit with
-    /// GHOST_INFER_INK_RESERVE_MB (default 400) left free; GHOST_INFER_INK_GPU_LAYERS=a,b,... picks them instead.
+    /// GHOST_INFER_INK_RESERVE_MB (default 128) left free; GHOST_INFER_INK_GPU_LAYERS=a,b,... picks them instead.
     fn place_experts(&mut self, g: &Gguf) -> Result<(), String> {
         let c = &self.c;
         // NVFP4 downs with NVFP4 or IQ3_XXS gate_ups have GPU kernels
@@ -1387,11 +1493,15 @@ impl<'a> GpuInkling<'a> {
             Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).filter(|&i| i < c.n_layers && nv(i)).collect(),
             Err(_) => (c.loop_start..c.loop_end).filter(|&i| nv(i)).chain((0..c.n_layers).filter(|&i| !(c.loop_start..c.loop_end).contains(&i) && nv(i))).collect(),
         };
-        let reserve = std::env::var("GHOST_INFER_INK_RESERVE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(400usize) << 20;
+        let reserve = std::env::var("GHOST_INFER_INK_RESERVE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize) << 20;
         let mut up = Uploader::new()?;
+        // looped layers first (each runs every pass), whole then in part; then the others the same way
+        let in_loop = |i: &usize| (c.loop_start..c.loop_end).contains(i);
+        let groups = [wanted.iter().copied().filter(|i| in_loop(i)).collect::<Vec<usize>>(), wanted.iter().copied().filter(|i| !in_loop(i)).collect()];
+        for group in groups {
         let mut left = Vec::new();
         for pass in 0..2 {
-        let list = if pass == 0 { wanted.clone() } else { left.clone() };
+        let list = if pass == 0 { group.clone() } else { left.clone() };
         for i in list {
             let (gu, dn) = (g.tensor(&format!("blk.{i}.ffn_gate_up_exps.weight")).unwrap(), g.tensor(&format!("blk.{i}.ffn_down_exps.weight")).unwrap());
             let per = (gu.n_bytes + dn.n_bytes) / c.n_exp;
@@ -1410,7 +1520,7 @@ impl<'a> GpuInkling<'a> {
                 if n < (c.n_exp / 4).max(c.k) || std::env::var_os("GHOST_INFER_INK_NO_PARTIAL").is_some() {
                     continue;
                 }
-                hot_experts(i, c.n_exp, n)
+                hot_experts(i, c.n_exp, n, &g.path)
             };
             let resident = if which.len() == c.n_exp { None } else {
                 let mut r = vec![false; c.n_exp];
@@ -1435,11 +1545,12 @@ impl<'a> GpuInkling<'a> {
             let ones = vec![1f32; c.n_exp];
             let gs = match g.tensor(&format!("blk.{i}.ffn_gate_up_exps.scale")) { Some(_) => read_f32(g, &format!("blk.{i}.ffn_gate_up_exps.scale"))?, None => ones.clone() };
             let ds = match g.tensor(&format!("blk.{i}.ffn_down_exps.scale")) { Some(_) => read_f32(g, &format!("blk.{i}.ffn_down_exps.scale"))?, None => ones };
-            self.layers[i].experts = Some(GExperts { gu: gbuf, gu_iq3, slot: up.put_vec(&slot)?, resident, down: dbuf, gu_bytes: gu.n_bytes / c.n_exp, down_bytes: dn.n_bytes / c.n_exp, gu_scale: up.put_vec(&gs)?, down_scale: up.put_vec(&ds)? });
+            self.layers[i].experts = Some(GExperts { gu: gbuf, gu_iq3, slot: up.put_vec(&slot)?, slots: slot.clone(), resident, down: dbuf, gu_bytes: gu.n_bytes / c.n_exp, down_bytes: dn.n_bytes / c.n_exp, gu_scale: up.put_vec(&gs)?, down_scale: up.put_vec(&ds)? });
             self.gpu_expert_layers.push(i);
             if which.len() < c.n_exp {
                 eprintln!("[layer {i}: {} of {} experts on the GPU, the rest on the CPU]", which.len(), c.n_exp);
             }
+        }
         }
         }
         up.finish()?;
@@ -1650,6 +1761,54 @@ impl<'a> GpuInkling<'a> {
             Arg::I(end as i32)
         }));
         self.launch(self.ik.mv_q8s, (used.div_ceil(8) as u32, nb.div_ceil(8) as u32), 256, &args)
+    }
+
+    /// Every 32 tokens, between them: in each partly resident layer, up to 4 of the coolest experts on the GPU
+    /// give their slots to hotter ones the CPU has been doing (their weights copied up from the CPU's copy); the
+    /// counts then decay, so the GPU follows what the conversation uses (GHOST_INFER_INK_NO_SWAP=1: fixed).
+    fn swap_experts(&mut self) -> Result<usize, String> {
+        if self.steps % 32 != 0 || std::env::var_os("GHOST_INFER_INK_NO_SWAP").is_some() {
+            return Ok(0);
+        }
+        let mut swapped = 0;
+        for il in 0..self.c.n_layers {
+            let Some(e) = self.layers[il].experts.as_ref() else { continue };
+            let Some(res) = e.resident.clone() else { continue };
+            let heat = &self.heat[il];
+            let mut out: Vec<usize> = (0..res.len()).filter(|&x| res[x]).collect();
+            let mut inn: Vec<usize> = (0..res.len()).filter(|&x| !res[x]).collect();
+            out.sort_by(|a, b| heat[*a].total_cmp(&heat[*b]));
+            inn.sort_by(|a, b| heat[*b].total_cmp(&heat[*a]));
+            let pairs: Vec<(usize, usize)> = inn.iter().zip(&out).take(4).filter(|(i, o)| heat[**i] > heat[**o] * 1.5 + 2.0).map(|(&i, &o)| (i, o)).collect();
+            for (e_in, e_out) in pairs {
+                let (gu_m, dn_m) = self.cpu.expert_mats(il, e_in);
+                let ex = self.layers[il].experts.as_mut().unwrap();
+                let j = ex.slots[e_out];
+                let (gu_at, dn_at) = (ex.gu.ptr + (j as usize * ex.gu_bytes) as u64, ex.down.ptr + (j as usize * ex.down_bytes) as u64);
+                if ex.gu_iq3.is_some() {
+                    self.mm.k.h2d(gu_at, gu_m.data)?;
+                } else {
+                    let mut buf = vec![0u8; gu_m.data.len()];
+                    nvfp4_split_into(gu_m.data, gu_m.rows, gu_m.cols, &mut buf);
+                    self.mm.k.h2d(gu_at, &buf)?;
+                }
+                let mut buf = vec![0u8; dn_m.data.len()];
+                nvfp4_split_into(dn_m.data, dn_m.rows, dn_m.cols, &mut buf);
+                self.mm.k.h2d(dn_at, &buf)?;
+                ex.slots[e_out] = -1;
+                ex.slots[e_in] = j;
+                let r = ex.resident.as_mut().unwrap();
+                r[e_out] = false;
+                r[e_in] = true;
+                let (slot_dev, slots) = (ex.slot.ptr, ex.slots.clone());
+                self.mm.k.h2d(slot_dev, &slots)?;
+                swapped += 1;
+            }
+        }
+        for h in self.heat.iter_mut().flatten() {
+            *h *= 0.85;
+        }
+        Ok(swapped)
     }
 
     /// One-graph tokens (one token a pass, mapped hand-offs on).
@@ -1935,7 +2094,19 @@ impl<'a> GpuInkling<'a> {
                 // every token of the pass in one launch (blockIdx.z)
                 let (picks_b, weights_b, xq_b, xd_b, mo_b) = (w.picks.ptr, w.weights.ptr, w.xq.ptr, w.xd.ptr, w.mo.ptr);
                 let z = nb as u32;
+                let grouped = nb > 1 && e.gu_iq3.is_none() && d <= 2304 && c.n_exp <= 256 && std::env::var_os("GHOST_INFER_INK_NO_GROUP").is_none();
+                if grouped {
+                    let (cnt, off, list) = (w.grp.ptr, w.grp.ptr + (4 * c.n_exp) as u64, w.grp.ptr + (8 * c.n_exp) as u64);
+                    self.launch(self.ik.group, (1, 1), 256, &[Arg::P(w.picks.ptr), Arg::I((nb * c.k) as i32), Arg::I(c.n_exp as i32), Arg::P(cnt), Arg::P(off), Arg::P(list)])?;
+                    self.launch(
+                        self.ik.moe_gu_g,
+                        (rows_gu.div_ceil(32) as u32, c.n_exp as u32),
+                        256,
+                        &[Arg::P(e.gu.ptr), Arg::P(e.gu_bytes as u64), Arg::P(cnt), Arg::P(off), Arg::P(list), Arg::I(c.k as i32), Arg::P(e.gu_scale.ptr), Arg::P(w.xq.ptr), Arg::P(w.xd.ptr), Arg::P(w.gu.ptr), Arg::I(rows_gu as i32), Arg::I(d as i32), Arg::P(e.slot.ptr)],
+                    )?;
+                }
                 match &e.gu_iq3 {
+                    _ if grouped => {}
                     None => self.launch3(
                         self.ik.moe_gu,
                         (rows_gu.div_ceil(32) as u32, c.k as u32, z),
@@ -1965,6 +2136,7 @@ impl<'a> GpuInkling<'a> {
                     self.elem(self.ik.add, &[Arg::P(mo), Arg::P(down), Arg::P(mo), Arg::I(d as i32)], d)?;
                     if self.gmode != 1 {
                         let (xn, picks, wts) = self.hop_host_in()?;
+                        picks.iter().for_each(|&e| self.heat[il][e as usize] += 1.0);
                         let t1 = std::time::Instant::now();
                         let mine: Vec<(usize, f32)> = picks.iter().zip(&wts).filter(|(e, _)| !res[**e as usize]).map(|(&e, &w)| (e as usize, w)).collect();
                         let out = if mine.is_empty() { vec![0f32; d] } else { self.cpu.moe_picks(il, &xn, &mine, &mut self.sc) };
@@ -1985,6 +2157,7 @@ impl<'a> GpuInkling<'a> {
                     self.mm.k.d2h(&mut wts, weights_p)?;
                     self.mm.k.d2h(&mut xn, fnorm)?;
                     let t1 = std::time::Instant::now();
+                    picks.iter().for_each(|&e| self.heat[il][e as usize] += 1.0);
                     let mine: Vec<Vec<(usize, f32)>> = picks.chunks(c.k).zip(wts.chunks(c.k)).map(|(p, w)| p.iter().zip(w).filter(|(e, _)| !res[**e as usize]).map(|(&e, &w)| (e as usize, w)).collect()).collect();
                     let out = if mine.iter().all(|m| m.is_empty()) {
                         vec![0f32; dn]
@@ -2080,11 +2253,13 @@ impl<'a> GpuInkling<'a> {
                 continue;
             }
             std::mem::swap(&mut self.w, self.wb.as_mut().unwrap());
+            std::mem::swap(&mut self.graphs, &mut self.graphs_b);
             self.nb = chunk.len();
             let t = std::time::Instant::now();
             let r = self.step_inner(chunk);
             self.hostprof[0] += t.elapsed().as_secs_f64();
             self.nb = 1;
+            std::mem::swap(&mut self.graphs, &mut self.graphs_b);
             std::mem::swap(&mut self.w, self.wb.as_mut().unwrap());
             logits = r?;
         }
@@ -2098,12 +2273,15 @@ impl<'a> GpuInkling<'a> {
             return Err(format!("the context of {} tokens is full", self.ctx));
         }
         self.steps += 1;
+        if nb == 1 && self.trace.is_none() {
+            self.swaps += self.swap_experts()?;
+        }
         self.mm.k.h2d(self.w.pos.ptr, &[self.pos as i32, self.steps])?;
         let e: Vec<f32> = tokens.iter().flat_map(|&t| self.cpu.embed(t)).collect();
         self.mm.k.h2d(self.w.mo.ptr, &e)?;
         // graphs from the second token on; not while tracing or timing kernels (they read and sync between launches)
         self.gmode = match self.gmode {
-            _ if nb > 1 || self.trace.is_some() || self.kprof.is_some() || self.counts.is_some() || std::env::var_os("GHOST_INFER_INK_NO_GRAPHS").is_some() => 0,
+            _ if (nb > 1 && nb != PREFILL_B) || std::env::var_os("GHOST_INFER_INK_NO_BATCH_GRAPHS").is_some_and(|_| nb > 1) || self.trace.is_some() || self.kprof.is_some() || self.counts.is_some() || std::env::var_os("GHOST_INFER_INK_NO_GRAPHS").is_some() => 0,
             _ if self.graphs.is_empty() => 1,
             _ => 2,
         };
@@ -2195,6 +2373,9 @@ impl<'a> GpuInkling<'a> {
         for il in c.loop_end..c.n_layers {
             self.layer(il, il, il, &mut blocks, &mut next, None)?;
         }
+        if next > POOL_ROWS {
+            return Err(format!("{next} depth states, the pool holds {POOL_ROWS}"));
+        }
         let mut st = blocks.clone();
         st.push(x);
         self.mix(&st, self.output_res_q.ptr, 1, self.w.f.ptr)?;
@@ -2267,6 +2448,10 @@ pub fn run(path: &std::path::Path, ids: &str, n_gen: Option<usize>) -> Result<()
     eprintln!("[prompt: {} tokens in {:.2} s ({:.1} tok/s); waiting for the GPU {:.2} s, CPU experts {:.2} s]", ids.len(), tp.elapsed().as_secs_f64(), ids.len() as f64 / tp.elapsed().as_secs_f64(), m.prof[0], m.prof[1]);
     let per: Vec<String> = m.prof_layer.iter().enumerate().filter(|(_, p)| p.1 > 0).map(|(i, p)| format!("{i}:{:.1}ms", 1000.0 * p.0 / p.1 as f64)).collect();
     eprintln!("[prompt CPU experts per pass: {}]", per.join(" "));
+    let bp: Vec<u64> = crate::quant::BATCH_PROF.iter().map(|v| v.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    if bp[4] > 0 {
+        eprintln!("[prompt CPU expert batches: {} calls, {:.1} pairs each; setup {:.2} s, gate_up {:.2} s, h to int8 {:.2} s, down {:.2} s]", bp[4], bp[5] as f64 / bp[4] as f64, bp[0] as f64 * 1e-9, bp[1] as f64 * 1e-9, bp[2] as f64 * 1e-9, bp[3] as f64 * 1e-9);
+    }
     match n_gen {
         None => {
             for (name, rows) in &per_name {
@@ -2296,6 +2481,9 @@ pub fn run(path: &std::path::Path, ids: &str, n_gen: Option<usize>) -> Result<()
             eprintln!("[steps {:.2} s; graph launches {:.3} s, copies after CPU experts {:.3} s, logits back (with the last stretch) {:.3} s]", h[0], h[1], h[2], h[3]);
             let per: Vec<String> = m.prof_layer.iter().enumerate().filter(|(_, p)| p.1 > 0).map(|(i, p)| format!("{i}:{:.1}ms", 1000.0 * p.0 / p.1 as f64)).collect();
             eprintln!("[CPU experts per pass: {}]", per.join(" "));
+            if m.swaps > 0 {
+                eprintln!("[{} experts swapped onto the GPU as they got hot]", m.swaps);
+            }
             if let Some(st) = &m.segtime {
                 let per: Vec<String> = st.iter().map(|(ms, n)| format!("{:.2}", ms / *n as f64)).collect();
                 eprintln!("[GPU ms per stretch: {}; {:.1} ms a token]", per.join(" "), st.iter().map(|(ms, n)| ms / *n as f64).sum::<f64>());
